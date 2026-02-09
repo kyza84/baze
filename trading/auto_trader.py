@@ -78,10 +78,8 @@ class AutoTrader:
 
     def can_open_trade(self) -> bool:
         self._refresh_daily_window()
-        if self.trading_pause_until_ts > datetime.now(timezone.utc).timestamp():
-            return False
-        if self._hit_daily_drawdown_limit():
-            return False
+        # Manual control mode: no auto pause by daily drawdown or streak.
+        self.trading_pause_until_ts = 0.0
         max_open = int(config.MAX_OPEN_TRADES)
         if max_open > 0 and len(self.open_positions) >= max_open:
             return False
@@ -111,22 +109,6 @@ class AutoTrader:
         return self.paper_balance_usd + sum(
             pos.position_size_usd + pos.pnl_usd for pos in self.open_positions.values()
         )
-
-    def _hit_daily_drawdown_limit(self) -> bool:
-        max_dd_pct = float(config.DAILY_MAX_DRAWDOWN_PERCENT)
-        if max_dd_pct <= 0:
-            return False
-        limit = -abs(self.day_start_equity_usd) * (max_dd_pct / 100)
-        if self.day_realized_pnl_usd <= limit:
-            next_day_ts = datetime.now(timezone.utc).replace(
-                hour=23,
-                minute=59,
-                second=59,
-                microsecond=0,
-            ).timestamp()
-            self.trading_pause_until_ts = max(self.trading_pause_until_ts, next_day_ts)
-            return True
-        return False
 
     async def plan_batch(self, candidates: list[tuple[dict[str, Any], dict[str, Any]]]) -> int:
         if not candidates:
@@ -407,18 +389,7 @@ class AutoTrader:
             self.total_losses += 1
             self.current_loss_streak += 1
 
-        if self.current_loss_streak >= int(config.MAX_CONSECUTIVE_LOSSES):
-            cooldown_seconds = int(config.LOSS_STREAK_COOLDOWN_SECONDS)
-            if cooldown_seconds > 0:
-                self.trading_pause_until_ts = max(
-                    self.trading_pause_until_ts,
-                    datetime.now(timezone.utc).timestamp() + cooldown_seconds,
-                )
-            logger.warning(
-                "AutoTrade pause: loss_streak=%s cooldown=%ss",
-                self.current_loss_streak,
-                cooldown_seconds,
-            )
+        self.trading_pause_until_ts = 0.0
 
         token_cooldown = int(config.MAX_TOKEN_COOLDOWN_SECONDS)
         if token_cooldown > 0:
@@ -693,7 +664,7 @@ class AutoTrader:
             self.total_wins = int(payload.get("total_wins", 0))
             self.total_losses = int(payload.get("total_losses", 0))
             self.current_loss_streak = int(payload.get("current_loss_streak", 0))
-            self.trading_pause_until_ts = float(payload.get("trading_pause_until_ts", 0.0))
+            self.trading_pause_until_ts = 0.0
             self.day_id = str(payload.get("day_id", self._current_day_id()))
             self.day_start_equity_usd = float(payload.get("day_start_equity_usd", self.paper_balance_usd))
             self.day_realized_pnl_usd = float(payload.get("day_realized_pnl_usd", 0.0))

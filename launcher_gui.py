@@ -500,6 +500,7 @@ class App(tk.Tk):
             font=("Consolas", 10),
         )
         self.feed_text.pack(fill=tk.BOTH, expand=True)
+        self._attach_text_copy_support(self.feed_text)
         self.feed_text.tag_configure("BUY", foreground=EVENT_KEYS["BUY"][1])
         self.feed_text.tag_configure("SELL", foreground=EVENT_KEYS["SELL"][1])
         self.feed_text.tag_configure("SCAN", foreground=EVENT_KEYS["SCAN"][1])
@@ -521,6 +522,7 @@ class App(tk.Tk):
             font=("Consolas", 9),
         )
         self.raw_text.pack(fill=tk.BOTH, expand=True)
+        self._attach_text_copy_support(self.raw_text)
 
     def _build_signals_tab(self) -> None:
         top = ttk.Frame(self.signals_tab, style="Card.TFrame")
@@ -594,6 +596,8 @@ class App(tk.Tk):
         ttk.Button(presets, text="Medium", command=self._apply_medium_preset).pack(side=tk.LEFT, padx=6)
         ttk.Button(presets, text="Hard", command=self._apply_hard_preset).pack(side=tk.LEFT)
         ttk.Button(presets, text="Hard Lite", command=self._apply_hard_lite_preset).pack(side=tk.LEFT, padx=6)
+        ttk.Button(presets, text="Safe Flow", command=self._apply_safe_flow_preset).pack(side=tk.LEFT, padx=6)
+        ttk.Button(presets, text="Medium Flow", command=self._apply_medium_flow_preset).pack(side=tk.LEFT, padx=6)
 
         grid = ttk.Frame(self.settings_content, style="Card.TFrame")
         grid.pack(fill=tk.X)
@@ -760,10 +764,71 @@ class App(tk.Tk):
             self.closed_tree.column(col, width=width, anchor="center")
         self.closed_tree.pack(fill=tk.BOTH, expand=True)
 
+    @staticmethod
+    def _to_float(raw: str | None, default: float) -> float:
+        try:
+            if raw is None:
+                return default
+            return float(str(raw).strip())
+        except (TypeError, ValueError):
+            return default
+
+    def _effective_wallet_balance(self, preset: dict[str, str]) -> float:
+        if "WALLET_BALANCE_USD" in preset:
+            return max(0.1, self._to_float(preset.get("WALLET_BALANCE_USD"), 2.75))
+        env_value = self.env_vars.get("WALLET_BALANCE_USD")
+        if env_value and env_value.get().strip():
+            return max(0.1, self._to_float(env_value.get(), 2.75))
+        env_map = read_env_map()
+        return max(0.1, self._to_float(env_map.get("WALLET_BALANCE_USD"), 2.75))
+
+    def _adapt_preset_by_balance(self, preset: dict[str, str]) -> tuple[dict[str, str], float, str]:
+        tuned = dict(preset)
+        balance = self._effective_wallet_balance(tuned)
+
+        if balance <= 5:
+            # Small-bank profile: keep trade flow alive without over-blocking by risk cap.
+            tuned.update(
+                {
+                    "AUTO_TRADE_ENTRY_MODE": "single",
+                    "AUTO_TRADE_TOP_N": "3",
+                    "MAX_OPEN_TRADES": "1",
+                    "PAPER_TRADE_SIZE_USD": "0.45",
+                    "PAPER_TRADE_SIZE_MIN_USD": "0.15",
+                    "PAPER_TRADE_SIZE_MAX_USD": "0.70",
+                    "MAX_LOSS_PER_TRADE_PERCENT_BALANCE": str(max(8.0, self._to_float(tuned.get("MAX_LOSS_PER_TRADE_PERCENT_BALANCE"), 8.0))),
+                    "PAPER_GAS_PER_TX_USD": "0.02",
+                }
+            )
+            if str(tuned.get("SAFE_TEST_MODE", "")).lower() == "true":
+                tuned["SAFE_MIN_LIQUIDITY_USD"] = str(min(22000, int(self._to_float(tuned.get("SAFE_MIN_LIQUIDITY_USD"), 22000))))
+                tuned["SAFE_MIN_VOLUME_5M_USD"] = str(min(5000, int(self._to_float(tuned.get("SAFE_MIN_VOLUME_5M_USD"), 5000))))
+                tuned["SAFE_MIN_AGE_SECONDS"] = str(min(120, int(self._to_float(tuned.get("SAFE_MIN_AGE_SECONDS"), 120))))
+            return tuned, balance, "small-bank"
+
+        if balance <= 25:
+            tuned.update(
+                {
+                    "AUTO_TRADE_ENTRY_MODE": str(tuned.get("AUTO_TRADE_ENTRY_MODE", "top_n")).lower()
+                    if str(tuned.get("AUTO_TRADE_ENTRY_MODE", "top_n")).lower() in {"single", "top_n", "all"}
+                    else "top_n",
+                    "AUTO_TRADE_TOP_N": str(max(3, int(self._to_float(tuned.get("AUTO_TRADE_TOP_N"), 5)))),
+                    "MAX_OPEN_TRADES": str(min(3, max(1, int(self._to_float(tuned.get("MAX_OPEN_TRADES"), 2))))),
+                    "MAX_LOSS_PER_TRADE_PERCENT_BALANCE": str(max(5.0, self._to_float(tuned.get("MAX_LOSS_PER_TRADE_PERCENT_BALANCE"), 5.0))),
+                    "PAPER_GAS_PER_TX_USD": str(min(0.03, self._to_float(tuned.get("PAPER_GAS_PER_TX_USD"), 0.03))),
+                }
+            )
+            return tuned, balance, "mid-bank"
+
+        return tuned, balance, "large-bank"
+
     def _apply_preset_map(self, preset: dict[str, str]) -> None:
-        for key, value in preset.items():
+        tuned, balance, profile = self._adapt_preset_by_balance(preset)
+        for key, value in tuned.items():
             if key in self.env_vars:
                 self.env_vars[key].set(value)
+        if hasattr(self, "hint_var"):
+            self.hint_var.set(f"Preset auto-tuned for balance ${balance:.2f} ({profile}).")
 
     def _apply_super_safe_preset(self) -> None:
         self._apply_preset_map(
@@ -915,6 +980,86 @@ class App(tk.Tk):
             }
         )
 
+    def _apply_safe_flow_preset(self) -> None:
+        self._apply_preset_map(
+            {
+                "AUTO_TRADE_ENABLED": "true",
+                "AUTO_TRADE_PAPER": "true",
+                "AUTO_FILTER_ENABLED": "true",
+                "AUTO_TRADE_ENTRY_MODE": "top_n",
+                "AUTO_TRADE_TOP_N": "5",
+                "MIN_TOKEN_SCORE": "78",
+                "SAFE_TEST_MODE": "true",
+                "SAFE_MIN_LIQUIDITY_USD": "20000",
+                "SAFE_MIN_VOLUME_5M_USD": "2500",
+                "SAFE_MIN_AGE_SECONDS": "90",
+                "SAFE_MAX_PRICE_CHANGE_5M_ABS_PERCENT": "18",
+                "SAFE_REQUIRE_CONTRACT_SAFE": "true",
+                "SAFE_REQUIRE_RISK_LEVEL": "MEDIUM",
+                "SAFE_MAX_WARNING_FLAGS": "1",
+                "MAX_OPEN_TRADES": "2",
+                "PAPER_TRADE_SIZE_USD": "0.50",
+                "PAPER_TRADE_SIZE_MIN_USD": "0.20",
+                "PAPER_TRADE_SIZE_MAX_USD": "0.75",
+                "MAX_LOSS_PER_TRADE_PERCENT_BALANCE": "6.0",
+                "DAILY_MAX_DRAWDOWN_PERCENT": "0",
+                "MAX_CONSECUTIVE_LOSSES": "0",
+                "LOSS_STREAK_COOLDOWN_SECONDS": "0",
+                "MAX_TOKEN_COOLDOWN_SECONDS": "600",
+                "MAX_TOKEN_PRICE_CHANGE_5M_ABS_PERCENT": "35",
+                "EDGE_FILTER_ENABLED": "true",
+                "MIN_EXPECTED_EDGE_PERCENT": "2.0",
+                "PROFIT_TARGET_PERCENT": "40",
+                "STOP_LOSS_PERCENT": "15",
+                "PAPER_GAS_PER_TX_USD": "0.02",
+                "PAPER_BASE_SLIPPAGE_BPS": "60",
+                "DEX_BOOSTS_SOURCE_ENABLED": "true",
+                "DEX_BOOSTS_MAX_TOKENS": "30",
+                "DEX_SEARCH_QUERIES": "base,new,meme",
+                "GECKO_NEW_POOLS_PAGES": "3",
+            }
+        )
+
+    def _apply_medium_flow_preset(self) -> None:
+        self._apply_preset_map(
+            {
+                "AUTO_TRADE_ENABLED": "true",
+                "AUTO_TRADE_PAPER": "true",
+                "AUTO_FILTER_ENABLED": "true",
+                "AUTO_TRADE_ENTRY_MODE": "top_n",
+                "AUTO_TRADE_TOP_N": "8",
+                "MIN_TOKEN_SCORE": "72",
+                "SAFE_TEST_MODE": "true",
+                "SAFE_MIN_LIQUIDITY_USD": "16000",
+                "SAFE_MIN_VOLUME_5M_USD": "1200",
+                "SAFE_MIN_AGE_SECONDS": "60",
+                "SAFE_MAX_PRICE_CHANGE_5M_ABS_PERCENT": "22",
+                "SAFE_REQUIRE_CONTRACT_SAFE": "true",
+                "SAFE_REQUIRE_RISK_LEVEL": "MEDIUM",
+                "SAFE_MAX_WARNING_FLAGS": "2",
+                "MAX_OPEN_TRADES": "3",
+                "PAPER_TRADE_SIZE_USD": "0.60",
+                "PAPER_TRADE_SIZE_MIN_USD": "0.20",
+                "PAPER_TRADE_SIZE_MAX_USD": "0.95",
+                "MAX_LOSS_PER_TRADE_PERCENT_BALANCE": "8.0",
+                "DAILY_MAX_DRAWDOWN_PERCENT": "0",
+                "MAX_CONSECUTIVE_LOSSES": "0",
+                "LOSS_STREAK_COOLDOWN_SECONDS": "0",
+                "MAX_TOKEN_COOLDOWN_SECONDS": "450",
+                "MAX_TOKEN_PRICE_CHANGE_5M_ABS_PERCENT": "40",
+                "EDGE_FILTER_ENABLED": "true",
+                "MIN_EXPECTED_EDGE_PERCENT": "1.0",
+                "PROFIT_TARGET_PERCENT": "45",
+                "STOP_LOSS_PERCENT": "18",
+                "PAPER_GAS_PER_TX_USD": "0.02",
+                "PAPER_BASE_SLIPPAGE_BPS": "70",
+                "DEX_BOOSTS_SOURCE_ENABLED": "true",
+                "DEX_BOOSTS_MAX_TOKENS": "40",
+                "DEX_SEARCH_QUERIES": "base,new,meme",
+                "GECKO_NEW_POOLS_PAGES": "4",
+            }
+        )
+
     def _load_settings(self) -> None:
         env_map = read_env_map()
         for key, _ in SETTINGS_FIELDS:
@@ -949,12 +1094,13 @@ class App(tk.Tk):
         feed_y = self.feed_text.yview()
         app_lines = read_tail(APP_LOG, 220)
         events = parse_activity(app_lines)
-        self.feed_text.delete("1.0", tk.END)
-        if not events:
-            self.feed_text.insert(tk.END, "Пока нет активности. Запусти бота и дождись цикла сканирования.\n", ("INFO",))
-        for level, line in events[-180:]:
-            self.feed_text.insert(tk.END, line + "\n", (level,))
-        self._restore_scroll(self.feed_text, feed_y, feed_bottom)
+        if not self._text_has_active_selection(self.feed_text):
+            self.feed_text.delete("1.0", tk.END)
+            if not events:
+                self.feed_text.insert(tk.END, "Пока нет активности. Запусти бота и дождись цикла сканирования.\n", ("INFO",))
+            for level, line in events[-180:]:
+                self.feed_text.insert(tk.END, line + "\n", (level,))
+            self._restore_scroll(self.feed_text, feed_y, feed_bottom)
 
         raw_bottom = self._is_near_bottom(self.raw_text)
         raw_y = self.raw_text.yview()
@@ -964,12 +1110,47 @@ class App(tk.Tk):
             combined.append(f"===== {label} LOG (clean) =====")
             combined.extend(lines[-120:] or ["<empty>"])
             combined.append("")
-        self.raw_text.delete("1.0", tk.END)
-        self.raw_text.insert(tk.END, "\n".join(combined))
-        self._restore_scroll(self.raw_text, raw_y, raw_bottom)
+        if not self._text_has_active_selection(self.raw_text):
+            self.raw_text.delete("1.0", tk.END)
+            self.raw_text.insert(tk.END, "\n".join(combined))
+            self._restore_scroll(self.raw_text, raw_y, raw_bottom)
         self._refresh_signals()
         self._refresh_wallet()
         self._refresh_positions(app_lines)
+
+    @staticmethod
+    def _text_has_active_selection(widget: tk.Text) -> bool:
+        try:
+            widget.index("sel.first")
+            widget.index("sel.last")
+            return True
+        except tk.TclError:
+            return False
+
+    def _attach_text_copy_support(self, widget: tk.Text) -> None:
+        menu = tk.Menu(widget, tearoff=0)
+        menu.add_command(label="Copy", command=lambda w=widget: self._copy_text_selection(w))
+        widget.bind("<Control-c>", lambda _e, w=widget: self._copy_text_selection(w))
+        widget.bind("<Button-3>", lambda e, m=menu: self._show_context_menu(e, m))
+
+    @staticmethod
+    def _show_context_menu(event, menu: tk.Menu) -> str:
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return "break"
+
+    def _copy_text_selection(self, widget: tk.Text) -> str:
+        try:
+            text = widget.get("sel.first", "sel.last")
+        except tk.TclError:
+            return "break"
+        if not text:
+            return "break"
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        return "break"
 
     @staticmethod
     def _is_near_bottom(widget: tk.Text) -> bool:
