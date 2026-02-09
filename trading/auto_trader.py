@@ -54,6 +54,7 @@ class AutoTrader:
         self.total_losses = 0
         self.current_loss_streak = 0
         self.token_cooldowns: dict[str, float] = {}
+        self.trade_open_timestamps: list[float] = []
         self.trading_pause_until_ts = 0.0
         self.day_id = self._current_day_id()
         self.day_start_equity_usd = float(config.WALLET_BALANCE_USD)
@@ -80,6 +81,13 @@ class AutoTrader:
         self._refresh_daily_window()
         # Manual control mode: no auto pause by daily drawdown or streak.
         self.trading_pause_until_ts = 0.0
+        if self._kill_switch_active():
+            logger.warning("KILL_SWITCH active path=%s", config.KILL_SWITCH_FILE)
+            return False
+        self._prune_hourly_window()
+        max_trades_per_hour = int(config.MAX_TRADES_PER_HOUR)
+        if max_trades_per_hour > 0 and len(self.trade_open_timestamps) >= max_trades_per_hour:
+            return False
         max_open = int(config.MAX_OPEN_TRADES)
         if max_open > 0 and len(self.open_positions) >= max_open:
             return False
@@ -104,6 +112,17 @@ class AutoTrader:
         self.day_realized_pnl_usd = 0.0
         self.day_start_equity_usd = self._equity_usd()
         self.current_loss_streak = 0
+
+    @staticmethod
+    def _kill_switch_active() -> bool:
+        try:
+            return bool(config.KILL_SWITCH_FILE) and os.path.exists(config.KILL_SWITCH_FILE)
+        except Exception:
+            return False
+
+    def _prune_hourly_window(self) -> None:
+        now_ts = datetime.now(timezone.utc).timestamp()
+        self.trade_open_timestamps = [ts for ts in self.trade_open_timestamps if (now_ts - ts) <= 3600]
 
     def _equity_usd(self) -> float:
         return self.paper_balance_usd + sum(
@@ -155,6 +174,9 @@ class AutoTrader:
         symbol = str(token_data.get("symbol", "N/A"))
         if not self.can_open_trade():
             logger.info("AutoTrade skip token=%s reason=disabled_or_limits", symbol)
+            return None
+        if self._kill_switch_active():
+            logger.warning("KILL_SWITCH active path=%s", config.KILL_SWITCH_FILE)
             return None
 
         recommendation = str(score_data.get("recommendation", "SKIP"))
@@ -215,6 +237,17 @@ class AutoTrader:
             total_cost_percent=cost_profile["total_percent"],
             gas_usd=cost_profile["gas_usd"],
         )
+        max_buy_weth = float(config.MAX_BUY_AMOUNT)
+        if max_buy_weth > 0:
+            weth_price_usd = float(token_data.get("weth_price_usd") or token_data.get("base_quote_price_usd") or 0)
+            if weth_price_usd <= 0:
+                logger.info("AutoTrade skip token=%s reason=missing_weth_price_for_cap", symbol)
+                return None
+            cap_usd = max_buy_weth * weth_price_usd
+            if cap_usd <= 0:
+                logger.info("AutoTrade skip token=%s reason=invalid_max_buy_cap", symbol)
+                return None
+            position_size_usd = min(position_size_usd, cap_usd)
         if position_size_usd < 0.1:
             logger.info("AutoTrade skip token=%s reason=low_balance", symbol)
             return None
@@ -248,10 +281,11 @@ class AutoTrader:
         self.open_positions[token_address] = pos
         self.total_plans += 1
         self.total_executed += 1
+        self.trade_open_timestamps.append(datetime.now(timezone.utc).timestamp())
         self.paper_balance_usd -= position_size_usd
 
         logger.info(
-            "Paper BUY token=%s address=%s entry=$%.8f size=$%.2f score=%s edge=%.2f%% hold=%ss costs=%.2f%% gas=$%.2f",
+            "AUTO_BUY Paper BUY token=%s address=%s entry=$%.8f size=$%.2f score=%s edge=%.2f%% hold=%ss costs=%.2f%% gas=$%.2f",
             pos.symbol,
             pos.token_address,
             pos.entry_price_usd,
@@ -396,7 +430,7 @@ class AutoTrader:
             self.token_cooldowns[position.token_address] = datetime.now(timezone.utc).timestamp() + token_cooldown
 
         logger.info(
-            "Paper SELL token=%s reason=%s exit=$%.8f pnl=%.2f%% ($%.2f) raw=%.2f%% cost=%.2f%% gas=$%.2f balance=$%.2f",
+            "AUTO_SELL Paper SELL token=%s reason=%s exit=$%.8f pnl=%.2f%% ($%.2f) raw=%.2f%% cost=%.2f%% gas=$%.2f balance=$%.2f",
             position.symbol,
             reason,
             position.current_price_usd,
@@ -479,6 +513,7 @@ class AutoTrader:
         return token_address, best_price
 
     def get_stats(self) -> dict[str, float]:
+        self._prune_hourly_window()
         win_rate = (self.total_wins / self.total_closed * 100) if self.total_closed else 0.0
         unrealized_pnl = sum(pos.pnl_usd for pos in self.open_positions.values())
         equity = self.paper_balance_usd + sum(pos.position_size_usd + pos.pnl_usd for pos in self.open_positions.values())
@@ -499,6 +534,7 @@ class AutoTrader:
             "initial_balance_usd": round(self.initial_balance_usd, 2),
             "loss_streak": self.current_loss_streak,
             "trading_pause_until_ts": round(self.trading_pause_until_ts, 2),
+            "trades_last_hour": len(self.trade_open_timestamps),
         }
 
     def reset_paper_state(self, keep_closed: bool = True) -> None:
@@ -511,6 +547,7 @@ class AutoTrader:
         self.current_loss_streak = 0
         self.trading_pause_until_ts = 0.0
         self.token_cooldowns.clear()
+        self.trade_open_timestamps.clear()
         self.open_positions.clear()
         if not keep_closed:
             self.closed_positions.clear()
@@ -641,6 +678,7 @@ class AutoTrader:
                 "day_start_equity_usd": self.day_start_equity_usd,
                 "day_realized_pnl_usd": self.day_realized_pnl_usd,
                 "token_cooldowns": self.token_cooldowns,
+                "trade_open_timestamps": self.trade_open_timestamps[-500:],
                 "open_positions": [self._serialize_pos(p) for p in self.open_positions.values()],
                 "closed_positions": [self._serialize_pos(p) for p in self.closed_positions[-500:]],
             }
@@ -670,6 +708,14 @@ class AutoTrader:
             self.day_realized_pnl_usd = float(payload.get("day_realized_pnl_usd", 0.0))
             raw_cooldowns = payload.get("token_cooldowns", {}) or {}
             self.token_cooldowns = {str(k): float(v) for k, v in raw_cooldowns.items()}
+            raw_trade_ts = payload.get("trade_open_timestamps", []) or []
+            self.trade_open_timestamps = []
+            for value in raw_trade_ts:
+                try:
+                    self.trade_open_timestamps.append(float(value))
+                except (TypeError, ValueError):
+                    continue
+            self._prune_hourly_window()
 
             self.open_positions.clear()
             for row in payload.get("open_positions", []):

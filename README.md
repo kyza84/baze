@@ -89,7 +89,40 @@ python launcher_gui.py
 
 - Конфиг: `config.py`
 - Мониторинг Base: `monitor/dexscreener.py`
+- On-chain мониторинг factory: `monitor/onchain_factory.py`
 - Риск-чек: `monitor/token_checker.py`
 - Скоринг: `monitor/token_scorer.py`
 - Рассылка: `monitor/alerter.py`
 - Автотрейд (подготовка): `trading/auto_trader.py`
+
+## On-chain signals (Base)
+
+Можно переключить источник сигналов на on-chain PairCreated:
+
+```env
+RPC_PRIMARY=https://...
+RPC_SECONDARY=https://...
+BASE_FACTORY_ADDRESS=0x...
+PAIR_CREATED_TOPIC=0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e9
+ONCHAIN_ENABLE_UNISWAP_V3=true
+UNISWAP_V3_FACTORY_ADDRESS=0x33128a8fC17869897dcE68Ed026d694621f6FDfD
+UNISWAP_V3_POOL_CREATED_TOPIC=0x783cca1c0412dd0d695e784568c96da2e9c22ff989357a2e8b1d9b2b4e6b7118
+WETH_ADDRESS=0x...
+SIGNAL_SOURCE=onchain
+ONCHAIN_FINALITY_BLOCKS=2
+ONCHAIN_SEEN_PAIR_TTL_SECONDS=7200
+AUTO_TRADE_ENABLED=true
+AUTO_TRADE_PAPER=true
+```
+
+Быстрый self-test одного прохода:
+
+```powershell
+python -m monitor.onchain_factory --once
+```
+
+Важно:
+- На бесплатных/public RPC возможны rate-limit, пропуски логов и задержки.
+- При 3 RPC-ошибках подряд `main_local.py` временно переключается на `dexscreener` на 60 секунд, затем пробует вернуть `onchain`.
+- On-chain обработка идет с lag `latest-2` (`ONCHAIN_FINALITY_BLOCKS`) и дедупом пар (`ONCHAIN_SEEN_PAIRS_FILE` + TTL), чтобы снизить дубли/reorg-шум.
+- Для аварийной остановки авто-входов можно создать файл `data/kill.txt` (`KILL_SWITCH_FILE`).

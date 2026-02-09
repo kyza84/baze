@@ -60,6 +60,7 @@ BUY_RE = re.compile(
 SELL_RE = re.compile(
     r"Paper SELL token=(?P<symbol>\S+) reason=(?P<reason>\S+) exit=\$(?P<exit>[0-9.]+) pnl=(?P<pnl_pct>[-+0-9.]+)% \(\$(?P<pnl_usd>[-+0-9.]+)\)(?: raw=[-+0-9.]+% cost=[-+0-9.]+% gas=\$[-+0-9.]+)? balance=\$(?P<balance>[0-9.]+)"
 )
+PAIR_SOURCE_RE = re.compile(r"PAIR_DETECTED source=(?P<source>[a-zA-Z0-9_:-]+)")
 
 SETTINGS_FIELDS = [
     ("PERSONAL_MODE", "Личный режим"),
@@ -530,9 +531,14 @@ class App(tk.Tk):
         self.signals_summary_var = tk.StringVar(value="Входящих сигналов пока нет.")
         ttk.Label(top, text="Входящие сигналы", font=("Segoe UI Semibold", 12)).pack(anchor="w")
         ttk.Label(top, textvariable=self.signals_summary_var, foreground="#93c5fd").pack(anchor="w", pady=(4, 0))
+        self.signals_diag_var = tk.StringVar(value="Signal check: not started.")
+        ttk.Label(top, textvariable=self.signals_diag_var, foreground="#a7f3d0").pack(anchor="w", pady=(2, 0))
+        self.signals_sources_var = tk.StringVar(value="Sources: v2=0 | v3=0 | total=0")
+        ttk.Label(top, textvariable=self.signals_sources_var, foreground="#fcd34d").pack(anchor="w", pady=(2, 0))
         actions = ttk.Frame(top, style="Card.TFrame")
         actions.pack(anchor="w", pady=(8, 0))
         ttk.Button(actions, text="\u041e\u0447\u0438\u0441\u0442\u0438\u0442\u044c \u0441\u0438\u0433\u043d\u0430\u043b\u044b", command=self.on_clear_signals).pack(side=tk.LEFT)
+        ttk.Button(actions, text="Signal Check", command=self.on_signal_check).pack(side=tk.LEFT, padx=8)
 
         self.signals_tree = ttk.Treeview(
             self.signals_tab,
@@ -824,20 +830,34 @@ class App(tk.Tk):
 
     def _apply_preset_map(self, preset: dict[str, str]) -> None:
         tuned, balance, profile = self._adapt_preset_by_balance(preset)
+        extra_env_values: dict[str, str] = {}
         for key, value in tuned.items():
             if key in self.env_vars:
                 self.env_vars[key].set(value)
+            else:
+                extra_env_values[key] = value
+        if extra_env_values:
+            save_env_map(extra_env_values)
         if hasattr(self, "hint_var"):
             self.hint_var.set(f"Preset auto-tuned for balance ${balance:.2f} ({profile}).")
 
     def _apply_super_safe_preset(self) -> None:
         self._apply_preset_map(
             {
+                "SIGNAL_SOURCE": "onchain",
+                "ONCHAIN_ENABLE_UNISWAP_V3": "true",
+                "ONCHAIN_POLL_INTERVAL_SECONDS": "5",
+                "DEX_SEARCH_QUERIES": "base",
+                "GECKO_NEW_POOLS_PAGES": "1",
+                "DEX_BOOSTS_SOURCE_ENABLED": "false",
+                "DEX_BOOSTS_MAX_TOKENS": "10",
                 "AUTO_TRADE_ENABLED": "true",
                 "AUTO_TRADE_PAPER": "true",
                 "AUTO_FILTER_ENABLED": "true",
                 "AUTO_TRADE_ENTRY_MODE": "single",
-                "AUTO_TRADE_TOP_N": "3",
+                "AUTO_TRADE_TOP_N": "1",
+                "MAX_TRADES_PER_HOUR": "2",
+                "MAX_BUY_AMOUNT": "0.00020",
                 "MIN_TOKEN_SCORE": "82",
                 "SAFE_TEST_MODE": "true",
                 "SAFE_MIN_LIQUIDITY_USD": "35000",
@@ -862,21 +882,26 @@ class App(tk.Tk):
                 "PROFIT_TARGET_PERCENT": "35",
                 "STOP_LOSS_PERCENT": "12",
                 "PAPER_BASE_SLIPPAGE_BPS": "50",
-                "DEX_BOOSTS_SOURCE_ENABLED": "true",
-                "DEX_BOOSTS_MAX_TOKENS": "10",
-                "DEX_SEARCH_QUERIES": "base",
-                "GECKO_NEW_POOLS_PAGES": "1",
             }
         )
 
     def _apply_medium_preset(self) -> None:
         self._apply_preset_map(
             {
+                "SIGNAL_SOURCE": "onchain",
+                "ONCHAIN_ENABLE_UNISWAP_V3": "true",
+                "ONCHAIN_POLL_INTERVAL_SECONDS": "5",
+                "DEX_SEARCH_QUERIES": "base",
+                "GECKO_NEW_POOLS_PAGES": "1",
+                "DEX_BOOSTS_SOURCE_ENABLED": "false",
+                "DEX_BOOSTS_MAX_TOKENS": "10",
                 "AUTO_TRADE_ENABLED": "true",
                 "AUTO_TRADE_PAPER": "true",
                 "AUTO_FILTER_ENABLED": "true",
                 "AUTO_TRADE_ENTRY_MODE": "top_n",
-                "AUTO_TRADE_TOP_N": "5",
+                "AUTO_TRADE_TOP_N": "2",
+                "MAX_TRADES_PER_HOUR": "4",
+                "MAX_BUY_AMOUNT": "0.00030",
                 "MIN_TOKEN_SCORE": "75",
                 "SAFE_TEST_MODE": "true",
                 "SAFE_MIN_LIQUIDITY_USD": "22000",
@@ -901,21 +926,26 @@ class App(tk.Tk):
                 "PROFIT_TARGET_PERCENT": "40",
                 "STOP_LOSS_PERCENT": "15",
                 "PAPER_BASE_SLIPPAGE_BPS": "60",
-                "DEX_BOOSTS_SOURCE_ENABLED": "true",
-                "DEX_BOOSTS_MAX_TOKENS": "20",
-                "DEX_SEARCH_QUERIES": "base,new",
-                "GECKO_NEW_POOLS_PAGES": "2",
             }
         )
 
     def _apply_hard_preset(self) -> None:
         self._apply_preset_map(
             {
+                "SIGNAL_SOURCE": "onchain",
+                "ONCHAIN_ENABLE_UNISWAP_V3": "true",
+                "ONCHAIN_POLL_INTERVAL_SECONDS": "4",
+                "DEX_SEARCH_QUERIES": "base",
+                "GECKO_NEW_POOLS_PAGES": "1",
+                "DEX_BOOSTS_SOURCE_ENABLED": "false",
+                "DEX_BOOSTS_MAX_TOKENS": "10",
                 "AUTO_TRADE_ENABLED": "true",
                 "AUTO_TRADE_PAPER": "true",
                 "AUTO_FILTER_ENABLED": "false",
                 "AUTO_TRADE_ENTRY_MODE": "all",
                 "AUTO_TRADE_TOP_N": "10",
+                "MAX_TRADES_PER_HOUR": "8",
+                "MAX_BUY_AMOUNT": "0.00050",
                 "MIN_TOKEN_SCORE": "65",
                 "SAFE_TEST_MODE": "false",
                 "SAFE_REQUIRE_CONTRACT_SAFE": "true",
@@ -936,21 +966,26 @@ class App(tk.Tk):
                 "PROFIT_TARGET_PERCENT": "45",
                 "STOP_LOSS_PERCENT": "20",
                 "PAPER_BASE_SLIPPAGE_BPS": "90",
-                "DEX_BOOSTS_SOURCE_ENABLED": "true",
-                "DEX_BOOSTS_MAX_TOKENS": "30",
-                "DEX_SEARCH_QUERIES": "base,new,meme",
-                "GECKO_NEW_POOLS_PAGES": "3",
             }
         )
 
     def _apply_hard_lite_preset(self) -> None:
         self._apply_preset_map(
             {
+                "SIGNAL_SOURCE": "onchain",
+                "ONCHAIN_ENABLE_UNISWAP_V3": "true",
+                "ONCHAIN_POLL_INTERVAL_SECONDS": "5",
+                "DEX_SEARCH_QUERIES": "base",
+                "GECKO_NEW_POOLS_PAGES": "1",
+                "DEX_BOOSTS_SOURCE_ENABLED": "false",
+                "DEX_BOOSTS_MAX_TOKENS": "10",
                 "AUTO_TRADE_ENABLED": "true",
                 "AUTO_TRADE_PAPER": "true",
                 "AUTO_FILTER_ENABLED": "false",
                 "AUTO_TRADE_ENTRY_MODE": "single",
                 "AUTO_TRADE_TOP_N": "3",
+                "MAX_TRADES_PER_HOUR": "4",
+                "MAX_BUY_AMOUNT": "0.00035",
                 "MIN_TOKEN_SCORE": "65",
                 "SAFE_TEST_MODE": "false",
                 "SAFE_REQUIRE_CONTRACT_SAFE": "true",
@@ -973,21 +1008,26 @@ class App(tk.Tk):
                 "STOP_LOSS_PERCENT": "20",
                 "PAPER_GAS_PER_TX_USD": "0.02",
                 "PAPER_BASE_SLIPPAGE_BPS": "80",
-                "DEX_BOOSTS_SOURCE_ENABLED": "true",
-                "DEX_BOOSTS_MAX_TOKENS": "25",
-                "DEX_SEARCH_QUERIES": "base,new,meme",
-                "GECKO_NEW_POOLS_PAGES": "3",
             }
         )
 
     def _apply_safe_flow_preset(self) -> None:
         self._apply_preset_map(
             {
+                "SIGNAL_SOURCE": "onchain",
+                "ONCHAIN_ENABLE_UNISWAP_V3": "true",
+                "ONCHAIN_POLL_INTERVAL_SECONDS": "5",
+                "DEX_SEARCH_QUERIES": "base",
+                "GECKO_NEW_POOLS_PAGES": "1",
+                "DEX_BOOSTS_SOURCE_ENABLED": "false",
+                "DEX_BOOSTS_MAX_TOKENS": "10",
                 "AUTO_TRADE_ENABLED": "true",
                 "AUTO_TRADE_PAPER": "true",
                 "AUTO_FILTER_ENABLED": "true",
                 "AUTO_TRADE_ENTRY_MODE": "top_n",
-                "AUTO_TRADE_TOP_N": "5",
+                "AUTO_TRADE_TOP_N": "2",
+                "MAX_TRADES_PER_HOUR": "3",
+                "MAX_BUY_AMOUNT": "0.00025",
                 "MIN_TOKEN_SCORE": "78",
                 "SAFE_TEST_MODE": "true",
                 "SAFE_MIN_LIQUIDITY_USD": "20000",
@@ -1013,21 +1053,26 @@ class App(tk.Tk):
                 "STOP_LOSS_PERCENT": "15",
                 "PAPER_GAS_PER_TX_USD": "0.02",
                 "PAPER_BASE_SLIPPAGE_BPS": "60",
-                "DEX_BOOSTS_SOURCE_ENABLED": "true",
-                "DEX_BOOSTS_MAX_TOKENS": "30",
-                "DEX_SEARCH_QUERIES": "base,new,meme",
-                "GECKO_NEW_POOLS_PAGES": "3",
             }
         )
 
     def _apply_medium_flow_preset(self) -> None:
         self._apply_preset_map(
             {
+                "SIGNAL_SOURCE": "onchain",
+                "ONCHAIN_ENABLE_UNISWAP_V3": "true",
+                "ONCHAIN_POLL_INTERVAL_SECONDS": "5",
+                "DEX_SEARCH_QUERIES": "base",
+                "GECKO_NEW_POOLS_PAGES": "1",
+                "DEX_BOOSTS_SOURCE_ENABLED": "false",
+                "DEX_BOOSTS_MAX_TOKENS": "10",
                 "AUTO_TRADE_ENABLED": "true",
                 "AUTO_TRADE_PAPER": "true",
                 "AUTO_FILTER_ENABLED": "true",
                 "AUTO_TRADE_ENTRY_MODE": "top_n",
-                "AUTO_TRADE_TOP_N": "8",
+                "AUTO_TRADE_TOP_N": "3",
+                "MAX_TRADES_PER_HOUR": "5",
+                "MAX_BUY_AMOUNT": "0.00035",
                 "MIN_TOKEN_SCORE": "72",
                 "SAFE_TEST_MODE": "true",
                 "SAFE_MIN_LIQUIDITY_USD": "16000",
@@ -1053,10 +1098,6 @@ class App(tk.Tk):
                 "STOP_LOSS_PERCENT": "18",
                 "PAPER_GAS_PER_TX_USD": "0.02",
                 "PAPER_BASE_SLIPPAGE_BPS": "70",
-                "DEX_BOOSTS_SOURCE_ENABLED": "true",
-                "DEX_BOOSTS_MAX_TOKENS": "40",
-                "DEX_SEARCH_QUERIES": "base,new,meme",
-                "GECKO_NEW_POOLS_PAGES": "4",
             }
         )
 
@@ -1230,6 +1271,7 @@ class App(tk.Tk):
         self.signals_tree.delete(*self.signals_tree.get_children())
         if not rows:
             self.signals_summary_var.set("Входящих сигналов пока нет.")
+            self._refresh_signal_sources()
             return
 
         for row in reversed(rows[-250:]):
@@ -1258,6 +1300,27 @@ class App(tk.Tk):
                 ),
             )
         self.signals_summary_var.set(f"Сигналов: {len(rows)} | Показано: {min(len(rows), 250)}")
+        self._refresh_signal_sources()
+
+    def _refresh_signal_sources(self) -> None:
+        if not hasattr(self, "signals_sources_var"):
+            return
+        lines = read_tail(APP_LOG, 500)
+        counts: dict[str, int] = {}
+        total = 0
+        for line in lines:
+            match = PAIR_SOURCE_RE.search(line)
+            if not match:
+                continue
+            source = match.group("source").strip().lower() or "unknown"
+            counts[source] = counts.get(source, 0) + 1
+            total += 1
+        v2_count = counts.get("uniswap_v2", 0)
+        v3_count = counts.get("uniswap_v3", 0)
+        other_count = max(0, total - v2_count - v3_count)
+        self.signals_sources_var.set(
+            f"Sources (tail): v2={v2_count} | v3={v3_count} | other={other_count} | total={total}"
+        )
 
     def _refresh_positions_from_state(self, state: dict) -> None:
         open_rows = state.get("open_positions", []) or []
@@ -1467,6 +1530,79 @@ class App(tk.Tk):
             self.signals_tree.delete(*self.signals_tree.get_children())
         if hasattr(self, "signals_summary_var"):
             self.signals_summary_var.set("\u0412\u0445\u043e\u0434\u044f\u0449\u0438\u0445 \u0441\u0438\u0433\u043d\u0430\u043b\u043e\u0432 \u043f\u043e\u043a\u0430 \u043d\u0435\u0442.")
+
+    def on_signal_check(self) -> None:
+        env_map = read_env_map()
+        signal_source = str(env_map.get("SIGNAL_SOURCE", "dexscreener") or "dexscreener").strip().lower()
+
+        rows = read_jsonl_tail(LOCAL_ALERTS_FILE, 400)
+        last_alert = "-"
+        if rows:
+            ts = str(rows[-1].get("timestamp", "")).strip()
+            if ts:
+                try:
+                    dt = datetime.fromisoformat(ts)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    last_alert = dt.astimezone().strftime("%H:%M:%S")
+                except Exception:
+                    last_alert = ts
+
+        app_lines = read_tail(APP_LOG, 260)
+        scan_count = sum(1 for line in app_lines if "Scanned " in line)
+        pair_detected = sum(1 for line in app_lines if "PAIR_DETECTED" in line)
+        filter_pass = sum(1 for line in app_lines if "FILTER_PASS" in line)
+        auto_buy = sum(1 for line in app_lines if "AUTO_BUY" in line)
+        auto_sell = sum(1 for line in app_lines if "AUTO_SELL" in line)
+
+        state = read_json(PAPER_STATE_FILE)
+        paper_balance = float(state.get("paper_balance_usd", env_map.get("WALLET_BALANCE_USD", "0")) or 0)
+        open_count = len(state.get("open_positions", []) or [])
+        closed_count = len(state.get("closed_positions", []) or [])
+
+        onchain_probe = "n/a"
+        if signal_source == "onchain":
+            if not os.path.exists(PYTHON_PATH):
+                onchain_probe = f"python_not_found:{PYTHON_PATH}"
+            else:
+                try:
+                    diag_env = os.environ.copy()
+                    diag_env["ONCHAIN_LAST_BLOCK_FILE"] = os.path.join(LOG_DIR, "diag_last_block_base.txt")
+                    diag_env["ONCHAIN_SEEN_PAIRS_FILE"] = os.path.join(LOG_DIR, "diag_seen_pairs_base.json")
+                    result = subprocess.run(
+                        [PYTHON_PATH, "-m", "monitor.onchain_factory", "--once"],
+                        cwd=PROJECT_ROOT,
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                        env=diag_env,
+                    )
+                    output = (result.stdout or "").strip()
+                    if not output:
+                        output = (result.stderr or "").strip()
+                    onchain_probe = output.splitlines()[-1] if output else "no_output"
+                except subprocess.TimeoutExpired:
+                    onchain_probe = "timeout"
+                except Exception as exc:
+                    onchain_probe = f"error:{exc}"
+
+        summary_line = (
+            f"signals={len(rows)} last={last_alert} scans={scan_count} "
+            f"pair={pair_detected} pass={filter_pass} buy={auto_buy} sell={auto_sell} "
+            f"paper=${paper_balance:.2f} open={open_count} closed={closed_count}"
+        )
+        if hasattr(self, "signals_diag_var"):
+            self.signals_diag_var.set(f"Signal check: {summary_line}")
+
+        details = [
+            f"Source: {signal_source}",
+            f"On-chain probe: {onchain_probe}",
+            f"Signals in feed: {len(rows)} (last: {last_alert})",
+            f"Recent runtime (app.log tail): scans={scan_count}, PAIR_DETECTED={pair_detected}, FILTER_PASS={filter_pass}",
+            f"Paper activity: AUTO_BUY={auto_buy}, AUTO_SELL={auto_sell}",
+            f"Paper state: balance=${paper_balance:.2f}, open={open_count}, closed={closed_count}",
+        ]
+        messagebox.showinfo("Signal Check", "\n".join(details))
 
     def on_prune_closed_trades(self) -> None:
         env_map = read_env_map()

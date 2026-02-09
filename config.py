@@ -25,6 +25,7 @@ PLAN_DURATIONS_DAYS = {
 
 TRIAL_HOURS = int(os.getenv("TRIAL_HOURS", "6"))
 RUN_MODE = os.getenv("RUN_MODE", "local").strip().lower()
+SIGNAL_SOURCE = os.getenv("SIGNAL_SOURCE", "onchain").strip().lower()
 
 CHAIN_NAME = os.getenv("CHAIN_NAME", "base")
 CHAIN_ID = os.getenv("CHAIN_ID", "base")
@@ -32,6 +33,7 @@ EVM_CHAIN_ID = os.getenv("EVM_CHAIN_ID", "8453")
 GECKO_NETWORK = os.getenv("GECKO_NETWORK", "base")
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "30"))
+ONCHAIN_POLL_INTERVAL_SECONDS = max(1, int(os.getenv("ONCHAIN_POLL_INTERVAL_SECONDS", "2")))
 MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY", "5000"))
 TOKEN_AGE_MAX = int(os.getenv("TOKEN_AGE_MAX", "3600"))
 DEXSCREENER_API = os.getenv("DEXSCREENER_API", "https://api.dexscreener.com/latest/dex")
@@ -60,6 +62,34 @@ SWAP_URL_TEMPLATE = os.getenv(
 DEX_TIMEOUT = int(os.getenv("DEX_TIMEOUT", "15"))
 DEX_RETRIES = int(os.getenv("DEX_RETRIES", "3"))
 SEEN_TOKEN_TTL = int(os.getenv("SEEN_TOKEN_TTL", "21600"))
+RPC_TIMEOUT_SECONDS = max(3, int(os.getenv("RPC_TIMEOUT_SECONDS", "10")))
+ONCHAIN_BLOCK_CHUNK = max(1, int(os.getenv("ONCHAIN_BLOCK_CHUNK", "500")))
+ONCHAIN_FINALITY_BLOCKS = max(0, int(os.getenv("ONCHAIN_FINALITY_BLOCKS", "2")))
+
+# Base on-chain PairCreated source
+RPC_PRIMARY = os.getenv("RPC_PRIMARY", "").strip()
+RPC_SECONDARY = os.getenv("RPC_SECONDARY", "").strip()
+BASE_FACTORY_ADDRESS = os.getenv("BASE_FACTORY_ADDRESS", "").strip().lower()
+PAIR_CREATED_TOPIC = os.getenv(
+    "PAIR_CREATED_TOPIC",
+    # keccak256("PairCreated(address,address,address,uint256)")
+    "0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e9",
+).strip().lower()
+# Optional Uniswap v3 PoolCreated source on Base.
+ONCHAIN_ENABLE_UNISWAP_V3 = os.getenv("ONCHAIN_ENABLE_UNISWAP_V3", "true").lower() == "true"
+UNISWAP_V3_FACTORY_ADDRESS = os.getenv(
+    "UNISWAP_V3_FACTORY_ADDRESS",
+    "0x33128a8fC17869897dcE68Ed026d694621f6FDfD",
+).strip().lower()
+UNISWAP_V3_POOL_CREATED_TOPIC = os.getenv(
+    "UNISWAP_V3_POOL_CREATED_TOPIC",
+    # keccak256("PoolCreated(address,address,uint24,int24,address)")
+    "0x783cca1c0412dd0d695e784568c96da2e9c22ff989357a2e8b1d9b2b4e6b7118",
+).strip().lower()
+WETH_ADDRESS = os.getenv("WETH_ADDRESS", "").strip().lower()
+ONCHAIN_LAST_BLOCK_FILE = os.getenv("ONCHAIN_LAST_BLOCK_FILE", os.path.join("data", "last_block_base.txt"))
+ONCHAIN_SEEN_PAIRS_FILE = os.getenv("ONCHAIN_SEEN_PAIRS_FILE", os.path.join("data", "seen_pairs_base.json"))
+ONCHAIN_SEEN_PAIR_TTL_SECONDS = max(300, int(os.getenv("ONCHAIN_SEEN_PAIR_TTL_SECONDS", "7200")))
 
 PERSONAL_MODE = os.getenv("PERSONAL_MODE", "true").lower() == "true"
 PERSONAL_TELEGRAM_ID = int(os.getenv("PERSONAL_TELEGRAM_ID", "0"))
@@ -95,6 +125,9 @@ AUTO_TRADE_TOP_N = int(os.getenv("AUTO_TRADE_TOP_N", "10"))
 # MAX_OPEN_TRADES:
 # - 0 means unlimited open positions
 MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "1"))
+MAX_BUY_AMOUNT = float(os.getenv("MAX_BUY_AMOUNT", "0.001"))
+MAX_TRADES_PER_HOUR = max(0, int(os.getenv("MAX_TRADES_PER_HOUR", "3")))
+KILL_SWITCH_FILE = os.getenv("KILL_SWITCH_FILE", os.path.join("data", "kill.txt"))
 WALLET_BALANCE_USD = float(os.getenv("WALLET_BALANCE_USD", "2.75"))
 PAPER_TRADE_SIZE_USD = float(os.getenv("PAPER_TRADE_SIZE_USD", "1.0"))
 PAPER_MAX_HOLD_SECONDS = int(os.getenv("PAPER_MAX_HOLD_SECONDS", "1800"))
@@ -146,6 +179,7 @@ CARD_PAYMENT_DETAILS = os.getenv(
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 LOG_DIR = os.getenv("LOG_DIR", "logs")
 APP_LOG_FILE = os.path.join(LOG_DIR, "app.log")
+OUT_LOG_FILE = os.path.join(LOG_DIR, "out.log")
 
 ADMIN_IDS = {
     int(x.strip())

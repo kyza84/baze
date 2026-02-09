@@ -3,3 +3,4 @@ sqlalchemy==2.0.23
 aiohttp==3.9.1
 python-dotenv==1.0.0
 aiocryptopay==0.4.8
+web3==6.20.4
