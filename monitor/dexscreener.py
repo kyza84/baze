@@ -9,6 +9,8 @@ import aiohttp
 from config import (
     CHAIN_ID,
     CHAIN_NAME,
+    DEX_BOOSTS_MAX_TOKENS,
+    DEX_BOOSTS_SOURCE_ENABLED,
     DEXSCREENER_API,
     DEXSCREENER_TOKEN_URL_TEMPLATE,
     DEX_RETRIES,
@@ -42,8 +44,14 @@ class DexScreenerMonitor:
 
         dex_task = asyncio.create_task(self._fetch_from_dexscreener())
         gecko_task = asyncio.create_task(self._fetch_from_geckoterminal())
-        dex_tokens, gecko_tokens = await asyncio.gather(dex_task, gecko_task)
-        return self._merge_tokens(dex_tokens, gecko_tokens)
+        tasks = [dex_task, gecko_task]
+        if DEX_BOOSTS_SOURCE_ENABLED and DEX_BOOSTS_MAX_TOKENS > 0:
+            tasks.append(asyncio.create_task(self._fetch_from_dex_boosts()))
+        results = await asyncio.gather(*tasks)
+        dex_tokens = results[0] if len(results) > 0 else []
+        gecko_tokens = results[1] if len(results) > 1 else []
+        boost_tokens = results[2] if len(results) > 2 else []
+        return self._merge_tokens(dex_tokens, gecko_tokens, boost_tokens)
 
     async def _fetch_from_dexscreener(self) -> list[dict[str, Any]]:
         queries = DEX_SEARCH_QUERIES or [DEX_SEARCH_QUERY]
@@ -117,6 +125,79 @@ class DexScreenerMonitor:
                 return []
 
         return []
+
+    async def _fetch_from_dex_boosts(self) -> list[dict[str, Any]]:
+        url = "https://api.dexscreener.com/token-boosts/latest/v1"
+        timeout = aiohttp.ClientTimeout(total=DEX_TIMEOUT)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url, headers=self._headers) as response:
+                    if response.status != 200:
+                        return []
+                    data = await response.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError, ValueError):
+            return []
+
+        if not isinstance(data, list):
+            return []
+
+        token_addresses: list[str] = []
+        for row in data:
+            if not isinstance(row, dict):
+                continue
+            chain = str(row.get("chainId", "")).lower()
+            if chain and chain != CHAIN_ID.lower():
+                continue
+            addr = str(row.get("tokenAddress", "")).strip()
+            if addr:
+                token_addresses.append(addr)
+            if len(token_addresses) >= DEX_BOOSTS_MAX_TOKENS:
+                break
+        if not token_addresses:
+            return []
+
+        tasks = [self._fetch_token_by_address(addr) for addr in token_addresses]
+        rows = await asyncio.gather(*tasks)
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            if row:
+                out.append(row)
+        return out
+
+    async def _fetch_token_by_address(self, token_address: str) -> dict[str, Any] | None:
+        url = f"{DEXSCREENER_API}/tokens/{token_address}"
+        timeout = aiohttp.ClientTimeout(total=DEX_TIMEOUT)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url, headers=self._headers) as response:
+                    if response.status != 200:
+                        return None
+                    data = await response.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError, ValueError):
+            return None
+
+        pairs = data.get("pairs", []) or []
+        best_pair = None
+        best_liq = -1.0
+        for pair in pairs:
+            if str(pair.get("chainId", "")).lower() != CHAIN_ID.lower():
+                continue
+            liq = float((pair.get("liquidity") or {}).get("usd") or 0)
+            if liq > best_liq:
+                best_liq = liq
+                best_pair = pair
+        if not isinstance(best_pair, dict):
+            return None
+
+        created_ms = best_pair.get("pairCreatedAt")
+        if not created_ms:
+            return None
+        created_at = datetime.fromtimestamp(float(created_ms) / 1000, tz=timezone.utc)
+        address = str((best_pair.get("baseToken") or {}).get("address") or "")
+        liquidity_usd = float((best_pair.get("liquidity") or {}).get("usd") or 0)
+        if not self._passes_filters(address, liquidity_usd, created_at):
+            return None
+        return self._format_token_data(best_pair, created_at)
 
     @staticmethod
     def _merge_tokens(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:

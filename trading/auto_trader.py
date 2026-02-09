@@ -52,14 +52,36 @@ class AutoTrader:
         self.total_closed = 0
         self.total_wins = 0
         self.total_losses = 0
+        self.current_loss_streak = 0
+        self.token_cooldowns: dict[str, float] = {}
+        self.trading_pause_until_ts = 0.0
+        self.day_id = self._current_day_id()
+        self.day_start_equity_usd = float(config.WALLET_BALANCE_USD)
+        self.day_realized_pnl_usd = 0.0
 
         self.initial_balance_usd = float(config.WALLET_BALANCE_USD)
         self.paper_balance_usd = float(config.WALLET_BALANCE_USD)
         self.realized_pnl_usd = 0.0
         self._load_state()
+        if config.PAPER_RESET_ON_START:
+            self._apply_startup_reset()
         self._prune_closed_positions()
 
+    def _apply_startup_reset(self) -> None:
+        if self.open_positions:
+            logger.info(
+                "PAPER_RESET_ON_START skipped: keeping %s open position(s).",
+                len(self.open_positions),
+            )
+            return
+        self.reset_paper_state(keep_closed=True)
+
     def can_open_trade(self) -> bool:
+        self._refresh_daily_window()
+        if self.trading_pause_until_ts > datetime.now(timezone.utc).timestamp():
+            return False
+        if self._hit_daily_drawdown_limit():
+            return False
         max_open = int(config.MAX_OPEN_TRADES)
         if max_open > 0 and len(self.open_positions) >= max_open:
             return False
@@ -69,6 +91,42 @@ class AutoTrader:
             # Live execution is intentionally blocked until explicit implementation.
             return False
         return self.paper_balance_usd >= 0.1
+
+    @staticmethod
+    def _current_day_id() -> str:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    def _refresh_daily_window(self) -> None:
+        now_ts = datetime.now(timezone.utc).timestamp()
+        self.token_cooldowns = {k: v for k, v in self.token_cooldowns.items() if v > now_ts}
+        current_day = self._current_day_id()
+        if self.day_id == current_day:
+            return
+        self.day_id = current_day
+        self.day_realized_pnl_usd = 0.0
+        self.day_start_equity_usd = self._equity_usd()
+        self.current_loss_streak = 0
+
+    def _equity_usd(self) -> float:
+        return self.paper_balance_usd + sum(
+            pos.position_size_usd + pos.pnl_usd for pos in self.open_positions.values()
+        )
+
+    def _hit_daily_drawdown_limit(self) -> bool:
+        max_dd_pct = float(config.DAILY_MAX_DRAWDOWN_PERCENT)
+        if max_dd_pct <= 0:
+            return False
+        limit = -abs(self.day_start_equity_usd) * (max_dd_pct / 100)
+        if self.day_realized_pnl_usd <= limit:
+            next_day_ts = datetime.now(timezone.utc).replace(
+                hour=23,
+                minute=59,
+                second=59,
+                microsecond=0,
+            ).timestamp()
+            self.trading_pause_until_ts = max(self.trading_pause_until_ts, next_day_ts)
+            return True
+        return False
 
     async def plan_batch(self, candidates: list[tuple[dict[str, Any], dict[str, Any]]]) -> int:
         if not candidates:
@@ -132,6 +190,11 @@ class AutoTrader:
         if not token_address or token_address in self.open_positions:
             logger.info("AutoTrade skip token=%s reason=address_or_duplicate", symbol)
             return None
+        cooldown_until = float(self.token_cooldowns.get(token_address, 0.0))
+        now_ts = datetime.now(timezone.utc).timestamp()
+        if cooldown_until > now_ts:
+            logger.info("AutoTrade skip token=%s reason=cooldown_left_%ss", symbol, int(cooldown_until - now_ts))
+            return None
 
         entry_price_usd = float(token_data.get("price_usd") or 0)
         if entry_price_usd <= 0:
@@ -148,6 +211,9 @@ class AutoTrader:
         volume_5m = float(token_data.get("volume_5m") or 0)
         price_change_5m = float(token_data.get("price_change_5m") or 0)
         risk_level = str(token_data.get("risk_level", "MEDIUM")).upper()
+        if not self._passes_token_guards(token_data):
+            logger.info("AutoTrade skip token=%s reason=safety_guards", symbol)
+            return None
         cost_profile = self._estimate_cost_profile(liquidity_usd, risk_level, score)
         expected_edge_percent = self._estimate_edge_percent(score, tp, sl, cost_profile["total_percent"], risk_level)
         if config.EDGE_FILTER_ENABLED and expected_edge_percent < float(config.MIN_EXPECTED_EDGE_PERCENT):
@@ -161,6 +227,12 @@ class AutoTrader:
 
         position_size_usd = self._choose_position_size(expected_edge_percent)
         position_size_usd = min(position_size_usd, self.paper_balance_usd)
+        position_size_usd = self._apply_max_loss_per_trade_cap(
+            position_size_usd=position_size_usd,
+            stop_loss_percent=sl,
+            total_cost_percent=cost_profile["total_percent"],
+            gas_usd=cost_profile["gas_usd"],
+        )
         if position_size_usd < 0.1:
             logger.info("AutoTrade skip token=%s reason=low_balance", symbol)
             return None
@@ -211,6 +283,52 @@ class AutoTrader:
         self._save_state()
         return pos
 
+    def _passes_token_guards(self, token_data: dict[str, Any]) -> bool:
+        if abs(float(token_data.get("price_change_5m") or 0)) > float(config.MAX_TOKEN_PRICE_CHANGE_5M_ABS_PERCENT):
+            return False
+
+        safety = token_data.get("safety") if isinstance(token_data.get("safety"), dict) else {}
+        is_contract_safe = bool(token_data.get("is_contract_safe", safety.get("is_safe", False)))
+        warning_flags = int(token_data.get("warning_flags", len((safety or {}).get("warnings") or [])) or 0)
+        risk_level = str(token_data.get("risk_level", (safety or {}).get("risk_level", "HIGH"))).upper()
+
+        if config.SAFE_TEST_MODE:
+            if float(token_data.get("liquidity") or 0) < float(config.SAFE_MIN_LIQUIDITY_USD):
+                return False
+            if float(token_data.get("volume_5m") or 0) < float(config.SAFE_MIN_VOLUME_5M_USD):
+                return False
+            if int(token_data.get("age_seconds") or 0) < int(config.SAFE_MIN_AGE_SECONDS):
+                return False
+            if abs(float(token_data.get("price_change_5m") or 0)) > float(config.SAFE_MAX_PRICE_CHANGE_5M_ABS_PERCENT):
+                return False
+            if config.SAFE_REQUIRE_CONTRACT_SAFE and not is_contract_safe:
+                return False
+            required_risk = str(config.SAFE_REQUIRE_RISK_LEVEL).upper()
+            rank = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
+            if rank.get(risk_level, 2) > rank.get(required_risk, 1):
+                return False
+            if warning_flags > int(config.SAFE_MAX_WARNING_FLAGS):
+                return False
+        return True
+
+    def _apply_max_loss_per_trade_cap(
+        self,
+        position_size_usd: float,
+        stop_loss_percent: int,
+        total_cost_percent: float,
+        gas_usd: float,
+    ) -> float:
+        max_loss_pct = float(config.MAX_LOSS_PER_TRADE_PERCENT_BALANCE)
+        if max_loss_pct <= 0:
+            return position_size_usd
+        equity = max(0.1, self._equity_usd())
+        max_allowed_loss_usd = equity * (max_loss_pct / 100)
+        worst_loss_ratio = max(0.0, abs(float(stop_loss_percent)) + float(total_cost_percent)) / 100
+        if worst_loss_ratio <= 0:
+            return position_size_usd
+        max_size_by_risk = max(0.0, (max_allowed_loss_usd - gas_usd) / worst_loss_ratio)
+        return max(0.0, min(position_size_usd, max_size_by_risk))
+
     async def process_open_positions(self, bot=None) -> None:
         if not self.open_positions:
             return
@@ -254,6 +372,7 @@ class AutoTrader:
                     await self._send_close_message(bot, position)
 
     def _close_position(self, position: PaperPosition, reason: str) -> None:
+        self._refresh_daily_window()
         raw_price_pnl_percent = ((position.current_price_usd - position.entry_price_usd) / position.entry_price_usd) * 100
         gross_value_usd = position.position_size_usd * (1 + raw_price_pnl_percent / 100)
 
@@ -279,11 +398,31 @@ class AutoTrader:
 
         self.paper_balance_usd += final_value_usd
         self.realized_pnl_usd += position.pnl_usd
+        self.day_realized_pnl_usd += position.pnl_usd
 
         if position.pnl_usd >= 0:
             self.total_wins += 1
+            self.current_loss_streak = 0
         else:
             self.total_losses += 1
+            self.current_loss_streak += 1
+
+        if self.current_loss_streak >= int(config.MAX_CONSECUTIVE_LOSSES):
+            cooldown_seconds = int(config.LOSS_STREAK_COOLDOWN_SECONDS)
+            if cooldown_seconds > 0:
+                self.trading_pause_until_ts = max(
+                    self.trading_pause_until_ts,
+                    datetime.now(timezone.utc).timestamp() + cooldown_seconds,
+                )
+            logger.warning(
+                "AutoTrade pause: loss_streak=%s cooldown=%ss",
+                self.current_loss_streak,
+                cooldown_seconds,
+            )
+
+        token_cooldown = int(config.MAX_TOKEN_COOLDOWN_SECONDS)
+        if token_cooldown > 0:
+            self.token_cooldowns[position.token_address] = datetime.now(timezone.utc).timestamp() + token_cooldown
 
         logger.info(
             "Paper SELL token=%s reason=%s exit=$%.8f pnl=%.2f%% ($%.2f) raw=%.2f%% cost=%.2f%% gas=$%.2f balance=$%.2f",
@@ -383,10 +522,31 @@ class AutoTrader:
             "win_rate_percent": round(win_rate, 2),
             "paper_balance_usd": round(self.paper_balance_usd, 2),
             "realized_pnl_usd": round(self.realized_pnl_usd, 2),
+            "day_realized_pnl_usd": round(self.day_realized_pnl_usd, 2),
             "unrealized_pnl_usd": round(unrealized_pnl, 2),
             "equity_usd": round(equity, 2),
             "initial_balance_usd": round(self.initial_balance_usd, 2),
+            "loss_streak": self.current_loss_streak,
+            "trading_pause_until_ts": round(self.trading_pause_until_ts, 2),
         }
+
+    def reset_paper_state(self, keep_closed: bool = True) -> None:
+        self.initial_balance_usd = float(config.WALLET_BALANCE_USD)
+        self.paper_balance_usd = float(config.WALLET_BALANCE_USD)
+        self.realized_pnl_usd = 0.0
+        self.day_id = self._current_day_id()
+        self.day_start_equity_usd = float(config.WALLET_BALANCE_USD)
+        self.day_realized_pnl_usd = 0.0
+        self.current_loss_streak = 0
+        self.trading_pause_until_ts = 0.0
+        self.token_cooldowns.clear()
+        self.open_positions.clear()
+        if not keep_closed:
+            self.closed_positions.clear()
+            self.total_closed = 0
+            self.total_wins = 0
+            self.total_losses = 0
+        self._save_state()
 
     @staticmethod
     def _estimate_edge_percent(
@@ -504,6 +664,12 @@ class AutoTrader:
                 "total_closed": self.total_closed,
                 "total_wins": self.total_wins,
                 "total_losses": self.total_losses,
+                "current_loss_streak": self.current_loss_streak,
+                "trading_pause_until_ts": self.trading_pause_until_ts,
+                "day_id": self.day_id,
+                "day_start_equity_usd": self.day_start_equity_usd,
+                "day_realized_pnl_usd": self.day_realized_pnl_usd,
+                "token_cooldowns": self.token_cooldowns,
                 "open_positions": [self._serialize_pos(p) for p in self.open_positions.values()],
                 "closed_positions": [self._serialize_pos(p) for p in self.closed_positions[-500:]],
             }
@@ -516,7 +682,7 @@ class AutoTrader:
         if not os.path.exists(self.state_file):
             return
         try:
-            with open(self.state_file, "r", encoding="utf-8") as f:
+            with open(self.state_file, "r", encoding="utf-8-sig") as f:
                 payload = json.load(f)
             self.initial_balance_usd = float(payload.get("initial_balance_usd", self.initial_balance_usd))
             self.paper_balance_usd = float(payload.get("paper_balance_usd", self.paper_balance_usd))
@@ -526,6 +692,13 @@ class AutoTrader:
             self.total_closed = int(payload.get("total_closed", 0))
             self.total_wins = int(payload.get("total_wins", 0))
             self.total_losses = int(payload.get("total_losses", 0))
+            self.current_loss_streak = int(payload.get("current_loss_streak", 0))
+            self.trading_pause_until_ts = float(payload.get("trading_pause_until_ts", 0.0))
+            self.day_id = str(payload.get("day_id", self._current_day_id()))
+            self.day_start_equity_usd = float(payload.get("day_start_equity_usd", self.paper_balance_usd))
+            self.day_realized_pnl_usd = float(payload.get("day_realized_pnl_usd", 0.0))
+            raw_cooldowns = payload.get("token_cooldowns", {}) or {}
+            self.token_cooldowns = {str(k): float(v) for k, v in raw_cooldowns.items()}
 
             self.open_positions.clear()
             for row in payload.get("open_positions", []):

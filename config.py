@@ -24,6 +24,7 @@ PLAN_DURATIONS_DAYS = {
 }
 
 TRIAL_HOURS = int(os.getenv("TRIAL_HOURS", "6"))
+RUN_MODE = os.getenv("RUN_MODE", "local").strip().lower()
 
 CHAIN_NAME = os.getenv("CHAIN_NAME", "base")
 CHAIN_ID = os.getenv("CHAIN_ID", "base")
@@ -64,6 +65,18 @@ PERSONAL_MODE = os.getenv("PERSONAL_MODE", "true").lower() == "true"
 PERSONAL_TELEGRAM_ID = int(os.getenv("PERSONAL_TELEGRAM_ID", "0"))
 MIN_TOKEN_SCORE = int(os.getenv("MIN_TOKEN_SCORE", "70"))
 AUTO_FILTER_ENABLED = os.getenv("AUTO_FILTER_ENABLED", "true").lower() == "true"
+SAFE_TEST_MODE = os.getenv("SAFE_TEST_MODE", "true").lower() == "true"
+SAFE_MIN_LIQUIDITY_USD = float(os.getenv("SAFE_MIN_LIQUIDITY_USD", "20000"))
+SAFE_MIN_VOLUME_5M_USD = float(os.getenv("SAFE_MIN_VOLUME_5M_USD", "5000"))
+SAFE_MIN_AGE_SECONDS = int(os.getenv("SAFE_MIN_AGE_SECONDS", "120"))
+SAFE_MAX_PRICE_CHANGE_5M_ABS_PERCENT = float(os.getenv("SAFE_MAX_PRICE_CHANGE_5M_ABS_PERCENT", "18"))
+SAFE_REQUIRE_CONTRACT_SAFE = os.getenv("SAFE_REQUIRE_CONTRACT_SAFE", "true").lower() == "true"
+SAFE_REQUIRE_RISK_LEVEL = os.getenv("SAFE_REQUIRE_RISK_LEVEL", "MEDIUM").strip().upper()
+SAFE_MAX_WARNING_FLAGS = int(os.getenv("SAFE_MAX_WARNING_FLAGS", "1"))
+
+# Optional extra token flow sources
+DEX_BOOSTS_SOURCE_ENABLED = os.getenv("DEX_BOOSTS_SOURCE_ENABLED", "true").lower() == "true"
+DEX_BOOSTS_MAX_TOKENS = max(0, int(os.getenv("DEX_BOOSTS_MAX_TOKENS", "20")))
 
 BUY_AMOUNT_ETH = float(os.getenv("BUY_AMOUNT_ETH", "0.0005"))
 # Backward compatibility with previous variable naming.
@@ -102,6 +115,15 @@ CLOSED_TRADES_MAX_AGE_DAYS = max(0, int(os.getenv("CLOSED_TRADES_MAX_AGE_DAYS", 
 DYNAMIC_HOLD_ENABLED = os.getenv("DYNAMIC_HOLD_ENABLED", "true").lower() == "true"
 HOLD_MIN_SECONDS = max(60, int(os.getenv("HOLD_MIN_SECONDS", "300")))
 HOLD_MAX_SECONDS = max(HOLD_MIN_SECONDS, int(os.getenv("HOLD_MAX_SECONDS", str(PAPER_MAX_HOLD_SECONDS))))
+PAPER_RESET_ON_START = os.getenv("PAPER_RESET_ON_START", "false").lower() == "true"
+
+# Trade risk controls
+MAX_TOKEN_PRICE_CHANGE_5M_ABS_PERCENT = float(os.getenv("MAX_TOKEN_PRICE_CHANGE_5M_ABS_PERCENT", "35"))
+MAX_TOKEN_COOLDOWN_SECONDS = max(0, int(os.getenv("MAX_TOKEN_COOLDOWN_SECONDS", "600")))
+MAX_LOSS_PER_TRADE_PERCENT_BALANCE = float(os.getenv("MAX_LOSS_PER_TRADE_PERCENT_BALANCE", "1.2"))
+DAILY_MAX_DRAWDOWN_PERCENT = float(os.getenv("DAILY_MAX_DRAWDOWN_PERCENT", "5.0"))
+MAX_CONSECUTIVE_LOSSES = max(1, int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3")))
+LOSS_STREAK_COOLDOWN_SECONDS = max(0, int(os.getenv("LOSS_STREAK_COOLDOWN_SECONDS", "1800")))
 
 GOPLUS_EVM_API = os.getenv(
     "GOPLUS_EVM_API",

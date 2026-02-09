@@ -36,14 +36,18 @@ Copy-Item .env.example .env
 ## Запуск
 
 ```powershell
-python main.py
+python main_local.py
 ```
+
+Этот проект сейчас ориентирован на desktop-first режим (без Telegram в рабочем контуре).
 
 GUI-панель (Activity/Trades/Settings):
 
 ```powershell
 python launcher_gui.py
 ```
+
+В GUI есть вкладка `Сигналы` с входящими локальными алертами по новым токенам.
 
 ## Paper trading
 
@@ -67,6 +71,7 @@ python launcher_gui.py
 - `EDGE_FILTER_ENABLED=true`
 - `MIN_EXPECTED_EDGE_PERCENT=2.0`
 - `CLOSED_TRADES_MAX_AGE_DAYS=14`
+- `PAPER_RESET_ON_START=false`
 - `DEX_SEARCH_QUERIES=base,new`
 - `GECKO_NEW_POOLS_PAGES=2`
 

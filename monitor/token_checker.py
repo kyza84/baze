@@ -18,7 +18,7 @@ class TokenChecker:
         risk_level = "MEDIUM"
         is_safe = True
 
-        if liquidity is not None and liquidity < 10000:
+        if liquidity is not None and liquidity < 15000:
             risk_level = "HIGH"
             is_safe = False
             warnings.append("Low liquidity")
@@ -34,6 +34,7 @@ class TokenChecker:
             "is_safe": is_safe,
             "risk_level": risk_level,
             "warnings": warnings,
+            "warning_flags": len(warnings),
             "source": "fallback",
         }
 
@@ -72,21 +73,52 @@ class TokenChecker:
         warnings: list[str] = []
         risk_points = 0
 
+        def _flag(name: str, points: int = 1) -> None:
+            nonlocal risk_points
+            warnings.append(name)
+            risk_points += points
+
         if result.get("is_mintable") in ("1", 1, True):
-            warnings.append("Mint is enabled")
-            risk_points += 1
+            _flag("Mint is enabled", 1)
 
         if result.get("is_freezeable") in ("1", 1, True):
-            warnings.append("Freeze authority enabled")
-            risk_points += 1
+            _flag("Freeze authority enabled", 1)
 
         if result.get("is_blacklisted") in ("1", 1, True):
-            warnings.append("Blacklist flag present")
-            risk_points += 2
+            _flag("Blacklist flag present", 2)
 
         if result.get("is_open_source") in ("0", 0, False):
-            warnings.append("Contract not open source")
-            risk_points += 1
+            _flag("Contract not open source", 1)
+
+        if result.get("can_take_back_ownership") in ("1", 1, True):
+            _flag("Ownership can be reclaimed", 2)
+
+        if result.get("owner_change_balance") in ("1", 1, True):
+            _flag("Owner can change balances", 2)
+
+        if result.get("trading_cooldown") in ("1", 1, True):
+            _flag("Trading cooldown enabled", 1)
+
+        if result.get("is_proxy") in ("1", 1, True):
+            _flag("Proxy contract", 1)
+
+        try:
+            buy_tax = float(result.get("buy_tax") or 0)
+            if buy_tax >= 10:
+                _flag(f"High buy tax {buy_tax:.1f}%", 2)
+            elif buy_tax > 3:
+                _flag(f"Buy tax {buy_tax:.1f}%", 1)
+        except (TypeError, ValueError):
+            pass
+
+        try:
+            sell_tax = float(result.get("sell_tax") or 0)
+            if sell_tax >= 10:
+                _flag(f"High sell tax {sell_tax:.1f}%", 2)
+            elif sell_tax > 3:
+                _flag(f"Sell tax {sell_tax:.1f}%", 1)
+        except (TypeError, ValueError):
+            pass
 
         if risk_points >= 3:
             risk_level = "HIGH"
@@ -103,5 +135,6 @@ class TokenChecker:
             "is_safe": is_safe,
             "risk_level": risk_level,
             "warnings": warnings,
+            "warning_flags": len(warnings),
             "source": "goplus",
         }

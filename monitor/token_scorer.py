@@ -9,13 +9,16 @@ class TokenScorer:
         volume_5m = float(token_data.get("volume_5m") or 0)
         risk_level = str(token_data.get("risk_level") or "MEDIUM").upper()
         age_seconds = int(token_data.get("age_seconds") or 0)
+        warning_flags = int(token_data.get("warning_flags") or 0)
+        is_contract_safe = bool(token_data.get("is_contract_safe", True))
 
         liquidity_score = self._score_liquidity(liquidity)
         volume_score = self._score_volume(volume_5m)
         risk_score = self._score_risk(risk_level)
         age_score = self._score_age(age_seconds)
 
-        score = max(0, min(100, liquidity_score + volume_score + risk_score + age_score))
+        safety_score = self._score_safety(warning_flags, is_contract_safe)
+        score = max(0, min(100, liquidity_score + volume_score + risk_score + age_score + safety_score))
         recommendation = self._recommendation(score)
 
         return {
@@ -25,6 +28,7 @@ class TokenScorer:
                 "volume_score": volume_score,
                 "risk_score": risk_score,
                 "age_score": age_score,
+                "safety_score": safety_score,
             },
             "recommendation": recommendation,
         }
@@ -66,6 +70,19 @@ class TokenScorer:
         if age_seconds < 1800:
             return 5
         return 0
+
+    @staticmethod
+    def _score_safety(warning_flags: int, is_contract_safe: bool) -> int:
+        score = 0
+        if is_contract_safe:
+            score += 8
+        if warning_flags <= 0:
+            score += 7
+        elif warning_flags == 1:
+            score += 2
+        else:
+            score -= min(15, warning_flags * 4)
+        return score
 
     @staticmethod
     def _recommendation(score: int) -> str:
