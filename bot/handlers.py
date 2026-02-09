@@ -2,6 +2,8 @@
 
 from datetime import datetime
 
+import config
+
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
@@ -33,6 +35,7 @@ from database.db import (
 )
 from database.models import User
 from monitor.alerter import TokenAlerter
+from monitor.personal_stats import get_stats
 from payments.cryptobot import CryptoPayment
 
 payment_client = CryptoPayment()
@@ -63,6 +66,20 @@ def _is_admin(user_id: int | None) -> bool:
 
 def _is_paid_subscription(user: User) -> bool:
     return user.is_subscribed() and not user.is_demo
+
+
+def _is_personal_admin(user_id: int | None) -> bool:
+    return bool(user_id and int(config.PERSONAL_TELEGRAM_ID or 0) > 0 and user_id == int(config.PERSONAL_TELEGRAM_ID))
+
+
+def _settings_markup(current_settings: dict, paid_enabled: bool, user_id: int | None) -> InlineKeyboardMarkup:
+    return settings_keyboard(
+        current_settings,
+        paid_enabled=paid_enabled,
+        show_personal_controls=_is_personal_admin(user_id),
+        auto_trade_enabled=bool(config.AUTO_TRADE_ENABLED),
+        auto_filter_enabled=bool(config.AUTO_FILTER_ENABLED),
+    )
 
 
 def _admin_card_actions_keyboard(request_id: int) -> InlineKeyboardMarkup:
@@ -157,7 +174,23 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"- Notifications: {'ON' if user.settings.get('notify_enabled', True) else 'OFF'}"
     )
 
-    message = STATUS_TEMPLATE.format(time_left=time_left, plan_type=plan_type) + settings_text
+    stats = get_stats(tg_user.id)
+    auto_trader = context.application.bot_data.get("auto_trader")
+    auto_stats = auto_trader.get_stats() if auto_trader else {}
+    personal_text = (
+        f"\n\nPersonal mode:\n"
+        f"- Min token score: {int(config.MIN_TOKEN_SCORE)}\n"
+        f"- Buy amount: {float(config.BUY_AMOUNT_ETH)} ETH\n"
+        f"- Auto-filter: {'ON' if config.AUTO_FILTER_ENABLED else 'OFF'}\n"
+        f"- Auto-trade: {'ON' if config.AUTO_TRADE_ENABLED else 'OFF'} ({'paper' if config.AUTO_TRADE_PAPER else 'live'})\n"
+        f"- Alerts received today: {stats['alerts_today']}\n"
+        f"- High-score alerts today (score >= 70): {stats['high_score_today']}\n"
+        f"- Open trades: {int(auto_stats.get('open_trades', 0))}\n"
+        f"- Win rate: {float(auto_stats.get('win_rate_percent', 0.0)):.2f}%\n"
+        f"- Paper balance: ${float(auto_stats.get('paper_balance_usd', 0.0)):.2f}"
+    )
+
+    message = STATUS_TEMPLATE.format(time_left=time_left, plan_type=plan_type) + settings_text + personal_text
     target = update.message or (update.callback_query.message if update.callback_query else None)
     if target:
         await target.reply_text(message, parse_mode="HTML", reply_markup=main_menu_keyboard())
@@ -176,7 +209,7 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             SETTINGS_INFO
             + ("\n\n🔒 Advanced settings are available for paid subscriptions only." if not paid_enabled else ""),
             parse_mode="HTML",
-            reply_markup=settings_keyboard(user.settings or {}, paid_enabled=paid_enabled),
+            reply_markup=_settings_markup(user.settings or {}, paid_enabled=paid_enabled, user_id=tg_user.id),
         )
 
 
@@ -190,16 +223,123 @@ async def test_alert_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     token_data = {
         "name": "Test Token",
         "symbol": "TST",
-        "address": "So11111111111111111111111111111111111111112",
+        "address": "0x4200000000000000000000000000000000000006",
         "liquidity": 12500.0,
         "volume_5m": 3400.0,
         "price_change_5m": 12.7,
-        "dexscreener_url": "https://dexscreener.com/solana",
-        "pumpfun_url": "https://pump.fun",
+        "dexscreener_url": "https://dexscreener.com/base",
         "created_at": datetime.utcnow(),
+        "age_seconds": 120,
+        "age_minutes": 2,
     }
     await alerter.send_alert(context.bot, token_data, [user])
     await update.message.reply_text("Test alert sent.")
+
+
+async def mystats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    tg_user = update.effective_user
+    target = update.message
+    if not tg_user or not target:
+        return
+    if not _is_personal_admin(tg_user.id):
+        await target.reply_text("Access denied.")
+        return
+
+    stats = get_stats(tg_user.id)
+    auto_trader = context.application.bot_data.get("auto_trader")
+    auto_stats = auto_trader.get_stats() if auto_trader else {}
+    trade_tracker_enabled = bool(auto_trader)
+
+    lines = [
+        "📊 <b>My Trading Stats</b>",
+        "",
+        f"Total alerts received: <b>{stats['total_alerts']}</b>",
+        f"Tokens scored 70+: <b>{stats['total_high_score']}</b>",
+    ]
+    if trade_tracker_enabled:
+        lines.append(f"Your open trades: <b>{int(auto_stats.get('open_trades', 0))}</b>")
+        lines.append(f"Closed trades: <b>{int(auto_stats.get('closed', 0))}</b>")
+        lines.append(f"Wins / Losses: <b>{int(auto_stats.get('wins', 0))}/{int(auto_stats.get('losses', 0))}</b>")
+        lines.append(f"Win rate: <b>{float(auto_stats.get('win_rate_percent', 0.0)):.2f}%</b>")
+        lines.append(f"Auto-trade plans created: <b>{int(auto_stats.get('planned', 0))}</b>")
+        lines.append(f"Auto-trade executed (paper/live): <b>{int(auto_stats.get('executed', 0))}</b>")
+        lines.append(f"Paper balance: <b>${float(auto_stats.get('paper_balance_usd', 0.0)):.2f}</b>")
+        lines.append(f"Equity: <b>${float(auto_stats.get('equity_usd', 0.0)):.2f}</b>")
+        lines.append(f"Realized PnL: <b>${float(auto_stats.get('realized_pnl_usd', 0.0)):+.2f}</b>")
+        lines.append(f"Unrealized PnL: <b>${float(auto_stats.get('unrealized_pnl_usd', 0.0)):+.2f}</b>")
+    else:
+        lines.append("Your open trades: <b>N/A</b> (trade tracker disabled)")
+
+    await target.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def setscore_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    tg_user = update.effective_user
+    target = update.message
+    if not tg_user or not target:
+        return
+    if not _is_personal_admin(tg_user.id):
+        await target.reply_text("Access denied.")
+        return
+    if len(context.args) != 1:
+        await target.reply_text("Usage: /setscore <number>")
+        return
+
+    try:
+        new_score = int(context.args[0])
+    except ValueError:
+        await target.reply_text("Score must be an integer from 0 to 100.")
+        return
+
+    if new_score < 0 or new_score > 100:
+        await target.reply_text("Score must be in 0-100 range.")
+        return
+
+    config.MIN_TOKEN_SCORE = new_score
+    await target.reply_text(f"Minimum score updated to {new_score}. You'll only receive top-tier alerts.")
+
+
+async def setamount_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    tg_user = update.effective_user
+    target = update.message
+    if not tg_user or not target:
+        return
+    if not _is_personal_admin(tg_user.id):
+        await target.reply_text("Access denied.")
+        return
+    if len(context.args) != 1:
+        await target.reply_text("Usage: /setamount <number>")
+        return
+
+    try:
+        new_amount = float(context.args[0])
+    except ValueError:
+        await target.reply_text("Amount must be a number.")
+        return
+
+    if new_amount <= 0:
+        await target.reply_text("Amount must be greater than 0.")
+        return
+
+    config.BUY_AMOUNT_ETH = new_amount
+    config.BUY_AMOUNT_SOL = new_amount
+    await target.reply_text(f"Buy amount updated to {new_amount} ETH per trade.")
+
+
+async def togglefilter_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    tg_user = update.effective_user
+    target = update.message
+    if not tg_user or not target:
+        return
+    if not _is_personal_admin(tg_user.id):
+        await target.reply_text("Access denied.")
+        return
+
+    config.AUTO_FILTER_ENABLED = not bool(config.AUTO_FILTER_ENABLED)
+    if config.AUTO_FILTER_ENABLED:
+        await target.reply_text("Auto-filter: ON. You will receive filtered alerts.")
+    else:
+        await target.reply_text("Auto-filter: OFF. You will receive all alerts.")
 
 
 async def admin_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -497,6 +637,38 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await status_command(update, context)
     elif query.data == "settings":
         await settings_command(update, context)
+    elif query.data == "toggle_auto_trade":
+        user_id = update.effective_user.id if update.effective_user else None
+        if not _is_personal_admin(user_id):
+            await query.message.reply_text("Access denied.")
+            return
+        config.AUTO_TRADE_ENABLED = not bool(config.AUTO_TRADE_ENABLED)
+        user = get_user(user_id) if user_id else None
+        await query.message.reply_text(
+            f"Auto-trade: {'ON' if config.AUTO_TRADE_ENABLED else 'OFF'}.",
+            reply_markup=_settings_markup(
+                (user.settings if user else {}),
+                paid_enabled=True,
+                user_id=user_id,
+            ),
+        )
+    elif query.data == "toggle_auto_filter":
+        user_id = update.effective_user.id if update.effective_user else None
+        if not _is_personal_admin(user_id):
+            await query.message.reply_text("Access denied.")
+            return
+        config.AUTO_FILTER_ENABLED = not bool(config.AUTO_FILTER_ENABLED)
+        user = get_user(user_id) if user_id else None
+        await query.message.reply_text(
+            f"Auto-filter: {'ON' if config.AUTO_FILTER_ENABLED else 'OFF'}.",
+            reply_markup=_settings_markup(
+                (user.settings if user else {}),
+                paid_enabled=True,
+                user_id=user_id,
+            ),
+        )
+    elif query.data.startswith("skip_"):
+        await query.message.reply_text("Skipped.")
     elif query.data == "main_menu":
         await query.message.reply_text(
             "Main menu:",
@@ -513,7 +685,11 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             if updated:
                 await query.message.reply_text(
                     "Notifications updated.",
-                    reply_markup=settings_keyboard(updated.settings, paid_enabled=True),
+                    reply_markup=_settings_markup(
+                        updated.settings,
+                        paid_enabled=True,
+                        user_id=(update.effective_user.id if update.effective_user else None),
+                    ),
                 )
     elif query.data == "set_liquidity" and update.effective_user:
         user = get_user(update.effective_user.id)
@@ -528,7 +704,11 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             if updated:
                 await query.message.reply_text(
                     f"Min liquidity updated to ${next_value}.",
-                    reply_markup=settings_keyboard(updated.settings, paid_enabled=True),
+                    reply_markup=_settings_markup(
+                        updated.settings,
+                        paid_enabled=True,
+                        user_id=(update.effective_user.id if update.effective_user else None),
+                    ),
                 )
     elif query.data == "set_liquidity_menu" and update.effective_user:
         user = get_user(update.effective_user.id)
@@ -554,7 +734,11 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                 if updated:
                     await query.message.reply_text(
                         f"Min liquidity updated to ${next_value}.",
-                        reply_markup=settings_keyboard(updated.settings, paid_enabled=True),
+                        reply_markup=_settings_markup(
+                            updated.settings,
+                            paid_enabled=True,
+                            user_id=(update.effective_user.id if update.effective_user else None),
+                        ),
                     )
     elif query.data == "set_max_age" and update.effective_user:
         user = get_user(update.effective_user.id)
@@ -569,7 +753,11 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             if updated:
                 await query.message.reply_text(
                     f"Max age updated to {next_value} minutes.",
-                    reply_markup=settings_keyboard(updated.settings, paid_enabled=True),
+                    reply_markup=_settings_markup(
+                        updated.settings,
+                        paid_enabled=True,
+                        user_id=(update.effective_user.id if update.effective_user else None),
+                    ),
                 )
     elif query.data == "set_max_age_menu" and update.effective_user:
         user = get_user(update.effective_user.id)
@@ -595,7 +783,11 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                 if updated:
                     await query.message.reply_text(
                         f"Max age updated to {next_value} minutes.",
-                        reply_markup=settings_keyboard(updated.settings, paid_enabled=True),
+                        reply_markup=_settings_markup(
+                            updated.settings,
+                            paid_enabled=True,
+                            user_id=(update.effective_user.id if update.effective_user else None),
+                        ),
                     )
     elif query.data == "set_interval" and update.effective_user:
         user = get_user(update.effective_user.id)
@@ -610,7 +802,11 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             if updated:
                 await query.message.reply_text(
                     f"Alert interval updated to {next_value} seconds.",
-                    reply_markup=settings_keyboard(updated.settings, paid_enabled=True),
+                    reply_markup=_settings_markup(
+                        updated.settings,
+                        paid_enabled=True,
+                        user_id=(update.effective_user.id if update.effective_user else None),
+                    ),
                 )
     elif query.data == "set_interval_menu" and update.effective_user:
         user = get_user(update.effective_user.id)
@@ -636,7 +832,11 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                 if updated:
                     await query.message.reply_text(
                         f"Alert interval updated to {next_value} seconds.",
-                        reply_markup=settings_keyboard(updated.settings, paid_enabled=True),
+                        reply_markup=_settings_markup(
+                            updated.settings,
+                            paid_enabled=True,
+                            user_id=(update.effective_user.id if update.effective_user else None),
+                        ),
                     )
 
 

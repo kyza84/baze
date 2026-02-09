@@ -4,9 +4,7 @@ from typing import Any
 
 import aiohttp
 
-from config import GOPLUS_ACCESS_TOKEN
-
-GOPLUS_SOLANA_URL = "https://api.gopluslabs.io/api/v1/solana/token_security"
+from config import CHAIN_ID, EVM_CHAIN_ID, GOPLUS_ACCESS_TOKEN, GOPLUS_EVM_API, GOPLUS_SOLANA_API
 
 
 class TokenChecker:
@@ -48,18 +46,26 @@ class TokenChecker:
             headers["Authorization"] = f"Bearer {GOPLUS_ACCESS_TOKEN}"
 
         params = {"contract_addresses": token_address}
+        if CHAIN_ID.lower() != "solana":
+            params["chain_id"] = EVM_CHAIN_ID
 
         try:
+            url = GOPLUS_SOLANA_API if CHAIN_ID.lower() == "solana" else GOPLUS_EVM_API.format(chain_id=EVM_CHAIN_ID)
             timeout = aiohttp.ClientTimeout(total=10)
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(GOPLUS_SOLANA_URL, params=params, headers=headers) as response:
+                async with session.get(url, params=params, headers=headers) as response:
                     if response.status != 200:
                         return None
                     data = await response.json()
         except Exception:
             return None
 
-        result = (data.get("result") or {}).get(token_address)
+        result_map = data.get("result") or {}
+        result = (
+            result_map.get(token_address)
+            or result_map.get(token_address.lower())
+            or result_map.get(token_address.upper())
+        )
         if not isinstance(result, dict):
             return None
 

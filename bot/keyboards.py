@@ -39,7 +39,13 @@ def subscription_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def settings_keyboard(current_settings: dict, paid_enabled: bool) -> InlineKeyboardMarkup:
+def settings_keyboard(
+    current_settings: dict,
+    paid_enabled: bool,
+    show_personal_controls: bool = False,
+    auto_trade_enabled: bool = False,
+    auto_filter_enabled: bool = True,
+) -> InlineKeyboardMarkup:
     min_liquidity = current_settings.get("min_liquidity", 5000)
     max_age_minutes = current_settings.get("max_age_minutes", 60)
     alert_cooldown = current_settings.get("alert_cooldown_seconds", 30)
@@ -53,20 +59,36 @@ def settings_keyboard(current_settings: dict, paid_enabled: bool) -> InlineKeybo
             ]
         )
 
-    return InlineKeyboardMarkup(
+    rows = [
+        [InlineKeyboardButton(f"Min Liquidity: ${min_liquidity}", callback_data="set_liquidity_menu")],
+        [InlineKeyboardButton(f"Max Age: {max_age_minutes}m", callback_data="set_max_age_menu")],
+        [InlineKeyboardButton(f"Alert Interval: {alert_cooldown}s", callback_data="set_interval_menu")],
         [
-            [InlineKeyboardButton(f"Min Liquidity: ${min_liquidity}", callback_data="set_liquidity_menu")],
-            [InlineKeyboardButton(f"Max Age: {max_age_minutes}m", callback_data="set_max_age_menu")],
-            [InlineKeyboardButton(f"Alert Interval: {alert_cooldown}s", callback_data="set_interval_menu")],
+            InlineKeyboardButton(
+                f"Notifications: {'ON' if notify_enabled else 'OFF'}",
+                callback_data="toggle_notify",
+            )
+        ],
+    ]
+    if show_personal_controls:
+        rows.append(
             [
                 InlineKeyboardButton(
-                    f"Notifications: {'ON' if notify_enabled else 'OFF'}",
-                    callback_data="toggle_notify",
+                    f"Auto-trade: {'ON' if auto_trade_enabled else 'OFF'}",
+                    callback_data="toggle_auto_trade",
                 )
-            ],
-            [InlineKeyboardButton("< Back", callback_data="main_menu")],
-        ]
-    )
+            ]
+        )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"Auto-filter: {'ON' if auto_filter_enabled else 'OFF'}",
+                    callback_data="toggle_auto_filter",
+                )
+            ]
+        )
+    rows.append([InlineKeyboardButton("< Back", callback_data="main_menu")])
+    return InlineKeyboardMarkup(rows)
 
 
 def liquidity_options_keyboard(current_value: int) -> InlineKeyboardMarkup:

@@ -1,75 +1,18 @@
-﻿# Solana Alert Bot
+﻿# Base Alert Bot
 
-Telegram-бот для алертов по новым Solana токенам, подпискам и оплате через CryptoBot.
+Telegram-бот для алертов по новым токенам в сети Base, с подписками и оплатой через CryptoBot.
 
 ## Быстрый старт
 
 ```powershell
-cd d:\earn\solana-alert-bot
+cd d:\earnforme\solana-alert-bot
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 Copy-Item .env.example .env
 ```
 
-Заполни `.env`:
-
-```env
-TELEGRAM_BOT_TOKEN=...
-CRYPTOBOT_TOKEN=...
-GOPLUS_ACCESS_TOKEN=... # optional
-DATABASE_URL=sqlite:///bot.db
-TRIAL_HOURS=6
-CRYPTOBOT_WEBHOOK_SECRET=... # обязательно
-CARD_PAYMENT_DETAILS=CardNumber:0000 0000 0000 0000; Name:YOUR_NAME; Bank:YOUR_BANK
-ADMIN_IDS=123456789
-```
-
-## Где взять webhook secret
-
-Webhook secret не выдается сервисом, его создаешь ты сам.
-
-Сгенерировать:
-
-```powershell
-python -c "import secrets; print(secrets.token_urlsafe(32))"
-```
-
-Скопируй результат в `.env` как `CRYPTOBOT_WEBHOOK_SECRET=...`.
-
-## Тарифы
-
-- 1 неделя: `$5`
-- 2.5 недели: `$10`
-- 1 месяц: `$15`
-- Пробный триал: `6 часов`
-
-## Запуск
-
-```powershell
-python main.py
-```
-
-## Запуск в фоне (PowerShell)
-
-```powershell
-.\run_bot_background.ps1
-.\bot_status.ps1
-.\stop_bot.ps1
-```
-
-Логи:
-- `logs/app.log`
-- `logs/bot.out.log`
-- `logs/bot.err.log`
-
-## Мини-окно управления
-
-```powershell
-.\.venv\Scripts\python.exe launcher_gui.py
-```
-
-## Команды в Telegram
+## Основные команды
 
 Пользователь:
 - `/start`
@@ -78,6 +21,10 @@ python main.py
 - `/status`
 - `/settings`
 - `/testalert`
+- `/mystats`
+- `/setscore <0-100>`
+- `/setamount <ETH>`
+- `/togglefilter`
 
 Админ:
 - `/admin_stats`
@@ -86,28 +33,58 @@ python main.py
 - `/admin_approve_card <request_id>`
 - `/admin_reject_card <request_id> [reason]`
 
-## Webhook для CryptoBot
+## Запуск
 
-Endpoint:
-
-```text
-POST http://WEBHOOK_HOST:WEBHOOK_PORT/cryptobot/webhook
+```powershell
+python main.py
 ```
 
-Параметры из `.env`:
-- `WEBHOOK_HOST`
-- `WEBHOOK_PORT`
-- `CRYPTOBOT_WEBHOOK_PATH`
-- `CRYPTOBOT_WEBHOOK_SECRET`
+GUI-панель (Activity/Trades/Settings):
 
-Сервер webhook теперь запускается только при заданном `CRYPTOBOT_WEBHOOK_SECRET`.
+```powershell
+python launcher_gui.py
+```
 
-## Где что менять
+## Paper trading
+
+- `AUTO_TRADE_ENABLED=true`
+- `AUTO_TRADE_PAPER=true`
+- `AUTO_TRADE_ENTRY_MODE=single|all|top_n`
+- `AUTO_TRADE_TOP_N=10`
+- `MAX_OPEN_TRADES=0` (unlimited) or any limit
+- `PAPER_TRADE_SIZE_USD=1.0`
+- `PAPER_TRADE_SIZE_MIN_USD=0.25`
+- `PAPER_TRADE_SIZE_MAX_USD=1.0`
+- `PAPER_MAX_HOLD_SECONDS=1800`
+- `DYNAMIC_HOLD_ENABLED=true`
+- `HOLD_MIN_SECONDS=300`
+- `HOLD_MAX_SECONDS=1800`
+- `PAPER_REALISM_ENABLED=true`
+- `PAPER_GAS_PER_TX_USD=0.03`
+- `PAPER_SWAP_FEE_BPS=30`
+- `PAPER_BASE_SLIPPAGE_BPS=80`
+- `DYNAMIC_POSITION_SIZING_ENABLED=true`
+- `EDGE_FILTER_ENABLED=true`
+- `MIN_EXPECTED_EDGE_PERCENT=2.0`
+- `CLOSED_TRADES_MAX_AGE_DAYS=14`
+- `DEX_SEARCH_QUERIES=base,new`
+- `GECKO_NEW_POOLS_PAGES=2`
+
+В paper режиме бот открывает и закрывает сделки автоматически:
+- BUY по сигналу (score/recommendation)
+- SELL по `TP`, `SL` или `TIMEOUT`
+- время удержания может подбираться автоматически по качеству/риску токена
+- PnL учитывает комиссию, проскальзывание и gas (если `PAPER_REALISM_ENABLED=true`)
+- размер позиции может меняться от ожидаемого edge (`PAPER_TRADE_SIZE_MIN_USD` .. `PAPER_TRADE_SIZE_MAX_USD`)
+- состояния сделок сохраняются в `trading/paper_state.json` и восстанавливаются после перезапуска
+- старые закрытые сделки автоматически чистятся по `CLOSED_TRADES_MAX_AGE_DAYS`
+- статистика и PnL доступны в `/mystats`
+
+## Важные файлы
 
 - Конфиг: `config.py`
-- Хендлеры Telegram: `bot/handlers.py`
-- Мониторинг: `monitor/dexscreener.py`
+- Мониторинг Base: `monitor/dexscreener.py`
 - Риск-чек: `monitor/token_checker.py`
+- Скоринг: `monitor/token_scorer.py`
 - Рассылка: `monitor/alerter.py`
-- Оплаты: `payments/cryptobot.py`, `payments/webhook_server.py`
-- База: `database/models.py`, `database/db.py`
+- Автотрейд (подготовка): `trading/auto_trader.py`

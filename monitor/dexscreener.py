@@ -6,9 +6,21 @@ from typing import Any
 
 import aiohttp
 
-from config import DEXSCREENER_API, DEX_RETRIES, DEX_TIMEOUT, MIN_LIQUIDITY, SEEN_TOKEN_TTL, TOKEN_AGE_MAX
-
-GECKO_NEW_POOLS_URL = "https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page=1&include=base_token"
+from config import (
+    CHAIN_ID,
+    CHAIN_NAME,
+    DEXSCREENER_API,
+    DEXSCREENER_TOKEN_URL_TEMPLATE,
+    DEX_RETRIES,
+    DEX_SEARCH_QUERY,
+    DEX_SEARCH_QUERIES,
+    DEX_TIMEOUT,
+    GECKO_NETWORK,
+    GECKO_NEW_POOLS_PAGES,
+    MIN_LIQUIDITY,
+    SEEN_TOKEN_TTL,
+    TOKEN_AGE_MAX,
+)
 
 
 class DexScreenerMonitor:
@@ -28,14 +40,22 @@ class DexScreenerMonitor:
     async def fetch_new_tokens(self) -> list[dict[str, Any]]:
         self._prune_seen_tokens()
 
-        tokens = await self._fetch_from_dexscreener()
-        if tokens:
-            return tokens
-
-        return await self._fetch_from_geckoterminal()
+        dex_task = asyncio.create_task(self._fetch_from_dexscreener())
+        gecko_task = asyncio.create_task(self._fetch_from_geckoterminal())
+        dex_tokens, gecko_tokens = await asyncio.gather(dex_task, gecko_task)
+        return self._merge_tokens(dex_tokens, gecko_tokens)
 
     async def _fetch_from_dexscreener(self) -> list[dict[str, Any]]:
-        url = f"{DEXSCREENER_API}/search?q=solana"
+        queries = DEX_SEARCH_QUERIES or [DEX_SEARCH_QUERY]
+        tasks = [self._fetch_dex_query(query) for query in queries]
+        result_sets = await asyncio.gather(*tasks)
+        merged: list[dict[str, Any]] = []
+        for rows in result_sets:
+            merged.extend(rows)
+        return merged
+
+    async def _fetch_dex_query(self, query: str) -> list[dict[str, Any]]:
+        url = f"{DEXSCREENER_API}/search?q={query}"
         timeout = aiohttp.ClientTimeout(total=DEX_TIMEOUT)
 
         for attempt in range(1, DEX_RETRIES + 1):
@@ -59,12 +79,27 @@ class DexScreenerMonitor:
         return []
 
     async def _fetch_from_geckoterminal(self) -> list[dict[str, Any]]:
+        all_tokens: list[dict[str, Any]] = []
+        for page in range(1, GECKO_NEW_POOLS_PAGES + 1):
+            page_tokens = await self._fetch_gecko_page(page)
+            if not page_tokens:
+                if page == 1:
+                    return []
+                break
+            all_tokens.extend(page_tokens)
+        return all_tokens
+
+    async def _fetch_gecko_page(self, page: int) -> list[dict[str, Any]]:
+        gecko_url = (
+            f"https://api.geckoterminal.com/api/v2/networks/{GECKO_NETWORK}/new_pools"
+            f"?page={page}&include=base_token"
+        )
         timeout = aiohttp.ClientTimeout(total=DEX_TIMEOUT)
 
         for attempt in range(1, DEX_RETRIES + 1):
             try:
                 async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.get(GECKO_NEW_POOLS_URL, headers=self._headers) as response:
+                    async with session.get(gecko_url, headers=self._headers) as response:
                         if response.status != 200:
                             if attempt < DEX_RETRIES:
                                 await asyncio.sleep(attempt)
@@ -83,11 +118,27 @@ class DexScreenerMonitor:
 
         return []
 
+    @staticmethod
+    def _merge_tokens(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        by_address: dict[str, dict[str, Any]] = {}
+        for tokens in groups:
+            for token in tokens:
+                address = str(token.get("address", "")).strip().lower()
+                if not address:
+                    continue
+                existing = by_address.get(address)
+                if not existing:
+                    by_address[address] = token
+                    continue
+                if float(token.get("liquidity", 0)) > float(existing.get("liquidity", 0)):
+                    by_address[address] = token
+        return list(by_address.values())
+
     def _filter_dex_pairs(self, pairs: list[dict[str, Any]]) -> list[dict[str, Any]]:
         filtered: list[dict[str, Any]] = []
 
         for pair in pairs:
-            if pair.get("chainId") != "solana":
+            if str(pair.get("chainId", "")).lower() != CHAIN_ID.lower():
                 continue
 
             base_token = pair.get("baseToken", {})
@@ -104,7 +155,7 @@ class DexScreenerMonitor:
             if not self._passes_filters(address, liquidity_usd, created_at):
                 continue
 
-            filtered.append(self._format_dex_token_data(pair, created_at))
+            filtered.append(self._format_token_data(pair, created_at))
 
         return filtered
 
@@ -133,6 +184,8 @@ class DexScreenerMonitor:
             if not self._passes_filters(address, liquidity_usd, created_at):
                 continue
 
+            now = datetime.now(timezone.utc)
+            age_seconds = int((now - created_at).total_seconds())
             filtered.append(
                 {
                     "name": base_token.get("name") or (attrs.get("name", "Unknown").split("/")[0].strip()),
@@ -141,9 +194,14 @@ class DexScreenerMonitor:
                     "liquidity": liquidity_usd,
                     "volume_5m": float((attrs.get("volume_usd") or {}).get("m5") or 0),
                     "price_change_5m": float((attrs.get("price_change_percentage") or {}).get("m5") or 0),
-                    "dexscreener_url": f"https://dexscreener.com/solana/{address}",
-                    "pumpfun_url": f"https://pump.fun/{address}",
+                    "price_usd": float(attrs.get("base_token_price_usd") or 0),
+                    "dexscreener_url": DEXSCREENER_TOKEN_URL_TEMPLATE.format(
+                        chain=CHAIN_NAME,
+                        token_address=address,
+                    ),
                     "created_at": created_at,
+                    "age_seconds": age_seconds,
+                    "age_minutes": int(round(age_seconds / 60)),
                 }
             )
 
@@ -164,14 +222,21 @@ class DexScreenerMonitor:
         self.seen_tokens[address] = now.timestamp()
         return True
 
-    def _format_dex_token_data(self, pair: dict[str, Any], created_at: datetime) -> dict[str, Any]:
+    def _format_token_data(self, pair: dict[str, Any], created_at: datetime) -> dict[str, Any]:
         base = pair.get("baseToken", {})
         liquidity = float((pair.get("liquidity") or {}).get("usd") or 0)
         volume_5m = float((pair.get("volume") or {}).get("m5") or 0)
         price_change_5m = float((pair.get("priceChange") or {}).get("m5") or 0)
+        price_usd = float(pair.get("priceUsd") or 0)
 
         address = base.get("address", "")
-        dexscreener_url = pair.get("url") or f"https://dexscreener.com/solana/{address}"
+        dexscreener_url = pair.get("url") or DEXSCREENER_TOKEN_URL_TEMPLATE.format(
+            chain=CHAIN_NAME,
+            token_address=address,
+        )
+        current_time = datetime.now(timezone.utc)
+        created_ms = pair.get("pairCreatedAt") or int(created_at.timestamp() * 1000)
+        token_age_seconds = current_time.timestamp() - (created_ms / 1000)
 
         return {
             "name": base.get("name", "Unknown"),
@@ -180,9 +245,11 @@ class DexScreenerMonitor:
             "liquidity": liquidity,
             "volume_5m": volume_5m,
             "price_change_5m": price_change_5m,
+            "price_usd": price_usd,
             "dexscreener_url": dexscreener_url,
-            "pumpfun_url": f"https://pump.fun/{address}" if address else "https://pump.fun",
             "created_at": created_at,
+            "age_seconds": max(0, int(token_age_seconds)),
+            "age_minutes": max(0, int(round(token_age_seconds / 60))),
         }
 
     def _build_gecko_token_map(self, included: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:

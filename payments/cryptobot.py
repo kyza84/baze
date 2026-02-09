@@ -24,7 +24,7 @@ class CryptoPayment:
             invoice = await self.client.create_invoice(
                 asset="USDT",
                 amount=PRICES[plan_type],
-                description=f"Solana Alert Bot - {plan_type}",
+                description=f"Base Alert Bot - {plan_type}",
                 payload=payload,
             )
             invoice_id = getattr(invoice, "invoice_id", None)
