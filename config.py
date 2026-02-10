@@ -129,6 +129,7 @@ AUTO_TRADE_TOP_N = int(os.getenv("AUTO_TRADE_TOP_N", "10"))
 # - 0 means unlimited open positions
 MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "1"))
 MAX_BUY_AMOUNT = float(os.getenv("MAX_BUY_AMOUNT", "0.001"))
+WETH_PRICE_FALLBACK_USD = float(os.getenv("WETH_PRICE_FALLBACK_USD", "3000"))
 MAX_TRADES_PER_HOUR = max(0, int(os.getenv("MAX_TRADES_PER_HOUR", "3")))
 KILL_SWITCH_FILE = os.getenv("KILL_SWITCH_FILE", os.path.join("data", "kill.txt"))
 WALLET_BALANCE_USD = float(os.getenv("WALLET_BALANCE_USD", "2.75"))
@@ -140,6 +141,9 @@ PAPER_REALISM_ENABLED = os.getenv("PAPER_REALISM_ENABLED", "true").lower() == "t
 PAPER_GAS_PER_TX_USD = float(os.getenv("PAPER_GAS_PER_TX_USD", "0.03"))
 PAPER_SWAP_FEE_BPS = float(os.getenv("PAPER_SWAP_FEE_BPS", "30"))
 PAPER_BASE_SLIPPAGE_BPS = float(os.getenv("PAPER_BASE_SLIPPAGE_BPS", "80"))
+PAPER_REALISM_CAP_ENABLED = os.getenv("PAPER_REALISM_CAP_ENABLED", "true").lower() == "true"
+PAPER_REALISM_MAX_GAIN_PERCENT = float(os.getenv("PAPER_REALISM_MAX_GAIN_PERCENT", "600"))
+PAPER_REALISM_MAX_LOSS_PERCENT = float(os.getenv("PAPER_REALISM_MAX_LOSS_PERCENT", "95"))
 
 # Position sizing and edge filtering
 DYNAMIC_POSITION_SIZING_ENABLED = os.getenv("DYNAMIC_POSITION_SIZING_ENABLED", "true").lower() == "true"
@@ -156,6 +160,9 @@ PAPER_PRICE_GUARD_ENABLED = os.getenv("PAPER_PRICE_GUARD_ENABLED", "true").lower
 PAPER_PRICE_GUARD_MAX_JUMP_PERCENT = float(os.getenv("PAPER_PRICE_GUARD_MAX_JUMP_PERCENT", "250"))
 PAPER_PRICE_GUARD_CONFIRMATIONS = max(1, int(os.getenv("PAPER_PRICE_GUARD_CONFIRMATIONS", "2")))
 PAPER_PRICE_GUARD_WINDOW_SECONDS = max(5, int(os.getenv("PAPER_PRICE_GUARD_WINDOW_SECONDS", "90")))
+STAIR_STEP_ENABLED = os.getenv("STAIR_STEP_ENABLED", "false").lower() == "true"
+STAIR_STEP_START_BALANCE_USD = float(os.getenv("STAIR_STEP_START_BALANCE_USD", "0"))
+STAIR_STEP_SIZE_USD = float(os.getenv("STAIR_STEP_SIZE_USD", "5"))
 
 # Trade risk controls
 MAX_TOKEN_PRICE_CHANGE_5M_ABS_PERCENT = float(os.getenv("MAX_TOKEN_PRICE_CHANGE_5M_ABS_PERCENT", "35"))

@@ -64,6 +64,9 @@ python launcher_gui.py
 - `HOLD_MIN_SECONDS=300`
 - `HOLD_MAX_SECONDS=1800`
 - `PAPER_REALISM_ENABLED=true`
+- `PAPER_REALISM_CAP_ENABLED=true`
+- `PAPER_REALISM_MAX_GAIN_PERCENT=600`
+- `PAPER_REALISM_MAX_LOSS_PERCENT=95`
 - `PAPER_GAS_PER_TX_USD=0.03`
 - `PAPER_SWAP_FEE_BPS=30`
 - `PAPER_BASE_SLIPPAGE_BPS=80`
@@ -72,6 +75,10 @@ python launcher_gui.py
 - `MIN_EXPECTED_EDGE_PERCENT=2.0`
 - `CLOSED_TRADES_MAX_AGE_DAYS=14`
 - `PAPER_RESET_ON_START=false`
+- `WETH_PRICE_FALLBACK_USD=3000`
+- `STAIR_STEP_ENABLED=false`
+- `STAIR_STEP_START_BALANCE_USD=2.75`
+- `STAIR_STEP_SIZE_USD=5`
 - `DEX_SEARCH_QUERIES=base,new`
 - `GECKO_NEW_POOLS_PAGES=2`
 
@@ -80,10 +87,14 @@ python launcher_gui.py
 - SELL по `TP`, `SL` или `TIMEOUT`
 - время удержания может подбираться автоматически по качеству/риску токена
 - PnL учитывает комиссию, проскальзывание и gas (если `PAPER_REALISM_ENABLED=true`)
+- если включен `PAPER_REALISM_CAP_ENABLED`, экстремальные бумажные пампы/дампы ограничиваются (`PAPER_REALISM_MAX_GAIN_PERCENT`/`PAPER_REALISM_MAX_LOSS_PERCENT`)
 - размер позиции может меняться от ожидаемого edge (`PAPER_TRADE_SIZE_MIN_USD` .. `PAPER_TRADE_SIZE_MAX_USD`)
+- если включен `STAIR_STEP_ENABLED`, часть баланса блокируется как floor и не тратится в новых входах; floor поднимается шагами `STAIR_STEP_SIZE_USD` по мере роста баланса
 - состояния сделок сохраняются в `trading/paper_state.json` и восстанавливаются после перезапуска
 - старые закрытые сделки автоматически чистятся по `CLOSED_TRADES_MAX_AGE_DAYS`
 - статистика и PnL доступны в `/mystats`
+
+В `launcher_gui.py` на вкладке `Кошелек` есть переключатель `Step protection` (`false/true`) с кнопкой `Apply step`, чтобы включать/выключать ступеньки без ручной правки `.env`.
 
 ## Важные файлы
 

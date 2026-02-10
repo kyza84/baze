@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -60,6 +61,9 @@ class AutoTrader:
         self.day_id = self._current_day_id()
         self.day_start_equity_usd = float(config.WALLET_BALANCE_USD)
         self.day_realized_pnl_usd = 0.0
+        self.last_weth_price_usd = max(0.0, float(config.WETH_PRICE_FALLBACK_USD))
+        self.stair_floor_usd = 0.0
+        self.stair_peak_balance_usd = float(config.WALLET_BALANCE_USD)
 
         self.initial_balance_usd = float(config.WALLET_BALANCE_USD)
         self.paper_balance_usd = float(config.WALLET_BALANCE_USD)
@@ -67,6 +71,7 @@ class AutoTrader:
         self._load_state()
         if config.PAPER_RESET_ON_START:
             self._apply_startup_reset()
+        self._sync_stair_state()
         self._prune_closed_positions()
 
     def _apply_startup_reset(self) -> None:
@@ -97,7 +102,7 @@ class AutoTrader:
         if not config.AUTO_TRADE_PAPER:
             # Live execution is intentionally blocked until explicit implementation.
             return False
-        return self.paper_balance_usd >= 0.1
+        return self._available_balance_usd() >= 0.1
 
     @staticmethod
     def _current_day_id() -> str:
@@ -129,6 +134,53 @@ class AutoTrader:
         return self.paper_balance_usd + sum(
             pos.position_size_usd + pos.pnl_usd for pos in self.open_positions.values()
         )
+
+    def _available_balance_usd(self) -> float:
+        reserved = self._stair_reserved_usd()
+        gas_buffer = float(config.PAPER_GAS_PER_TX_USD) * 3.0
+        return max(0.0, self.paper_balance_usd - reserved - gas_buffer)
+
+    def _stair_reserved_usd(self) -> float:
+        if not config.STAIR_STEP_ENABLED:
+            return 0.0
+        return max(0.0, min(self.paper_balance_usd, self.stair_floor_usd))
+
+    def _sync_stair_state(self) -> None:
+        if not config.STAIR_STEP_ENABLED:
+            self.stair_floor_usd = 0.0
+            self.stair_peak_balance_usd = max(self.paper_balance_usd, float(config.WALLET_BALANCE_USD))
+            return
+
+        if self.stair_floor_usd <= 0:
+            self.stair_floor_usd = 0.0
+        self.stair_floor_usd = min(self.stair_floor_usd, self.paper_balance_usd)
+        self.stair_peak_balance_usd = max(self.stair_peak_balance_usd, self.paper_balance_usd)
+        self._update_stair_floor()
+
+    def _update_stair_floor(self) -> None:
+        if not config.STAIR_STEP_ENABLED:
+            return
+        step_size = float(config.STAIR_STEP_SIZE_USD)
+        if step_size <= 0:
+            return
+        start_balance = float(config.STAIR_STEP_START_BALANCE_USD)
+        if start_balance <= 0:
+            start_balance = 0.0
+        start_balance = max(0.0, start_balance)
+
+        self.stair_peak_balance_usd = max(self.stair_peak_balance_usd, self.paper_balance_usd)
+        if self.stair_peak_balance_usd < start_balance:
+            return
+        milestone_floor = math.floor(self.stair_peak_balance_usd / step_size) * step_size
+        new_floor = max(self.stair_floor_usd, milestone_floor)
+        if new_floor > self.stair_floor_usd:
+            self.stair_floor_usd = min(new_floor, self.paper_balance_usd)
+            logger.info(
+                "STAIR_STEP floor_up new_floor=$%.2f peak=$%.2f step=$%.2f",
+                self.stair_floor_usd,
+                self.stair_peak_balance_usd,
+                step_size,
+            )
 
     async def plan_batch(self, candidates: list[tuple[dict[str, Any], dict[str, Any]]]) -> int:
         if not candidates:
@@ -231,7 +283,7 @@ class AutoTrader:
             return None
 
         position_size_usd = self._choose_position_size(expected_edge_percent)
-        position_size_usd = min(position_size_usd, self.paper_balance_usd)
+        position_size_usd = min(position_size_usd, self._available_balance_usd())
         position_size_usd = self._apply_max_loss_per_trade_cap(
             position_size_usd=position_size_usd,
             stop_loss_percent=sl,
@@ -240,10 +292,7 @@ class AutoTrader:
         )
         max_buy_weth = float(config.MAX_BUY_AMOUNT)
         if max_buy_weth > 0:
-            weth_price_usd = float(token_data.get("weth_price_usd") or token_data.get("base_quote_price_usd") or 0)
-            if weth_price_usd <= 0:
-                logger.info("AutoTrade skip token=%s reason=missing_weth_price_for_cap", symbol)
-                return None
+            weth_price_usd = await self._resolve_weth_price_usd(token_data)
             cap_usd = max_buy_weth * weth_price_usd
             if cap_usd <= 0:
                 logger.info("AutoTrade skip token=%s reason=invalid_max_buy_cap", symbol)
@@ -393,7 +442,23 @@ class AutoTrader:
     def _close_position(self, position: PaperPosition, reason: str) -> None:
         self._refresh_daily_window()
         raw_price_pnl_percent = ((position.current_price_usd - position.entry_price_usd) / position.entry_price_usd) * 100
-        gross_value_usd = position.position_size_usd * (1 + raw_price_pnl_percent / 100)
+        effective_price_pnl_percent = raw_price_pnl_percent
+        if config.PAPER_REALISM_CAP_ENABLED:
+            max_gain = max(0.0, float(config.PAPER_REALISM_MAX_GAIN_PERCENT))
+            max_loss = max(0.0, float(config.PAPER_REALISM_MAX_LOSS_PERCENT))
+            min_bound = -abs(max_loss)
+            max_bound = abs(max_gain)
+            capped = max(min_bound, min(max_bound, effective_price_pnl_percent))
+            if capped != effective_price_pnl_percent:
+                logger.info(
+                    "AUTO_SELL realism_cap token=%s raw=%.2f%% capped=%.2f%%",
+                    position.symbol,
+                    effective_price_pnl_percent,
+                    capped,
+                )
+                effective_price_pnl_percent = capped
+
+        gross_value_usd = position.position_size_usd * (1 + effective_price_pnl_percent / 100)
 
         if config.PAPER_REALISM_ENABLED:
             total_percent_cost = (position.buy_cost_percent + position.sell_cost_percent) / 100
@@ -417,6 +482,7 @@ class AutoTrader:
         self.total_closed += 1
 
         self.paper_balance_usd += final_value_usd
+        self._update_stair_floor()
         self.realized_pnl_usd += position.pnl_usd
         self.day_realized_pnl_usd += position.pnl_usd
 
@@ -516,6 +582,30 @@ class AutoTrader:
             return None
         return token_address, best_price
 
+    async def _resolve_weth_price_usd(self, token_data: dict[str, Any]) -> float:
+        direct = float(token_data.get("weth_price_usd") or token_data.get("base_quote_price_usd") or 0)
+        if direct > 0:
+            self.last_weth_price_usd = direct
+            return direct
+
+        if self.last_weth_price_usd > 0:
+            return self.last_weth_price_usd
+
+        weth_address = str(config.WETH_ADDRESS or "").strip().lower()
+        if weth_address:
+            fetched = await self._fetch_current_price(weth_address)
+            if fetched and float(fetched[1]) > 0:
+                self.last_weth_price_usd = float(fetched[1])
+                return self.last_weth_price_usd
+
+        fallback = max(0.0, float(config.WETH_PRICE_FALLBACK_USD))
+        if fallback > 0:
+            self.last_weth_price_usd = fallback
+            logger.info("AutoTrade cap fallback weth_price=$%.2f", fallback)
+            return fallback
+
+        return 0.0
+
     def _accept_price_update(self, position: PaperPosition, next_price_usd: float) -> bool:
         if not config.PAPER_PRICE_GUARD_ENABLED:
             return True
@@ -593,6 +683,10 @@ class AutoTrader:
             "loss_streak": self.current_loss_streak,
             "trading_pause_until_ts": round(self.trading_pause_until_ts, 2),
             "trades_last_hour": len(self.trade_open_timestamps),
+            "stair_step_enabled": bool(config.STAIR_STEP_ENABLED),
+            "stair_floor_usd": round(self.stair_floor_usd, 2),
+            "stair_peak_balance_usd": round(self.stair_peak_balance_usd, 2),
+            "available_balance_usd": round(self._available_balance_usd(), 2),
         }
 
     def reset_paper_state(self, keep_closed: bool = True) -> None:
@@ -607,12 +701,15 @@ class AutoTrader:
         self.token_cooldowns.clear()
         self.trade_open_timestamps.clear()
         self.price_guard_pending.clear()
+        self.stair_floor_usd = 0.0
+        self.stair_peak_balance_usd = self.paper_balance_usd
         self.open_positions.clear()
         if not keep_closed:
             self.closed_positions.clear()
             self.total_closed = 0
             self.total_wins = 0
             self.total_losses = 0
+        self._sync_stair_state()
         self._save_state()
 
     @staticmethod
@@ -739,6 +836,8 @@ class AutoTrader:
                 "token_cooldowns": self.token_cooldowns,
                 "trade_open_timestamps": self.trade_open_timestamps[-500:],
                 "price_guard_pending": self.price_guard_pending,
+                "stair_floor_usd": self.stair_floor_usd,
+                "stair_peak_balance_usd": self.stair_peak_balance_usd,
                 "open_positions": [self._serialize_pos(p) for p in self.open_positions.values()],
                 "closed_positions": [self._serialize_pos(p) for p in self.closed_positions[-500:]],
             }
@@ -786,6 +885,8 @@ class AutoTrader:
                         "count": int(record.get("count", 0)),
                         "first_ts": float(record.get("first_ts", 0.0)),
                     }
+            self.stair_floor_usd = float(payload.get("stair_floor_usd", self.stair_floor_usd))
+            self.stair_peak_balance_usd = float(payload.get("stair_peak_balance_usd", self.paper_balance_usd))
             self._prune_hourly_window()
 
             self.open_positions.clear()
@@ -800,6 +901,7 @@ class AutoTrader:
                 if pos:
                     self.closed_positions.append(pos)
             self._prune_closed_positions()
+            self._sync_stair_state()
 
             logger.info(
                 "AutoTrade state loaded open=%s closed=%s balance=$%.2f",

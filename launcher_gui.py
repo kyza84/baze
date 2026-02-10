@@ -22,6 +22,7 @@ LOCAL_ALERTS_FILE = os.path.join(LOG_DIR, "local_alerts.jsonl")
 PAPER_STATE_FILE = os.path.join(PROJECT_ROOT, "trading", "paper_state.json")
 WALLET_MODE_KEY = "WALLET_MODE"
 LIVE_WALLET_BALANCE_KEY = "LIVE_WALLET_BALANCE_USD"
+STAIR_STEP_ENABLED_KEY = "STAIR_STEP_ENABLED"
 
 EVENT_KEYS = {
     "BUY": ("Paper BUY", "#67e8f9"),
@@ -82,6 +83,9 @@ SETTINGS_FIELDS = [
     ("MAX_OPEN_TRADES", "Макс. открытых сделок"),
     ("CLOSED_TRADES_MAX_AGE_DAYS", "Хранить закрытые (дней)"),
     ("PAPER_REALISM_ENABLED", "Реалистичный режим"),
+    ("PAPER_REALISM_CAP_ENABLED", "Realism cap"),
+    ("PAPER_REALISM_MAX_GAIN_PERCENT", "Realism max gain %"),
+    ("PAPER_REALISM_MAX_LOSS_PERCENT", "Realism max loss %"),
     ("PAPER_GAS_PER_TX_USD", "Газ за tx $"),
     ("PAPER_SWAP_FEE_BPS", "Комиссия свапа (bps)"),
     ("PAPER_BASE_SLIPPAGE_BPS", "Базовый slippage (bps)"),
@@ -108,6 +112,10 @@ SETTINGS_FIELDS = [
     ("DEX_BOOSTS_MAX_TOKENS", "Dex boosts max tokens"),
     ("DEX_SEARCH_QUERIES", "Поиск Dex (через запятую)"),
     ("GECKO_NEW_POOLS_PAGES", "Страниц Gecko"),
+    ("WETH_PRICE_FALLBACK_USD", "WETH fallback $"),
+    ("STAIR_STEP_ENABLED", "Step protection"),
+    ("STAIR_STEP_START_BALANCE_USD", "Step start floor $"),
+    ("STAIR_STEP_SIZE_USD", "Step size $"),
 ]
 
 FIELD_OPTIONS = {
@@ -129,6 +137,9 @@ FIELD_OPTIONS = {
     "MAX_OPEN_TRADES": ["0", "1", "2", "3", "5", "10"],
     "CLOSED_TRADES_MAX_AGE_DAYS": ["0", "3", "7", "14", "30", "60", "90"],
     "PAPER_REALISM_ENABLED": ["true", "false"],
+    "PAPER_REALISM_CAP_ENABLED": ["true", "false"],
+    "PAPER_REALISM_MAX_GAIN_PERCENT": ["200", "300", "600", "1000"],
+    "PAPER_REALISM_MAX_LOSS_PERCENT": ["50", "70", "85", "95"],
     "PAPER_GAS_PER_TX_USD": ["0.01", "0.02", "0.03", "0.05", "0.08", "0.1"],
     "PAPER_SWAP_FEE_BPS": ["5", "10", "20", "30", "40", "50"],
     "PAPER_BASE_SLIPPAGE_BPS": ["30", "50", "80", "100", "150", "200"],
@@ -145,6 +156,9 @@ FIELD_OPTIONS = {
     "DEX_BOOSTS_SOURCE_ENABLED": ["true", "false"],
     "DEX_BOOSTS_MAX_TOKENS": ["5", "10", "20", "30", "50"],
     "GECKO_NEW_POOLS_PAGES": ["1", "2", "3", "4", "5"],
+    "STAIR_STEP_ENABLED": ["false", "true"],
+    "STAIR_STEP_START_BALANCE_USD": ["1.5", "2.75", "5", "10"],
+    "STAIR_STEP_SIZE_USD": ["2", "5", "10"],
 }
 
 
@@ -686,10 +700,23 @@ class App(tk.Tk):
         ttk.Entry(grid, textvariable=self.live_balance_var, width=20).grid(row=2, column=1, sticky="w", pady=(6, 2))
         ttk.Button(grid, text="Apply live", command=self.on_apply_live_balance).grid(row=2, column=2, sticky="w", padx=8)
 
-        ttk.Button(grid, text="Set paper 2.75", command=self.on_set_paper_275).grid(row=3, column=1, sticky="w", pady=(10, 2))
-        ttk.Button(grid, text="Refresh wallet", command=self._refresh_wallet).grid(row=3, column=2, sticky="w", padx=8, pady=(10, 2))
+        self.stair_enabled_var = tk.StringVar(value="false")
+        ttk.Label(grid, text="Step protection", foreground="#bfdbfe", font=("Segoe UI Semibold", 10)).grid(
+            row=3, column=0, sticky="w", pady=(6, 2)
+        )
+        ttk.Combobox(
+            grid,
+            textvariable=self.stair_enabled_var,
+            values=["false", "true"],
+            width=18,
+            state="readonly",
+        ).grid(row=3, column=1, sticky="w", pady=(6, 2))
+        ttk.Button(grid, text="Apply step", command=self.on_apply_stair_mode).grid(row=3, column=2, sticky="w", padx=8)
+
+        ttk.Button(grid, text="Set paper 2.75", command=self.on_set_paper_275).grid(row=4, column=1, sticky="w", pady=(10, 2))
+        ttk.Button(grid, text="Refresh wallet", command=self._refresh_wallet).grid(row=4, column=2, sticky="w", padx=8, pady=(10, 2))
         ttk.Button(grid, text="Критический сброс", command=self.on_critical_reset).grid(
-            row=4, column=1, sticky="w", pady=(12, 2)
+            row=5, column=1, sticky="w", pady=(12, 2)
         )
 
     def _bind_settings_scroll(self, _event=None) -> None:
@@ -1053,6 +1080,13 @@ class App(tk.Tk):
                 "STOP_LOSS_PERCENT": "15",
                 "PAPER_GAS_PER_TX_USD": "0.02",
                 "PAPER_BASE_SLIPPAGE_BPS": "60",
+                "PAPER_REALISM_CAP_ENABLED": "true",
+                "PAPER_REALISM_MAX_GAIN_PERCENT": "600",
+                "PAPER_REALISM_MAX_LOSS_PERCENT": "95",
+                "WETH_PRICE_FALLBACK_USD": "3000",
+                "STAIR_STEP_ENABLED": "true",
+                "STAIR_STEP_START_BALANCE_USD": "2.75",
+                "STAIR_STEP_SIZE_USD": "5",
             }
         )
 
@@ -1098,6 +1132,13 @@ class App(tk.Tk):
                 "STOP_LOSS_PERCENT": "18",
                 "PAPER_GAS_PER_TX_USD": "0.02",
                 "PAPER_BASE_SLIPPAGE_BPS": "70",
+                "PAPER_REALISM_CAP_ENABLED": "true",
+                "PAPER_REALISM_MAX_GAIN_PERCENT": "600",
+                "PAPER_REALISM_MAX_LOSS_PERCENT": "95",
+                "WETH_PRICE_FALLBACK_USD": "3000",
+                "STAIR_STEP_ENABLED": "false",
+                "STAIR_STEP_START_BALANCE_USD": "2.75",
+                "STAIR_STEP_SIZE_USD": "5",
             }
         )
 
@@ -1387,12 +1428,14 @@ class App(tk.Tk):
         paper_balance = float(state.get("paper_balance_usd", env_map.get("WALLET_BALANCE_USD", "0")) or 0)
         paper_open = len(state.get("open_positions", []) or [])
         paper_closed = len(state.get("closed_positions", []) or [])
+        stair_floor = float(state.get("stair_floor_usd", env_map.get("STAIR_STEP_START_BALANCE_USD", "0")) or 0)
+        stair_enabled = str(env_map.get(STAIR_STEP_ENABLED_KEY, "false")).strip().lower()
 
         active = paper_balance if mode == "paper" else live_balance
         mode_label = "PAPER" if mode == "paper" else "LIVE"
         if hasattr(self, "wallet_summary_var"):
             self.wallet_summary_var.set(
-                f"Mode: {mode_label} | Active balance: ${active:.2f} | Paper: ${paper_balance:.2f} | Live: ${live_balance:.2f} | Open: {paper_open} | Closed: {paper_closed}"
+                f"Mode: {mode_label} | Active balance: ${active:.2f} | Paper: ${paper_balance:.2f} | Live: ${live_balance:.2f} | Stair: {stair_enabled.upper()} floor=${stair_floor:.2f} | Open: {paper_open} | Closed: {paper_closed}"
             )
         if hasattr(self, "wallet_mode_var"):
             self.wallet_mode_var.set(mode if mode in {"paper", "live"} else "paper")
@@ -1400,6 +1443,8 @@ class App(tk.Tk):
             self.live_balance_var.set(f"{live_balance:.2f}")
         if hasattr(self, "paper_balance_set_var"):
             self.paper_balance_set_var.set(f"{paper_balance:.2f}")
+        if hasattr(self, "stair_enabled_var"):
+            self.stair_enabled_var.set("true" if stair_enabled == "true" else "false")
 
     def on_apply_wallet_mode(self) -> None:
         mode = str(self.wallet_mode_var.get()).strip().lower()
@@ -1413,6 +1458,14 @@ class App(tk.Tk):
                 "Live mode",
                 "Внимание: live execution пока не подключен. Сейчас это режим отображения баланса.",
             )
+
+    def on_apply_stair_mode(self) -> None:
+        mode = str(self.stair_enabled_var.get()).strip().lower()
+        if mode not in {"true", "false"}:
+            messagebox.showerror("Ошибка", "Step protection должен быть true или false.")
+            return
+        save_env_map({STAIR_STEP_ENABLED_KEY: mode})
+        self._refresh_wallet()
 
     def on_apply_live_balance(self) -> None:
         try:
@@ -1449,6 +1502,8 @@ class App(tk.Tk):
         state["initial_balance_usd"] = float(val)
         state["paper_balance_usd"] = float(val)
         state["realized_pnl_usd"] = 0.0
+        state["stair_floor_usd"] = 0.0
+        state["stair_peak_balance_usd"] = float(val)
         with open(PAPER_STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
         save_env_map({"WALLET_BALANCE_USD": f"{val:.2f}"})
@@ -1483,6 +1538,8 @@ class App(tk.Tk):
             "total_closed": 0,
             "total_wins": 0,
             "total_losses": 0,
+            "stair_floor_usd": 0.0,
+            "stair_peak_balance_usd": balance,
             "open_positions": [],
             "closed_positions": [],
         }
