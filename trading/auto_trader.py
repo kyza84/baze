@@ -14,6 +14,7 @@ from typing import Any
 import aiohttp
 
 import config
+from trading.live_executor import LiveExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +42,11 @@ class PaperPosition:
     closed_at: datetime | None = None
     pnl_percent: float = 0.0
     pnl_usd: float = 0.0
+    peak_pnl_percent: float = 0.0
+    token_amount_raw: int = 0
+    buy_tx_hash: str = ""
+    sell_tx_hash: str = ""
+    spent_eth: float = 0.0
 
 
 class AutoTrader:
@@ -64,15 +70,27 @@ class AutoTrader:
         self.last_weth_price_usd = max(0.0, float(config.WETH_PRICE_FALLBACK_USD))
         self.stair_floor_usd = 0.0
         self.stair_peak_balance_usd = float(config.WALLET_BALANCE_USD)
+        self.emergency_halt_reason = ""
+        self.emergency_halt_ts = 0.0
+        self._last_guard_log_ts = 0.0
+        self._live_sell_failures = 0
 
         self.initial_balance_usd = float(config.WALLET_BALANCE_USD)
         self.paper_balance_usd = float(config.WALLET_BALANCE_USD)
         self.realized_pnl_usd = 0.0
+        self.live_executor: LiveExecutor | None = None
         self._load_state()
         if config.PAPER_RESET_ON_START:
             self._apply_startup_reset()
         self._sync_stair_state()
         self._prune_closed_positions()
+        if self._is_live_mode():
+            try:
+                self.live_executor = LiveExecutor()
+                logger.info("Live executor ready wallet=%s", config.LIVE_WALLET_ADDRESS)
+            except Exception as exc:
+                self.live_executor = None
+                logger.error("Live executor init failed: %s", exc)
 
     def _apply_startup_reset(self) -> None:
         if self.open_positions:
@@ -87,6 +105,8 @@ class AutoTrader:
         self._refresh_daily_window()
         # Manual control mode: no auto pause by daily drawdown or streak.
         self.trading_pause_until_ts = 0.0
+        if self.emergency_halt_reason:
+            return False
         if self._kill_switch_active():
             logger.warning("KILL_SWITCH active path=%s", config.KILL_SWITCH_FILE)
             return False
@@ -99,10 +119,26 @@ class AutoTrader:
             return False
         if not config.AUTO_TRADE_ENABLED:
             return False
-        if not config.AUTO_TRADE_PAPER:
-            # Live execution is intentionally blocked until explicit implementation.
+        if self._is_live_mode() and self.live_executor is None:
             return False
-        return self._available_balance_usd() >= 0.1
+        min_available = max(0.1, float(config.AUTO_STOP_MIN_AVAILABLE_USD))
+        available = self._available_balance_usd()
+        if available < min_available:
+            now_ts = datetime.now(timezone.utc).timestamp()
+            if now_ts - self._last_guard_log_ts >= 30:
+                self._last_guard_log_ts = now_ts
+                logger.warning(
+                    "KILL_SWITCH reason=LOW_BALANCE_GUARD available=$%.2f min=$%.2f open=%s",
+                    available,
+                    min_available,
+                    len(self.open_positions),
+                )
+            return False
+        return True
+
+    @staticmethod
+    def _is_live_mode() -> bool:
+        return bool(config.AUTO_TRADE_ENABLED) and not bool(config.AUTO_TRADE_PAPER)
 
     @staticmethod
     def _current_day_id() -> str:
@@ -136,14 +172,33 @@ class AutoTrader:
         )
 
     def _available_balance_usd(self) -> float:
+        if self._is_live_mode():
+            if self.live_executor is None:
+                return 0.0
+            try:
+                balance_eth = float(self.live_executor.native_balance_eth())
+                return max(0.0, (balance_eth * max(1.0, float(self.last_weth_price_usd))) - self._stair_reserved_usd())
+            except Exception:
+                return 0.0
         reserved = self._stair_reserved_usd()
-        gas_buffer = float(config.PAPER_GAS_PER_TX_USD) * 3.0
-        return max(0.0, self.paper_balance_usd - reserved - gas_buffer)
+        available = self.paper_balance_usd - reserved
+        if not config.STAIR_STEP_ENABLED:
+            gas_buffer = float(config.PAPER_GAS_PER_TX_USD) * 3.0
+            available -= gas_buffer
+        return max(0.0, available)
+
+    @staticmethod
+    def _stair_tradable_buffer_usd() -> float:
+        configured = max(0.0, float(config.STAIR_STEP_TRADABLE_BUFFER_USD))
+        min_trade_with_gas = max(0.0, float(config.PAPER_TRADE_SIZE_MIN_USD)) + (float(config.PAPER_GAS_PER_TX_USD) * 3.0)
+        return max(configured, min_trade_with_gas)
 
     def _stair_reserved_usd(self) -> float:
         if not config.STAIR_STEP_ENABLED:
             return 0.0
-        return max(0.0, min(self.paper_balance_usd, self.stair_floor_usd))
+        reserve_target = max(0.0, min(self.paper_balance_usd, self.stair_floor_usd))
+        max_reservable = max(0.0, self.paper_balance_usd - self._stair_tradable_buffer_usd())
+        return max(0.0, min(reserve_target, max_reservable))
 
     def _sync_stair_state(self) -> None:
         if not config.STAIR_STEP_ENABLED:
@@ -171,15 +226,19 @@ class AutoTrader:
         self.stair_peak_balance_usd = max(self.stair_peak_balance_usd, self.paper_balance_usd)
         if self.stair_peak_balance_usd < start_balance:
             return
-        milestone_floor = math.floor(self.stair_peak_balance_usd / step_size) * step_size
+        levels = math.floor((self.stair_peak_balance_usd - start_balance) / step_size)
+        milestone_floor = start_balance + (levels * step_size)
         new_floor = max(self.stair_floor_usd, milestone_floor)
+        max_reservable = max(0.0, self.paper_balance_usd - self._stair_tradable_buffer_usd())
+        new_floor = min(new_floor, max_reservable)
         if new_floor > self.stair_floor_usd:
             self.stair_floor_usd = min(new_floor, self.paper_balance_usd)
             logger.info(
-                "STAIR_STEP floor_up new_floor=$%.2f peak=$%.2f step=$%.2f",
+                "STAIR_STEP floor_up new_floor=$%.2f peak=$%.2f step=$%.2f buffer=$%.2f",
                 self.stair_floor_usd,
                 self.stair_peak_balance_usd,
                 step_size,
+                self._stair_tradable_buffer_usd(),
             )
 
     async def plan_batch(self, candidates: list[tuple[dict[str, Any], dict[str, Any]]]) -> int:
@@ -309,6 +368,61 @@ class AutoTrader:
             price_change_5m=price_change_5m,
         )
 
+        if self._is_live_mode():
+            if self.live_executor is None:
+                logger.error("AutoTrade skip token=%s reason=live_executor_unavailable", symbol)
+                return None
+            weth_price_usd = await self._resolve_weth_price_usd(token_data)
+            if weth_price_usd <= 0:
+                logger.info("AutoTrade skip token=%s reason=no_weth_price", symbol)
+                return None
+            spend_eth = position_size_usd / weth_price_usd
+            try:
+                buy_result = await asyncio.to_thread(self.live_executor.buy_token, token_address, spend_eth)
+            except Exception as exc:
+                logger.error("AUTO_BUY live_failed token=%s err=%s", symbol, exc)
+                return None
+            if int(buy_result.token_amount_raw) <= 0:
+                logger.error("AUTO_BUY live_failed token=%s err=zero_token_amount", symbol)
+                return None
+            pos = PaperPosition(
+                token_address=token_address,
+                symbol=symbol,
+                entry_price_usd=entry_price_usd,
+                current_price_usd=entry_price_usd,
+                position_size_usd=position_size_usd,
+                score=score,
+                liquidity_usd=liquidity_usd,
+                risk_level=risk_level,
+                opened_at=datetime.now(timezone.utc),
+                max_hold_seconds=max_hold_seconds,
+                take_profit_percent=tp,
+                stop_loss_percent=sl,
+                expected_edge_percent=expected_edge_percent,
+                buy_cost_percent=cost_profile["buy_percent"],
+                sell_cost_percent=cost_profile["sell_percent"],
+                gas_cost_usd=cost_profile["gas_usd"],
+                token_amount_raw=int(buy_result.token_amount_raw),
+                buy_tx_hash=str(buy_result.tx_hash),
+                spent_eth=float(buy_result.spent_eth),
+            )
+            self.open_positions[token_address] = pos
+            self.total_plans += 1
+            self.total_executed += 1
+            self.trade_open_timestamps.append(datetime.now(timezone.utc).timestamp())
+            logger.info(
+                "AUTO_BUY Live BUY token=%s address=%s spend=%.8f ETH score=%s edge=%.2f%% hold=%ss tx=%s",
+                pos.symbol,
+                pos.token_address,
+                pos.spent_eth,
+                pos.score,
+                pos.expected_edge_percent,
+                pos.max_hold_seconds,
+                pos.buy_tx_hash,
+            )
+            self._save_state()
+            return pos
+
         pos = PaperPosition(
             token_address=token_address,
             symbol=symbol,
@@ -396,6 +510,7 @@ class AutoTrader:
         return max(0.0, min(position_size_usd, max_size_by_risk))
 
     async def process_open_positions(self, bot=None) -> None:
+        await self._check_critical_conditions()
         if not self.open_positions:
             return
 
@@ -418,6 +533,7 @@ class AutoTrader:
             raw_price_pnl_percent = ((price_usd - position.entry_price_usd) / position.entry_price_usd) * 100
             position.pnl_percent = raw_price_pnl_percent
             position.pnl_usd = (position.position_size_usd * raw_price_pnl_percent) / 100
+            position.peak_pnl_percent = max(float(position.peak_pnl_percent), float(position.pnl_percent))
 
             should_close = False
             close_reason = ""
@@ -428,16 +544,164 @@ class AutoTrader:
             elif position.pnl_percent <= -abs(position.stop_loss_percent):
                 should_close = True
                 close_reason = "SL"
+            elif (
+                config.PROFIT_LOCK_ENABLED
+                and float(position.peak_pnl_percent) >= float(config.PROFIT_LOCK_TRIGGER_PERCENT)
+                and float(position.pnl_percent) <= float(config.PROFIT_LOCK_FLOOR_PERCENT)
+            ):
+                should_close = True
+                close_reason = "PROFIT_LOCK"
             else:
                 age_seconds = int((datetime.now(timezone.utc) - position.opened_at).total_seconds())
-                if age_seconds >= int(position.max_hold_seconds):
+                min_age_ratio = max(0.0, min(100.0, float(config.WEAKNESS_EXIT_MIN_AGE_PERCENT))) / 100.0
+                if (
+                    config.WEAKNESS_EXIT_ENABLED
+                    and age_seconds >= int(position.max_hold_seconds * min_age_ratio)
+                    and float(position.pnl_percent) <= float(config.WEAKNESS_EXIT_PNL_PERCENT)
+                    and float(position.peak_pnl_percent) < float(config.PROFIT_LOCK_TRIGGER_PERCENT)
+                ):
+                    should_close = True
+                    close_reason = "WEAKNESS"
+                elif age_seconds >= int(position.max_hold_seconds):
                     should_close = True
                     close_reason = "TIMEOUT"
 
             if should_close:
-                self._close_position(position, close_reason)
+                if self._is_live_mode():
+                    await self._close_position_live(position, close_reason)
+                else:
+                    self._close_position(position, close_reason)
                 if bot and int(config.PERSONAL_TELEGRAM_ID or 0) > 0:
                     await self._send_close_message(bot, position)
+
+    async def _check_critical_conditions(self) -> None:
+        if self._kill_switch_active():
+            if not self.emergency_halt_reason:
+                self.emergency_halt_reason = "KILL_SWITCH_FILE"
+                self.emergency_halt_ts = datetime.now(timezone.utc).timestamp()
+                logger.warning("KILL_SWITCH reason=file_detected path=%s", config.KILL_SWITCH_FILE)
+            if self.open_positions:
+                await self._force_close_all_positions("KILL_SWITCH")
+            return
+        if self.emergency_halt_reason == "KILL_SWITCH_FILE":
+            self._clear_emergency_halt("kill_switch_removed")
+
+        min_available = max(0.1, float(config.AUTO_STOP_MIN_AVAILABLE_USD))
+        available = self._available_balance_usd()
+        if available < min_available and not self.open_positions:
+            self._activate_emergency_halt(
+                "LOW_BALANCE_STOP",
+                f"available=${available:.2f} min=${min_available:.2f}",
+            )
+        elif self.emergency_halt_reason == "LOW_BALANCE_STOP" and available >= min_available:
+            self._clear_emergency_halt("balance_recovered")
+
+    def _activate_emergency_halt(self, reason: str, detail: str = "") -> None:
+        if self.emergency_halt_reason == reason:
+            return
+        self.emergency_halt_reason = reason
+        self.emergency_halt_ts = datetime.now(timezone.utc).timestamp()
+        logger.error("CRITICAL_AUTO_RESET reason=%s detail=%s", reason, detail)
+        if config.KILL_SWITCH_FILE:
+            try:
+                kill_path = config.KILL_SWITCH_FILE
+                kill_dir = os.path.dirname(kill_path)
+                if kill_dir:
+                    os.makedirs(kill_dir, exist_ok=True)
+                with open(kill_path, "w", encoding="utf-8") as f:
+                    f.write(f"{datetime.now(timezone.utc).isoformat()} {reason} {detail}\n")
+                logger.warning("KILL_SWITCH reason=auto_created path=%s", kill_path)
+            except Exception as exc:
+                logger.warning("KILL_SWITCH create failed: %s", exc)
+        self._save_state()
+
+    def _clear_emergency_halt(self, detail: str = "") -> None:
+        if not self.emergency_halt_reason:
+            return
+        logger.warning("CRITICAL_AUTO_RESET cleared reason=%s detail=%s", self.emergency_halt_reason, detail)
+        self.emergency_halt_reason = ""
+        self.emergency_halt_ts = 0.0
+        self._save_state()
+
+    async def _force_close_all_positions(self, reason: str) -> None:
+        if not self.open_positions:
+            return
+        closed = 0
+        failed = 0
+        for position in list(self.open_positions.values()):
+            try:
+                if self._is_live_mode():
+                    await self._close_position_live(position, reason)
+                else:
+                    self._close_position(position, reason)
+                closed += 1
+            except Exception as exc:
+                failed += 1
+                logger.error("AUTO_SELL forced_failed token=%s reason=%s err=%s", position.symbol, reason, exc)
+        logger.warning("CRITICAL_AUTO_RESET close_all reason=%s closed=%s failed=%s", reason, closed, failed)
+
+    async def _close_position_live(self, position: PaperPosition, reason: str) -> None:
+        if self.live_executor is None:
+            logger.error("AUTO_SELL live_failed token=%s reason=no_executor", position.symbol)
+            self._live_sell_failures += 1
+            if self._live_sell_failures >= 3:
+                self._activate_emergency_halt("LIVE_SELL_FAILED", "live_executor_unavailable")
+            return
+        try:
+            sell_result = await asyncio.to_thread(
+                self.live_executor.sell_token,
+                position.token_address,
+                int(position.token_amount_raw),
+            )
+        except Exception as exc:
+            logger.error("AUTO_SELL live_failed token=%s reason=%s", position.symbol, exc)
+            self._live_sell_failures += 1
+            if self._live_sell_failures >= 3:
+                self._activate_emergency_halt("LIVE_SELL_FAILED", str(exc))
+            return
+        self._live_sell_failures = 0
+
+        weth_price = max(1.0, float(self.last_weth_price_usd))
+        received_usd = float(sell_result.received_eth) * weth_price
+        pnl_usd = received_usd - float(position.position_size_usd)
+        pnl_percent = (pnl_usd / position.position_size_usd * 100) if position.position_size_usd > 0 else 0.0
+
+        position.status = "CLOSED"
+        position.close_reason = reason
+        position.closed_at = datetime.now(timezone.utc)
+        position.pnl_usd = pnl_usd
+        position.pnl_percent = pnl_percent
+        position.sell_tx_hash = str(sell_result.tx_hash)
+
+        self.open_positions.pop(position.token_address, None)
+        self.price_guard_pending.pop(position.token_address, None)
+        self.closed_positions.append(position)
+        self._prune_closed_positions()
+        self.total_closed += 1
+        self.realized_pnl_usd += position.pnl_usd
+        self.day_realized_pnl_usd += position.pnl_usd
+
+        if position.pnl_usd >= 0:
+            self.total_wins += 1
+            self.current_loss_streak = 0
+        else:
+            self.total_losses += 1
+            self.current_loss_streak += 1
+
+        token_cooldown = int(config.MAX_TOKEN_COOLDOWN_SECONDS)
+        if token_cooldown > 0:
+            self.token_cooldowns[position.token_address] = datetime.now(timezone.utc).timestamp() + token_cooldown
+
+        logger.info(
+            "AUTO_SELL Live SELL token=%s reason=%s recv=%.8f ETH pnl=%.2f%% ($%.2f) tx=%s",
+            position.symbol,
+            reason,
+            float(sell_result.received_eth),
+            position.pnl_percent,
+            position.pnl_usd,
+            position.sell_tx_hash,
+        )
+        self._save_state()
 
     def _close_position(self, position: PaperPosition, reason: str) -> None:
         self._refresh_daily_window()
@@ -687,6 +951,8 @@ class AutoTrader:
             "stair_floor_usd": round(self.stair_floor_usd, 2),
             "stair_peak_balance_usd": round(self.stair_peak_balance_usd, 2),
             "available_balance_usd": round(self._available_balance_usd(), 2),
+            "emergency_halt_reason": self.emergency_halt_reason,
+            "emergency_halt_ts": round(self.emergency_halt_ts, 2),
         }
 
     def reset_paper_state(self, keep_closed: bool = True) -> None:
@@ -701,6 +967,9 @@ class AutoTrader:
         self.token_cooldowns.clear()
         self.trade_open_timestamps.clear()
         self.price_guard_pending.clear()
+        self.emergency_halt_reason = ""
+        self.emergency_halt_ts = 0.0
+        self._live_sell_failures = 0
         self.stair_floor_usd = 0.0
         self.stair_peak_balance_usd = self.paper_balance_usd
         self.open_positions.clear()
@@ -836,6 +1105,8 @@ class AutoTrader:
                 "token_cooldowns": self.token_cooldowns,
                 "trade_open_timestamps": self.trade_open_timestamps[-500:],
                 "price_guard_pending": self.price_guard_pending,
+                "emergency_halt_reason": self.emergency_halt_reason,
+                "emergency_halt_ts": self.emergency_halt_ts,
                 "stair_floor_usd": self.stair_floor_usd,
                 "stair_peak_balance_usd": self.stair_peak_balance_usd,
                 "open_positions": [self._serialize_pos(p) for p in self.open_positions.values()],
@@ -885,6 +1156,8 @@ class AutoTrader:
                         "count": int(record.get("count", 0)),
                         "first_ts": float(record.get("first_ts", 0.0)),
                     }
+            self.emergency_halt_reason = str(payload.get("emergency_halt_reason", "") or "")
+            self.emergency_halt_ts = float(payload.get("emergency_halt_ts", 0.0) or 0.0)
             self.stair_floor_usd = float(payload.get("stair_floor_usd", self.stair_floor_usd))
             self.stair_peak_balance_usd = float(payload.get("stair_peak_balance_usd", self.paper_balance_usd))
             self._prune_hourly_window()
@@ -936,6 +1209,11 @@ class AutoTrader:
             "closed_at": pos.closed_at.isoformat() if pos.closed_at else None,
             "pnl_percent": pos.pnl_percent,
             "pnl_usd": pos.pnl_usd,
+            "peak_pnl_percent": pos.peak_pnl_percent,
+            "token_amount_raw": pos.token_amount_raw,
+            "buy_tx_hash": pos.buy_tx_hash,
+            "sell_tx_hash": pos.sell_tx_hash,
+            "spent_eth": pos.spent_eth,
         }
 
     @staticmethod
@@ -972,6 +1250,11 @@ class AutoTrader:
                 closed_at=closed_at,
                 pnl_percent=float(row.get("pnl_percent", 0.0)),
                 pnl_usd=float(row.get("pnl_usd", 0.0)),
+                peak_pnl_percent=float(row.get("peak_pnl_percent", 0.0)),
+                token_amount_raw=int(row.get("token_amount_raw", 0)),
+                buy_tx_hash=str(row.get("buy_tx_hash", "")),
+                sell_tx_hash=str(row.get("sell_tx_hash", "")),
+                spent_eth=float(row.get("spent_eth", 0.0)),
             )
         except Exception:
             return None

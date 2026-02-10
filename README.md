@@ -48,6 +48,10 @@ python launcher_gui.py
 ```
 
 В GUI есть вкладка `Сигналы` с входящими локальными алертами по новым токенам.
+Также есть вкладка `Аварийный`:
+- отдельная лента критических событий (`CRITICAL_AUTO_RESET`, `KILL_SWITCH`, `AUTO_SELL live_failed`, `[ERROR]`)
+- кнопки `Включить/Выключить KILL SWITCH`
+- `Критический сброс`, `Signal Check`, `Очистить логи`
 
 ## Paper trading
 
@@ -96,6 +100,25 @@ python launcher_gui.py
 
 В `launcher_gui.py` на вкладке `Кошелек` есть переключатель `Step protection` (`false/true`) с кнопкой `Apply step`, чтобы включать/выключать ступеньки без ручной правки `.env`.
 
+## Аварийная защита
+
+В авто-трейдер добавлены аварийные условия:
+- при наличии `KILL_SWITCH_FILE` бот блокирует новые входы и пытается закрыть открытые позиции
+- при падении доступного баланса ниже `AUTO_STOP_MIN_AVAILABLE_USD` (и отсутствии открытых позиций) срабатывает аварийный halt (`LOW_BALANCE_STOP`)
+- при повторных сбоях live-продажи срабатывает аварийный halt (`LIVE_SELL_FAILED`)
+
+Ключевые строки в логах:
+- `CRITICAL_AUTO_RESET`
+- `KILL_SWITCH`
+- `AUTO_SELL live_failed`
+- `AUTO_SELL forced_failed`
+
+Путь kill-switch по умолчанию:
+
+```env
+KILL_SWITCH_FILE=data/kill.txt
+```
+
 ## Важные файлы
 
 - Конфиг: `config.py`
@@ -137,3 +160,28 @@ python -m monitor.onchain_factory --once
 - При 3 RPC-ошибках подряд `main_local.py` временно переключается на `dexscreener` на 60 секунд, затем пробует вернуть `onchain`.
 - On-chain обработка идет с lag `latest-2` (`ONCHAIN_FINALITY_BLOCKS`) и дедупом пар (`ONCHAIN_SEEN_PAIRS_FILE` + TTL), чтобы снизить дубли/reorg-шум.
 - Для аварийной остановки авто-входов можно создать файл `data/kill.txt` (`KILL_SWITCH_FILE`).
+
+## Live execution (Base)
+
+Для реальных on-chain сделок:
+
+```env
+AUTO_TRADE_ENABLED=true
+AUTO_TRADE_PAPER=false
+LIVE_WALLET_ADDRESS=0x...
+LIVE_PRIVATE_KEY=0x...
+LIVE_CHAIN_ID=8453
+LIVE_ROUTER_ADDRESS=0x4752ba5dbc23f44d87826276bf6fd6b1c372ad24
+LIVE_SLIPPAGE_BPS=200
+LIVE_SWAP_DEADLINE_SECONDS=120
+LIVE_TX_TIMEOUT_SECONDS=180
+LIVE_MAX_GAS_GWEI=2.0
+LIVE_PRIORITY_FEE_GWEI=0.02
+```
+
+Режим `AUTO_TRADE_PAPER=false` использует `trading/live_executor.py`:
+- BUY: `swapExactETHForTokensSupportingFeeOnTransferTokens`
+- SELL: `swapExactTokensForETHSupportingFeeOnTransferTokens`
+- Перед SELL делается `approve` при необходимости.
+
+Для первого запуска используйте минимальные суммы и `MAX_OPEN_TRADES=1`.

@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import tkinter as tk
+import ctypes
 from datetime import datetime, timezone
 import json
 from tkinter import messagebox, ttk
@@ -23,6 +24,7 @@ PAPER_STATE_FILE = os.path.join(PROJECT_ROOT, "trading", "paper_state.json")
 WALLET_MODE_KEY = "WALLET_MODE"
 LIVE_WALLET_BALANCE_KEY = "LIVE_WALLET_BALANCE_USD"
 STAIR_STEP_ENABLED_KEY = "STAIR_STEP_ENABLED"
+GUI_MUTEX_NAME = "Global\\solana_alert_bot_launcher_gui_single_instance"
 
 EVENT_KEYS = {
     "BUY": ("Paper BUY", "#67e8f9"),
@@ -53,6 +55,14 @@ NOISE_LOG_SNIPPETS = (
     "site-packages\\telegram\\",
     "site-packages\\httpx\\",
     "site-packages\\httpcore\\",
+)
+CRITICAL_LOG_MARKERS = (
+    "CRITICAL_AUTO_RESET",
+    "KILL_SWITCH",
+    "AUTO_SELL live_failed",
+    "AUTO_SELL forced_failed",
+    "Local monitoring loop error",
+    "[ERROR]",
 )
 
 BUY_RE = re.compile(
@@ -116,6 +126,8 @@ SETTINGS_FIELDS = [
     ("STAIR_STEP_ENABLED", "Step protection"),
     ("STAIR_STEP_START_BALANCE_USD", "Step start floor $"),
     ("STAIR_STEP_SIZE_USD", "Step size $"),
+    ("STAIR_STEP_TRADABLE_BUFFER_USD", "Step tradable buffer $"),
+    ("AUTO_STOP_MIN_AVAILABLE_USD", "Stop min available $"),
 ]
 
 FIELD_OPTIONS = {
@@ -159,6 +171,8 @@ FIELD_OPTIONS = {
     "STAIR_STEP_ENABLED": ["false", "true"],
     "STAIR_STEP_START_BALANCE_USD": ["1.5", "2.75", "5", "10"],
     "STAIR_STEP_SIZE_USD": ["2", "5", "10"],
+    "STAIR_STEP_TRADABLE_BUFFER_USD": ["0.25", "0.35", "0.5", "0.75", "1.0"],
+    "AUTO_STOP_MIN_AVAILABLE_USD": ["0.10", "0.25", "0.35", "0.50", "1.00"],
 }
 
 
@@ -208,11 +222,17 @@ def start_bot() -> tuple[bool, str]:
     if not os.path.exists(PYTHON_PATH):
         return False, f"Python not found: {PYTHON_PATH}"
 
-    existing = list_main_local_pids()
+    existing = sorted(set(list_main_local_pids()))
     if existing:
+        keep_pid = existing[0]
+        # Kill duplicated workers if any, keep one process alive.
+        for pid in existing[1:]:
+            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, text=True)
         with open(PID_FILE, "w", encoding="ascii") as f:
-            f.write(str(existing[0]))
-        return True, f"Already running main_local.py (PID {existing[0]})"
+            f.write(str(keep_pid))
+        if len(existing) > 1:
+            return True, f"Already running main_local.py (PID {keep_pid}), duplicates removed: {len(existing) - 1}"
+        return True, f"Already running main_local.py (PID {keep_pid})"
 
     pid = read_pid()
     if pid and is_running(pid):
@@ -265,6 +285,50 @@ def stop_bot() -> tuple[bool, str]:
     if failed:
         return False, f"Failed to stop PID(s): {', '.join(str(pid) for pid in failed)}"
     return True, f"Stopped main_local.py instances: {', '.join(str(pid) for pid in pids)}"
+
+
+class GuiInstanceLock:
+    def __init__(self) -> None:
+        self._handle = None
+        self.acquired = False
+        self._lock_file = os.path.join(PROJECT_ROOT, "launcher_gui.lock")
+
+    def acquire(self) -> bool:
+        if os.name != "nt":
+            try:
+                fd = os.open(self._lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                with os.fdopen(fd, "w", encoding="ascii") as f:
+                    f.write(str(os.getpid()))
+            except FileExistsError:
+                return False
+            self.acquired = True
+            return True
+
+        kernel32 = ctypes.windll.kernel32
+        mutex = kernel32.CreateMutexW(None, False, GUI_MUTEX_NAME)
+        if not mutex:
+            return False
+        if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+            kernel32.CloseHandle(mutex)
+            return False
+        self._handle = mutex
+        self.acquired = True
+        return True
+
+    def release(self) -> None:
+        if not self.acquired:
+            return
+        if os.name != "nt":
+            try:
+                os.remove(self._lock_file)
+            except OSError:
+                pass
+            self.acquired = False
+            return
+        if self._handle:
+            ctypes.windll.kernel32.CloseHandle(self._handle)
+            self._handle = None
+        self.acquired = False
 
 
 def read_tail(path: str, max_lines: int) -> list[str]:
@@ -483,17 +547,20 @@ class App(tk.Tk):
         self.wallet_tab = ttk.Frame(self.tabs, style="Card.TFrame", padding=12)
         self.positions_tab = ttk.Frame(self.tabs, style="Card.TFrame", padding=12)
         self.settings_tab = ttk.Frame(self.tabs, style="Card.TFrame", padding=12)
+        self.emergency_tab = ttk.Frame(self.tabs, style="Card.TFrame", padding=12)
         self.tabs.add(self.activity_tab, text="Активность")
         self.tabs.add(self.signals_tab, text="Сигналы")
         self.tabs.add(self.wallet_tab, text="Кошелек")
         self.tabs.add(self.positions_tab, text="Сделки")
         self.tabs.add(self.settings_tab, text="Настройки")
+        self.tabs.add(self.emergency_tab, text="Аварийный")
 
         self._build_activity_tab()
         self._build_signals_tab()
         self._build_wallet_tab()
         self._build_positions_tab()
         self._build_settings_tab()
+        self._build_emergency_tab()
 
     def _build_activity_tab(self) -> None:
         activity_top = ttk.Frame(self.activity_tab, style="Card.TFrame")
@@ -618,6 +685,7 @@ class App(tk.Tk):
         ttk.Button(presets, text="Hard Lite", command=self._apply_hard_lite_preset).pack(side=tk.LEFT, padx=6)
         ttk.Button(presets, text="Safe Flow", command=self._apply_safe_flow_preset).pack(side=tk.LEFT, padx=6)
         ttk.Button(presets, text="Medium Flow", command=self._apply_medium_flow_preset).pack(side=tk.LEFT, padx=6)
+        ttk.Button(presets, text="Live Wallet", command=self._apply_live_wallet_preset).pack(side=tk.LEFT, padx=6)
 
         grid = ttk.Frame(self.settings_content, style="Card.TFrame")
         grid.pack(fill=tk.X)
@@ -713,11 +781,58 @@ class App(tk.Tk):
         ).grid(row=3, column=1, sticky="w", pady=(6, 2))
         ttk.Button(grid, text="Apply step", command=self.on_apply_stair_mode).grid(row=3, column=2, sticky="w", padx=8)
 
-        ttk.Button(grid, text="Set paper 2.75", command=self.on_set_paper_275).grid(row=4, column=1, sticky="w", pady=(10, 2))
-        ttk.Button(grid, text="Refresh wallet", command=self._refresh_wallet).grid(row=4, column=2, sticky="w", padx=8, pady=(10, 2))
-        ttk.Button(grid, text="Критический сброс", command=self.on_critical_reset).grid(
-            row=5, column=1, sticky="w", pady=(12, 2)
+        self.stair_start_var = tk.StringVar(value="2.00")
+        ttk.Label(grid, text="Step start floor ($)", foreground="#bfdbfe", font=("Segoe UI Semibold", 10)).grid(
+            row=4, column=0, sticky="w", pady=(6, 2)
         )
+        ttk.Entry(grid, textvariable=self.stair_start_var, width=20).grid(row=4, column=1, sticky="w", pady=(6, 2))
+
+        self.stair_size_var = tk.StringVar(value="2")
+        ttk.Label(grid, text="Step size ($)", foreground="#bfdbfe", font=("Segoe UI Semibold", 10)).grid(
+            row=5, column=0, sticky="w", pady=(6, 2)
+        )
+        ttk.Entry(grid, textvariable=self.stair_size_var, width=20).grid(row=5, column=1, sticky="w", pady=(6, 2))
+        ttk.Button(grid, text="Apply step params", command=self.on_apply_stair_params).grid(
+            row=5, column=2, sticky="w", padx=8
+        )
+
+        ttk.Button(grid, text="Set paper 2.75", command=self.on_set_paper_275).grid(row=6, column=1, sticky="w", pady=(10, 2))
+        ttk.Button(grid, text="Refresh wallet", command=self._refresh_wallet).grid(row=6, column=2, sticky="w", padx=8, pady=(10, 2))
+        ttk.Label(
+            grid,
+            text="Critical actions moved to tab: Аварийный",
+            foreground="#fca5a5",
+            font=("Segoe UI", 10),
+        ).grid(row=7, column=0, columnspan=3, sticky="w", pady=(12, 2))
+
+    def _build_emergency_tab(self) -> None:
+        top = ttk.Frame(self.emergency_tab, style="Card.TFrame")
+        top.pack(fill=tk.X, pady=(0, 10))
+        ttk.Label(top, text="Аварийный блок управления", font=("Segoe UI Semibold", 12)).pack(anchor="w")
+        self.emergency_summary_var = tk.StringVar(
+            value="KILL_SWITCH: OFF | CRITICAL_AUTO_RESET: 0 | live_failed: 0 | errors: 0"
+        )
+        ttk.Label(top, textvariable=self.emergency_summary_var, foreground="#fca5a5").pack(anchor="w", pady=(4, 0))
+
+        actions = ttk.Frame(top, style="Card.TFrame")
+        actions.pack(anchor="w", pady=(8, 0))
+        ttk.Button(actions, text="Включить KILL SWITCH", command=self.on_enable_kill_switch).pack(side=tk.LEFT)
+        ttk.Button(actions, text="Выключить KILL SWITCH", command=self.on_disable_kill_switch).pack(side=tk.LEFT, padx=8)
+        ttk.Button(actions, text="Критический сброс", command=self.on_critical_reset).pack(side=tk.LEFT, padx=8)
+        ttk.Button(actions, text="Signal Check", command=self.on_signal_check).pack(side=tk.LEFT, padx=8)
+        ttk.Button(actions, text="Очистить логи", command=self.on_clear_logs).pack(side=tk.LEFT, padx=8)
+
+        self.critical_text = tk.Text(
+            self.emergency_tab,
+            bg="#0b1220",
+            fg="#fecaca",
+            insertbackground="#fecaca",
+            relief=tk.FLAT,
+            wrap="word",
+            font=("Consolas", 10),
+        )
+        self.critical_text.pack(fill=tk.BOTH, expand=True)
+        self._attach_text_copy_support(self.critical_text)
 
     def _bind_settings_scroll(self, _event=None) -> None:
         self.bind_all("<MouseWheel>", self._on_settings_mousewheel)
@@ -820,23 +935,23 @@ class App(tk.Tk):
         balance = self._effective_wallet_balance(tuned)
 
         if balance <= 5:
-            # Small-bank profile: keep trade flow alive without over-blocking by risk cap.
+            # Small-bank profile: keep flow alive on tiny balance while preserving guardrails.
             tuned.update(
                 {
-                    "AUTO_TRADE_ENTRY_MODE": "single",
-                    "AUTO_TRADE_TOP_N": "3",
-                    "MAX_OPEN_TRADES": "1",
-                    "PAPER_TRADE_SIZE_USD": "0.45",
-                    "PAPER_TRADE_SIZE_MIN_USD": "0.15",
-                    "PAPER_TRADE_SIZE_MAX_USD": "0.70",
-                    "MAX_LOSS_PER_TRADE_PERCENT_BALANCE": str(max(8.0, self._to_float(tuned.get("MAX_LOSS_PER_TRADE_PERCENT_BALANCE"), 8.0))),
+                    "AUTO_TRADE_ENTRY_MODE": "top_n",
+                    "AUTO_TRADE_TOP_N": str(min(3, max(2, int(self._to_float(tuned.get("AUTO_TRADE_TOP_N"), 2))))),
+                    "MAX_OPEN_TRADES": str(min(2, max(1, int(self._to_float(tuned.get("MAX_OPEN_TRADES"), 2))))),
+                    "PAPER_TRADE_SIZE_USD": "0.30",
+                    "PAPER_TRADE_SIZE_MIN_USD": "0.12",
+                    "PAPER_TRADE_SIZE_MAX_USD": "0.45",
+                    "MAX_LOSS_PER_TRADE_PERCENT_BALANCE": str(max(6.0, self._to_float(tuned.get("MAX_LOSS_PER_TRADE_PERCENT_BALANCE"), 6.0))),
                     "PAPER_GAS_PER_TX_USD": "0.02",
                 }
             )
             if str(tuned.get("SAFE_TEST_MODE", "")).lower() == "true":
-                tuned["SAFE_MIN_LIQUIDITY_USD"] = str(min(22000, int(self._to_float(tuned.get("SAFE_MIN_LIQUIDITY_USD"), 22000))))
-                tuned["SAFE_MIN_VOLUME_5M_USD"] = str(min(5000, int(self._to_float(tuned.get("SAFE_MIN_VOLUME_5M_USD"), 5000))))
-                tuned["SAFE_MIN_AGE_SECONDS"] = str(min(120, int(self._to_float(tuned.get("SAFE_MIN_AGE_SECONDS"), 120))))
+                tuned["SAFE_MIN_LIQUIDITY_USD"] = str(min(14000, int(self._to_float(tuned.get("SAFE_MIN_LIQUIDITY_USD"), 14000))))
+                tuned["SAFE_MIN_VOLUME_5M_USD"] = str(min(800, int(self._to_float(tuned.get("SAFE_MIN_VOLUME_5M_USD"), 800))))
+                tuned["SAFE_MIN_AGE_SECONDS"] = str(min(45, int(self._to_float(tuned.get("SAFE_MIN_AGE_SECONDS"), 45))))
             return tuned, balance, "small-bank"
 
         if balance <= 25:
@@ -1019,7 +1134,6 @@ class App(tk.Tk):
                 "SAFE_REQUIRE_RISK_LEVEL": "MEDIUM",
                 "SAFE_MAX_WARNING_FLAGS": "2",
                 "MAX_OPEN_TRADES": "1",
-                "WALLET_BALANCE_USD": "2.75",
                 "PAPER_TRADE_SIZE_USD": "0.55",
                 "PAPER_TRADE_SIZE_MIN_USD": "0.20",
                 "PAPER_TRADE_SIZE_MAX_USD": "0.90",
@@ -1043,7 +1157,7 @@ class App(tk.Tk):
             {
                 "SIGNAL_SOURCE": "onchain",
                 "ONCHAIN_ENABLE_UNISWAP_V3": "true",
-                "ONCHAIN_POLL_INTERVAL_SECONDS": "5",
+                "ONCHAIN_POLL_INTERVAL_SECONDS": "4",
                 "DEX_SEARCH_QUERIES": "base",
                 "GECKO_NEW_POOLS_PAGES": "1",
                 "DEX_BOOSTS_SOURCE_ENABLED": "false",
@@ -1052,31 +1166,31 @@ class App(tk.Tk):
                 "AUTO_TRADE_PAPER": "true",
                 "AUTO_FILTER_ENABLED": "true",
                 "AUTO_TRADE_ENTRY_MODE": "top_n",
-                "AUTO_TRADE_TOP_N": "2",
-                "MAX_TRADES_PER_HOUR": "3",
+                "AUTO_TRADE_TOP_N": "3",
+                "MAX_TRADES_PER_HOUR": "6",
                 "MAX_BUY_AMOUNT": "0.00025",
-                "MIN_TOKEN_SCORE": "78",
+                "MIN_TOKEN_SCORE": "70",
                 "SAFE_TEST_MODE": "true",
-                "SAFE_MIN_LIQUIDITY_USD": "20000",
-                "SAFE_MIN_VOLUME_5M_USD": "2500",
-                "SAFE_MIN_AGE_SECONDS": "90",
-                "SAFE_MAX_PRICE_CHANGE_5M_ABS_PERCENT": "18",
+                "SAFE_MIN_LIQUIDITY_USD": "14000",
+                "SAFE_MIN_VOLUME_5M_USD": "800",
+                "SAFE_MIN_AGE_SECONDS": "45",
+                "SAFE_MAX_PRICE_CHANGE_5M_ABS_PERCENT": "24",
                 "SAFE_REQUIRE_CONTRACT_SAFE": "true",
                 "SAFE_REQUIRE_RISK_LEVEL": "MEDIUM",
-                "SAFE_MAX_WARNING_FLAGS": "1",
+                "SAFE_MAX_WARNING_FLAGS": "2",
                 "MAX_OPEN_TRADES": "2",
-                "PAPER_TRADE_SIZE_USD": "0.50",
-                "PAPER_TRADE_SIZE_MIN_USD": "0.20",
-                "PAPER_TRADE_SIZE_MAX_USD": "0.75",
+                "PAPER_TRADE_SIZE_USD": "0.30",
+                "PAPER_TRADE_SIZE_MIN_USD": "0.12",
+                "PAPER_TRADE_SIZE_MAX_USD": "0.45",
                 "MAX_LOSS_PER_TRADE_PERCENT_BALANCE": "6.0",
                 "DAILY_MAX_DRAWDOWN_PERCENT": "0",
                 "MAX_CONSECUTIVE_LOSSES": "0",
                 "LOSS_STREAK_COOLDOWN_SECONDS": "0",
-                "MAX_TOKEN_COOLDOWN_SECONDS": "600",
-                "MAX_TOKEN_PRICE_CHANGE_5M_ABS_PERCENT": "35",
+                "MAX_TOKEN_COOLDOWN_SECONDS": "300",
+                "MAX_TOKEN_PRICE_CHANGE_5M_ABS_PERCENT": "42",
                 "EDGE_FILTER_ENABLED": "true",
-                "MIN_EXPECTED_EDGE_PERCENT": "2.0",
-                "PROFIT_TARGET_PERCENT": "40",
+                "MIN_EXPECTED_EDGE_PERCENT": "1.0",
+                "PROFIT_TARGET_PERCENT": "42",
                 "STOP_LOSS_PERCENT": "15",
                 "PAPER_GAS_PER_TX_USD": "0.02",
                 "PAPER_BASE_SLIPPAGE_BPS": "60",
@@ -1085,8 +1199,10 @@ class App(tk.Tk):
                 "PAPER_REALISM_MAX_LOSS_PERCENT": "95",
                 "WETH_PRICE_FALLBACK_USD": "3000",
                 "STAIR_STEP_ENABLED": "true",
-                "STAIR_STEP_START_BALANCE_USD": "2.75",
-                "STAIR_STEP_SIZE_USD": "5",
+                "STAIR_STEP_START_BALANCE_USD": "2.00",
+                "STAIR_STEP_SIZE_USD": "2",
+                "STAIR_STEP_TRADABLE_BUFFER_USD": "0.35",
+                "AUTO_STOP_MIN_AVAILABLE_USD": "0.25",
             }
         )
 
@@ -1141,6 +1257,73 @@ class App(tk.Tk):
                 "STAIR_STEP_SIZE_USD": "5",
             }
         )
+
+    def _apply_live_wallet_preset(self) -> None:
+        self._apply_preset_map(
+            {
+                "WALLET_MODE": "live",
+                "SIGNAL_SOURCE": "onchain",
+                "ONCHAIN_ENABLE_UNISWAP_V3": "true",
+                "ONCHAIN_PARALLEL_MARKET_SOURCES": "true",
+                "ONCHAIN_POLL_INTERVAL_SECONDS": "3",
+                "ONCHAIN_FINALITY_BLOCKS": "2",
+                "ONCHAIN_BLOCK_CHUNK": "300",
+                "DEX_SEARCH_QUERIES": "base,memecoin,new",
+                "GECKO_NEW_POOLS_PAGES": "2",
+                "DEX_BOOSTS_SOURCE_ENABLED": "true",
+                "DEX_BOOSTS_MAX_TOKENS": "20",
+                "AUTO_TRADE_ENABLED": "true",
+                "AUTO_TRADE_PAPER": "true",
+                "AUTO_FILTER_ENABLED": "true",
+                "AUTO_TRADE_ENTRY_MODE": "top_n",
+                "AUTO_TRADE_TOP_N": "2",
+                "MAX_TRADES_PER_HOUR": "0",
+                "MAX_OPEN_TRADES": "2",
+                "MAX_BUY_AMOUNT": "0.00020",
+                "MIN_TOKEN_SCORE": "70",
+                "SAFE_TEST_MODE": "true",
+                "SAFE_MIN_LIQUIDITY_USD": "14000",
+                "SAFE_MIN_VOLUME_5M_USD": "800",
+                "SAFE_MIN_AGE_SECONDS": "45",
+                "SAFE_MAX_PRICE_CHANGE_5M_ABS_PERCENT": "24",
+                "SAFE_REQUIRE_CONTRACT_SAFE": "true",
+                "SAFE_REQUIRE_RISK_LEVEL": "MEDIUM",
+                "SAFE_MAX_WARNING_FLAGS": "1",
+                "PAPER_TRADE_SIZE_USD": "0.28",
+                "PAPER_TRADE_SIZE_MIN_USD": "0.12",
+                "PAPER_TRADE_SIZE_MAX_USD": "0.40",
+                "PAPER_GAS_PER_TX_USD": "0.02",
+                "PAPER_BASE_SLIPPAGE_BPS": "60",
+                "PAPER_REALISM_CAP_ENABLED": "true",
+                "PAPER_REALISM_MAX_GAIN_PERCENT": "300",
+                "PAPER_REALISM_MAX_LOSS_PERCENT": "85",
+                "EDGE_FILTER_ENABLED": "true",
+                "MIN_EXPECTED_EDGE_PERCENT": "1.0",
+                "PROFIT_TARGET_PERCENT": "35",
+                "STOP_LOSS_PERCENT": "14",
+                "MAX_TOKEN_COOLDOWN_SECONDS": "300",
+                "MAX_TOKEN_PRICE_CHANGE_5M_ABS_PERCENT": "38",
+                "MAX_LOSS_PER_TRADE_PERCENT_BALANCE": "6.0",
+                "DAILY_MAX_DRAWDOWN_PERCENT": "0",
+                "MAX_CONSECUTIVE_LOSSES": "0",
+                "LOSS_STREAK_COOLDOWN_SECONDS": "0",
+                "WALLET_BALANCE_USD": "2.00",
+                "WETH_PRICE_FALLBACK_USD": "3000",
+                "STAIR_STEP_ENABLED": "true",
+                "STAIR_STEP_START_BALANCE_USD": "1.25",
+                "STAIR_STEP_SIZE_USD": "1.00",
+                "STAIR_STEP_TRADABLE_BUFFER_USD": "0.35",
+                "AUTO_STOP_MIN_AVAILABLE_USD": "0.25",
+            }
+        )
+        if "WALLET_MODE" in self.env_vars:
+            self.env_vars["WALLET_MODE"].set("live")
+        if hasattr(self, "wallet_mode_var"):
+            self.wallet_mode_var.set("live")
+        if hasattr(self, "paper_balance_set_var"):
+            self.paper_balance_set_var.set("2.00")
+        if hasattr(self, "hint_var"):
+            self.hint_var.set("Live Wallet preset applied (live profile + paper execution until live executor is enabled).")
 
     def _load_settings(self) -> None:
         env_map = read_env_map()
@@ -1199,6 +1382,64 @@ class App(tk.Tk):
         self._refresh_signals()
         self._refresh_wallet()
         self._refresh_positions(app_lines)
+        self._refresh_emergency_tab(app_lines)
+
+    @staticmethod
+    def _kill_switch_path() -> str:
+        env_map = read_env_map()
+        raw = str(env_map.get("KILL_SWITCH_FILE", os.path.join("data", "kill.txt")) or "").strip()
+        if not raw:
+            raw = os.path.join("data", "kill.txt")
+        if os.path.isabs(raw):
+            return raw
+        return os.path.join(PROJECT_ROOT, raw)
+
+    def _refresh_emergency_tab(self, app_lines: list[str]) -> None:
+        if not hasattr(self, "critical_text"):
+            return
+        kill_path = self._kill_switch_path()
+        kill_on = os.path.exists(kill_path)
+        critical_lines = [line for line in app_lines if any(marker in line for marker in CRITICAL_LOG_MARKERS)]
+        reset_count = sum(1 for line in app_lines if "CRITICAL_AUTO_RESET" in line)
+        live_fail = sum(1 for line in app_lines if "AUTO_SELL live_failed" in line)
+        err_count = sum(1 for line in app_lines if "[ERROR]" in line)
+        if hasattr(self, "emergency_summary_var"):
+            self.emergency_summary_var.set(
+                f"KILL_SWITCH: {'ON' if kill_on else 'OFF'} | CRITICAL_AUTO_RESET: {reset_count} | live_failed: {live_fail} | errors: {err_count}"
+            )
+
+        critical_bottom = self._is_near_bottom(self.critical_text)
+        critical_y = self.critical_text.yview()
+        if not self._text_has_active_selection(self.critical_text):
+            self.critical_text.delete("1.0", tk.END)
+            if critical_lines:
+                self.critical_text.insert(tk.END, "\n".join(critical_lines[-220:]))
+            else:
+                self.critical_text.insert(
+                    tk.END,
+                    "No critical events in latest app.log tail.\n"
+                    f"KILL_SWITCH path: {kill_path}\n",
+                )
+            self._restore_scroll(self.critical_text, critical_y, critical_bottom)
+
+    def on_enable_kill_switch(self) -> None:
+        path = self._kill_switch_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(f"{datetime.now(timezone.utc).isoformat()} manual_kill_switch\n")
+        self.refresh()
+        messagebox.showinfo("KILL SWITCH", f"KILL SWITCH enabled:\n{path}")
+
+    def on_disable_kill_switch(self) -> None:
+        path = self._kill_switch_path()
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError as exc:
+                messagebox.showerror("KILL SWITCH", f"Cannot disable kill switch:\n{exc}")
+                return
+        self.refresh()
+        messagebox.showinfo("KILL SWITCH", "KILL SWITCH disabled.")
 
     @staticmethod
     def _text_has_active_selection(widget: tk.Text) -> bool:
@@ -1430,12 +1671,13 @@ class App(tk.Tk):
         paper_closed = len(state.get("closed_positions", []) or [])
         stair_floor = float(state.get("stair_floor_usd", env_map.get("STAIR_STEP_START_BALANCE_USD", "0")) or 0)
         stair_enabled = str(env_map.get(STAIR_STEP_ENABLED_KEY, "false")).strip().lower()
+        emergency_reason = str(state.get("emergency_halt_reason", "") or "").strip()
 
         active = paper_balance if mode == "paper" else live_balance
         mode_label = "PAPER" if mode == "paper" else "LIVE"
         if hasattr(self, "wallet_summary_var"):
             self.wallet_summary_var.set(
-                f"Mode: {mode_label} | Active balance: ${active:.2f} | Paper: ${paper_balance:.2f} | Live: ${live_balance:.2f} | Stair: {stair_enabled.upper()} floor=${stair_floor:.2f} | Open: {paper_open} | Closed: {paper_closed}"
+                f"Mode: {mode_label} | Active balance: ${active:.2f} | Paper: ${paper_balance:.2f} | Live: ${live_balance:.2f} | Stair: {stair_enabled.upper()} floor=${stair_floor:.2f} | Open: {paper_open} | Closed: {paper_closed} | Halt: {emergency_reason or 'none'}"
             )
         if hasattr(self, "wallet_mode_var"):
             self.wallet_mode_var.set(mode if mode in {"paper", "live"} else "paper")
@@ -1443,8 +1685,20 @@ class App(tk.Tk):
             self.live_balance_var.set(f"{live_balance:.2f}")
         if hasattr(self, "paper_balance_set_var"):
             self.paper_balance_set_var.set(f"{paper_balance:.2f}")
+        if "WALLET_BALANCE_USD" in self.env_vars:
+            self.env_vars["WALLET_BALANCE_USD"].set(f"{paper_balance:.2f}")
         if hasattr(self, "stair_enabled_var"):
             self.stair_enabled_var.set("true" if stair_enabled == "true" else "false")
+        if hasattr(self, "stair_start_var"):
+            self.stair_start_var.set(str(env_map.get("STAIR_STEP_START_BALANCE_USD", "0")).strip() or "0")
+        if hasattr(self, "stair_size_var"):
+            self.stair_size_var.set(str(env_map.get("STAIR_STEP_SIZE_USD", "5")).strip() or "5")
+        if "STAIR_STEP_START_BALANCE_USD" in self.env_vars:
+            self.env_vars["STAIR_STEP_START_BALANCE_USD"].set(
+                str(env_map.get("STAIR_STEP_START_BALANCE_USD", "0")).strip() or "0"
+            )
+        if "STAIR_STEP_SIZE_USD" in self.env_vars:
+            self.env_vars["STAIR_STEP_SIZE_USD"].set(str(env_map.get("STAIR_STEP_SIZE_USD", "5")).strip() or "5")
 
     def on_apply_wallet_mode(self) -> None:
         mode = str(self.wallet_mode_var.get()).strip().lower()
@@ -1465,6 +1719,33 @@ class App(tk.Tk):
             messagebox.showerror("Ошибка", "Step protection должен быть true или false.")
             return
         save_env_map({STAIR_STEP_ENABLED_KEY: mode})
+        if STAIR_STEP_ENABLED_KEY in self.env_vars:
+            self.env_vars[STAIR_STEP_ENABLED_KEY].set(mode)
+        self._refresh_wallet()
+
+    def on_apply_stair_params(self) -> None:
+        try:
+            start_floor = float(str(self.stair_start_var.get()).strip())
+            step_size = float(str(self.stair_size_var.get()).strip())
+        except ValueError:
+            messagebox.showerror("Ошибка", "Step start/size должны быть числами.")
+            return
+        if start_floor < 0:
+            messagebox.showerror("Ошибка", "Step start floor не может быть отрицательным.")
+            return
+        if step_size <= 0:
+            messagebox.showerror("Ошибка", "Step size должен быть больше 0.")
+            return
+        save_env_map(
+            {
+                "STAIR_STEP_START_BALANCE_USD": f"{start_floor:.2f}",
+                "STAIR_STEP_SIZE_USD": f"{step_size:.2f}",
+            }
+        )
+        if "STAIR_STEP_START_BALANCE_USD" in self.env_vars:
+            self.env_vars["STAIR_STEP_START_BALANCE_USD"].set(f"{start_floor:.2f}")
+        if "STAIR_STEP_SIZE_USD" in self.env_vars:
+            self.env_vars["STAIR_STEP_SIZE_USD"].set(f"{step_size:.2f}")
         self._refresh_wallet()
 
     def on_apply_live_balance(self) -> None:
@@ -1507,6 +1788,8 @@ class App(tk.Tk):
         with open(PAPER_STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
         save_env_map({"WALLET_BALANCE_USD": f"{val:.2f}"})
+        if "WALLET_BALANCE_USD" in self.env_vars:
+            self.env_vars["WALLET_BALANCE_USD"].set(f"{val:.2f}")
         self._refresh_wallet()
 
     def on_critical_reset(self) -> None:
@@ -1547,6 +1830,8 @@ class App(tk.Tk):
         with open(PAPER_STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
         save_env_map({"WALLET_BALANCE_USD": f"{balance:.2f}"})
+        if "WALLET_BALANCE_USD" in self.env_vars:
+            self.env_vars["WALLET_BALANCE_USD"].set(f"{balance:.2f}")
         self._refresh_wallet()
         self._refresh_positions([])
         messagebox.showinfo("Готово", f"Paper-состояние сброшено. Текущий баланс: ${balance:.2f}")
@@ -1611,6 +1896,8 @@ class App(tk.Tk):
         filter_pass = sum(1 for line in app_lines if "FILTER_PASS" in line)
         auto_buy = sum(1 for line in app_lines if "AUTO_BUY" in line)
         auto_sell = sum(1 for line in app_lines if "AUTO_SELL" in line)
+        critical_events = sum(1 for line in app_lines if "CRITICAL_AUTO_RESET" in line)
+        kill_events = sum(1 for line in app_lines if "KILL_SWITCH" in line)
 
         state = read_json(PAPER_STATE_FILE)
         paper_balance = float(state.get("paper_balance_usd", env_map.get("WALLET_BALANCE_USD", "0")) or 0)
@@ -1657,6 +1944,7 @@ class App(tk.Tk):
             f"Signals in feed: {len(rows)} (last: {last_alert})",
             f"Recent runtime (app.log tail): scans={scan_count}, PAIR_DETECTED={pair_detected}, FILTER_PASS={filter_pass}",
             f"Paper activity: AUTO_BUY={auto_buy}, AUTO_SELL={auto_sell}",
+            f"Critical: CRITICAL_AUTO_RESET={critical_events}, KILL_SWITCH={kill_events}",
             f"Paper state: balance=${paper_balance:.2f}, open={open_count}, closed={closed_count}",
         ]
         messagebox.showinfo("Signal Check", "\n".join(details))
@@ -1723,4 +2011,12 @@ class App(tk.Tk):
 
 
 if __name__ == "__main__":
-    App().mainloop()
+    gui_lock = GuiInstanceLock()
+    if not gui_lock.acquire():
+        print("Another launcher_gui.py instance is already running. Exit.")
+    else:
+        try:
+            App().mainloop()
+        finally:
+            gui_lock.release()
+

@@ -119,6 +119,15 @@ STOP_LOSS_PERCENT = int(os.getenv("STOP_LOSS_PERCENT", "30"))
 
 AUTO_TRADE_ENABLED = os.getenv("AUTO_TRADE_ENABLED", "false").lower() == "true"
 AUTO_TRADE_PAPER = os.getenv("AUTO_TRADE_PAPER", "true").lower() == "true"
+LIVE_WALLET_ADDRESS = os.getenv("LIVE_WALLET_ADDRESS", "").strip()
+LIVE_PRIVATE_KEY = os.getenv("LIVE_PRIVATE_KEY", "").strip()
+LIVE_CHAIN_ID = int(os.getenv("LIVE_CHAIN_ID", EVM_CHAIN_ID))
+LIVE_ROUTER_ADDRESS = os.getenv("LIVE_ROUTER_ADDRESS", "").strip()
+LIVE_SLIPPAGE_BPS = max(1, int(os.getenv("LIVE_SLIPPAGE_BPS", "200")))
+LIVE_SWAP_DEADLINE_SECONDS = max(30, int(os.getenv("LIVE_SWAP_DEADLINE_SECONDS", "120")))
+LIVE_TX_TIMEOUT_SECONDS = max(30, int(os.getenv("LIVE_TX_TIMEOUT_SECONDS", "180")))
+LIVE_MAX_GAS_GWEI = float(os.getenv("LIVE_MAX_GAS_GWEI", "2.0"))
+LIVE_PRIORITY_FEE_GWEI = float(os.getenv("LIVE_PRIORITY_FEE_GWEI", "0.02"))
 # AUTO_TRADE_ENTRY_MODE:
 # - single: open only one best candidate per scan cycle
 # - all: open every eligible candidate
@@ -144,6 +153,12 @@ PAPER_BASE_SLIPPAGE_BPS = float(os.getenv("PAPER_BASE_SLIPPAGE_BPS", "80"))
 PAPER_REALISM_CAP_ENABLED = os.getenv("PAPER_REALISM_CAP_ENABLED", "true").lower() == "true"
 PAPER_REALISM_MAX_GAIN_PERCENT = float(os.getenv("PAPER_REALISM_MAX_GAIN_PERCENT", "600"))
 PAPER_REALISM_MAX_LOSS_PERCENT = float(os.getenv("PAPER_REALISM_MAX_LOSS_PERCENT", "95"))
+PROFIT_LOCK_ENABLED = os.getenv("PROFIT_LOCK_ENABLED", "true").lower() == "true"
+PROFIT_LOCK_TRIGGER_PERCENT = float(os.getenv("PROFIT_LOCK_TRIGGER_PERCENT", "18"))
+PROFIT_LOCK_FLOOR_PERCENT = float(os.getenv("PROFIT_LOCK_FLOOR_PERCENT", "4"))
+WEAKNESS_EXIT_ENABLED = os.getenv("WEAKNESS_EXIT_ENABLED", "true").lower() == "true"
+WEAKNESS_EXIT_MIN_AGE_PERCENT = float(os.getenv("WEAKNESS_EXIT_MIN_AGE_PERCENT", "45"))
+WEAKNESS_EXIT_PNL_PERCENT = float(os.getenv("WEAKNESS_EXIT_PNL_PERCENT", "-9"))
 
 # Position sizing and edge filtering
 DYNAMIC_POSITION_SIZING_ENABLED = os.getenv("DYNAMIC_POSITION_SIZING_ENABLED", "true").lower() == "true"
@@ -163,6 +178,8 @@ PAPER_PRICE_GUARD_WINDOW_SECONDS = max(5, int(os.getenv("PAPER_PRICE_GUARD_WINDO
 STAIR_STEP_ENABLED = os.getenv("STAIR_STEP_ENABLED", "false").lower() == "true"
 STAIR_STEP_START_BALANCE_USD = float(os.getenv("STAIR_STEP_START_BALANCE_USD", "0"))
 STAIR_STEP_SIZE_USD = float(os.getenv("STAIR_STEP_SIZE_USD", "5"))
+STAIR_STEP_TRADABLE_BUFFER_USD = float(os.getenv("STAIR_STEP_TRADABLE_BUFFER_USD", "0.35"))
+AUTO_STOP_MIN_AVAILABLE_USD = float(os.getenv("AUTO_STOP_MIN_AVAILABLE_USD", "0.25"))
 
 # Trade risk controls
 MAX_TOKEN_PRICE_CHANGE_5M_ABS_PERCENT = float(os.getenv("MAX_TOKEN_PRICE_CHANGE_5M_ABS_PERCENT", "35"))

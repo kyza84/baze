@@ -34,3 +34,4 @@ Thumbs.db
 # Runtime files
 bot.pid
 trading/paper_state.json
+data/
