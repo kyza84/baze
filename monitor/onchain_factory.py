@@ -381,29 +381,45 @@ class OnChainFactoryMonitor:
         url = f"{config.DEXSCREENER_API}/tokens/{token_address}"
         timeout = aiohttp.ClientTimeout(total=config.DEX_TIMEOUT)
 
-        payload: dict[str, Any] | None = None
-        try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(url) as response:
-                    if response.status == 200:
-                        payload = await response.json()
-        except Exception:
-            payload = None
-
         best_pair: dict[str, Any] | None = None
-        best_liq = -1.0
-        pairs = (payload or {}).get("pairs", []) or []
-        for pair in pairs:
-            if str(pair.get("chainId", "")).lower() != str(config.CHAIN_ID).lower():
-                continue
-            pair_address = str(pair.get("pairAddress", "") or "").lower()
-            liq = float((pair.get("liquidity") or {}).get("usd") or 0)
-            if pair_address and pair_address == candidate.pair_address:
-                best_pair = pair
+        retries = int(config.ONCHAIN_ENRICH_RETRIES)
+        retry_delay = int(config.ONCHAIN_ENRICH_RETRY_DELAY_SECONDS)
+        for attempt in range(1, retries + 1):
+            payload: dict[str, Any] | None = None
+            try:
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(url) as response:
+                        if response.status == 200:
+                            payload = await response.json()
+            except Exception:
+                payload = None
+
+            best_liq = -1.0
+            pairs = (payload or {}).get("pairs", []) or []
+            for pair in pairs:
+                if str(pair.get("chainId", "")).lower() != str(config.CHAIN_ID).lower():
+                    continue
+                pair_address = str(pair.get("pairAddress", "") or "").lower()
+                liq = float((pair.get("liquidity") or {}).get("usd") or 0)
+                if pair_address and pair_address == candidate.pair_address:
+                    best_pair = pair
+                    break
+                if liq > best_liq:
+                    best_liq = liq
+                    best_pair = pair
+
+            if best_pair:
                 break
-            if liq > best_liq:
-                best_liq = liq
-                best_pair = pair
+            if attempt < retries:
+                logger.info(
+                    "ENRICH_RETRY token=%s pair=%s attempt=%s/%s delay=%ss",
+                    token_address,
+                    candidate.pair_address,
+                    attempt,
+                    retries,
+                    retry_delay,
+                )
+                await asyncio.sleep(retry_delay)
 
         now = datetime.now(timezone.utc)
         if not best_pair:

@@ -55,6 +55,7 @@ class AutoTrader:
         self.current_loss_streak = 0
         self.token_cooldowns: dict[str, float] = {}
         self.trade_open_timestamps: list[float] = []
+        self.price_guard_pending: dict[str, dict[str, float | int]] = {}
         self.trading_pause_until_ts = 0.0
         self.day_id = self._current_day_id()
         self.day_start_equity_usd = float(config.WALLET_BALANCE_USD)
@@ -361,6 +362,8 @@ class AutoTrader:
                 continue
             if price_usd <= 0:
                 continue
+            if not self._accept_price_update(position, price_usd):
+                continue
 
             position.current_price_usd = price_usd
             raw_price_pnl_percent = ((price_usd - position.entry_price_usd) / position.entry_price_usd) * 100
@@ -408,6 +411,7 @@ class AutoTrader:
         position.pnl_percent = pnl_percent
 
         self.open_positions.pop(position.token_address, None)
+        self.price_guard_pending.pop(position.token_address, None)
         self.closed_positions.append(position)
         self._prune_closed_positions()
         self.total_closed += 1
@@ -512,6 +516,60 @@ class AutoTrader:
             return None
         return token_address, best_price
 
+    def _accept_price_update(self, position: PaperPosition, next_price_usd: float) -> bool:
+        if not config.PAPER_PRICE_GUARD_ENABLED:
+            return True
+        current_price = float(position.current_price_usd or 0.0)
+        if current_price <= 0 or next_price_usd <= 0:
+            return True
+
+        jump_percent = abs((next_price_usd - current_price) / current_price) * 100
+        if jump_percent <= float(config.PAPER_PRICE_GUARD_MAX_JUMP_PERCENT):
+            self.price_guard_pending.pop(position.token_address, None)
+            return True
+
+        now_ts = datetime.now(timezone.utc).timestamp()
+        pending = self.price_guard_pending.get(position.token_address)
+        if pending:
+            first_ts = float(pending.get("first_ts", 0.0))
+            base_price = float(pending.get("price", 0.0))
+            similar = False
+            if base_price > 0:
+                similar = abs((next_price_usd - base_price) / base_price) * 100 <= 20
+            if (now_ts - first_ts) <= float(config.PAPER_PRICE_GUARD_WINDOW_SECONDS) and similar:
+                pending["count"] = int(pending.get("count", 0)) + 1
+                if int(pending["count"]) >= int(config.PAPER_PRICE_GUARD_CONFIRMATIONS):
+                    self.price_guard_pending.pop(position.token_address, None)
+                    logger.info(
+                        "AUTO_SELL price_guard_confirm token=%s jump=%.2f%% confirmations=%s",
+                        position.symbol,
+                        jump_percent,
+                        int(pending["count"]),
+                    )
+                    return True
+                self.price_guard_pending[position.token_address] = pending
+                logger.info(
+                    "AUTO_SELL price_guard_pending token=%s jump=%.2f%% confirmations=%s/%s",
+                    position.symbol,
+                    jump_percent,
+                    int(pending["count"]),
+                    int(config.PAPER_PRICE_GUARD_CONFIRMATIONS),
+                )
+                return False
+
+        self.price_guard_pending[position.token_address] = {
+            "price": next_price_usd,
+            "count": 1,
+            "first_ts": now_ts,
+        }
+        logger.info(
+            "AUTO_SELL price_guard_pending token=%s jump=%.2f%% confirmations=1/%s",
+            position.symbol,
+            jump_percent,
+            int(config.PAPER_PRICE_GUARD_CONFIRMATIONS),
+        )
+        return False
+
     def get_stats(self) -> dict[str, float]:
         self._prune_hourly_window()
         win_rate = (self.total_wins / self.total_closed * 100) if self.total_closed else 0.0
@@ -548,6 +606,7 @@ class AutoTrader:
         self.trading_pause_until_ts = 0.0
         self.token_cooldowns.clear()
         self.trade_open_timestamps.clear()
+        self.price_guard_pending.clear()
         self.open_positions.clear()
         if not keep_closed:
             self.closed_positions.clear()
@@ -679,6 +738,7 @@ class AutoTrader:
                 "day_realized_pnl_usd": self.day_realized_pnl_usd,
                 "token_cooldowns": self.token_cooldowns,
                 "trade_open_timestamps": self.trade_open_timestamps[-500:],
+                "price_guard_pending": self.price_guard_pending,
                 "open_positions": [self._serialize_pos(p) for p in self.open_positions.values()],
                 "closed_positions": [self._serialize_pos(p) for p in self.closed_positions[-500:]],
             }
@@ -715,6 +775,17 @@ class AutoTrader:
                     self.trade_open_timestamps.append(float(value))
                 except (TypeError, ValueError):
                     continue
+            pending_raw = payload.get("price_guard_pending", {}) or {}
+            self.price_guard_pending = {}
+            if isinstance(pending_raw, dict):
+                for address, record in pending_raw.items():
+                    if not isinstance(record, dict):
+                        continue
+                    self.price_guard_pending[str(address)] = {
+                        "price": float(record.get("price", 0.0)),
+                        "count": int(record.get("count", 0)),
+                        "first_ts": float(record.get("first_ts", 0.0)),
+                    }
             self._prune_hourly_window()
 
             self.open_positions.clear()

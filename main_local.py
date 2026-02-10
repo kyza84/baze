@@ -24,6 +24,32 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 WINDOWS_MUTEX_NAME = "Global\\solana_alert_bot_main_local_single_instance"
 
 
+def _merge_token_streams(*groups: list[dict]) -> list[dict]:
+    merged: dict[str, dict] = {}
+    for group in groups:
+        for token in group or []:
+            address = str(token.get("address", "")).strip().lower()
+            if not address:
+                continue
+            existing = merged.get(address)
+            if not existing:
+                merged[address] = token
+                continue
+            existing_score = (
+                (1 if float(existing.get("liquidity") or 0) > 0 else 0)
+                + (1 if float(existing.get("volume_5m") or 0) > 0 else 0)
+                + (1 if float(existing.get("price_usd") or 0) > 0 else 0)
+            )
+            candidate_score = (
+                (1 if float(token.get("liquidity") or 0) > 0 else 0)
+                + (1 if float(token.get("volume_5m") or 0) > 0 else 0)
+                + (1 if float(token.get("price_usd") or 0) > 0 else 0)
+            )
+            if candidate_score > existing_score:
+                merged[address] = token
+    return list(merged.values())
+
+
 class InstanceLock:
     def __init__(self) -> None:
         self._handle = None
@@ -127,7 +153,14 @@ async def run_local_loop() -> None:
                 else:
                     try:
                         source_mode = "onchain"
-                        tokens = await onchain_monitor.fetch_new_tokens()
+                        if config.ONCHAIN_PARALLEL_MARKET_SOURCES:
+                            onchain_task = asyncio.create_task(onchain_monitor.fetch_new_tokens())
+                            dex_task = asyncio.create_task(dex_monitor.fetch_new_tokens())
+                            onchain_tokens, dex_tokens = await asyncio.gather(onchain_task, dex_task)
+                            tokens = _merge_token_streams(onchain_tokens, dex_tokens)
+                            source_mode = "onchain+market"
+                        else:
+                            tokens = await onchain_monitor.fetch_new_tokens()
                         onchain_error_streak = 0
                     except OnChainRPCError as exc:
                         onchain_error_streak += 1
