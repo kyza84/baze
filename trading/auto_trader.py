@@ -52,6 +52,8 @@ class PaperPosition:
 class AutoTrader:
     def __init__(self) -> None:
         self.state_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "paper_state.json")
+        self._blacklist_file = str(getattr(config, "AUTOTRADE_BLACKLIST_FILE", os.path.join("data", "autotrade_blacklist.json")))
+        self._blacklist: dict[str, dict[str, Any]] = {}
         self.open_positions: dict[str, PaperPosition] = {}
         self.closed_positions: list[PaperPosition] = []
         self.total_plans = 0
@@ -74,12 +76,24 @@ class AutoTrader:
         self.emergency_halt_ts = 0.0
         self._last_guard_log_ts = 0.0
         self._live_sell_failures = 0
+        self._honeypot_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+
+        # Live session baseline tracking (used for "stop after profit" guard).
+        self.live_start_ts = 0.0
+        self.live_start_balance_eth = 0.0
+        self.live_start_balance_usd = 0.0
 
         self.initial_balance_usd = float(config.WALLET_BALANCE_USD)
         self.paper_balance_usd = float(config.WALLET_BALANCE_USD)
         self.realized_pnl_usd = 0.0
         self.live_executor: LiveExecutor | None = None
         self._load_state()
+        if bool(getattr(config, "LIVE_SESSION_RESET_ON_START", True)):
+            # Reset baseline on each process start to make overnight runs predictable.
+            self.live_start_ts = 0.0
+            self.live_start_balance_eth = 0.0
+            self.live_start_balance_usd = 0.0
+        self._load_blacklist()
         if config.PAPER_RESET_ON_START:
             self._apply_startup_reset()
         self._sync_stair_state()
@@ -91,6 +105,91 @@ class AutoTrader:
             except Exception as exc:
                 self.live_executor = None
                 logger.error("Live executor init failed: %s", exc)
+
+    def _load_blacklist(self) -> None:
+        if not bool(getattr(config, "AUTOTRADE_BLACKLIST_ENABLED", True)):
+            self._blacklist = {}
+            return
+        try:
+            path = self._blacklist_file
+            if not path:
+                self._blacklist = {}
+                return
+            if not os.path.exists(path):
+                self._blacklist = {}
+                return
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if isinstance(payload, dict):
+                self._blacklist = payload  # type: ignore[assignment]
+            else:
+                self._blacklist = {}
+        except Exception:
+            self._blacklist = {}
+
+    def _save_blacklist(self) -> None:
+        if not bool(getattr(config, "AUTOTRADE_BLACKLIST_ENABLED", True)):
+            return
+        try:
+            path = self._blacklist_file
+            if not path:
+                return
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self._blacklist, f, ensure_ascii=False, indent=2, sort_keys=True)
+        except Exception:
+            pass
+
+    def _blacklist_prune(self) -> None:
+        now_ts = datetime.now(timezone.utc).timestamp()
+        # Drop expired
+        self._blacklist = {
+            k: v
+            for k, v in self._blacklist.items()
+            if float((v or {}).get("until_ts") or 0.0) > now_ts
+        }
+        max_entries = int(getattr(config, "AUTOTRADE_BLACKLIST_MAX_ENTRIES", 5000) or 5000)
+        if len(self._blacklist) <= max_entries:
+            return
+        # Remove oldest entries (by added_ts)
+        rows = sorted(
+            self._blacklist.items(),
+            key=lambda kv: float((kv[1] or {}).get("added_ts") or 0.0),
+        )
+        for addr, _ in rows[: max(0, len(rows) - max_entries)]:
+            self._blacklist.pop(addr, None)
+
+    def _blacklist_is_blocked(self, token_address: str) -> tuple[bool, str]:
+        if not bool(getattr(config, "AUTOTRADE_BLACKLIST_ENABLED", True)):
+            return False, ""
+        key = str(token_address or "").strip().lower()
+        if not key:
+            return False, ""
+        row = self._blacklist.get(key)
+        if not isinstance(row, dict):
+            return False, ""
+        until_ts = float(row.get("until_ts") or 0.0)
+        now_ts = datetime.now(timezone.utc).timestamp()
+        if until_ts <= now_ts:
+            return False, ""
+        return True, str(row.get("reason") or "blacklisted")
+
+    def _blacklist_add(self, token_address: str, reason: str, ttl_seconds: int | None = None) -> None:
+        if not bool(getattr(config, "AUTOTRADE_BLACKLIST_ENABLED", True)):
+            return
+        key = str(token_address or "").strip().lower()
+        if not key:
+            return
+        now_ts = datetime.now(timezone.utc).timestamp()
+        ttl = int(ttl_seconds or int(getattr(config, "AUTOTRADE_BLACKLIST_TTL_SECONDS", 86400) or 86400))
+        ttl = max(300, ttl)
+        self._blacklist[key] = {
+            "reason": str(reason or "blacklisted"),
+            "added_ts": now_ts,
+            "until_ts": now_ts + ttl,
+        }
+        self._blacklist_prune()
+        self._save_blacklist()
 
     def _apply_startup_reset(self) -> None:
         if self.open_positions:
@@ -121,24 +220,130 @@ class AutoTrader:
             return False
         if self._is_live_mode() and self.live_executor is None:
             return False
-        min_available = max(0.1, float(config.AUTO_STOP_MIN_AVAILABLE_USD))
-        available = self._available_balance_usd()
-        if available < min_available:
-            now_ts = datetime.now(timezone.utc).timestamp()
-            if now_ts - self._last_guard_log_ts >= 30:
-                self._last_guard_log_ts = now_ts
-                logger.warning(
-                    "KILL_SWITCH reason=LOW_BALANCE_GUARD available=$%.2f min=$%.2f open=%s",
-                    available,
-                    min_available,
-                    len(self.open_positions),
-                )
-            return False
+        if bool(getattr(config, "LOW_BALANCE_GUARD_ENABLED", True)):
+            min_available = max(0.1, float(config.AUTO_STOP_MIN_AVAILABLE_USD))
+            available = self._available_balance_usd()
+            if available < min_available:
+                now_ts = datetime.now(timezone.utc).timestamp()
+                if now_ts - self._last_guard_log_ts >= 30:
+                    self._last_guard_log_ts = now_ts
+                    logger.warning(
+                        "KILL_SWITCH reason=LOW_BALANCE_GUARD available=$%.2f min=$%.2f open=%s",
+                        available,
+                        min_available,
+                        len(self.open_positions),
+                    )
+                return False
         return True
+
+    def _cannot_open_trade_detail(self) -> str:
+        # Keep this in sync with can_open_trade() so "disabled_or_limits" logs
+        # tell the operator exactly which guard/limit is active.
+        self._refresh_daily_window()
+        self.trading_pause_until_ts = 0.0
+        if self.emergency_halt_reason:
+            return f"emergency_halt:{self.emergency_halt_reason}"
+        if self._kill_switch_active():
+            return "kill_switch_file"
+
+        self._prune_hourly_window()
+        max_trades_per_hour = int(config.MAX_TRADES_PER_HOUR)
+        if max_trades_per_hour > 0 and len(self.trade_open_timestamps) >= max_trades_per_hour:
+            return f"max_trades_per_hour {len(self.trade_open_timestamps)}/{max_trades_per_hour}"
+
+        max_open = int(config.MAX_OPEN_TRADES)
+        if max_open > 0 and len(self.open_positions) >= max_open:
+            return f"max_open_trades {len(self.open_positions)}/{max_open}"
+
+        if not config.AUTO_TRADE_ENABLED:
+            return "AUTO_TRADE_ENABLED=false"
+
+        if self._is_live_mode() and self.live_executor is None:
+            return "live_executor_unavailable"
+
+        if bool(getattr(config, "LOW_BALANCE_GUARD_ENABLED", True)):
+            min_available = max(0.1, float(config.AUTO_STOP_MIN_AVAILABLE_USD))
+            available = self._available_balance_usd()
+            if available < min_available:
+                return f"low_balance_guard available=${available:.2f} min=${min_available:.2f}"
+
+        return "unknown"
 
     @staticmethod
     def _is_live_mode() -> bool:
         return bool(config.AUTO_TRADE_ENABLED) and not bool(config.AUTO_TRADE_PAPER)
+
+    @staticmethod
+    def _short_error_text(value: Any, limit: int = 140) -> str:
+        text = str(value or "").replace("\n", " ").replace("\r", " ").strip()
+        if len(text) <= limit:
+            return text
+        return f"{text[:limit]}..."
+
+    @staticmethod
+    def _quality_size_multiplier(
+        score: int,
+        liquidity_usd: float,
+        volume_5m: float,
+        price_change_5m: float,
+    ) -> tuple[float, str]:
+        """
+        Conservative sizing multiplier to reduce exposure on weak/unstable tokens.
+        Returns (multiplier, detail_string).
+        """
+        # Score factor: reward high score slightly, punish low score more.
+        s = int(score)
+        if s >= 90:
+            score_mult = 1.15
+        elif s >= 80:
+            score_mult = 1.08
+        elif s >= 70:
+            score_mult = 1.00
+        elif s >= 60:
+            score_mult = 0.85
+        else:
+            score_mult = 0.70
+
+        liq = float(liquidity_usd or 0.0)
+        if liq >= 250_000:
+            liq_mult = 1.15
+        elif liq >= 100_000:
+            liq_mult = 1.08
+        elif liq >= 25_000:
+            liq_mult = 1.00
+        elif liq >= 15_000:
+            liq_mult = 0.90
+        else:
+            liq_mult = 0.75
+
+        vol = float(volume_5m or 0.0)
+        if vol >= 50_000:
+            vol_mult = 1.10
+        elif vol >= 10_000:
+            vol_mult = 1.05
+        elif vol >= 3_000:
+            vol_mult = 1.00
+        elif vol >= 1_500:
+            vol_mult = 0.90
+        else:
+            vol_mult = 0.80
+
+        chg = abs(float(price_change_5m or 0.0))
+        if chg >= 35:
+            volat_mult = 0.75
+        elif chg >= 25:
+            volat_mult = 0.85
+        elif chg >= 15:
+            volat_mult = 0.95
+        elif chg <= 5:
+            volat_mult = 1.05
+        else:
+            volat_mult = 1.00
+
+        mult = float(score_mult * liq_mult * vol_mult * volat_mult)
+        mult = max(0.25, min(1.35, mult))
+        detail = f"score={score_mult:.2f} liq={liq_mult:.2f} vol={vol_mult:.2f} volat={volat_mult:.2f}"
+        return mult, detail
 
     @staticmethod
     def _current_day_id() -> str:
@@ -167,9 +372,22 @@ class AutoTrader:
         self.trade_open_timestamps = [ts for ts in self.trade_open_timestamps if (now_ts - ts) <= 3600]
 
     def _equity_usd(self) -> float:
-        return self.paper_balance_usd + sum(
-            pos.position_size_usd + pos.pnl_usd for pos in self.open_positions.values()
-        )
+        # In live mode, sizing/risk caps should be based on real on-chain wallet balance,
+        # not the persisted paper_state.json balance (which can be stale and cause tiny caps).
+        if self._is_live_mode() and self.live_executor is not None:
+            try:
+                balance_eth = float(self.live_executor.native_balance_eth())
+                price_usd = float(self.last_weth_price_usd or 0.0)
+                if price_usd <= 100.0:
+                    price_usd = float(getattr(config, "WETH_PRICE_FALLBACK_USD", 0.0) or 0.0)
+                if price_usd <= 0.0:
+                    price_usd = 1.0
+                return max(0.0, balance_eth * price_usd)
+            except Exception:
+                # Fall back to paper equity calculation below.
+                pass
+
+        return self.paper_balance_usd + sum(pos.position_size_usd + pos.pnl_usd for pos in self.open_positions.values())
 
     def _available_balance_usd(self) -> float:
         if self._is_live_mode():
@@ -177,7 +395,13 @@ class AutoTrader:
                 return 0.0
             try:
                 balance_eth = float(self.live_executor.native_balance_eth())
-                return max(0.0, (balance_eth * max(1.0, float(self.last_weth_price_usd))) - self._stair_reserved_usd())
+                # On startup we might not have market data yet. Using 1.0 here causes "low_balance" skips forever.
+                price_usd = float(self.last_weth_price_usd or 0.0)
+                if price_usd <= 100.0:
+                    price_usd = float(getattr(config, "WETH_PRICE_FALLBACK_USD", 0.0) or 0.0)
+                if price_usd <= 0:
+                    price_usd = 1.0
+                return max(0.0, (balance_eth * price_usd) - self._stair_reserved_usd())
             except Exception:
                 return 0.0
         reserved = self._stair_reserved_usd()
@@ -187,6 +411,94 @@ class AutoTrader:
             available -= gas_buffer
         return max(0.0, available)
 
+    def _honeypot_cache_get(self, token_address: str) -> dict[str, Any] | None:
+        if not token_address:
+            return None
+        key = token_address.strip().lower()
+        now_ts = datetime.now(timezone.utc).timestamp()
+        ttl = int(config.HONEYPOT_API_CACHE_TTL_SECONDS)
+        row = self._honeypot_cache.get(key)
+        if not row:
+            return None
+        ts, payload = row
+        if (now_ts - float(ts)) > ttl:
+            self._honeypot_cache.pop(key, None)
+            return None
+        return payload
+
+    def _honeypot_cache_put(self, token_address: str, payload: dict[str, Any]) -> None:
+        if not token_address:
+            return
+        key = token_address.strip().lower()
+        self._honeypot_cache[key] = (datetime.now(timezone.utc).timestamp(), payload)
+
+    async def _honeypot_guard_passes(self, token_address: str) -> tuple[bool, str]:
+        if not config.HONEYPOT_API_ENABLED:
+            return True, "disabled"
+        if not config.HONEYPOT_API_URL:
+            return True, "no_url"
+
+        cached = self._honeypot_cache_get(token_address)
+        if cached is not None:
+            is_ok = bool(cached.get("ok", False))
+            return is_ok, str(cached.get("detail", "cached"))
+
+        url = config.HONEYPOT_API_URL
+        params = {
+            "address": token_address,
+            "chainID": int(config.LIVE_CHAIN_ID),
+        }
+        timeout = aiohttp.ClientTimeout(total=int(config.HONEYPOT_API_TIMEOUT_SECONDS))
+
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url, params=params) as response:
+                    if response.status != 200:
+                        detail = f"honeypot_api_status_{response.status}"
+                        ok = not bool(config.HONEYPOT_API_FAIL_CLOSED)
+                        self._honeypot_cache_put(token_address, {"ok": ok, "detail": detail})
+                        return ok, detail
+                    payload = await response.json()
+        except Exception as exc:
+            detail = f"honeypot_api_error:{exc}"
+            ok = not bool(config.HONEYPOT_API_FAIL_CLOSED)
+            self._honeypot_cache_put(token_address, {"ok": ok, "detail": detail})
+            return ok, detail
+
+        # Parse common honeypot.is fields. We keep it defensive because the response can change.
+        hp = payload if isinstance(payload, dict) else {}
+        is_honeypot = bool((hp.get("honeypotResult") or {}).get("isHoneypot", False))
+        simulation = hp.get("simulationResult") or {}
+        buy_tax = float(simulation.get("buyTax") or 0)
+        sell_tax = float(simulation.get("sellTax") or 0)
+        can_sell = simulation.get("canSell")
+        if can_sell is None:
+            # Some versions expose it under a different key.
+            can_sell = simulation.get("sellSuccess")
+        can_sell_bool = True if can_sell is None else bool(can_sell)
+
+        max_buy_tax = float(config.HONEYPOT_MAX_BUY_TAX_PERCENT)
+        max_sell_tax = float(config.HONEYPOT_MAX_SELL_TAX_PERCENT)
+
+        ok = True
+        reasons: list[str] = []
+        if is_honeypot:
+            ok = False
+            reasons.append("is_honeypot")
+        if not can_sell_bool:
+            ok = False
+            reasons.append("cannot_sell")
+        if max_buy_tax > 0 and buy_tax > max_buy_tax:
+            ok = False
+            reasons.append(f"buy_tax>{max_buy_tax:.1f}%({buy_tax:.1f}%)")
+        if max_sell_tax > 0 and sell_tax > max_sell_tax:
+            ok = False
+            reasons.append(f"sell_tax>{max_sell_tax:.1f}%({sell_tax:.1f}%)")
+
+        detail = ",".join(reasons) if reasons else f"ok buyTax={buy_tax:.1f}% sellTax={sell_tax:.1f}%"
+        self._honeypot_cache_put(token_address, {"ok": ok, "detail": detail, "buy_tax": buy_tax, "sell_tax": sell_tax})
+        return ok, detail
+
     @staticmethod
     def _stair_tradable_buffer_usd() -> float:
         configured = max(0.0, float(config.STAIR_STEP_TRADABLE_BUFFER_USD))
@@ -194,6 +506,9 @@ class AutoTrader:
         return max(configured, min_trade_with_gas)
 
     def _stair_reserved_usd(self) -> float:
+        # Stair-step reserve is a paper-account concept; never apply it to live wallet balance.
+        if self._is_live_mode():
+            return 0.0
         if not config.STAIR_STEP_ENABLED:
             return 0.0
         reserve_target = max(0.0, min(self.paper_balance_usd, self.stair_floor_usd))
@@ -245,6 +560,9 @@ class AutoTrader:
         if not candidates:
             return 0
 
+        if await self._check_live_profit_stop():
+            return 0
+
         # only BUY recommendations above configured threshold
         eligible = [
             (token, score)
@@ -259,7 +577,16 @@ class AutoTrader:
         if mode not in {"single", "all", "top_n"}:
             mode = "single"
 
-        eligible.sort(key=lambda item: int(item[1].get("score", 0)), reverse=True)
+        # Prefer the highest score, but break ties by liquidity/volume to avoid selecting thin pools
+        # when multiple candidates have similar scores.
+        eligible.sort(
+            key=lambda item: (
+                int(item[1].get("score", 0)),
+                float(item[0].get("liquidity") or 0),
+                float(item[0].get("volume_5m") or 0),
+            ),
+            reverse=True,
+        )
         if mode == "single":
             selected = eligible[:1]
         elif mode == "top_n":
@@ -282,10 +609,61 @@ class AutoTrader:
         )
         return opened
 
+    async def _check_live_profit_stop(self) -> bool:
+        target = float(getattr(config, "LIVE_STOP_AFTER_PROFIT_USD", 0.0) or 0.0)
+        if target <= 0:
+            return False
+        if not self._is_live_mode() or self.live_executor is None:
+            return False
+
+        # Initialize baseline when missing.
+        if self.live_start_ts <= 0 or self.live_start_balance_usd <= 0:
+            try:
+                bal_eth = float(self.live_executor.native_balance_eth())
+            except Exception:
+                bal_eth = 0.0
+            weth_price = await self._resolve_weth_price_usd({})
+            bal_usd = bal_eth * float(weth_price or 0.0)
+            self.live_start_ts = datetime.now(timezone.utc).timestamp()
+            self.live_start_balance_eth = float(bal_eth)
+            self.live_start_balance_usd = float(bal_usd)
+            self._save_state()
+            logger.info(
+                "LIVE_SESSION baseline set eth=%.8f usd=%.2f target_profit=$%.2f",
+                self.live_start_balance_eth,
+                self.live_start_balance_usd,
+                target,
+            )
+
+        if self.live_start_balance_usd <= 0:
+            return False
+
+        try:
+            cur_eth = float(self.live_executor.native_balance_eth())
+        except Exception:
+            return False
+        weth_price = await self._resolve_weth_price_usd({})
+        cur_usd = cur_eth * float(weth_price or 0.0)
+        profit = cur_usd - float(self.live_start_balance_usd)
+        if profit >= target:
+            self._activate_emergency_halt(
+                "LIVE_PROFIT_TARGET",
+                f"profit_usd=${profit:.2f} target=${target:.2f} start=${self.live_start_balance_usd:.2f} cur=${cur_usd:.2f}",
+            )
+            logger.warning(
+                "LIVE_PROFIT_TARGET hit profit=$%.2f target=$%.2f start=$%.2f cur=$%.2f",
+                profit,
+                target,
+                self.live_start_balance_usd,
+                cur_usd,
+            )
+            return True
+        return False
+
     async def plan_trade(self, token_data: dict[str, Any], score_data: dict[str, Any]) -> PaperPosition | None:
         symbol = str(token_data.get("symbol", "N/A"))
         if not self.can_open_trade():
-            logger.info("AutoTrade skip token=%s reason=disabled_or_limits", symbol)
+            logger.info("AutoTrade skip token=%s reason=disabled_or_limits detail=%s", symbol, self._cannot_open_trade_detail())
             return None
         if self._kill_switch_active():
             logger.warning("KILL_SWITCH active path=%s", config.KILL_SWITCH_FILE)
@@ -303,6 +681,10 @@ class AutoTrader:
             return None
 
         token_address = str(token_data.get("address", "")).strip()
+        blocked, blk_reason = self._blacklist_is_blocked(token_address)
+        if blocked:
+            logger.info("AutoTrade skip token=%s reason=blacklist detail=%s", symbol, self._short_error_text(blk_reason))
+            return None
         if not token_address or token_address in self.open_positions:
             logger.info("AutoTrade skip token=%s reason=address_or_duplicate", symbol)
             return None
@@ -332,16 +714,19 @@ class AutoTrader:
             return None
         cost_profile = self._estimate_cost_profile(liquidity_usd, risk_level, score)
         expected_edge_percent = self._estimate_edge_percent(score, tp, sl, cost_profile["total_percent"], risk_level)
-        if config.EDGE_FILTER_ENABLED and expected_edge_percent < float(config.MIN_EXPECTED_EDGE_PERCENT):
-            logger.info(
-                "AutoTrade skip token=%s reason=negative_edge edge=%.2f cost=%.2f",
-                symbol,
-                expected_edge_percent,
-                cost_profile["total_percent"],
-            )
-            return None
 
         position_size_usd = self._choose_position_size(expected_edge_percent)
+        if bool(getattr(config, "POSITION_SIZE_QUALITY_ENABLED", True)):
+            mult, mult_detail = self._quality_size_multiplier(
+                score=score,
+                liquidity_usd=liquidity_usd,
+                volume_5m=volume_5m,
+                price_change_5m=price_change_5m,
+            )
+            position_size_usd *= float(mult)
+        else:
+            mult, mult_detail = 1.0, "off"
+
         position_size_usd = min(position_size_usd, self._available_balance_usd())
         position_size_usd = self._apply_max_loss_per_trade_cap(
             position_size_usd=position_size_usd,
@@ -360,6 +745,67 @@ class AutoTrader:
         if position_size_usd < 0.1:
             logger.info("AutoTrade skip token=%s reason=low_balance", symbol)
             return None
+
+        expected_edge_usd = float(position_size_usd) * float(expected_edge_percent) / 100.0
+        if config.EDGE_FILTER_ENABLED:
+            mode = str(getattr(config, "EDGE_FILTER_MODE", "usd") or "usd").strip().lower()
+            min_edge_pct = float(getattr(config, "MIN_EXPECTED_EDGE_PERCENT", 0.0) or 0.0)
+            min_edge_usd = float(getattr(config, "MIN_EXPECTED_EDGE_USD", 0.0) or 0.0)
+            pct_ok = expected_edge_percent >= float(min_edge_pct)
+            usd_ok = expected_edge_usd >= float(min_edge_usd)
+            if mode == "percent" and not pct_ok:
+                logger.info(
+                    "AutoTrade skip token=%s reason=negative_edge edge=%.2f%% min=%.2f%% edge_usd=$%.3f size=$%.2f costs=%.2f%%",
+                    symbol,
+                    expected_edge_percent,
+                    min_edge_pct,
+                    expected_edge_usd,
+                    position_size_usd,
+                    cost_profile["total_percent"],
+                )
+                return None
+            if mode == "usd" and not usd_ok:
+                logger.info(
+                    "AutoTrade skip token=%s reason=edge_usd_low edge_usd=$%.3f min=$%.3f edge=%.2f%% size=$%.2f costs=%.2f%%",
+                    symbol,
+                    expected_edge_usd,
+                    min_edge_usd,
+                    expected_edge_percent,
+                    position_size_usd,
+                    cost_profile["total_percent"],
+                )
+                return None
+            if mode == "both" and not (pct_ok and usd_ok):
+                logger.info(
+                    "AutoTrade skip token=%s reason=edge_low mode=both edge=%.2f%% min=%.2f%% edge_usd=$%.3f min_usd=$%.3f size=$%.2f costs=%.2f%%",
+                    symbol,
+                    expected_edge_percent,
+                    min_edge_pct,
+                    expected_edge_usd,
+                    min_edge_usd,
+                    position_size_usd,
+                    cost_profile["total_percent"],
+                )
+                return None
+
+        breakdown = score_data.get("breakdown") if isinstance(score_data.get("breakdown"), dict) else {}
+        logger.info(
+            "AUTO_DECISION token=%s score=%s src=%s liq=%.0f vol5m=%.0f chg5m=%.2f%% edge=%.2f%% edge_usd=$%.3f size=$%.2f mult=%.2f(%s) costs=%.2f%% gas=$%.3f breakdown=%s",
+            symbol,
+            score,
+            str(token_data.get("source", "-")),
+            liquidity_usd,
+            volume_5m,
+            price_change_5m,
+            expected_edge_percent,
+            expected_edge_usd,
+            position_size_usd,
+            float(mult),
+            str(mult_detail),
+            float(cost_profile["total_percent"]),
+            float(cost_profile["gas_usd"]),
+            breakdown,
+        )
         max_hold_seconds = self._choose_hold_seconds(
             score=score,
             risk_level=risk_level,
@@ -377,13 +823,105 @@ class AutoTrader:
                 logger.info("AutoTrade skip token=%s reason=no_weth_price", symbol)
                 return None
             spend_eth = position_size_usd / weth_price_usd
+            # Ensure we keep enough native ETH for gas so we can still SELL/approve later.
+            try:
+                reserve_eth = float(getattr(config, "LIVE_MIN_GAS_RESERVE_ETH", 0.0) or 0.0)
+            except Exception:
+                reserve_eth = 0.0
+            if reserve_eth > 0:
+                try:
+                    bal_eth = float(self.live_executor.native_balance_eth())
+                    if (bal_eth - float(spend_eth)) < reserve_eth:
+                        logger.info(
+                            "AutoTrade skip token=%s reason=gas_reserve balance_eth=%.6f spend_eth=%.6f reserve_eth=%.6f",
+                            symbol,
+                            bal_eth,
+                            float(spend_eth),
+                            reserve_eth,
+                        )
+                        return None
+                except Exception:
+                    pass
+            route_ok, route_reason = await asyncio.to_thread(
+                self.live_executor.is_buy_route_supported,
+                token_address,
+                spend_eth,
+            )
+            if not route_ok:
+                dex = str(token_data.get("dex", "unknown"))
+                labels = token_data.get("dex_labels") or []
+                labels_text = ",".join(str(x) for x in labels) if isinstance(labels, list) else str(labels)
+                logger.info(
+                    "AutoTrade skip token=%s reason=unsupported_live_route dex=%s labels=%s detail=%s",
+                    symbol,
+                    dex,
+                    labels_text or "-",
+                    self._short_error_text(route_reason),
+                )
+                self._blacklist_add(token_address, f"unsupported_buy_route:{self._short_error_text(route_reason)}")
+                return None
+            if bool(getattr(config, "LIVE_SELLABILITY_CHECK_ENABLED", True)):
+                amt_tokens = float(getattr(config, "LIVE_SELLABILITY_CHECK_AMOUNT_TOKENS", 1.0) or 1.0)
+                sell_ok, sell_reason = await asyncio.to_thread(
+                    self.live_executor.is_sell_route_supported,
+                    token_address,
+                    amt_tokens,
+                )
+                if not sell_ok:
+                    logger.info(
+                        "AutoTrade skip token=%s reason=unsellable_or_no_quote detail=%s",
+                        symbol,
+                        self._short_error_text(sell_reason),
+                    )
+                    self._blacklist_add(token_address, f"unsupported_sell_route:{self._short_error_text(sell_reason)}")
+                    return None
+            if bool(getattr(config, "LIVE_ROUNDTRIP_CHECK_ENABLED", True)):
+                ok, rt_reason, rt_ratio = await asyncio.to_thread(
+                    self.live_executor.roundtrip_quote,
+                    token_address,
+                    spend_eth,
+                )
+                if not ok:
+                    logger.info(
+                        "AutoTrade skip token=%s reason=roundtrip_quote_failed detail=%s",
+                        symbol,
+                        self._short_error_text(rt_reason),
+                    )
+                    self._blacklist_add(token_address, f"roundtrip_quote_failed:{self._short_error_text(rt_reason)}")
+                    return None
+                min_ratio = float(getattr(config, "LIVE_ROUNDTRIP_MIN_RETURN_RATIO", 0.70) or 0.70)
+                if float(rt_ratio) < float(min_ratio):
+                    logger.info(
+                        "AutoTrade skip token=%s reason=roundtrip_ratio ratio=%.3f min=%.3f",
+                        symbol,
+                        float(rt_ratio),
+                        float(min_ratio),
+                    )
+                    self._blacklist_add(token_address, f"roundtrip_ratio:{rt_ratio:.3f}")
+                    return None
+            hp_ok, hp_detail = await self._honeypot_guard_passes(token_address)
+            if not hp_ok:
+                logger.warning(
+                    "AutoTrade skip token=%s reason=honeypot_guard detail=%s",
+                    symbol,
+                    self._short_error_text(hp_detail),
+                )
+                self._blacklist_add(token_address, f"honeypot_guard:{self._short_error_text(hp_detail)}")
+                return None
             try:
                 buy_result = await asyncio.to_thread(self.live_executor.buy_token, token_address, spend_eth)
             except Exception as exc:
                 logger.error("AUTO_BUY live_failed token=%s err=%s", symbol, exc)
+                self._blacklist_add(token_address, f"live_buy_failed:{self._short_error_text(exc)}", ttl_seconds=6 * 3600)
                 return None
             if int(buy_result.token_amount_raw) <= 0:
-                logger.error("AUTO_BUY live_failed token=%s err=zero_token_amount", symbol)
+                logger.error(
+                    "AUTO_BUY live_failed token=%s err=zero_token_amount tx=%s spent_eth=%.8f",
+                    symbol,
+                    str(getattr(buy_result, "tx_hash", "")),
+                    float(getattr(buy_result, "spent_eth", 0.0) or 0.0),
+                )
+                self._blacklist_add(token_address, "live_buy_zero_amount", ttl_seconds=6 * 3600)
                 return None
             pos = PaperPosition(
                 token_address=token_address,
@@ -411,12 +949,16 @@ class AutoTrader:
             self.total_executed += 1
             self.trade_open_timestamps.append(datetime.now(timezone.utc).timestamp())
             logger.info(
-                "AUTO_BUY Live BUY token=%s address=%s spend=%.8f ETH score=%s edge=%.2f%% hold=%ss tx=%s",
+                "AUTO_BUY Live BUY token=%s address=%s spend=%.8f ETH score=%s edge=%.2f%% edge_usd=$%.3f size=$%.2f mult=%.2f(%s) hold=%ss tx=%s",
                 pos.symbol,
                 pos.token_address,
                 pos.spent_eth,
                 pos.score,
                 pos.expected_edge_percent,
+                float(pos.position_size_usd) * float(pos.expected_edge_percent) / 100.0,
+                float(pos.position_size_usd),
+                float(mult),
+                str(mult_detail),
                 pos.max_hold_seconds,
                 pos.buy_tx_hash,
             )
@@ -449,13 +991,16 @@ class AutoTrader:
         self.paper_balance_usd -= position_size_usd
 
         logger.info(
-            "AUTO_BUY Paper BUY token=%s address=%s entry=$%.8f size=$%.2f score=%s edge=%.2f%% hold=%ss costs=%.2f%% gas=$%.2f",
+            "AUTO_BUY Paper BUY token=%s address=%s entry=$%.8f size=$%.2f score=%s edge=%.2f%% edge_usd=$%.3f mult=%.2f(%s) hold=%ss costs=%.2f%% gas=$%.2f",
             pos.symbol,
             pos.token_address,
             pos.entry_price_usd,
             pos.position_size_usd,
             pos.score,
             pos.expected_edge_percent,
+            float(pos.position_size_usd) * float(pos.expected_edge_percent) / 100.0,
+            float(mult),
+            str(mult_detail),
             pos.max_hold_seconds,
             pos.buy_cost_percent + pos.sell_cost_percent,
             pos.gas_cost_usd,
@@ -586,15 +1131,20 @@ class AutoTrader:
         if self.emergency_halt_reason == "KILL_SWITCH_FILE":
             self._clear_emergency_halt("kill_switch_removed")
 
-        min_available = max(0.1, float(config.AUTO_STOP_MIN_AVAILABLE_USD))
-        available = self._available_balance_usd()
-        if available < min_available and not self.open_positions:
-            self._activate_emergency_halt(
-                "LOW_BALANCE_STOP",
-                f"available=${available:.2f} min=${min_available:.2f}",
-            )
-        elif self.emergency_halt_reason == "LOW_BALANCE_STOP" and available >= min_available:
-            self._clear_emergency_halt("balance_recovered")
+        # Optional "low balance stop" (separate from the open-trade guard).
+        if bool(getattr(config, "LOW_BALANCE_GUARD_ENABLED", True)):
+            min_available = max(0.1, float(config.AUTO_STOP_MIN_AVAILABLE_USD))
+            available = self._available_balance_usd()
+            if available < min_available and not self.open_positions:
+                self._activate_emergency_halt(
+                    "LOW_BALANCE_STOP",
+                    f"available=${available:.2f} min=${min_available:.2f}",
+                )
+            elif self.emergency_halt_reason == "LOW_BALANCE_STOP" and available >= min_available:
+                self._clear_emergency_halt("balance_recovered")
+        elif self.emergency_halt_reason == "LOW_BALANCE_STOP":
+            # If the feature gets disabled, clear the halt so trading can resume.
+            self._clear_emergency_halt("low_balance_stop_disabled")
 
     def _activate_emergency_halt(self, reason: str, detail: str = "") -> None:
         if self.emergency_halt_reason == reason:
@@ -641,6 +1191,43 @@ class AutoTrader:
         logger.warning("CRITICAL_AUTO_RESET close_all reason=%s closed=%s failed=%s", reason, closed, failed)
 
     async def _close_position_live(self, position: PaperPosition, reason: str) -> None:
+        def _abandon_live_position(abandon_reason: str, detail: str = "") -> None:
+            # WARNING: This does not execute an on-chain sell. It only updates the local state so
+            # the bot is not permanently blocked by an unsellable/stuck token.
+            position.status = "CLOSED"
+            position.close_reason = f"ABANDON:{abandon_reason}"
+            position.closed_at = datetime.now(timezone.utc)
+            position.pnl_usd = -float(position.position_size_usd)
+            position.pnl_percent = -100.0
+            position.sell_tx_hash = ""
+
+            self.open_positions.pop(position.token_address, None)
+            self.price_guard_pending.pop(position.token_address, None)
+            self.closed_positions.append(position)
+            self._prune_closed_positions()
+            self.total_closed += 1
+            self.total_losses += 1
+            self.current_loss_streak += 1
+            self.realized_pnl_usd += position.pnl_usd
+            self.day_realized_pnl_usd += position.pnl_usd
+
+            try:
+                self._blacklist_add(position.token_address, f"abandoned:{self._short_error_text(abandon_reason)}")
+            except Exception:
+                pass
+
+            # Clear halt so new entries are possible again.
+            if self.emergency_halt_reason:
+                self._clear_emergency_halt(f"abandoned_position:{self._short_error_text(abandon_reason)}")
+
+            logger.error(
+                "AUTO_SELL Live ABANDON token=%s reason=%s detail=%s",
+                position.symbol,
+                abandon_reason,
+                self._short_error_text(detail),
+            )
+            self._save_state()
+
         if self.live_executor is None:
             logger.error("AUTO_SELL live_failed token=%s reason=no_executor", position.symbol)
             self._live_sell_failures += 1
@@ -655,9 +1242,30 @@ class AutoTrader:
             )
         except Exception as exc:
             logger.error("AUTO_SELL live_failed token=%s reason=%s", position.symbol, exc)
+            # If we cannot even fund the gas for SELL, continuing to retry is pointless and can
+            # trap the session in a noisy loop. Fail closed into emergency halt.
+            txt = str(exc).lower()
+            if "insufficient funds for gas" in txt:
+                if bool(getattr(config, "LIVE_ABANDON_UNSELLABLE_POSITIONS", False)):
+                    _abandon_live_position("insufficient_funds_for_gas", str(exc))
+                else:
+                    self._activate_emergency_halt("LIVE_SELL_FAILED", "insufficient_funds_for_gas")
+                return
+            if bool(getattr(config, "LIVE_ABANDON_UNSELLABLE_POSITIONS", False)) and (
+                "execution reverted" in txt
+                or "quote_failed" in txt
+                or "no data" in txt
+                or "unsupported" in txt
+                or "gas_estimate_too_high" in txt
+            ):
+                _abandon_live_position("unsellable_or_reverted", str(exc))
+                return
             self._live_sell_failures += 1
             if self._live_sell_failures >= 3:
-                self._activate_emergency_halt("LIVE_SELL_FAILED", str(exc))
+                if bool(getattr(config, "LIVE_ABANDON_UNSELLABLE_POSITIONS", False)):
+                    _abandon_live_position("sell_failed_3x", str(exc))
+                else:
+                    self._activate_emergency_halt("LIVE_SELL_FAILED", str(exc))
             return
         self._live_sell_failures = 0
 
@@ -1109,6 +1717,9 @@ class AutoTrader:
                 "emergency_halt_ts": self.emergency_halt_ts,
                 "stair_floor_usd": self.stair_floor_usd,
                 "stair_peak_balance_usd": self.stair_peak_balance_usd,
+                "live_start_ts": self.live_start_ts,
+                "live_start_balance_eth": self.live_start_balance_eth,
+                "live_start_balance_usd": self.live_start_balance_usd,
                 "open_positions": [self._serialize_pos(p) for p in self.open_positions.values()],
                 "closed_positions": [self._serialize_pos(p) for p in self.closed_positions[-500:]],
             }
@@ -1160,6 +1771,9 @@ class AutoTrader:
             self.emergency_halt_ts = float(payload.get("emergency_halt_ts", 0.0) or 0.0)
             self.stair_floor_usd = float(payload.get("stair_floor_usd", self.stair_floor_usd))
             self.stair_peak_balance_usd = float(payload.get("stair_peak_balance_usd", self.paper_balance_usd))
+            self.live_start_ts = float(payload.get("live_start_ts", self.live_start_ts) or 0.0)
+            self.live_start_balance_eth = float(payload.get("live_start_balance_eth", self.live_start_balance_eth) or 0.0)
+            self.live_start_balance_usd = float(payload.get("live_start_balance_usd", self.live_start_balance_usd) or 0.0)
             self._prune_hourly_window()
 
             self.open_positions.clear()

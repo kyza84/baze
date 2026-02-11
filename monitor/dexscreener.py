@@ -280,6 +280,10 @@ class DexScreenerMonitor:
                         chain=CHAIN_NAME,
                         token_address=address,
                     ),
+                    "source": "geckoterminal",
+                    "dex": str(attrs.get("dex_id") or attrs.get("dex_name") or "geckoterminal").lower(),
+                    "dex_labels": [],
+                    "pair_address": str(attrs.get("address") or pool.get("id") or ""),
                     "created_at": created_at,
                     "age_seconds": age_seconds,
                     "age_minutes": int(round(age_seconds / 60)),
@@ -309,6 +313,10 @@ class DexScreenerMonitor:
         volume_5m = float((pair.get("volume") or {}).get("m5") or 0)
         price_change_5m = float((pair.get("priceChange") or {}).get("m5") or 0)
         price_usd = float(pair.get("priceUsd") or 0)
+        dex_id = str(pair.get("dexId") or "").lower()
+        pair_address = str(pair.get("pairAddress") or "")
+        dex_labels_raw = pair.get("labels") or []
+        dex_labels = [str(label) for label in dex_labels_raw] if isinstance(dex_labels_raw, list) else []
 
         address = base.get("address", "")
         dexscreener_url = pair.get("url") or DEXSCREENER_TOKEN_URL_TEMPLATE.format(
@@ -328,6 +336,10 @@ class DexScreenerMonitor:
             "price_change_5m": price_change_5m,
             "price_usd": price_usd,
             "dexscreener_url": dexscreener_url,
+            "source": "dexscreener",
+            "dex": dex_id,
+            "dex_labels": dex_labels,
+            "pair_address": pair_address,
             "created_at": created_at,
             "age_seconds": max(0, int(token_age_seconds)),
             "age_minutes": max(0, int(round(token_age_seconds / 60))),

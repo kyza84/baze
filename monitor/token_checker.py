@@ -5,6 +5,7 @@ from typing import Any
 import aiohttp
 
 from config import CHAIN_ID, EVM_CHAIN_ID, GOPLUS_ACCESS_TOKEN, GOPLUS_EVM_API, GOPLUS_SOLANA_API
+import config
 
 
 class TokenChecker:
@@ -12,6 +13,17 @@ class TokenChecker:
         api_result = await self._check_with_goplus(token_address)
         if api_result:
             return api_result
+
+        # Stability-first mode: if we cannot validate safety with an external API, do not trade.
+        if bool(getattr(config, "TOKEN_SAFETY_FAIL_CLOSED", False)):
+            return {
+                "token_address": token_address,
+                "is_safe": False,
+                "risk_level": "HIGH",
+                "warnings": ["Safety API unavailable (fail-closed)"],
+                "warning_flags": 1,
+                "source": "fail_closed",
+            }
 
         # Fallback placeholder logic if external API is unavailable.
         warnings: list[str] = []

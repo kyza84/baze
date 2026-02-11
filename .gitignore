@@ -33,5 +33,7 @@ Thumbs.db
 
 # Runtime files
 bot.pid
+launcher_gui.lock
+main_local.lock
 trading/paper_state.json
 data/

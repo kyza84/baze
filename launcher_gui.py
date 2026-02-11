@@ -7,9 +7,34 @@ import re
 import subprocess
 import tkinter as tk
 import ctypes
+import threading
 from datetime import datetime, timezone
 import json
+import ssl
+import urllib.request
 from tkinter import messagebox, ttk
+
+try:
+    import msvcrt  # Windows-only, used for a robust single-instance file lock.
+except Exception:  # pragma: no cover
+    msvcrt = None  # type: ignore[assignment]
+
+try:
+    from web3 import HTTPProvider, Web3
+except Exception:  # pragma: no cover
+    HTTPProvider = None  # type: ignore[assignment]
+    Web3 = None  # type: ignore[assignment]
+
+def _fix_mojibake(text: str) -> str:
+    """Fix UTF-8 bytes that were mistakenly decoded as latin-1 (common Ð...Ñ... mojibake)."""
+    if not isinstance(text, str):
+        return str(text)
+    if "Ð" not in text and "Ñ" not in text:
+        return text
+    try:
+        return text.encode("latin1").decode("utf-8")
+    except Exception:
+        return text
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 PYTHON_PATH = os.path.join(PROJECT_ROOT, ".venv", "Scripts", "python.exe")
@@ -25,6 +50,7 @@ WALLET_MODE_KEY = "WALLET_MODE"
 LIVE_WALLET_BALANCE_KEY = "LIVE_WALLET_BALANCE_USD"
 STAIR_STEP_ENABLED_KEY = "STAIR_STEP_ENABLED"
 GUI_MUTEX_NAME = "Global\\solana_alert_bot_launcher_gui_single_instance"
+LIVE_BALANCE_POLL_SECONDS = 12
 
 EVENT_KEYS = {
     "BUY": ("Paper BUY", "#67e8f9"),
@@ -73,7 +99,7 @@ SELL_RE = re.compile(
 )
 PAIR_SOURCE_RE = re.compile(r"PAIR_DETECTED source=(?P<source>[a-zA-Z0-9_:-]+)")
 
-SETTINGS_FIELDS = [
+SETTINGS_FIELDS_RAW = [
     ("PERSONAL_MODE", "Личный режим"),
     ("PERSONAL_TELEGRAM_ID", "Telegram ID"),
     ("MIN_TOKEN_SCORE", "Мин. скор"),
@@ -129,6 +155,7 @@ SETTINGS_FIELDS = [
     ("STAIR_STEP_TRADABLE_BUFFER_USD", "Step tradable buffer $"),
     ("AUTO_STOP_MIN_AVAILABLE_USD", "Stop min available $"),
 ]
+SETTINGS_FIELDS = [(k, _fix_mojibake(v)) for (k, v) in SETTINGS_FIELDS_RAW]
 
 FIELD_OPTIONS = {
     "PERSONAL_MODE": ["true", "false"],
@@ -290,25 +317,63 @@ def stop_bot() -> tuple[bool, str]:
 class GuiInstanceLock:
     def __init__(self) -> None:
         self._handle = None
+        self._lock_fh = None
         self.acquired = False
         self._lock_file = os.path.join(PROJECT_ROOT, "launcher_gui.lock")
 
-    def acquire(self) -> bool:
-        if os.name != "nt":
-            try:
-                fd = os.open(self._lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                with os.fdopen(fd, "w", encoding="ascii") as f:
-                    f.write(str(os.getpid()))
-            except FileExistsError:
-                return False
-            self.acquired = True
-            return True
+    def _acquire_lock_file(self) -> bool:
+        # Keep the file handle open for the lifetime of the process.
+        os.makedirs(os.path.dirname(self._lock_file), exist_ok=True)
+        try:
+            fh = open(self._lock_file, "a+b")
+        except OSError:
+            return False
 
-        kernel32 = ctypes.windll.kernel32
+        try:
+            # Ensure there is at least 1 byte to lock.
+            fh.seek(0, os.SEEK_END)
+            if fh.tell() == 0:
+                fh.write(b"1")
+                fh.flush()
+            fh.seek(0)
+
+            if os.name == "nt" and msvcrt is not None:
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                # Best-effort fallback (non-Windows): no locking available here.
+                pass
+
+            # Human-friendly: store the PID in the lock file (lock is still held via the open file handle).
+            try:
+                fh.seek(0)
+                fh.truncate(0)
+                fh.write(f"{os.getpid()}\n".encode("ascii", errors="ignore"))
+                fh.flush()
+                fh.seek(0)
+            except Exception:
+                pass
+        except OSError:
+            try:
+                fh.close()
+            except Exception:
+                pass
+            return False
+
+        self._lock_fh = fh
+        return True
+
+    def acquire(self) -> bool:
+        # Prefer a real file lock: robust across admin/non-admin tokens, no PID reuse issues.
+        if not self._acquire_lock_file():
+            return False
+
+        # NOTE: When using ctypes, prefer get_last_error() with use_last_error=True.
+        # Calling kernel32.GetLastError() directly is unreliable here and can fail to detect duplicates.
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         mutex = kernel32.CreateMutexW(None, False, GUI_MUTEX_NAME)
         if not mutex:
             return False
-        if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+        if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
             kernel32.CloseHandle(mutex)
             return False
         self._handle = mutex
@@ -318,13 +383,18 @@ class GuiInstanceLock:
     def release(self) -> None:
         if not self.acquired:
             return
-        if os.name != "nt":
+        if self._lock_fh is not None:
             try:
-                os.remove(self._lock_file)
-            except OSError:
+                if os.name == "nt" and msvcrt is not None:
+                    self._lock_fh.seek(0)
+                    msvcrt.locking(self._lock_fh.fileno(), msvcrt.LK_UNLCK, 1)
+            except Exception:
                 pass
-            self.acquired = False
-            return
+            try:
+                self._lock_fh.close()
+            except Exception:
+                pass
+            self._lock_fh = None
         if self._handle:
             ctypes.windll.kernel32.CloseHandle(self._handle)
             self._handle = None
@@ -467,6 +537,12 @@ class App(tk.Tk):
 
         self.after(200, self.refresh)
         self.after(2200, self.auto_refresh)
+        self._live_wallet_eth = 0.0
+        self._live_wallet_usd = 0.0
+        self._live_wallet_last_ts = 0.0
+        self._live_wallet_last_err = ""
+        self._live_wallet_polling = False
+        self.after(800, self._schedule_live_wallet_poll)
 
     def _configure_theme(self) -> None:
         style = ttk.Style(self)
@@ -535,6 +611,7 @@ class App(tk.Tk):
         ttk.Button(right, text="Сохранить", command=self._save_settings).pack(side=tk.LEFT, padx=4)
         ttk.Button(right, text="Сохранить + Рестарт", command=self._save_restart).pack(side=tk.LEFT, padx=4)
         ttk.Button(right, text="Рестарт", command=self.on_restart).pack(side=tk.LEFT, padx=4)
+        ttk.Button(right, text="Перечитать .env", command=self.on_reload_env).pack(side=tk.LEFT, padx=4)
         ttk.Button(right, text="Очистить логи", command=self.on_clear_logs).pack(side=tk.LEFT, padx=4)
         ttk.Button(right, text="Обновить", command=self.refresh).pack(side=tk.LEFT, padx=4)
 
@@ -679,13 +756,11 @@ class App(tk.Tk):
         presets = ttk.Frame(self.settings_content, style="Card.TFrame")
         presets.pack(fill=tk.X, pady=(0, 10))
         ttk.Label(presets, text="Быстрые пресеты:", foreground="#93c5fd").pack(side=tk.LEFT)
-        ttk.Button(presets, text="\u0421\u0443\u043f\u0435\u0440 \u0431\u0435\u0437\u043e\u043f\u0430\u0441\u043d\u044b\u0439", command=self._apply_super_safe_preset).pack(side=tk.LEFT, padx=6)
-        ttk.Button(presets, text="Medium", command=self._apply_medium_preset).pack(side=tk.LEFT, padx=6)
-        ttk.Button(presets, text="Hard", command=self._apply_hard_preset).pack(side=tk.LEFT)
-        ttk.Button(presets, text="Hard Lite", command=self._apply_hard_lite_preset).pack(side=tk.LEFT, padx=6)
         ttk.Button(presets, text="Safe Flow", command=self._apply_safe_flow_preset).pack(side=tk.LEFT, padx=6)
         ttk.Button(presets, text="Medium Flow", command=self._apply_medium_flow_preset).pack(side=tk.LEFT, padx=6)
         ttk.Button(presets, text="Live Wallet", command=self._apply_live_wallet_preset).pack(side=tk.LEFT, padx=6)
+        ttk.Button(presets, text="Ultra Safe Live", command=self._apply_ultra_safe_live_preset).pack(side=tk.LEFT, padx=6)
+        ttk.Button(presets, text="Working Live", command=self._apply_working_live_preset).pack(side=tk.LEFT, padx=6)
 
         grid = ttk.Frame(self.settings_content, style="Card.TFrame")
         grid.pack(fill=tk.X)
@@ -734,6 +809,8 @@ class App(tk.Tk):
         ttk.Label(top, text="Wallet Center", font=("Segoe UI Semibold", 12)).pack(anchor="w")
         self.wallet_summary_var = tk.StringVar(value="No wallet data yet.")
         ttk.Label(top, textvariable=self.wallet_summary_var, foreground="#93c5fd").pack(anchor="w", pady=(4, 0))
+        self.live_onchain_var = tk.StringVar(value="Live on-chain: (not checked yet)")
+        ttk.Label(top, textvariable=self.live_onchain_var, foreground="#a7f3d0").pack(anchor="w", pady=(4, 0))
 
         grid = ttk.Frame(self.wallet_tab, style="Card.TFrame")
         grid.pack(fill=tk.X, pady=(6, 0))
@@ -821,6 +898,7 @@ class App(tk.Tk):
         ttk.Button(actions, text="Критический сброс", command=self.on_critical_reset).pack(side=tk.LEFT, padx=8)
         ttk.Button(actions, text="Signal Check", command=self.on_signal_check).pack(side=tk.LEFT, padx=8)
         ttk.Button(actions, text="Очистить логи", command=self.on_clear_logs).pack(side=tk.LEFT, padx=8)
+        ttk.Button(actions, text="Очистить GUI", command=self.on_clear_gui).pack(side=tk.LEFT, padx=8)
 
         self.critical_text = tk.Text(
             self.emergency_tab,
@@ -1325,6 +1403,177 @@ class App(tk.Tk):
         if hasattr(self, "hint_var"):
             self.hint_var.set("Live Wallet preset applied (live profile + paper execution until live executor is enabled).")
 
+    def _apply_ultra_safe_live_preset(self) -> None:
+        env_map = read_env_map()
+
+        # Prefer the most recent on-chain poll (non-blocking). If not available yet, fall back to .env value.
+        live_eth = 0.0
+        if float(getattr(self, "_live_wallet_last_ts", 0.0) or 0.0) > 0:
+            live_eth = float(getattr(self, "_live_wallet_eth", 0.0) or 0.0)
+
+        price_usd = self._to_float(env_map.get("WETH_PRICE_FALLBACK_USD"), 2000.0)
+        live_usd = (live_eth * price_usd) if live_eth > 0 else self._to_float(env_map.get(LIVE_WALLET_BALANCE_KEY), 0.0)
+
+        reserve_eth = self._to_float(env_map.get("LIVE_MIN_GAS_RESERVE_ETH"), 0.0007)
+        # If the wallet is tiny, make sure we don't reserve more than ~85% of the available ETH.
+        if live_eth > 0 and reserve_eth > (live_eth * 0.85):
+            reserve_eth = max(0.0002, live_eth * 0.65)
+
+        reserve_usd = reserve_eth * max(0.0, price_usd)
+        tradable_usd = max(0.0, live_usd - reserve_usd)
+
+        # Entry sizes are derived from the *tradable* portion of the wallet.
+        trade_max_usd = max(0.10, min(tradable_usd * 0.25, tradable_usd, 0.35))
+        trade_min_usd = max(0.10, min(trade_max_usd, tradable_usd * 0.10))
+
+        max_buy_eth = 0.0
+        if price_usd > 0:
+            max_buy_eth = (trade_max_usd / price_usd) * 1.05  # small headroom for rounding
+        if live_eth > 0:
+            max_buy_eth = min(max_buy_eth, max(0.0, live_eth - reserve_eth) * 0.90)
+        max_buy_eth = max(0.0, max_buy_eth)
+
+        stop_min_available_usd = max(0.10, reserve_usd + 0.10)
+
+        preset = {
+            "WALLET_MODE": "live",
+            "SIGNAL_SOURCE": "onchain",
+            "ONCHAIN_ENABLE_UNISWAP_V3": "true",
+            "ONCHAIN_PARALLEL_MARKET_SOURCES": "true",
+            "ONCHAIN_POLL_INTERVAL_SECONDS": "4",
+            "ONCHAIN_FINALITY_BLOCKS": "2",
+            "ONCHAIN_BLOCK_CHUNK": "300",
+            "AUTO_TRADE_ENABLED": "true",
+            "AUTO_TRADE_PAPER": "false",
+            "AUTO_FILTER_ENABLED": "true",
+            "AUTO_TRADE_ENTRY_MODE": "single",
+            "AUTO_TRADE_TOP_N": "1",
+            "MAX_OPEN_TRADES": "1",
+            "MAX_TRADES_PER_HOUR": "3",
+            "MIN_TOKEN_SCORE": "80",
+            "SAFE_TEST_MODE": "true",
+            "SAFE_MIN_LIQUIDITY_USD": "100000",
+            "SAFE_MIN_VOLUME_5M_USD": "8000",
+            "SAFE_MIN_AGE_SECONDS": "1800",
+            "SAFE_MAX_PRICE_CHANGE_5M_ABS_PERCENT": "15",
+            "SAFE_REQUIRE_CONTRACT_SAFE": "true",
+            "SAFE_REQUIRE_RISK_LEVEL": "LOW",
+            "SAFE_MAX_WARNING_FLAGS": "0",
+            "HONEYPOT_API_ENABLED": "true",
+            "HONEYPOT_API_FAIL_CLOSED": "true",
+            "HONEYPOT_MAX_BUY_TAX_PERCENT": "5",
+            "HONEYPOT_MAX_SELL_TAX_PERCENT": "5",
+            "TOKEN_SAFETY_FAIL_CLOSED": "true",
+            "LIVE_MAX_SWAP_GAS": "300000",
+            "LIVE_MIN_GAS_RESERVE_ETH": "0.00075",
+            "LIVE_ROUNDTRIP_CHECK_ENABLED": "true",
+            "LIVE_ROUNDTRIP_MIN_RETURN_RATIO": "0.80",
+            "DEX_BOOSTS_SOURCE_ENABLED": "false",
+            "PAPER_TRADE_SIZE_MIN_USD": f"{trade_min_usd:.2f}",
+            "PAPER_TRADE_SIZE_MAX_USD": f"{trade_max_usd:.2f}",
+            "MAX_BUY_AMOUNT": f"{max_buy_eth:.6f}" if max_buy_eth > 0 else "0",
+            "DYNAMIC_POSITION_SIZING_ENABLED": "true",
+            "EDGE_FILTER_ENABLED": "true",
+            "EDGE_FILTER_MODE": "percent",
+            "MIN_EXPECTED_EDGE_PERCENT": "10.0",
+            "PROFIT_TARGET_PERCENT": "12",
+            "STOP_LOSS_PERCENT": "7",
+            "PROFIT_LOCK_ENABLED": "true",
+            "PROFIT_LOCK_TRIGGER_PERCENT": "6",
+            "PROFIT_LOCK_FLOOR_PERCENT": "1",
+            "WEAKNESS_EXIT_ENABLED": "true",
+            "WEAKNESS_EXIT_MIN_AGE_PERCENT": "30",
+            "WEAKNESS_EXIT_PNL_PERCENT": "-3",
+            "MAX_TOKEN_COOLDOWN_SECONDS": "1200",
+            "DYNAMIC_HOLD_ENABLED": "true",
+            "HOLD_MIN_SECONDS": "90",
+            "HOLD_MAX_SECONDS": "600",
+            "PAPER_MAX_HOLD_SECONDS": "600",
+            "AUTO_STOP_MIN_AVAILABLE_USD": f"{stop_min_available_usd:.2f}",
+            "LIVE_STOP_AFTER_PROFIT_USD": "5.0",
+            "LIVE_SESSION_RESET_ON_START": "true",
+        }
+
+        # Keep GUI and .env in sync.
+        save_env_map(preset)
+        for k, v in preset.items():
+            if k in self.env_vars:
+                self.env_vars[k].set(v)
+
+        if hasattr(self, "wallet_mode_var"):
+            self.wallet_mode_var.set("live")
+        self._refresh_wallet()
+        if hasattr(self, "hint_var"):
+            self.hint_var.set(
+                f"Ultra Safe Live applied. Wallet~${live_usd:.2f}, tradable~${tradable_usd:.2f}, size ${trade_min_usd:.2f}-${trade_max_usd:.2f}."
+            )
+
+    def _apply_working_live_preset(self) -> None:
+        # "Working" profile: keeps core safety checks but allows more entries than Ultra Safe.
+        env_map = read_env_map()
+        live_usd = self._to_float(env_map.get(LIVE_WALLET_BALANCE_KEY), 0.0)
+        reserve_usd = self._to_float(env_map.get("AUTO_STOP_MIN_AVAILABLE_USD"), 0.25)
+        tradable_usd = max(0.0, live_usd - reserve_usd)
+        trade_max_usd = max(0.10, min(tradable_usd * 0.35, max(0.20, tradable_usd), 0.45))
+        trade_min_usd = max(0.10, min(trade_max_usd, max(0.10, tradable_usd * 0.15)))
+
+        preset = {
+            "WALLET_MODE": "live",
+            "AUTO_TRADE_ENABLED": "true",
+            "AUTO_TRADE_PAPER": "false",
+            "AUTO_TRADE_ENTRY_MODE": "single",
+            "AUTO_TRADE_TOP_N": "1",
+            "MAX_OPEN_TRADES": "1",
+            "MAX_TRADES_PER_HOUR": "3",
+            "MIN_TOKEN_SCORE": "75",
+            "SAFE_TEST_MODE": "true",
+            "SAFE_REQUIRE_CONTRACT_SAFE": "true",
+            "SAFE_REQUIRE_RISK_LEVEL": "LOW",
+            "SAFE_MAX_WARNING_FLAGS": "0",
+            "SAFE_MIN_LIQUIDITY_USD": "100000",
+            "SAFE_MIN_VOLUME_5M_USD": "5000",
+            "SAFE_MIN_AGE_SECONDS": "1800",
+            "SAFE_MAX_PRICE_CHANGE_5M_ABS_PERCENT": "15",
+            "EDGE_FILTER_ENABLED": "true",
+            "EDGE_FILTER_MODE": "percent",
+            "MIN_EXPECTED_EDGE_PERCENT": "10.0",
+            "LIVE_ROUNDTRIP_CHECK_ENABLED": "true",
+            "LIVE_ROUNDTRIP_MIN_RETURN_RATIO": "0.74",
+            "HONEYPOT_API_ENABLED": "true",
+            "HONEYPOT_API_FAIL_CLOSED": "true",
+            "TOKEN_SAFETY_FAIL_CLOSED": "true",
+            "LIVE_MIN_GAS_RESERVE_ETH": "0.00075",
+            "LIVE_MAX_SWAP_GAS": "300000",
+            "MAX_BUY_AMOUNT": "0.00020",
+            "PAPER_TRADE_SIZE_MIN_USD": f"{trade_min_usd:.2f}",
+            "PAPER_TRADE_SIZE_MAX_USD": f"{trade_max_usd:.2f}",
+            "PROFIT_TARGET_PERCENT": "12",
+            "STOP_LOSS_PERCENT": "7",
+            "PROFIT_LOCK_ENABLED": "true",
+            "PROFIT_LOCK_TRIGGER_PERCENT": "6",
+            "PROFIT_LOCK_FLOOR_PERCENT": "1",
+            "WEAKNESS_EXIT_ENABLED": "true",
+            "WEAKNESS_EXIT_MIN_AGE_PERCENT": "30",
+            "WEAKNESS_EXIT_PNL_PERCENT": "-3",
+            "MAX_TOKEN_COOLDOWN_SECONDS": "1200",
+            "HOLD_MIN_SECONDS": "90",
+            "HOLD_MAX_SECONDS": "600",
+            "PAPER_MAX_HOLD_SECONDS": "600",
+            "LIVE_STOP_AFTER_PROFIT_USD": "5.0",
+            "LIVE_SESSION_RESET_ON_START": "true",
+            "DEX_BOOSTS_SOURCE_ENABLED": "false",
+        }
+
+        save_env_map(preset)
+        for k, v in preset.items():
+            if k in self.env_vars:
+                self.env_vars[k].set(v)
+        if hasattr(self, "wallet_mode_var"):
+            self.wallet_mode_var.set("live")
+        self._refresh_wallet()
+        if hasattr(self, "hint_var"):
+            self.hint_var.set("Working Live applied. Safer core checks kept, entry flow widened moderately.")
+
     def _load_settings(self) -> None:
         env_map = read_env_map()
         for key, _ in SETTINGS_FIELDS:
@@ -1337,6 +1586,17 @@ class App(tk.Tk):
 
     def _save_settings(self) -> None:
         values = {k: v.get().strip() for k, v in self.env_vars.items()}
+        # Keep mode flags coherent. Bot's runtime decides "live" via:
+        # AUTO_TRADE_ENABLED && !AUTO_TRADE_PAPER.
+        try:
+            mode = str(self.wallet_mode_var.get()).strip().lower() if hasattr(self, "wallet_mode_var") else ""
+        except Exception:
+            mode = ""
+        if mode == "live":
+            # Prevent accidental paper flag re-enabling live and causing "AUTO_TRADE_ENABLED=false" confusion.
+            values["AUTO_TRADE_PAPER"] = "false"
+        elif mode == "paper":
+            values["AUTO_TRADE_PAPER"] = "true"
         try:
             save_env_map(values)
         except Exception as exc:
@@ -1660,6 +1920,84 @@ class App(tk.Tk):
             f"Открыто: {len(open_rows)} | Закрыто: {len(closed_rows)} | Побед/Поражений: {wins}/{losses} | Реализованный PnL: ${realized_pnl:+.2f}"
         )
 
+    def _schedule_live_wallet_poll(self) -> None:
+        # Keep UI responsive: RPC calls happen in a background thread.
+        if getattr(self, "_live_wallet_polling", False):
+            self.after(int(LIVE_BALANCE_POLL_SECONDS * 1000), self._schedule_live_wallet_poll)
+            return
+
+        env_map = read_env_map()
+        address = str(env_map.get("LIVE_WALLET_ADDRESS", "") or "").strip()
+        rpc_primary = str(env_map.get("RPC_PRIMARY", "") or "").strip()
+        rpc_secondary = str(env_map.get("RPC_SECONDARY", "") or "").strip()
+        rpc_urls = [u for u in (rpc_primary, rpc_secondary) if u]
+
+        if not address:
+            self._live_wallet_last_err = "no_live_wallet_address"
+            self._live_wallet_last_ts = 0.0
+            self.after(int(LIVE_BALANCE_POLL_SECONDS * 1000), self._schedule_live_wallet_poll)
+            return
+        if Web3 is None or HTTPProvider is None:
+            self._live_wallet_last_err = "web3_not_available"
+            self._live_wallet_last_ts = 0.0
+            self.after(int(LIVE_BALANCE_POLL_SECONDS * 1000), self._schedule_live_wallet_poll)
+            return
+        if not rpc_urls:
+            self._live_wallet_last_err = "no_rpc_configured"
+            self._live_wallet_last_ts = 0.0
+            self.after(int(LIVE_BALANCE_POLL_SECONDS * 1000), self._schedule_live_wallet_poll)
+            return
+
+        try:
+            weth_price = float(env_map.get("WETH_PRICE_FALLBACK_USD", "0") or 0)
+        except Exception:
+            weth_price = 0.0
+
+        self._live_wallet_polling = True
+        threading.Thread(
+            target=self._poll_live_wallet_worker,
+            args=(address, rpc_urls, weth_price),
+            daemon=True,
+        ).start()
+
+    def _poll_live_wallet_worker(self, address: str, rpc_urls: list[str], weth_price_fallback_usd: float) -> None:
+        eth = 0.0
+        err = ""
+        ts = datetime.now(timezone.utc).timestamp()
+
+        try:
+            checksum = Web3.to_checksum_address(address)  # type: ignore[union-attr]
+        except Exception:
+            checksum = address
+
+        for url in rpc_urls:
+            try:
+                w3 = Web3(HTTPProvider(url, request_kwargs={"timeout": 10}))  # type: ignore[misc]
+                bal_wei = int(w3.eth.get_balance(checksum))
+                eth = bal_wei / 1e18
+                err = ""
+                break
+            except Exception as exc:
+                err = f"rpc_error:{exc}"
+                continue
+
+        def _apply() -> None:
+            self._live_wallet_eth = float(eth)
+            self._live_wallet_usd = float(eth * max(0.0, float(weth_price_fallback_usd)))
+            self._live_wallet_last_ts = float(ts) if not err else 0.0
+            self._live_wallet_last_err = str(err or "")
+            self._live_wallet_polling = False
+            try:
+                self._refresh_wallet()
+            except Exception:
+                pass
+            self.after(int(LIVE_BALANCE_POLL_SECONDS * 1000), self._schedule_live_wallet_poll)
+
+        try:
+            self.after(0, _apply)
+        except Exception:
+            return
+
     def _refresh_wallet(self) -> None:
         env_map = read_env_map()
         mode = str(env_map.get(WALLET_MODE_KEY, self.wallet_mode_var.get() if hasattr(self, "wallet_mode_var") else "paper")).strip().lower()
@@ -1673,12 +2011,26 @@ class App(tk.Tk):
         stair_enabled = str(env_map.get(STAIR_STEP_ENABLED_KEY, "false")).strip().lower()
         emergency_reason = str(state.get("emergency_halt_reason", "") or "").strip()
 
-        active = paper_balance if mode == "paper" else live_balance
+        active_live = self._live_wallet_usd if float(getattr(self, "_live_wallet_last_ts", 0.0) or 0.0) > 0 else live_balance
+        active = paper_balance if mode == "paper" else active_live
         mode_label = "PAPER" if mode == "paper" else "LIVE"
         if hasattr(self, "wallet_summary_var"):
             self.wallet_summary_var.set(
                 f"Mode: {mode_label} | Active balance: ${active:.2f} | Paper: ${paper_balance:.2f} | Live: ${live_balance:.2f} | Stair: {stair_enabled.upper()} floor=${stair_floor:.2f} | Open: {paper_open} | Closed: {paper_closed} | Halt: {emergency_reason or 'none'}"
             )
+        if hasattr(self, "live_onchain_var"):
+            if float(getattr(self, "_live_wallet_last_ts", 0.0) or 0.0) > 0:
+                when = datetime.fromtimestamp(float(self._live_wallet_last_ts), tz=timezone.utc).astimezone().strftime("%H:%M:%S")
+                try:
+                    price = float(env_map.get("WETH_PRICE_FALLBACK_USD", "0") or 0)
+                except Exception:
+                    price = 0.0
+                usd_text = f"${(self._live_wallet_eth * price):.2f}" if price > 0 else "(USD n/a)"
+                self.live_onchain_var.set(f"Live on-chain: {self._live_wallet_eth:.6f} ETH  ~ {usd_text}  (updated {when})")
+            elif str(getattr(self, "_live_wallet_last_err", "") or ""):
+                self.live_onchain_var.set(f"Live on-chain: error: {self._live_wallet_last_err}")
+            else:
+                self.live_onchain_var.set("Live on-chain: (not checked yet)")
         if hasattr(self, "wallet_mode_var"):
             self.wallet_mode_var.set(mode if mode in {"paper", "live"} else "paper")
         if hasattr(self, "live_balance_var"):
@@ -1777,12 +2129,26 @@ class App(tk.Tk):
         state = read_json(PAPER_STATE_FILE)
         open_positions = state.get("open_positions", []) or []
         if open_positions:
-            messagebox.showerror("Ошибка", "Нельзя менять paper balance при открытых сделках.")
-            return
-
+            if not messagebox.askyesno(
+                "Open trades detected",
+                "Open paper trades exist in paper_state.json.\n\n"
+                "To change paper balance, open trades must be cleared (removed from paper tracking).\n\n"
+                "Clear open trades and set the new paper balance?",
+            ):
+                return
+            # Soft reset: clear only the parts that can block paper trading, keep closed history if any.
+            state["open_positions"] = []
+            state["price_guard_pending"] = {}
+            state["token_cooldowns"] = {}
+            state["trade_open_timestamps"] = []
+            state["trading_pause_until_ts"] = 0.0
+            state["emergency_halt_reason"] = ""
+            state["emergency_halt_ts"] = 0.0
         state["initial_balance_usd"] = float(val)
         state["paper_balance_usd"] = float(val)
         state["realized_pnl_usd"] = 0.0
+        state["day_start_equity_usd"] = float(val)
+        state["day_realized_pnl_usd"] = 0.0
         state["stair_floor_usd"] = 0.0
         state["stair_peak_balance_usd"] = float(val)
         with open(PAPER_STATE_FILE, "w", encoding="utf-8") as f:
@@ -1859,11 +2225,47 @@ class App(tk.Tk):
             messagebox.showerror("Ошибка рестарта", msg)
         self.refresh()
 
+    def on_reload_env(self) -> None:
+        # GUI keeps values in memory; restarting the bot does not refresh input fields.
+        # This explicitly reloads `.env` into the GUI controls.
+        try:
+            self._load_settings()
+        except Exception as exc:
+            messagebox.showerror("Ошибка", f"Не удалось перечитать .env: {exc}")
+            return
+        self.refresh()
+        messagebox.showinfo("Готово", "Настройки перечитаны из .env.")
+
     def on_clear_logs(self) -> None:
         for path in (APP_LOG, OUT_LOG, ERR_LOG):
             os.makedirs(os.path.dirname(path), exist_ok=True)
             truncate_file(path)
         self.refresh()
+
+    def on_clear_gui(self) -> None:
+        # UI-only cleanup: clears views and truncates log files. Does not touch wallet state or KILL SWITCH.
+        self.on_clear_logs()
+        self.on_clear_signals()
+        for attr in ("log_text", "critical_text"):
+            widget = getattr(self, attr, None)
+            if widget is None:
+                continue
+            try:
+                widget.delete("1.0", tk.END)
+            except Exception:
+                pass
+        for attr in ("open_tree", "closed_tree", "signals_tree"):
+            tree = getattr(self, attr, None)
+            if tree is None:
+                continue
+            try:
+                tree.delete(*tree.get_children())
+            except Exception:
+                pass
+        if hasattr(self, "pos_summary_var"):
+            self.pos_summary_var.set("Очистка выполнена.")
+        if hasattr(self, "hint_var"):
+            self.hint_var.set("GUI очищен: логи/сигналы/таблицы. KILL SWITCH не тронут.")
 
     def on_clear_signals(self) -> None:
         os.makedirs(os.path.dirname(LOCAL_ALERTS_FILE), exist_ok=True)

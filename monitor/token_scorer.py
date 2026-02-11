@@ -63,13 +63,16 @@ class TokenScorer:
 
     @staticmethod
     def _score_age(age_seconds: int) -> int:
-        if age_seconds < 300:
-            return 15
+        # New pairs are where most scams live. Reward some maturation instead of "newness".
+        if age_seconds < 180:
+            return -10
         if age_seconds < 600:
-            return 10
+            return 0
         if age_seconds < 1800:
             return 5
-        return 0
+        if age_seconds < 3600:
+            return 10
+        return 15
 
     @staticmethod
     def _score_safety(warning_flags: int, is_contract_safe: bool) -> int:

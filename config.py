@@ -62,6 +62,46 @@ SWAP_URL_TEMPLATE = os.getenv(
 DEX_TIMEOUT = int(os.getenv("DEX_TIMEOUT", "15"))
 DEX_RETRIES = int(os.getenv("DEX_RETRIES", "3"))
 SEEN_TOKEN_TTL = int(os.getenv("SEEN_TOKEN_TTL", "21600"))
+
+# Safety API behavior
+TOKEN_SAFETY_FAIL_CLOSED = os.getenv("TOKEN_SAFETY_FAIL_CLOSED", "false").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "y",
+    "on",
+)
+
+# Dynamic watchlist (vetted tokens) for stability-first trading.
+WATCHLIST_ENABLED = os.getenv("WATCHLIST_ENABLED", "false").strip().lower() in ("1", "true", "yes", "y", "on")
+WATCHLIST_REFRESH_SECONDS = max(60, int(os.getenv("WATCHLIST_REFRESH_SECONDS", "3600")))
+WATCHLIST_MAX_TOKENS = max(5, int(os.getenv("WATCHLIST_MAX_TOKENS", "30")))
+WATCHLIST_MIN_LIQUIDITY_USD = float(os.getenv("WATCHLIST_MIN_LIQUIDITY_USD", "200000"))
+WATCHLIST_MIN_VOLUME_24H_USD = float(os.getenv("WATCHLIST_MIN_VOLUME_24H_USD", "500000"))
+WATCHLIST_MIN_VOLUME_5M_USD = float(os.getenv("WATCHLIST_MIN_VOLUME_5M_USD", "5000"))
+WATCHLIST_MIN_PRICE_CHANGE_5M_ABS_PERCENT = float(os.getenv("WATCHLIST_MIN_PRICE_CHANGE_5M_ABS_PERCENT", "1.5"))
+WATCHLIST_GECKO_TRENDING_PAGES = max(1, int(os.getenv("WATCHLIST_GECKO_TRENDING_PAGES", "2")))
+WATCHLIST_GECKO_POOLS_PAGES = max(0, int(os.getenv("WATCHLIST_GECKO_POOLS_PAGES", "2")))
+WATCHLIST_DEX_ALLOWLIST = [
+    x.strip().lower()
+    for x in os.getenv("WATCHLIST_DEX_ALLOWLIST", "").split(",")
+    if x.strip()
+]
+WATCHLIST_REQUIRE_WETH_QUOTE = os.getenv("WATCHLIST_REQUIRE_WETH_QUOTE", "true").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "y",
+    "on",
+)
+WATCHLIST_ALERTS_ENABLED = os.getenv("WATCHLIST_ALERTS_ENABLED", "false").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "y",
+    "on",
+)
+WATCHLIST_CACHE_FILE = os.getenv("WATCHLIST_CACHE_FILE", os.path.join("data", "watchlist_cache.json"))
 RPC_TIMEOUT_SECONDS = max(3, int(os.getenv("RPC_TIMEOUT_SECONDS", "10")))
 ONCHAIN_BLOCK_CHUNK = max(1, int(os.getenv("ONCHAIN_BLOCK_CHUNK", "500")))
 ONCHAIN_FINALITY_BLOCKS = max(0, int(os.getenv("ONCHAIN_FINALITY_BLOCKS", "2")))
@@ -128,6 +168,53 @@ LIVE_SWAP_DEADLINE_SECONDS = max(30, int(os.getenv("LIVE_SWAP_DEADLINE_SECONDS",
 LIVE_TX_TIMEOUT_SECONDS = max(30, int(os.getenv("LIVE_TX_TIMEOUT_SECONDS", "180")))
 LIVE_MAX_GAS_GWEI = float(os.getenv("LIVE_MAX_GAS_GWEI", "2.0"))
 LIVE_PRIORITY_FEE_GWEI = float(os.getenv("LIVE_PRIORITY_FEE_GWEI", "0.02"))
+# Keep some native ETH for gas so we can still SELL/approve after a BUY.
+LIVE_MIN_GAS_RESERVE_ETH = float(os.getenv("LIVE_MIN_GAS_RESERVE_ETH", "0.0007"))
+# Hard cap on estimated gas for swaps/approves. Abnormally high estimates are common on honeypots.
+LIVE_MAX_SWAP_GAS = max(50_000, int(os.getenv("LIVE_MAX_SWAP_GAS", "450000")))
+# Live honeypot guard (pre-buy simulation via honeypot.is). This is best-effort protection, not a guarantee.
+HONEYPOT_API_ENABLED = os.getenv("HONEYPOT_API_ENABLED", "true").lower() == "true"
+HONEYPOT_API_URL = os.getenv("HONEYPOT_API_URL", "https://api.honeypot.is/v2/IsHoneypot").strip()
+HONEYPOT_API_TIMEOUT_SECONDS = max(3, int(os.getenv("HONEYPOT_API_TIMEOUT_SECONDS", "10")))
+HONEYPOT_API_CACHE_TTL_SECONDS = max(60, int(os.getenv("HONEYPOT_API_CACHE_TTL_SECONDS", "1800")))
+HONEYPOT_API_FAIL_CLOSED = os.getenv("HONEYPOT_API_FAIL_CLOSED", "true").lower() == "true"
+HONEYPOT_MAX_BUY_TAX_PERCENT = float(os.getenv("HONEYPOT_MAX_BUY_TAX_PERCENT", "10"))
+HONEYPOT_MAX_SELL_TAX_PERCENT = float(os.getenv("HONEYPOT_MAX_SELL_TAX_PERCENT", "10"))
+
+# Live security (autotrade)
+LIVE_SELLABILITY_CHECK_ENABLED = os.getenv("LIVE_SELLABILITY_CHECK_ENABLED", "true").lower() == "true"
+# For getAmountsOut(token->WETH). Any positive value works; 1 token is a good sanity check.
+LIVE_SELLABILITY_CHECK_AMOUNT_TOKENS = float(os.getenv("LIVE_SELLABILITY_CHECK_AMOUNT_TOKENS", "1.0"))
+LIVE_ROUNDTRIP_CHECK_ENABLED = os.getenv("LIVE_ROUNDTRIP_CHECK_ENABLED", "true").lower() == "true"
+# Quote WETH->token using spend size, then token->WETH for a fraction of the received tokens.
+LIVE_ROUNDTRIP_SELL_FRACTION = float(os.getenv("LIVE_ROUNDTRIP_SELL_FRACTION", "0.25"))
+# Minimum return ratio for the roundtrip quote (e.g. 0.70 means lose at most 30% to price impact/taxes).
+LIVE_ROUNDTRIP_MIN_RETURN_RATIO = float(os.getenv("LIVE_ROUNDTRIP_MIN_RETURN_RATIO", "0.70"))
+
+# Live session profit stop (USD). If > 0, the bot will stop opening new trades when
+# wallet PnL since session start reaches the target.
+LIVE_STOP_AFTER_PROFIT_USD = float(os.getenv("LIVE_STOP_AFTER_PROFIT_USD", "0.0"))
+LIVE_SESSION_RESET_ON_START = os.getenv("LIVE_SESSION_RESET_ON_START", "true").lower() == "true"
+
+# If enabled, a live position may be "abandoned" in local state when SELL cannot be executed
+# (e.g. not enough gas, route unsupported, revert). This does NOT sell on-chain, it only
+# unblocks the bot from being stuck forever with MAX_OPEN_TRADES=1.
+LIVE_ABANDON_UNSELLABLE_POSITIONS = os.getenv("LIVE_ABANDON_UNSELLABLE_POSITIONS", "false").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "y",
+    "on",
+)
+
+# Autotrade blacklist to avoid repeatedly touching tokens that already failed critical guards (route/honeypot/etc).
+AUTOTRADE_BLACKLIST_ENABLED = os.getenv("AUTOTRADE_BLACKLIST_ENABLED", "true").lower() == "true"
+AUTOTRADE_BLACKLIST_FILE = os.getenv(
+    "AUTOTRADE_BLACKLIST_FILE",
+    os.path.join("data", "autotrade_blacklist.json"),
+)
+AUTOTRADE_BLACKLIST_TTL_SECONDS = max(300, int(os.getenv("AUTOTRADE_BLACKLIST_TTL_SECONDS", "86400")))
+AUTOTRADE_BLACKLIST_MAX_ENTRIES = max(100, int(os.getenv("AUTOTRADE_BLACKLIST_MAX_ENTRIES", "5000")))
 # AUTO_TRADE_ENTRY_MODE:
 # - single: open only one best candidate per scan cycle
 # - all: open every eligible candidate
@@ -164,6 +251,11 @@ WEAKNESS_EXIT_PNL_PERCENT = float(os.getenv("WEAKNESS_EXIT_PNL_PERCENT", "-9"))
 DYNAMIC_POSITION_SIZING_ENABLED = os.getenv("DYNAMIC_POSITION_SIZING_ENABLED", "true").lower() == "true"
 EDGE_FILTER_ENABLED = os.getenv("EDGE_FILTER_ENABLED", "true").lower() == "true"
 MIN_EXPECTED_EDGE_PERCENT = float(os.getenv("MIN_EXPECTED_EDGE_PERCENT", "2.0"))
+EDGE_FILTER_MODE = os.getenv("EDGE_FILTER_MODE", "usd").strip().lower()
+MIN_EXPECTED_EDGE_USD = float(os.getenv("MIN_EXPECTED_EDGE_USD", "0.10"))
+
+# Position sizing quality multiplier (score/liquidity/volume/volatility).
+POSITION_SIZE_QUALITY_ENABLED = os.getenv("POSITION_SIZE_QUALITY_ENABLED", "true").lower() == "true"
 PAPER_TRADE_SIZE_MIN_USD = float(os.getenv("PAPER_TRADE_SIZE_MIN_USD", "0.25"))
 PAPER_TRADE_SIZE_MAX_USD = float(os.getenv("PAPER_TRADE_SIZE_MAX_USD", str(PAPER_TRADE_SIZE_USD)))
 CLOSED_TRADES_MAX_AGE_DAYS = max(0, int(os.getenv("CLOSED_TRADES_MAX_AGE_DAYS", "14")))
@@ -180,6 +272,8 @@ STAIR_STEP_START_BALANCE_USD = float(os.getenv("STAIR_STEP_START_BALANCE_USD", "
 STAIR_STEP_SIZE_USD = float(os.getenv("STAIR_STEP_SIZE_USD", "5"))
 STAIR_STEP_TRADABLE_BUFFER_USD = float(os.getenv("STAIR_STEP_TRADABLE_BUFFER_USD", "0.35"))
 AUTO_STOP_MIN_AVAILABLE_USD = float(os.getenv("AUTO_STOP_MIN_AVAILABLE_USD", "0.25"))
+# If false, AutoTrader will not stop trading due to low available balance.
+LOW_BALANCE_GUARD_ENABLED = os.getenv("LOW_BALANCE_GUARD_ENABLED", "true").lower() == "true"
 
 # Trade risk controls
 MAX_TOKEN_PRICE_CHANGE_5M_ABS_PERCENT = float(os.getenv("MAX_TOKEN_PRICE_CHANGE_5M_ABS_PERCENT", "35"))

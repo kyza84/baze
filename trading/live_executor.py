@@ -15,6 +15,13 @@ import config
 
 ERC20_ABI: list[dict[str, Any]] = [
     {
+        "name": "decimals",
+        "type": "function",
+        "stateMutability": "view",
+        "inputs": [],
+        "outputs": [{"name": "", "type": "uint8"}],
+    },
+    {
         "name": "balanceOf",
         "type": "function",
         "stateMutability": "view",
@@ -124,11 +131,133 @@ class LiveExecutor:
         wei = self.w3.eth.get_balance(self.wallet)
         return float(self.w3.from_wei(wei, "ether"))
 
+    def is_buy_route_supported(self, token_address: str, spend_eth: float) -> tuple[bool, str]:
+        try:
+            token = self.w3.to_checksum_address(token_address)
+        except Exception as exc:
+            return False, f"invalid_token_address:{exc}"
+
+        amount_in = int(self.w3.to_wei(max(0.0, float(spend_eth)), "ether"))
+        if amount_in <= 0:
+            amount_in = 1
+
+        path = [self.weth, token]
+        try:
+            amounts = self.router.functions.getAmountsOut(int(amount_in), path).call()
+            if not isinstance(amounts, (list, tuple)) or len(amounts) < 2:
+                return False, "quote_empty"
+            if int(amounts[-1]) <= 0:
+                return False, "quote_zero"
+            return True, "ok"
+        except Exception as exc:
+            return False, f"quote_failed:{exc}"
+
+    def token_decimals(self, token_address: str) -> int:
+        """Best-effort ERC20 decimals() with a safe fallback."""
+        try:
+            token = self.w3.to_checksum_address(token_address)
+        except Exception:
+            return 18
+        try:
+            token_contract = self.w3.eth.contract(address=token, abi=ERC20_ABI)
+            dec = int(token_contract.functions.decimals().call())
+            if 0 <= dec <= 255:
+                return dec
+        except Exception:
+            pass
+        return 18
+
+    def is_sell_route_supported(self, token_address: str, amount_tokens: float = 1.0) -> tuple[bool, str]:
+        """Sanity-check that router can quote token->WETH (helps avoid unsellable/no-quote tokens)."""
+        try:
+            token = self.w3.to_checksum_address(token_address)
+        except Exception as exc:
+            return False, f"invalid_token_address:{exc}"
+
+        decimals = self.token_decimals(token_address)
+        try:
+            amt = float(amount_tokens)
+        except Exception:
+            amt = 1.0
+        if amt <= 0:
+            amt = 1.0
+        # Clamp decimals to avoid huge pow in pathological cases.
+        decimals = int(max(0, min(36, int(decimals))))
+        amount_in = int(amt * (10**decimals))
+        if amount_in <= 0:
+            amount_in = 1
+
+        path = [token, self.weth]
+        try:
+            amounts = self.router.functions.getAmountsOut(int(amount_in), path).call()
+            if not isinstance(amounts, (list, tuple)) or len(amounts) < 2:
+                return False, "quote_empty"
+            if int(amounts[-1]) <= 0:
+                return False, "quote_zero"
+            return True, "ok"
+        except Exception as exc:
+            return False, f"quote_failed:{exc}"
+
+    def roundtrip_quote(self, token_address: str, spend_eth: float) -> tuple[bool, str, float]:
+        """
+        Quote WETH->token for the intended spend size, then quote token->WETH for a fraction of that output.
+        This helps filter out ultra-thin liquidity where selling is effectively impossible for our size.
+        Note: this cannot detect transfer taxes/honeypots reliably (use honeypot guard for that).
+        """
+        try:
+            token = self.w3.to_checksum_address(token_address)
+        except Exception as exc:
+            return False, f"invalid_token_address:{exc}", 0.0
+
+        try:
+            amount_in_wei = int(self.w3.to_wei(max(0.0, float(spend_eth)), "ether"))
+        except Exception:
+            amount_in_wei = 0
+        if amount_in_wei <= 0:
+            return False, "invalid_amount_in", 0.0
+
+        try:
+            sell_fraction = float(getattr(config, "LIVE_ROUNDTRIP_SELL_FRACTION", 0.25) or 0.25)
+        except Exception:
+            sell_fraction = 0.25
+        sell_fraction = max(0.01, min(1.0, sell_fraction))
+
+        path_buy = [self.weth, token]
+        path_sell = [token, self.weth]
+        try:
+            buy_amounts = self.router.functions.getAmountsOut(int(amount_in_wei), path_buy).call()
+            if not isinstance(buy_amounts, (list, tuple)) or len(buy_amounts) < 2:
+                return False, "buy_quote_empty", 0.0
+            token_out = int(buy_amounts[-1])
+            if token_out <= 0:
+                return False, "buy_quote_zero", 0.0
+
+            sell_amount_in = int(max(1, int(token_out * sell_fraction)))
+            sell_amounts = self.router.functions.getAmountsOut(int(sell_amount_in), path_sell).call()
+            if not isinstance(sell_amounts, (list, tuple)) or len(sell_amounts) < 2:
+                return False, "sell_quote_empty", 0.0
+            weth_out = int(sell_amounts[-1])
+            if weth_out <= 0:
+                return False, "sell_quote_zero", 0.0
+
+            # Compare to the proportional input size for the fraction we try to sell back.
+            denom = float(amount_in_wei) * float(sell_fraction)
+            ratio = float(weth_out) / denom if denom > 0 else 0.0
+            if ratio <= 0:
+                return False, "roundtrip_ratio_zero", 0.0
+            return True, "ok", ratio
+        except Exception as exc:
+            return False, f"roundtrip_quote_failed:{exc}", 0.0
+
     def buy_token(self, token_address: str, spend_eth: float) -> LiveBuyResult:
         token = self.w3.to_checksum_address(token_address)
         amount_in = int(self.w3.to_wei(spend_eth, "ether"))
         if amount_in <= 0:
             raise ValueError("amount_in is zero")
+
+        route_ok, route_reason = self.is_buy_route_supported(token_address, spend_eth)
+        if not route_ok:
+            raise RuntimeError(f"unsupported_route:{route_reason}")
 
         path = [self.weth, token]
         amount_out_min = self._estimate_amount_out_min(amount_in, path)
@@ -200,12 +329,24 @@ class LiveExecutor:
         latest = self.w3.eth.get_block("latest")
         base_fee = int(latest.get("baseFeePerGas") or 0)
         priority = int(self.w3.to_wei(max(0.0, float(config.LIVE_PRIORITY_FEE_GWEI)), "gwei"))
-        max_fee = (base_fee * 2) + priority
-        cap = int(self.w3.to_wei(max(0.1, float(config.LIVE_MAX_GAS_GWEI)), "gwei"))
-        if max_fee > cap:
-            max_fee = cap
+        cap = int(self.w3.to_wei(max(0.0, float(config.LIVE_MAX_GAS_GWEI)), "gwei"))
+        if cap <= 0:
+            # Hard fail-safe: never send a live tx with an unbounded fee cap.
+            cap = int(self.w3.to_wei(1, "gwei"))
+
+        # Some RPCs/networks can behave weirdly with baseFeePerGas. Always sanity-check
+        # current suggested gas price and refuse to send if it exceeds the configured cap.
+        observed_gas_price = int(self.w3.eth.gas_price or 0)
+        if observed_gas_price > cap:
+            obs_gwei = float(self.w3.from_wei(observed_gas_price, "gwei"))
+            cap_gwei = float(self.w3.from_wei(cap, "gwei"))
+            raise RuntimeError(f"gas_price_too_high observed_gwei={obs_gwei:.3f} cap_gwei={cap_gwei:.3f}")
+
+        # EIP-1559 style: compute a max fee, but keep it <= cap.
+        # Also keep it >= observed gas price so the tx isn't immediately underpriced.
+        max_fee = min(cap, max(observed_gas_price, (base_fee * 2) + priority))
         if max_fee <= 0:
-            max_fee = int(self.w3.to_wei(1, "gwei"))
+            max_fee = min(cap, int(self.w3.to_wei(1, "gwei")))
 
         return {
             "from": self.wallet,
@@ -219,9 +360,35 @@ class LiveExecutor:
 
     def _send_and_wait(self, tx: dict[str, Any]) -> str:
         gas = self.w3.eth.estimate_gas(tx)
-        tx["gas"] = int(gas * 1.15)
+        gas_cap = int(getattr(config, "LIVE_MAX_SWAP_GAS", 0) or 0)
+        gas_limit = int(gas * 1.15)
+        if gas_cap > 0 and int(gas_limit) > gas_cap:
+            raise RuntimeError(f"gas_estimate_too_high gas={int(gas_limit)} cap={gas_cap}")
+        tx["gas"] = int(gas_limit)
+
+        # Preflight: ensure we can afford worst-case maxFeePerGas * gas_limit + value.
+        # Without this, the node will reject with "insufficient funds for gas * price + value".
+        bal = int(self.w3.eth.get_balance(self.wallet))
+        max_fee = int(tx.get("maxFeePerGas") or 0)
+        value = int(tx.get("value") or 0)
+        worst_cost = (int(tx["gas"]) * max_fee) + value
+        # Base has additional L1 data fee; include a small buffer so we fail-safe.
+        buffered = int(worst_cost * 1.20)
+        if buffered > bal:
+            have_eth = float(self.w3.from_wei(bal, "ether"))
+            want_eth = float(self.w3.from_wei(buffered, "ether"))
+            fee_gwei = float(self.w3.from_wei(max_fee, "gwei")) if max_fee > 0 else 0.0
+            raise RuntimeError(
+                f"insufficient_balance_for_tx have_eth={have_eth:.8f} want_eth={want_eth:.8f} "
+                f"gas={int(tx['gas'])} maxFee_gwei={fee_gwei:.3f} value_wei={value}"
+            )
         signed = self.account.sign_transaction(tx)
-        tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+        raw_tx = getattr(signed, "raw_transaction", None)
+        if raw_tx is None:
+            raw_tx = getattr(signed, "rawTransaction", None)
+        if raw_tx is None:
+            raise RuntimeError("signed_tx_missing_raw_bytes")
+        tx_hash = self.w3.eth.send_raw_transaction(raw_tx)
         receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=int(config.LIVE_TX_TIMEOUT_SECONDS))
         if int(receipt.status) != 1:
             raise RuntimeError(f"tx_failed hash={tx_hash.hex()}")

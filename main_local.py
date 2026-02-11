@@ -10,6 +10,11 @@ import os
 import time
 from logging.handlers import RotatingFileHandler
 
+try:
+    import msvcrt  # Windows-only, used for a robust single-instance file lock.
+except Exception:  # pragma: no cover
+    msvcrt = None  # type: ignore[assignment]
+
 import config
 from config import APP_LOG_FILE, LOG_DIR, LOG_LEVEL, OUT_LOG_FILE, SCAN_INTERVAL
 from monitor.dexscreener import DexScreenerMonitor
@@ -17,6 +22,7 @@ from monitor.local_alerter import LocalAlerter
 from monitor.onchain_factory import OnChainFactoryMonitor, OnChainRPCError
 from monitor.token_checker import TokenChecker
 from monitor.token_scorer import TokenScorer
+from monitor.watchlist import WatchlistMonitor
 from trading.auto_trader import AutoTrader
 
 logger = logging.getLogger(__name__)
@@ -53,27 +59,60 @@ def _merge_token_streams(*groups: list[dict]) -> list[dict]:
 class InstanceLock:
     def __init__(self) -> None:
         self._handle = None
+        self._lock_fh = None
         self.acquired = False
 
-    def acquire(self) -> bool:
-        if os.name != "nt":
-            # Local fallback for non-Windows environments.
-            lock_file = os.path.join(PROJECT_ROOT, "main_local.lock")
-            try:
-                fd = os.open(lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                with os.fdopen(fd, "w", encoding="ascii") as f:
-                    f.write(str(os.getpid()))
-            except FileExistsError:
-                return False
-            self.acquired = True
-            return True
+    def _acquire_lock_file(self) -> bool:
+        lock_file = os.path.join(PROJECT_ROOT, "main_local.lock")
+        try:
+            fh = open(lock_file, "a+b")
+        except OSError:
+            return False
 
-        kernel32 = ctypes.windll.kernel32
+        try:
+            fh.seek(0, os.SEEK_END)
+            if fh.tell() == 0:
+                fh.write(b"1")
+                fh.flush()
+            fh.seek(0)
+
+            if os.name == "nt" and msvcrt is not None:
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                pass
+
+            # Human-friendly: store the PID in the lock file (lock is still held via the open file handle).
+            try:
+                fh.seek(0)
+                fh.truncate(0)
+                fh.write(f"{os.getpid()}\n".encode("ascii", errors="ignore"))
+                fh.flush()
+                fh.seek(0)
+            except Exception:
+                pass
+        except OSError:
+            try:
+                fh.close()
+            except Exception:
+                pass
+            return False
+
+        self._lock_fh = fh
+        return True
+
+    def acquire(self) -> bool:
+        # Prefer a real file lock: robust across admin/non-admin tokens, no PID reuse issues.
+        if not self._acquire_lock_file():
+            return False
+
+        # NOTE: When using ctypes, prefer get_last_error() with use_last_error=True.
+        # Calling kernel32.GetLastError() directly is unreliable here and can fail to detect duplicates.
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         mutex = kernel32.CreateMutexW(None, False, WINDOWS_MUTEX_NAME)
         if not mutex:
             return False
         error_already_exists = 183
-        if kernel32.GetLastError() == error_already_exists:
+        if ctypes.get_last_error() == error_already_exists:
             kernel32.CloseHandle(mutex)
             return False
         self._handle = mutex
@@ -83,14 +122,18 @@ class InstanceLock:
     def release(self) -> None:
         if not self.acquired:
             return
-        if os.name != "nt":
-            lock_file = os.path.join(PROJECT_ROOT, "main_local.lock")
+        if self._lock_fh is not None:
             try:
-                os.remove(lock_file)
-            except OSError:
+                if os.name == "nt" and msvcrt is not None:
+                    self._lock_fh.seek(0)
+                    msvcrt.locking(self._lock_fh.fileno(), msvcrt.LK_UNLCK, 1)
+            except Exception:
                 pass
-            self.acquired = False
-            return
+            try:
+                self._lock_fh.close()
+            except Exception:
+                pass
+            self._lock_fh = None
         if self._handle:
             ctypes.windll.kernel32.CloseHandle(self._handle)
             self._handle = None
@@ -121,6 +164,7 @@ def configure_logging() -> None:
 
 async def run_local_loop() -> None:
     dex_monitor = DexScreenerMonitor()
+    watchlist_monitor = WatchlistMonitor()
     onchain_monitor: OnChainFactoryMonitor | None = None
     onchain_error_streak = 0
     fallback_until_ts = 0.0
@@ -177,6 +221,17 @@ async def run_local_loop() -> None:
                         tokens = await dex_monitor.fetch_new_tokens()
             else:
                 tokens = await dex_monitor.fetch_new_tokens()
+
+            # Stability flow: dynamic watchlist tokens (vetted) in parallel to new-pairs sources.
+            if bool(getattr(config, "WATCHLIST_ENABLED", False)):
+                try:
+                    wl = await watchlist_monitor.fetch_tokens()
+                    if wl:
+                        tokens = _merge_token_streams(tokens or [], wl)
+                        if wl:
+                            logger.info("WATCHLIST merged count=%s", len(wl))
+                except Exception as exc:
+                    logger.warning("WATCHLIST fetch failed: %s", exc)
 
             high_quality = 0
             alerts_sent = 0
@@ -240,7 +295,13 @@ async def run_local_loop() -> None:
                         float(token.get("volume_5m") or 0),
                     )
                     trade_candidates.append((token, score_data))
-                    alerts_sent += await local_alerter.send_alert(token, score_data, safety=safety)
+                    # Optional: avoid alert spam from watchlist flow.
+                    if str(token.get("source", "")).lower() == "watchlist" and not bool(
+                        getattr(config, "WATCHLIST_ALERTS_ENABLED", False)
+                    ):
+                        pass
+                    else:
+                        alerts_sent += await local_alerter.send_alert(token, score_data, safety=safety)
 
             opened_trades = 0
             if trade_candidates:
