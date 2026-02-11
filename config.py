@@ -62,6 +62,19 @@ SWAP_URL_TEMPLATE = os.getenv(
 DEX_TIMEOUT = int(os.getenv("DEX_TIMEOUT", "15"))
 DEX_RETRIES = int(os.getenv("DEX_RETRIES", "3"))
 SEEN_TOKEN_TTL = int(os.getenv("SEEN_TOKEN_TTL", "21600"))
+HTTP_CONNECTOR_LIMIT = max(1, int(os.getenv("HTTP_CONNECTOR_LIMIT", "30")))
+HTTP_DEFAULT_CONCURRENCY = max(1, int(os.getenv("HTTP_DEFAULT_CONCURRENCY", "8")))
+HTTP_RETRY_ATTEMPTS = max(1, int(os.getenv("HTTP_RETRY_ATTEMPTS", "3")))
+HTTP_BACKOFF_BASE_SECONDS = max(0.05, float(os.getenv("HTTP_BACKOFF_BASE_SECONDS", "0.50")))
+HTTP_BACKOFF_MAX_SECONDS = max(0.10, float(os.getenv("HTTP_BACKOFF_MAX_SECONDS", "8.00")))
+HTTP_JITTER_SECONDS = max(0.0, float(os.getenv("HTTP_JITTER_SECONDS", "0.25")))
+HTTP_RATE_LIMIT_DELAY_SECONDS = max(0.0, float(os.getenv("HTTP_RATE_LIMIT_DELAY_SECONDS", "2.00")))
+DATA_POLICY_DEGRADED_ERROR_PERCENT = max(0.0, float(os.getenv("DATA_POLICY_DEGRADED_ERROR_PERCENT", "35")))
+DATA_POLICY_FAIL_CLOSED_FAIL_CLOSED_RATIO = max(0.0, float(os.getenv("DATA_POLICY_FAIL_CLOSED_FAIL_CLOSED_RATIO", "60")))
+DATA_POLICY_FAIL_CLOSED_API_ERROR_PERCENT = max(0.0, float(os.getenv("DATA_POLICY_FAIL_CLOSED_API_ERROR_PERCENT", "90")))
+DATA_POLICY_ENTER_STREAK = max(1, int(os.getenv("DATA_POLICY_ENTER_STREAK", "1")))
+DATA_POLICY_EXIT_STREAK = max(1, int(os.getenv("DATA_POLICY_EXIT_STREAK", "2")))
+METRICS_RSS_LOG_SECONDS = max(60, int(os.getenv("METRICS_RSS_LOG_SECONDS", "900")))
 
 # Safety API behavior
 TOKEN_SAFETY_FAIL_CLOSED = os.getenv("TOKEN_SAFETY_FAIL_CLOSED", "false").strip().lower() in (
@@ -206,6 +219,9 @@ LIVE_ABANDON_UNSELLABLE_POSITIONS = os.getenv("LIVE_ABANDON_UNSELLABLE_POSITIONS
     "y",
     "on",
 )
+RECOVERY_DISCOVERY_MAX_ADDRESSES = max(0, int(os.getenv("RECOVERY_DISCOVERY_MAX_ADDRESSES", "80")))
+RECOVERY_ATTEMPT_INTERVAL_SECONDS = max(5, int(os.getenv("RECOVERY_ATTEMPT_INTERVAL_SECONDS", "30")))
+RECOVERY_MAX_ATTEMPTS = max(1, int(os.getenv("RECOVERY_MAX_ATTEMPTS", "8")))
 
 # Autotrade blacklist to avoid repeatedly touching tokens that already failed critical guards (route/honeypot/etc).
 AUTOTRADE_BLACKLIST_ENABLED = os.getenv("AUTOTRADE_BLACKLIST_ENABLED", "true").lower() == "true"
@@ -227,7 +243,14 @@ MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "1"))
 MAX_BUY_AMOUNT = float(os.getenv("MAX_BUY_AMOUNT", "0.001"))
 WETH_PRICE_FALLBACK_USD = float(os.getenv("WETH_PRICE_FALLBACK_USD", "3000"))
 MAX_TRADES_PER_HOUR = max(0, int(os.getenv("MAX_TRADES_PER_HOUR", "3")))
+AUTO_TRADE_EXCLUDED_ADDRESSES = [
+    x.strip().lower()
+    for x in os.getenv("AUTO_TRADE_EXCLUDED_ADDRESSES", "").split(",")
+    if x.strip()
+]
 KILL_SWITCH_FILE = os.getenv("KILL_SWITCH_FILE", os.path.join("data", "kill.txt"))
+GRACEFUL_STOP_FILE = os.getenv("GRACEFUL_STOP_FILE", os.path.join("data", "graceful_stop.signal"))
+GRACEFUL_STOP_TIMEOUT_SECONDS = max(2, int(os.getenv("GRACEFUL_STOP_TIMEOUT_SECONDS", "12")))
 WALLET_BALANCE_USD = float(os.getenv("WALLET_BALANCE_USD", "2.75"))
 PAPER_TRADE_SIZE_USD = float(os.getenv("PAPER_TRADE_SIZE_USD", "1.0"))
 PAPER_MAX_HOLD_SECONDS = int(os.getenv("PAPER_MAX_HOLD_SECONDS", "1800"))

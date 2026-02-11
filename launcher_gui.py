@@ -8,6 +8,7 @@ import subprocess
 import tkinter as tk
 import ctypes
 import threading
+import time
 from datetime import datetime, timezone
 import json
 import ssl
@@ -46,6 +47,8 @@ ERR_LOG = os.path.join(LOG_DIR, "bot.err.log")
 APP_LOG = os.path.join(LOG_DIR, "app.log")
 LOCAL_ALERTS_FILE = os.path.join(LOG_DIR, "local_alerts.jsonl")
 PAPER_STATE_FILE = os.path.join(PROJECT_ROOT, "trading", "paper_state.json")
+GRACEFUL_STOP_FILE_DEFAULT = os.path.join(PROJECT_ROOT, "data", "graceful_stop.signal")
+GRACEFUL_STOP_TIMEOUT_SECONDS_DEFAULT = 12
 WALLET_MODE_KEY = "WALLET_MODE"
 LIVE_WALLET_BALANCE_KEY = "LIVE_WALLET_BALANCE_USD"
 STAIR_STEP_ENABLED_KEY = "STAIR_STEP_ENABLED"
@@ -64,6 +67,8 @@ IMPORTANT_LOG_SNIPPETS = (
     "Scanned ",
     "Trade candidates:",
     "Opened:",
+    "SAFETY_MODE",
+    "DATA_MODE",
     "Paper BUY",
     "Paper SELL",
     "AutoTrade skip",
@@ -98,6 +103,16 @@ SELL_RE = re.compile(
     r"Paper SELL token=(?P<symbol>\S+) reason=(?P<reason>\S+) exit=\$(?P<exit>[0-9.]+) pnl=(?P<pnl_pct>[-+0-9.]+)% \(\$(?P<pnl_usd>[-+0-9.]+)\)(?: raw=[-+0-9.]+% cost=[-+0-9.]+% gas=\$[-+0-9.]+)? balance=\$(?P<balance>[0-9.]+)"
 )
 PAIR_SOURCE_RE = re.compile(r"PAIR_DETECTED source=(?P<source>[a-zA-Z0-9_:-]+)")
+SCAN_SUMMARY_RE = re.compile(
+    r"Scanned (?P<scanned>\d+) tokens \| High quality: (?P<hq>\d+) \| Alerts sent: (?P<alerts>\d+) "
+    r"\| Trade candidates: (?P<candidates>\d+) \| Opened: (?P<opened>\d+) \| Mode: (?P<mode>[^|]+) "
+    r"\| Source: (?P<source>[^|]+) \| Policy: (?P<policy>[A-Z_]+)\((?P<reason>[^)]*)\) "
+    r"\| Safety: checked=(?P<safety_checked>\d+) fail_closed=(?P<safety_fc>\d+)(?: reasons=(?P<safety_reasons>.*?))? "
+    r"\| Sources: (?P<sources>.*?) \| Tasks: (?P<tasks>\d+) \| RSS: (?P<rss>[0-9.]+)MB \| CycleAvg: (?P<cycle>[0-9.]+)s"
+)
+AUTO_POLICY_RE = re.compile(
+    r"AUTO_POLICY mode=(?P<policy>[A-Z_]+) action=(?P<action>[a-z_]+) reason=(?P<reason>.+?) candidates=(?P<candidates>\d+)"
+)
 
 SETTINGS_FIELDS_RAW = [
     ("PERSONAL_MODE", "Личный режим"),
@@ -245,9 +260,71 @@ def list_main_local_pids() -> list[int]:
     return out
 
 
+def _resolve_graceful_stop_file() -> str:
+    raw = "data/graceful_stop.signal"
+    try:
+        if os.path.exists(ENV_FILE):
+            with open(ENV_FILE, "r", encoding="utf-8") as f:
+                for line in f:
+                    s = line.strip()
+                    if not s or s.startswith("#") or "=" not in s:
+                        continue
+                    k, v = s.split("=", 1)
+                    if k.strip() == "GRACEFUL_STOP_FILE":
+                        raw = v.strip().strip("'").strip('"') or raw
+                        break
+    except Exception:
+        pass
+    if os.path.isabs(raw):
+        return raw
+    return os.path.abspath(os.path.join(PROJECT_ROOT, raw))
+
+
+def _resolve_graceful_stop_timeout_seconds() -> int:
+    value = GRACEFUL_STOP_TIMEOUT_SECONDS_DEFAULT
+    try:
+        if os.path.exists(ENV_FILE):
+            with open(ENV_FILE, "r", encoding="utf-8") as f:
+                for line in f:
+                    s = line.strip()
+                    if not s or s.startswith("#") or "=" not in s:
+                        continue
+                    k, v = s.split("=", 1)
+                    if k.strip() == "GRACEFUL_STOP_TIMEOUT_SECONDS":
+                        try:
+                            value = int(v.strip().strip("'").strip('"'))
+                        except Exception:
+                            pass
+                        break
+    except Exception:
+        pass
+    return max(2, int(value))
+
+
+def _signal_graceful_stop() -> tuple[bool, str]:
+    path = _resolve_graceful_stop_file()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(f"{datetime.now(timezone.utc).isoformat()} gui_graceful_stop\n")
+        return True, path
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _clear_graceful_stop_flag() -> None:
+    path = _resolve_graceful_stop_file()
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
+
+
 def start_bot() -> tuple[bool, str]:
     if not os.path.exists(PYTHON_PATH):
         return False, f"Python not found: {PYTHON_PATH}"
+    _clear_graceful_stop_flag()
 
     existing = sorted(set(list_main_local_pids()))
     if existing:
@@ -300,18 +377,40 @@ def stop_bot() -> tuple[bool, str]:
                 pass
             return True, "Already stopped"
 
+    graceful_ok, graceful_msg = _signal_graceful_stop()
+    timeout_sec = _resolve_graceful_stop_timeout_seconds()
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        alive = [pid for pid in pids if is_running(pid)]
+        if not alive:
+            try:
+                os.remove(PID_FILE)
+            except OSError:
+                pass
+            _clear_graceful_stop_flag()
+            return True, f"Graceful stop completed in <= {timeout_sec}s."
+        time.sleep(0.25)
+
     failed: list[int] = []
+    hard_stopped: list[int] = []
     for pid in pids:
+        if not is_running(pid):
+            continue
         result = subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, text=True)
         if result.returncode != 0 and is_running(pid):
             failed.append(pid)
+        else:
+            hard_stopped.append(pid)
     try:
         os.remove(PID_FILE)
     except OSError:
         pass
     if failed:
-        return False, f"Failed to stop PID(s): {', '.join(str(pid) for pid in failed)}"
-    return True, f"Stopped main_local.py instances: {', '.join(str(pid) for pid in pids)}"
+        return False, f"Graceful stop timeout={timeout_sec}s; hard-kill failed for PID(s): {', '.join(str(pid) for pid in failed)}"
+    _clear_graceful_stop_flag()
+    if graceful_ok:
+        return True, f"Graceful stop timeout={timeout_sec}s; hard-kill fallback for PID(s): {', '.join(str(pid) for pid in hard_stopped)}"
+    return True, f"Graceful signal failed ({graceful_msg}); hard-kill fallback for PID(s): {', '.join(str(pid) for pid in hard_stopped)}"
 
 
 class GuiInstanceLock:
@@ -445,15 +544,104 @@ def parse_activity(lines: list[str]) -> list[tuple[str, str]]:
     for line in lines:
         if any(noise in line for noise in NOISE_LOG_SNIPPETS):
             continue
+        # Left feed is intentionally compact: skip per-token filter spam and low-level discovery noise.
+        if (
+            "FILTER_FAIL" in line
+            or "FILTER_PASS" in line
+            or "PAIR_DETECTED" in line
+            or "ENRICH_RETRY" in line
+            or "WATCHLIST merged count=" in line
+        ):
+            continue
+        pretty = _compact_activity_line(line)
         matched = "INFO"
+        if "[ERROR]" in line:
+            matched = "ERROR"
+        elif "[WARNING]" in line:
+            matched = "WARNING"
+        elif "[INFO]" in line:
+            matched = "INFO"
+
         for key, (needle, _) in EVENT_KEYS.items():
             if needle in line:
                 matched = key
                 break
-        if matched == "INFO" and not any(snippet in line for snippet in IMPORTANT_LOG_SNIPPETS):
+        if "Policy: FAIL_CLOSED(" in line or "AUTO_POLICY mode=FAIL_CLOSED" in line:
+            matched = "POLICY_FAIL_CLOSED"
+        elif "Policy: DEGRADED(" in line or "AUTO_POLICY mode=DEGRADED" in line:
+            matched = "POLICY_DEGRADED"
+        elif "Policy: OK(" in line:
+            matched = "POLICY_OK"
+        elif "SAFETY_MODE fail_closed active" in line:
+            matched = "POLICY_FAIL_CLOSED"
+        elif "DATA_MODE degraded" in line:
+            matched = "POLICY_DEGRADED"
+        elif "FILTER_FAIL" in line:
+            matched = "FILTER_FAIL"
+        elif "FILTER_PASS" in line:
+            matched = "FILTER_PASS"
+        elif "RATE_LIMIT" in line or "HTTP_RETRY" in line:
+            matched = "API"
+        elif "WATCHLIST" in line:
+            matched = "WATCHLIST"
+        elif "PAIR_DETECTED" in line or "ENRICH_RETRY" in line or "On-chain" in line:
+            matched = "ONCHAIN"
+        # Keep feed focused on summaries and critical events.
+        elif (
+            "Scanned " not in line
+            and "AUTO_POLICY" not in line
+            and "SAFETY_MODE" not in line
+            and "DATA_MODE" not in line
+            and "Paper BUY" not in line
+            and "Paper SELL" not in line
+            and "GRACEFUL_STOP" not in line
+            and "AUTOTRADER_SHUTDOWN" not in line
+            and "AUTOTRADER_INIT" not in line
+            and "[ERROR]" not in line
+            and "[WARNING]" not in line
+        ):
             continue
-        events.append((matched, line))
+        events.append((matched, pretty))
     return events
+
+
+def _compact_activity_line(line: str) -> str:
+    if "SAFETY_MODE fail_closed active;" in line:
+        reason = line.split("reason=", 1)[1].strip() if "reason=" in line else "unknown"
+        if reason.startswith("safety_api_down") or reason.startswith("safety_api_unreliable"):
+            reason = "safety_api_unreliable -> buy paused"
+        return f"[FAIL_CLOSED] BUY paused until safety API recovers | {reason}"
+    if "DATA_MODE degraded;" in line:
+        reason = line.split("reason=", 1)[1].strip() if "reason=" in line else "unknown"
+        return f"[DEGRADED] BUY paused by data policy | {reason}"
+
+    scan = SCAN_SUMMARY_RE.search(line)
+    if scan:
+        policy = str(scan.group("policy")).strip().upper()
+        reason = str(scan.group("reason")).strip()
+        reason_short = reason
+        if reason.startswith("safety_api_down") or reason.startswith("safety_api_unreliable"):
+            reason_short = "safety_api_unreliable -> buy paused"
+        safety_reasons = str(scan.group("safety_reasons") or "").strip()
+        safety_tail = f" safety_reasons={safety_reasons}" if safety_reasons else ""
+        return (
+            f"[{policy}] scan={scan.group('scanned')} hq={scan.group('hq')} "
+            f"cand={scan.group('candidates')} opened={scan.group('opened')} "
+            f"src={scan.group('source').strip()} safety_fc={scan.group('safety_fc')}/{scan.group('safety_checked')} "
+            f"tasks={scan.group('tasks')} cycle={scan.group('cycle')}s rss={scan.group('rss')}MB "
+            f"reason={reason_short}{safety_tail}"
+        )
+
+    auto_policy = AUTO_POLICY_RE.search(line)
+    if auto_policy:
+        policy = auto_policy.group("policy").strip().upper()
+        reason = auto_policy.group("reason").strip()
+        candidates = auto_policy.group("candidates").strip()
+        if reason.startswith("safety_api_down") or reason.startswith("safety_api_unreliable"):
+            reason = "safety_api_unreliable -> buy paused"
+        return f"[{policy}] BUY blocked candidates={candidates} reason={reason}"
+
+    return line
 
 
 def compact_runtime_lines(lines: list[str]) -> list[str]:
@@ -666,6 +854,15 @@ class App(tk.Tk):
         self.feed_text.tag_configure("ALERT", foreground=EVENT_KEYS["ALERT"][1])
         self.feed_text.tag_configure("SKIP", foreground=EVENT_KEYS["SKIP"][1])
         self.feed_text.tag_configure("ERROR", foreground=EVENT_KEYS["ERROR"][1])
+        self.feed_text.tag_configure("WARNING", foreground="#fb7185")
+        self.feed_text.tag_configure("FILTER_FAIL", foreground="#f59e0b")
+        self.feed_text.tag_configure("FILTER_PASS", foreground="#93c5fd")
+        self.feed_text.tag_configure("API", foreground="#c4b5fd")
+        self.feed_text.tag_configure("WATCHLIST", foreground="#67e8f9")
+        self.feed_text.tag_configure("ONCHAIN", foreground="#a7f3d0")
+        self.feed_text.tag_configure("POLICY_OK", foreground="#86efac")
+        self.feed_text.tag_configure("POLICY_DEGRADED", foreground="#fbbf24")
+        self.feed_text.tag_configure("POLICY_FAIL_CLOSED", foreground="#f87171")
         self.feed_text.tag_configure("INFO", foreground="#cbd5e1")
 
         right_card = ttk.Frame(activity_top, style="Card.TFrame")

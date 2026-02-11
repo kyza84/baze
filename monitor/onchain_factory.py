@@ -11,10 +11,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-import aiohttp
 from web3 import HTTPProvider, Web3
 
 import config
+from utils.http_client import ResilientHttpClient
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +57,33 @@ class OnChainFactoryMonitor:
 
         self._weth_price_usd = 0.0
         self._weth_price_ts = 0.0
+        self._http = ResilientHttpClient(
+            timeout_seconds=float(config.DEX_TIMEOUT),
+            source_limits={
+                "onchain_enrich": 6,
+                "onchain_weth_price": 3,
+            },
+        )
+
+    async def close(self) -> None:
+        await self._http.close()
+
+    def runtime_stats(self, reset: bool = False) -> dict[str, dict[str, int | float]]:
+        return self._http.snapshot_stats(reset=reset)
+
+    async def _http_get_json(self, url: str) -> dict[str, Any] | None:
+        source = "onchain_weth_price" if str(config.WETH_ADDRESS or "").lower() in str(url).lower() else "onchain_enrich"
+        result = await self._http.get_json(
+            url,
+            source=source,
+            max_attempts=int(getattr(config, "HTTP_RETRY_ATTEMPTS", 3)),
+        )
+        if not result.ok or not isinstance(result.data, dict):
+            if int(result.status or 0) == 429:
+                logger.warning("RATE_LIMIT source=%s status=429 url=%s", source, url)
+            return None
+        payload = result.data
+        return payload if isinstance(payload, dict) else None
 
     def _build_web3(self) -> Web3:
         if not self.providers:
@@ -351,14 +378,8 @@ class OnChainFactoryMonitor:
             return 0.0
 
         url = f"{config.DEXSCREENER_API}/tokens/{self.weth_address}"
-        timeout = aiohttp.ClientTimeout(total=config.DEX_TIMEOUT)
-        try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(url) as response:
-                    if response.status != 200:
-                        return self._weth_price_usd
-                    payload = await response.json()
-        except Exception:
+        payload = await self._http_get_json(url)
+        if not payload:
             return self._weth_price_usd
 
         best_liq = -1.0
@@ -379,20 +400,12 @@ class OnChainFactoryMonitor:
     async def _candidate_to_token(self, candidate: PairCandidate) -> dict[str, Any] | None:
         token_address = candidate.token0 if candidate.token1 == self.weth_address else candidate.token1
         url = f"{config.DEXSCREENER_API}/tokens/{token_address}"
-        timeout = aiohttp.ClientTimeout(total=config.DEX_TIMEOUT)
 
         best_pair: dict[str, Any] | None = None
         retries = int(config.ONCHAIN_ENRICH_RETRIES)
         retry_delay = int(config.ONCHAIN_ENRICH_RETRY_DELAY_SECONDS)
         for attempt in range(1, retries + 1):
-            payload: dict[str, Any] | None = None
-            try:
-                async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.get(url) as response:
-                        if response.status == 200:
-                            payload = await response.json()
-            except Exception:
-                payload = None
+            payload = await self._http_get_json(url)
 
             best_liq = -1.0
             pairs = (payload or {}).get("pairs", []) or []
@@ -497,8 +510,18 @@ class OnChainFactoryMonitor:
         candidates = await self.poll_pair_candidates_once()
         if not candidates:
             return []
-        enriched = await asyncio.gather(*[self._candidate_to_token(candidate) for candidate in candidates])
-        return [row for row in enriched if row]
+        enriched = await asyncio.gather(
+            *[self._candidate_to_token(candidate) for candidate in candidates],
+            return_exceptions=True,
+        )
+        out: list[dict[str, Any]] = []
+        for row in enriched:
+            if isinstance(row, Exception):
+                logger.warning("On-chain candidate enrich failed: %s", row)
+                continue
+            if row:
+                out.append(row)
+        return out
 
 
 async def _run_once() -> int:

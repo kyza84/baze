@@ -23,6 +23,12 @@ class TokenAlerter:
         self.max_concurrency = max_concurrency
         self.last_alert_sent_at: dict[int, datetime] = {}
 
+    async def close(self) -> None:
+        await self.token_checker.close()
+
+    def runtime_stats(self, reset: bool = False) -> dict[str, int | float]:
+        return self.token_checker.runtime_stats(reset=reset)
+
     async def send_alert(
         self,
         bot,

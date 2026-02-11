@@ -131,6 +131,11 @@ class LiveExecutor:
         wei = self.w3.eth.get_balance(self.wallet)
         return float(self.w3.from_wei(wei, "ether"))
 
+    def token_balance_raw(self, token_address: str) -> int:
+        token = self.w3.to_checksum_address(token_address)
+        token_contract = self.w3.eth.contract(address=token, abi=ERC20_ABI)
+        return int(token_contract.functions.balanceOf(self.wallet).call())
+
     def is_buy_route_supported(self, token_address: str, spend_eth: float) -> tuple[bool, str]:
         try:
             token = self.w3.to_checksum_address(token_address)

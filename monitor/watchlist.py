@@ -10,12 +10,16 @@ from __future__ import annotations
 import json
 import os
 import time
+import asyncio
+import logging
 from datetime import datetime, timezone
 from typing import Any
 
-import aiohttp
-
 import config
+from utils.addressing import normalize_address
+from utils.http_client import ResilientHttpClient
+
+logger = logging.getLogger(__name__)
 
 
 class WatchlistMonitor:
@@ -32,6 +36,33 @@ class WatchlistMonitor:
             "Accept-Language": "en-US,en;q=0.9",
             "Connection": "keep-alive",
         }
+        self._http = ResilientHttpClient(
+            timeout_seconds=float(config.DEX_TIMEOUT),
+            headers=self._headers,
+            source_limits={
+                "watchlist_dex": 8,
+                "watchlist_gecko": 5,
+            },
+        )
+
+    async def close(self) -> None:
+        await self._http.close()
+
+    def runtime_stats(self, reset: bool = False) -> dict[str, dict[str, int | float]]:
+        return self._http.snapshot_stats(reset=reset)
+
+    async def _fetch_json(self, url: str, source: str, retries: int | None = None) -> Any | None:
+        result = await self._http.get_json(
+            url,
+            source=source,
+            max_attempts=(retries if retries is not None else int(config.DEX_RETRIES)),
+        )
+        if result.ok:
+            return result.data
+        if result.status == 429:
+            logger.warning("RATE_LIMIT source=%s status=429 url=%s", source, url)
+            return None
+        return None
 
     async def fetch_tokens(self) -> list[dict[str, Any]]:
         if not bool(getattr(config, "WATCHLIST_ENABLED", False)):
@@ -53,7 +84,7 @@ class WatchlistMonitor:
         seen_addr: set[str] = set()
 
         for row in await self._fetch_dexscreener_watchlist():
-            addr = str(row.get("address", "")).strip().lower()
+            addr = normalize_address(row.get("address"))
             if not addr or addr in seen_addr:
                 continue
             seen_addr.add(addr)
@@ -64,17 +95,27 @@ class WatchlistMonitor:
         trending_pages = max(1, min(5, trending_pages))
         pools_pages = max(0, min(5, pools_pages))
 
-        for page in range(1, trending_pages + 1):
-            for row in await self._fetch_gecko_pool_page(kind="trending_pools", page=page):
-                addr = str(row.get("address", "")).strip().lower()
+        trending_tasks = [self._fetch_gecko_pool_page(kind="trending_pools", page=page) for page in range(1, trending_pages + 1)]
+        trending_rows = await asyncio.gather(*trending_tasks, return_exceptions=True) if trending_tasks else []
+        for rows in trending_rows:
+            if isinstance(rows, Exception):
+                logger.warning("Watchlist trending page failed: %s", rows)
+                continue
+            for row in rows:
+                addr = normalize_address(row.get("address"))
                 if not addr or addr in seen_addr:
                     continue
                 seen_addr.add(addr)
                 tokens.append(row)
 
-        for page in range(1, pools_pages + 1):
-            for row in await self._fetch_gecko_pool_page(kind="pools", page=page):
-                addr = str(row.get("address", "")).strip().lower()
+        pool_tasks = [self._fetch_gecko_pool_page(kind="pools", page=page) for page in range(1, pools_pages + 1)]
+        pool_rows = await asyncio.gather(*pool_tasks, return_exceptions=True) if pool_tasks else []
+        for rows in pool_rows:
+            if isinstance(rows, Exception):
+                logger.warning("Watchlist pools page failed: %s", rows)
+                continue
+            for row in rows:
+                addr = normalize_address(row.get("address"))
                 if not addr or addr in seen_addr:
                     continue
                 seen_addr.add(addr)
@@ -88,8 +129,8 @@ class WatchlistMonitor:
 
     async def _fetch_dexscreener_watchlist(self) -> list[dict[str, Any]]:
         queries = getattr(config, "DEX_SEARCH_QUERIES", None) or [getattr(config, "DEX_SEARCH_QUERY", "base")]
-        chain_id = str(getattr(config, "CHAIN_ID", "base") or "base").lower()
-        weth = str(getattr(config, "WETH_ADDRESS", "") or "").strip().lower()
+        chain_id = normalize_address(getattr(config, "CHAIN_ID", "base") or "base")
+        weth = normalize_address(getattr(config, "WETH_ADDRESS", "") or "")
         allow = set(getattr(config, "WATCHLIST_DEX_ALLOWLIST", []) or [])
         require_weth_quote = bool(getattr(config, "WATCHLIST_REQUIRE_WETH_QUOTE", True))
 
@@ -97,37 +138,38 @@ class WatchlistMonitor:
         min_vol_h24 = float(getattr(config, "WATCHLIST_MIN_VOLUME_24H_USD", 500000) or 500000)
 
         out: list[dict[str, Any]] = []
-        timeout = aiohttp.ClientTimeout(total=int(config.DEX_TIMEOUT))
-        for q in list(queries)[:20]:
-            query = str(q or "").strip()
-            if not query:
+        active_queries = [str(q or "").strip() for q in list(queries)[:20] if str(q or "").strip()]
+        if not active_queries:
+            return []
+
+        urls = [f"{config.DEXSCREENER_API}/search?q={query}" for query in active_queries]
+        payloads = await asyncio.gather(
+            *[self._fetch_json(url, source="watchlist_dex") for url in urls],
+            return_exceptions=True,
+        )
+        for payload in payloads:
+            if isinstance(payload, Exception):
+                logger.warning("Watchlist dex payload failed: %s", payload)
                 continue
-            url = f"{config.DEXSCREENER_API}/search?q={query}"
-            try:
-                async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.get(url, headers=self._headers) as resp:
-                        if resp.status != 200:
-                            continue
-                        payload = await resp.json()
-            except Exception:
+            if not isinstance(payload, dict):
                 continue
 
             pairs = payload.get("pairs", []) or []
             for pair in pairs:
                 if not isinstance(pair, dict):
                     continue
-                if str(pair.get("chainId", "")).lower() != chain_id:
+                if normalize_address(pair.get("chainId", "")) != chain_id:
                     continue
                 dex_id = str(pair.get("dexId") or "").lower()
                 if allow and dex_id and (dex_id not in allow):
                     continue
                 quote = pair.get("quoteToken") or {}
-                quote_addr = str((quote or {}).get("address", "")).strip().lower()
+                quote_addr = normalize_address((quote or {}).get("address", ""))
                 if require_weth_quote and weth and quote_addr and quote_addr != weth:
                     continue
 
                 base = pair.get("baseToken") or {}
-                address = str((base or {}).get("address", "")).strip().lower()
+                address = normalize_address((base or {}).get("address", ""))
                 if not address:
                     continue
 
@@ -199,14 +241,8 @@ class WatchlistMonitor:
         network = str(getattr(config, "GECKO_NETWORK", "base") or "base").strip()
         include = "base_token,quote_token,dex"
         url = f"https://api.geckoterminal.com/api/v2/networks/{network}/{kind}?page={int(page)}&include={include}"
-        timeout = aiohttp.ClientTimeout(total=int(config.DEX_TIMEOUT))
-        try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(url, headers=self._headers) as response:
-                    if response.status != 200:
-                        return []
-                    data = await response.json()
-        except Exception:
+        data = await self._fetch_json(url, source="watchlist_gecko")
+        if not isinstance(data, dict):
             return []
 
         pools = data.get("data", []) or []
@@ -221,7 +257,7 @@ class WatchlistMonitor:
             elif item.get("type") == "dex":
                 dex_map[str(item.get("id", ""))] = item.get("attributes", {}) or {}
 
-        weth = str(getattr(config, "WETH_ADDRESS", "") or "").strip().lower()
+        weth = normalize_address(getattr(config, "WETH_ADDRESS", "") or "")
         require_weth_quote = bool(getattr(config, "WATCHLIST_REQUIRE_WETH_QUOTE", True))
         min_liq = float(getattr(config, "WATCHLIST_MIN_LIQUIDITY_USD", 200000) or 200000)
         min_vol_h24 = float(getattr(config, "WATCHLIST_MIN_VOLUME_24H_USD", 500000) or 500000)
@@ -237,13 +273,13 @@ class WatchlistMonitor:
             rel = pool.get("relationships", {}) or {}
             base_id = str(((rel.get("base_token") or {}).get("data") or {}).get("id") or "")
             quote_id = str(((rel.get("quote_token") or {}).get("data") or {}).get("id") or "")
-            dex_id = str(((rel.get("dex") or {}).get("data") or {}).get("id") or "").lower()
+            dex_id = normalize_address(((rel.get("dex") or {}).get("data") or {}).get("id") or "")
             dex_name = str((dex_map.get(dex_id) or {}).get("name") or dex_id).lower()
 
             base_token = token_map.get(base_id, {}) or {}
             quote_token = token_map.get(quote_id, {}) or {}
-            address = str(base_token.get("address") or "").strip().lower()
-            quote_addr = str(quote_token.get("address") or "").strip().lower()
+            address = normalize_address(base_token.get("address") or "")
+            quote_addr = normalize_address(quote_token.get("address") or "")
             if not address:
                 continue
             # Ensure pool quote is WETH for our router.

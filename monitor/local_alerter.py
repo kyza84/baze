@@ -19,6 +19,9 @@ class LocalAlerter:
         self.token_checker = TokenChecker()
         os.makedirs(os.path.dirname(self.alerts_file), exist_ok=True)
 
+    async def close(self) -> None:
+        await self.token_checker.close()
+
     async def send_alert(
         self,
         token_data: dict[str, Any],

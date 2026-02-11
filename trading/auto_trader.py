@@ -7,16 +7,18 @@ import json
 import logging
 import math
 import os
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-import aiohttp
-
 import config
 from trading.live_executor import LiveExecutor
+from utils.addressing import normalize_address
+from utils.http_client import ResilientHttpClient
 
 logger = logging.getLogger(__name__)
+ADDRESS_RE = re.compile(r"^0x[a-f0-9]{40}$")
 
 
 @dataclass
@@ -46,6 +48,8 @@ class PaperPosition:
     token_amount_raw: int = 0
     buy_tx_hash: str = ""
     sell_tx_hash: str = ""
+    buy_tx_status: str = "none"
+    sell_tx_status: str = "none"
     spent_eth: float = 0.0
 
 
@@ -77,6 +81,19 @@ class AutoTrader:
         self._last_guard_log_ts = 0.0
         self._live_sell_failures = 0
         self._honeypot_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        self.recovery_queue: list[str] = []
+        self.recovery_untracked: dict[str, int] = {}
+        self._recovery_attempts: dict[str, int] = {}
+        self._recovery_last_attempt_ts: dict[str, float] = {}
+        self.data_policy_mode = "OK"
+        self.data_policy_reason = ""
+        self._http = ResilientHttpClient(
+            timeout_seconds=float(max(config.DEX_TIMEOUT, int(config.HONEYPOT_API_TIMEOUT_SECONDS))),
+            source_limits={
+                "dex_price": 6,
+                "honeypot": 3,
+            },
+        )
 
         # Live session baseline tracking (used for "stop after profit" guard).
         self.live_start_ts = 0.0
@@ -102,6 +119,7 @@ class AutoTrader:
             try:
                 self.live_executor = LiveExecutor()
                 logger.info("Live executor ready wallet=%s", config.LIVE_WALLET_ADDRESS)
+                self._reconcile_live_state_on_startup()
             except Exception as exc:
                 self.live_executor = None
                 logger.error("Live executor init failed: %s", exc)
@@ -162,7 +180,7 @@ class AutoTrader:
     def _blacklist_is_blocked(self, token_address: str) -> tuple[bool, str]:
         if not bool(getattr(config, "AUTOTRADE_BLACKLIST_ENABLED", True)):
             return False, ""
-        key = str(token_address or "").strip().lower()
+        key = normalize_address(token_address)
         if not key:
             return False, ""
         row = self._blacklist.get(key)
@@ -177,7 +195,7 @@ class AutoTrader:
     def _blacklist_add(self, token_address: str, reason: str, ttl_seconds: int | None = None) -> None:
         if not bool(getattr(config, "AUTOTRADE_BLACKLIST_ENABLED", True)):
             return
-        key = str(token_address or "").strip().lower()
+        key = normalize_address(token_address)
         if not key:
             return
         now_ts = datetime.now(timezone.utc).timestamp()
@@ -201,6 +219,8 @@ class AutoTrader:
         self.reset_paper_state(keep_closed=True)
 
     def can_open_trade(self) -> bool:
+        if self.data_policy_mode != "OK":
+            return False
         self._refresh_daily_window()
         # Manual control mode: no auto pause by daily drawdown or streak.
         self.trading_pause_until_ts = 0.0
@@ -239,6 +259,8 @@ class AutoTrader:
     def _cannot_open_trade_detail(self) -> str:
         # Keep this in sync with can_open_trade() so "disabled_or_limits" logs
         # tell the operator exactly which guard/limit is active.
+        if self.data_policy_mode != "OK":
+            return f"data_policy:{self.data_policy_mode}:{self.data_policy_reason}"
         self._refresh_daily_window()
         self.trading_pause_until_ts = 0.0
         if self.emergency_halt_reason:
@@ -268,6 +290,55 @@ class AutoTrader:
                 return f"low_balance_guard available=${available:.2f} min=${min_available:.2f}"
 
         return "unknown"
+
+    def set_data_policy(self, mode: str, reason: str = "") -> None:
+        normalized = str(mode or "OK").strip().upper()
+        if normalized not in {"OK", "DEGRADED", "FAIL_CLOSED"}:
+            normalized = "DEGRADED"
+        if normalized == self.data_policy_mode and str(reason or "") == self.data_policy_reason:
+            return
+        logger.warning(
+            "DATA_POLICY mode=%s reason=%s prev_mode=%s prev_reason=%s",
+            normalized,
+            reason,
+            self.data_policy_mode,
+            self.data_policy_reason,
+        )
+        self.data_policy_mode = normalized
+        self.data_policy_reason = str(reason or "")
+
+    def _recovery_record_attempt(self, address: str) -> int:
+        key = normalize_address(address)
+        now_ts = datetime.now(timezone.utc).timestamp()
+        self._recovery_last_attempt_ts[key] = now_ts
+        self._recovery_attempts[key] = int(self._recovery_attempts.get(key, 0)) + 1
+        return int(self._recovery_attempts.get(key, 0))
+
+    def _recovery_attempt_allowed(self, address: str) -> bool:
+        key = normalize_address(address)
+        now_ts = datetime.now(timezone.utc).timestamp()
+        min_interval = int(getattr(config, "RECOVERY_ATTEMPT_INTERVAL_SECONDS", 30) or 30)
+        max_attempts = int(getattr(config, "RECOVERY_MAX_ATTEMPTS", 8) or 8)
+        attempts = int(self._recovery_attempts.get(key, 0))
+        if attempts >= max_attempts:
+            return False
+        last_ts = float(self._recovery_last_attempt_ts.get(key, 0.0))
+        if last_ts > 0 and (now_ts - last_ts) < min_interval:
+            return False
+        return True
+
+    def _recovery_clear_tracking(self, address: str) -> None:
+        key = normalize_address(address)
+        self._recovery_attempts.pop(key, None)
+        self._recovery_last_attempt_ts.pop(key, None)
+
+    def _recovery_forget_address(self, address: str) -> None:
+        key = normalize_address(address)
+        if not key:
+            return
+        self.recovery_queue = [a for a in self.recovery_queue if normalize_address(a) != key]
+        self.recovery_untracked.pop(key, None)
+        self._recovery_clear_tracking(key)
 
     @staticmethod
     def _is_live_mode() -> bool:
@@ -414,7 +485,7 @@ class AutoTrader:
     def _honeypot_cache_get(self, token_address: str) -> dict[str, Any] | None:
         if not token_address:
             return None
-        key = token_address.strip().lower()
+        key = normalize_address(token_address)
         now_ts = datetime.now(timezone.utc).timestamp()
         ttl = int(config.HONEYPOT_API_CACHE_TTL_SECONDS)
         row = self._honeypot_cache.get(key)
@@ -429,7 +500,7 @@ class AutoTrader:
     def _honeypot_cache_put(self, token_address: str, payload: dict[str, Any]) -> None:
         if not token_address:
             return
-        key = token_address.strip().lower()
+        key = normalize_address(token_address)
         self._honeypot_cache[key] = (datetime.now(timezone.utc).timestamp(), payload)
 
     async def _honeypot_guard_passes(self, token_address: str) -> tuple[bool, str]:
@@ -448,17 +519,19 @@ class AutoTrader:
             "address": token_address,
             "chainID": int(config.LIVE_CHAIN_ID),
         }
-        timeout = aiohttp.ClientTimeout(total=int(config.HONEYPOT_API_TIMEOUT_SECONDS))
-
         try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(url, params=params) as response:
-                    if response.status != 200:
-                        detail = f"honeypot_api_status_{response.status}"
-                        ok = not bool(config.HONEYPOT_API_FAIL_CLOSED)
-                        self._honeypot_cache_put(token_address, {"ok": ok, "detail": detail})
-                        return ok, detail
-                    payload = await response.json()
+            result = await self._http.get_json(
+                url,
+                source="honeypot",
+                params=params,
+                max_attempts=int(getattr(config, "HTTP_RETRY_ATTEMPTS", 3)),
+            )
+            if not result.ok or not isinstance(result.data, dict):
+                detail = f"honeypot_api_status_{result.status}" if int(result.status or 0) > 0 else str(result.error or "honeypot_api_error")
+                ok = not bool(config.HONEYPOT_API_FAIL_CLOSED)
+                self._honeypot_cache_put(token_address, {"ok": ok, "detail": detail})
+                return ok, detail
+            payload = result.data
         except Exception as exc:
             detail = f"honeypot_api_error:{exc}"
             ok = not bool(config.HONEYPOT_API_FAIL_CLOSED)
@@ -660,6 +733,50 @@ class AutoTrader:
             return True
         return False
 
+    def _pre_buy_invariants(self, token_address: str, spend_eth: float) -> tuple[bool, str]:
+        addr = normalize_address(token_address)
+        if not addr or not bool(ADDRESS_RE.match(addr)):
+            return False, "invalid_normalized_address"
+
+        if self.data_policy_mode != "OK":
+            return False, f"data_policy_{self.data_policy_mode}"
+
+        try:
+            slippage_bps = int(config.LIVE_SLIPPAGE_BPS)
+        except Exception:
+            slippage_bps = 0
+        if slippage_bps < 1 or slippage_bps > 5000:
+            return False, f"slippage_out_of_range:{slippage_bps}"
+
+        try:
+            gas_cap_gwei = float(config.LIVE_MAX_GAS_GWEI)
+        except Exception:
+            gas_cap_gwei = 0.0
+        if gas_cap_gwei <= 0 or gas_cap_gwei > 500:
+            return False, f"gas_cap_out_of_range:{gas_cap_gwei}"
+
+        if not self.can_open_trade():
+            return False, self._cannot_open_trade_detail()
+
+        if float(spend_eth) <= 0:
+            return False, "invalid_spend_eth"
+
+        return True, "ok"
+
+    def _pre_sell_invariants(self, position: PaperPosition) -> tuple[bool, str]:
+        addr = normalize_address(position.token_address)
+        if not addr or not bool(ADDRESS_RE.match(addr)):
+            return False, "invalid_normalized_address"
+        if int(position.token_amount_raw or 0) <= 0:
+            return False, "invalid_token_amount_raw"
+        try:
+            gas_cap_gwei = float(config.LIVE_MAX_GAS_GWEI)
+        except Exception:
+            gas_cap_gwei = 0.0
+        if gas_cap_gwei <= 0 or gas_cap_gwei > 500:
+            return False, f"gas_cap_out_of_range:{gas_cap_gwei}"
+        return True, "ok"
+
     async def plan_trade(self, token_data: dict[str, Any], score_data: dict[str, Any]) -> PaperPosition | None:
         symbol = str(token_data.get("symbol", "N/A"))
         if not self.can_open_trade():
@@ -680,13 +797,20 @@ class AutoTrader:
             )
             return None
 
-        token_address = str(token_data.get("address", "")).strip()
+        raw_token_address = str(token_data.get("address", "") or "")
+        token_address = normalize_address(raw_token_address)
         blocked, blk_reason = self._blacklist_is_blocked(token_address)
         if blocked:
             logger.info("AutoTrade skip token=%s reason=blacklist detail=%s", symbol, self._short_error_text(blk_reason))
             return None
         if not token_address or token_address in self.open_positions:
-            logger.info("AutoTrade skip token=%s reason=address_or_duplicate", symbol)
+            logger.info(
+                "AutoTrade skip token=%s reason=address_or_duplicate raw_address=%s normalized=%s source=%s",
+                symbol,
+                raw_token_address,
+                token_address,
+                str(token_data.get("source", "-")),
+            )
             return None
         cooldown_until = float(self.token_cooldowns.get(token_address, 0.0))
         now_ts = datetime.now(timezone.utc).timestamp()
@@ -823,6 +947,17 @@ class AutoTrader:
                 logger.info("AutoTrade skip token=%s reason=no_weth_price", symbol)
                 return None
             spend_eth = position_size_usd / weth_price_usd
+            inv_ok, inv_reason = self._pre_buy_invariants(token_address, spend_eth)
+            if not inv_ok:
+                logger.warning(
+                    "AutoTrade skip token=%s reason=pre_buy_invariants detail=%s raw_address=%s normalized=%s source=%s",
+                    symbol,
+                    inv_reason,
+                    raw_token_address,
+                    token_address,
+                    str(token_data.get("source", "-")),
+                )
+                return None
             # Ensure we keep enough native ETH for gas so we can still SELL/approve later.
             try:
                 reserve_eth = float(getattr(config, "LIVE_MIN_GAS_RESERVE_ETH", 0.0) or 0.0)
@@ -942,6 +1077,7 @@ class AutoTrader:
                 gas_cost_usd=cost_profile["gas_usd"],
                 token_amount_raw=int(buy_result.token_amount_raw),
                 buy_tx_hash=str(buy_result.tx_hash),
+                buy_tx_status="confirmed",
                 spent_eth=float(buy_result.spent_eth),
             )
             self.open_positions[token_address] = pos
@@ -1055,6 +1191,7 @@ class AutoTrader:
         return max(0.0, min(position_size_usd, max_size_by_risk))
 
     async def process_open_positions(self, bot=None) -> None:
+        await self._process_recovery_queue()
         await self._check_critical_conditions()
         if not self.open_positions:
             return
@@ -1118,6 +1255,105 @@ class AutoTrader:
                     self._close_position(position, close_reason)
                 if bot and int(config.PERSONAL_TELEGRAM_ID or 0) > 0:
                     await self._send_close_message(bot, position)
+
+    async def _process_recovery_queue(self) -> None:
+        if (not self.recovery_queue) and (not self.recovery_untracked):
+            return
+        pending: list[str] = []
+        max_per_cycle = 2
+        processed = 0
+
+        for address in list(self.recovery_queue):
+            normalized = normalize_address(address)
+            if not normalized:
+                continue
+            pos = self.open_positions.get(normalized)
+            if not pos:
+                self._recovery_clear_tracking(normalized)
+                continue
+            if int(pos.token_amount_raw or 0) <= 0:
+                self._recovery_clear_tracking(normalized)
+                continue
+
+            if not self._is_live_mode() or self.live_executor is None:
+                pending.append(normalized)
+                continue
+
+            if not self._recovery_attempt_allowed(normalized):
+                pending.append(normalized)
+                continue
+
+            attempts = self._recovery_record_attempt(normalized)
+            processed += 1
+            logger.warning(
+                "RECOVERY queued_position token=%s address=%s amount_raw=%s attempt=%s",
+                pos.symbol,
+                normalized,
+                int(pos.token_amount_raw),
+                attempts,
+            )
+            await self._close_position_live(pos, "RECOVERY")
+            if normalized in self.open_positions:
+                pending.append(normalized)
+            else:
+                self._recovery_clear_tracking(normalized)
+            if processed >= max_per_cycle:
+                pending.extend(
+                    [normalize_address(x) for x in self.recovery_queue if normalize_address(x) and normalize_address(x) not in pending]
+                )
+                break
+        self.recovery_queue = pending
+
+        if self.recovery_untracked and self._is_live_mode() and self.live_executor is not None:
+            for address in list(self.recovery_untracked.keys()):
+                normalized = normalize_address(address)
+                if not normalized:
+                    self.recovery_untracked.pop(address, None)
+                    continue
+                if not self._recovery_attempt_allowed(normalized):
+                    continue
+
+                amount_raw = int(self.recovery_untracked.get(normalized, 0) or 0)
+                if amount_raw <= 0:
+                    self.recovery_untracked.pop(normalized, None)
+                    self._recovery_clear_tracking(normalized)
+                    continue
+
+                attempts = self._recovery_record_attempt(normalized)
+                logger.warning(
+                    "RECOVERY untracked_attempt address=%s amount_raw=%s attempt=%s",
+                    normalized,
+                    amount_raw,
+                    attempts,
+                )
+                try:
+                    sell_result = await asyncio.to_thread(
+                        self.live_executor.sell_token,
+                        normalized,
+                        amount_raw,
+                    )
+                    logger.warning(
+                        "RECOVERY untracked_sold address=%s recv_eth=%.8f tx=%s",
+                        normalized,
+                        float(getattr(sell_result, "received_eth", 0.0) or 0.0),
+                        str(getattr(sell_result, "tx_hash", "")),
+                    )
+                    self.recovery_untracked.pop(normalized, None)
+                    self._recovery_clear_tracking(normalized)
+                except Exception as exc:
+                    txt = str(exc).lower()
+                    logger.warning("RECOVERY untracked_sell_failed address=%s err=%s", normalized, exc)
+                    if bool(getattr(config, "LIVE_ABANDON_UNSELLABLE_POSITIONS", False)) and (
+                        "execution reverted" in txt
+                        or "quote_failed" in txt
+                        or "unsupported" in txt
+                    ):
+                        logger.warning("RECOVERY untracked_abandoned address=%s", normalized)
+                        self.recovery_untracked.pop(normalized, None)
+                        self._recovery_clear_tracking(normalized)
+
+        if self.recovery_queue or self.recovery_untracked:
+            self._save_state()
 
     async def _check_critical_conditions(self) -> None:
         if self._kill_switch_active():
@@ -1200,9 +1436,11 @@ class AutoTrader:
             position.pnl_usd = -float(position.position_size_usd)
             position.pnl_percent = -100.0
             position.sell_tx_hash = ""
+            position.sell_tx_status = "failed"
 
             self.open_positions.pop(position.token_address, None)
             self.price_guard_pending.pop(position.token_address, None)
+            self._recovery_forget_address(position.token_address)
             self.closed_positions.append(position)
             self._prune_closed_positions()
             self.total_closed += 1
@@ -1233,6 +1471,13 @@ class AutoTrader:
             self._live_sell_failures += 1
             if self._live_sell_failures >= 3:
                 self._activate_emergency_halt("LIVE_SELL_FAILED", "live_executor_unavailable")
+            return
+        inv_ok, inv_reason = self._pre_sell_invariants(position)
+        if not inv_ok:
+            logger.error("AUTO_SELL live_failed token=%s reason=pre_sell_invariants detail=%s", position.symbol, inv_reason)
+            self._live_sell_failures += 1
+            if self._live_sell_failures >= 3:
+                self._activate_emergency_halt("LIVE_SELL_FAILED", inv_reason)
             return
         try:
             sell_result = await asyncio.to_thread(
@@ -1280,9 +1525,11 @@ class AutoTrader:
         position.pnl_usd = pnl_usd
         position.pnl_percent = pnl_percent
         position.sell_tx_hash = str(sell_result.tx_hash)
+        position.sell_tx_status = "confirmed"
 
         self.open_positions.pop(position.token_address, None)
         self.price_guard_pending.pop(position.token_address, None)
+        self._recovery_forget_address(position.token_address)
         self.closed_positions.append(position)
         self._prune_closed_positions()
         self.total_closed += 1
@@ -1298,7 +1545,7 @@ class AutoTrader:
 
         token_cooldown = int(config.MAX_TOKEN_COOLDOWN_SECONDS)
         if token_cooldown > 0:
-            self.token_cooldowns[position.token_address] = datetime.now(timezone.utc).timestamp() + token_cooldown
+            self.token_cooldowns[normalize_address(position.token_address)] = datetime.now(timezone.utc).timestamp() + token_cooldown
 
         logger.info(
             "AUTO_SELL Live SELL token=%s reason=%s recv=%.8f ETH pnl=%.2f%% ($%.2f) tx=%s",
@@ -1346,9 +1593,11 @@ class AutoTrader:
         position.closed_at = datetime.now(timezone.utc)
         position.pnl_usd = pnl_usd
         position.pnl_percent = pnl_percent
+        position.sell_tx_status = "simulated"
 
         self.open_positions.pop(position.token_address, None)
         self.price_guard_pending.pop(position.token_address, None)
+        self._recovery_forget_address(position.token_address)
         self.closed_positions.append(position)
         self._prune_closed_positions()
         self.total_closed += 1
@@ -1369,7 +1618,7 @@ class AutoTrader:
 
         token_cooldown = int(config.MAX_TOKEN_COOLDOWN_SECONDS)
         if token_cooldown > 0:
-            self.token_cooldowns[position.token_address] = datetime.now(timezone.utc).timestamp() + token_cooldown
+            self.token_cooldowns[normalize_address(position.token_address)] = datetime.now(timezone.utc).timestamp() + token_cooldown
 
         logger.info(
             "AUTO_SELL Paper SELL token=%s reason=%s exit=$%.8f pnl=%.2f%% ($%.2f) raw=%.2f%% cost=%.2f%% gas=$%.2f balance=$%.2f",
@@ -1412,7 +1661,7 @@ class AutoTrader:
             await bot.send_message(
                 chat_id=int(config.PERSONAL_TELEGRAM_ID),
                 text=(
-                    "📉 <b>Paper Trade Closed</b>\n\n"
+                    "<b>Paper Trade Closed</b>\n\n"
                     f"Token: <b>{position.symbol}</b>\n"
                     f"Reason: <b>{position.close_reason}</b>\n"
                     f"Entry: <code>${position.entry_price_usd:.8f}</code>\n"
@@ -1426,16 +1675,18 @@ class AutoTrader:
             logger.warning("Failed to send paper close message: %s", exc)
 
     async def _fetch_current_price(self, token_address: str) -> tuple[str, float] | None:
-        url = f"{config.DEXSCREENER_API}/tokens/{token_address}"
-        timeout = aiohttp.ClientTimeout(total=config.DEX_TIMEOUT)
-        try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(url) as response:
-                    if response.status != 200:
-                        return None
-                    data = await response.json()
-        except Exception:
+        token_address = normalize_address(token_address)
+        if not token_address:
             return None
+        url = f"{config.DEXSCREENER_API}/tokens/{token_address}"
+        result = await self._http.get_json(
+            url,
+            source="dex_price",
+            max_attempts=int(getattr(config, "HTTP_RETRY_ATTEMPTS", 3)),
+        )
+        if not result.ok or not isinstance(result.data, dict):
+            return None
+        data = result.data
 
         pairs = data.get("pairs", []) or []
         best_liq = -1.0
@@ -1561,6 +1812,10 @@ class AutoTrader:
             "available_balance_usd": round(self._available_balance_usd(), 2),
             "emergency_halt_reason": self.emergency_halt_reason,
             "emergency_halt_ts": round(self.emergency_halt_ts, 2),
+            "data_policy_mode": self.data_policy_mode,
+            "data_policy_reason": self.data_policy_reason,
+            "recovery_queue": len(self.recovery_queue),
+            "recovery_untracked": len(self.recovery_untracked),
         }
 
     def reset_paper_state(self, keep_closed: bool = True) -> None:
@@ -1587,6 +1842,104 @@ class AutoTrader:
             self.total_wins = 0
             self.total_losses = 0
         self._sync_stair_state()
+        self._save_state()
+
+    def flush_state(self) -> None:
+        self._save_state()
+
+    async def shutdown(self, reason: str = "shutdown") -> None:
+        logger.info(
+            "AUTOTRADER_SHUTDOWN reason=%s open=%s closed=%s",
+            reason,
+            len(self.open_positions),
+            len(self.closed_positions),
+        )
+        self._save_state()
+        await self._http.close()
+
+    def _reconcile_live_state_on_startup(self) -> None:
+        if not self._is_live_mode() or self.live_executor is None:
+            return
+
+        logger.warning("RECOVERY startup begin open_positions=%s", len(self.open_positions))
+        now = datetime.now(timezone.utc)
+        for key, position in list(self.open_positions.items()):
+            addr = normalize_address(position.token_address or key)
+            if not addr:
+                continue
+            try:
+                onchain_amount = int(self.live_executor.token_balance_raw(addr))
+            except Exception as exc:
+                logger.warning("RECOVERY balance_check_failed token=%s err=%s", position.symbol, exc)
+                continue
+
+            if onchain_amount <= 0:
+                logger.warning(
+                    "RECOVERY closing_zero_balance token=%s address=%s stored_raw=%s",
+                    position.symbol,
+                    addr,
+                    int(position.token_amount_raw or 0),
+                )
+                position.status = "CLOSED"
+                position.close_reason = "RECOVERY_ZERO_BALANCE"
+                position.closed_at = now
+                position.pnl_percent = 0.0
+                position.pnl_usd = 0.0
+                position.sell_tx_status = "recovered"
+                self.open_positions.pop(key, None)
+                self.price_guard_pending.pop(key, None)
+                self.closed_positions.append(position)
+                self.total_closed += 1
+                continue
+
+            old_raw = int(position.token_amount_raw or 0)
+            if old_raw != onchain_amount:
+                position.token_amount_raw = onchain_amount
+                self.recovery_queue.append(addr)
+                logger.warning(
+                    "RECOVERY sync_token_amount token=%s address=%s old_raw=%s new_raw=%s",
+                    position.symbol,
+                    addr,
+                    old_raw,
+                    onchain_amount,
+                )
+
+        # Discover potentially untracked tokens from known address universe.
+        max_discovery = int(getattr(config, "RECOVERY_DISCOVERY_MAX_ADDRESSES", 80) or 80)
+        if max_discovery > 0:
+            candidates: list[str] = []
+            seen: set[str] = set()
+
+            def _push(addr: str) -> None:
+                a = normalize_address(addr)
+                if not a or a in seen or a in self.open_positions:
+                    return
+                if not bool(ADDRESS_RE.match(a)):
+                    return
+                seen.add(a)
+                candidates.append(a)
+
+            for a in self._blacklist.keys():
+                _push(str(a))
+            for p in self.closed_positions[-300:]:
+                _push(str(p.token_address))
+            for a in self.token_cooldowns.keys():
+                _push(str(a))
+
+            candidates = candidates[:max_discovery]
+            for addr in candidates:
+                try:
+                    amount_raw = int(self.live_executor.token_balance_raw(addr))
+                except Exception:
+                    continue
+                if amount_raw <= 0:
+                    continue
+                self.recovery_untracked[addr] = amount_raw
+                logger.warning(
+                    "RECOVERY untracked_detected address=%s amount_raw=%s",
+                    addr,
+                    amount_raw,
+                )
         self._save_state()
 
     @staticmethod
@@ -1713,6 +2066,12 @@ class AutoTrader:
                 "token_cooldowns": self.token_cooldowns,
                 "trade_open_timestamps": self.trade_open_timestamps[-500:],
                 "price_guard_pending": self.price_guard_pending,
+                "recovery_queue": self.recovery_queue[-200:],
+                "recovery_untracked": self.recovery_untracked,
+                "recovery_attempts": self._recovery_attempts,
+                "recovery_last_attempt_ts": self._recovery_last_attempt_ts,
+                "data_policy_mode": self.data_policy_mode,
+                "data_policy_reason": self.data_policy_reason,
                 "emergency_halt_reason": self.emergency_halt_reason,
                 "emergency_halt_ts": self.emergency_halt_ts,
                 "stair_floor_usd": self.stair_floor_usd,
@@ -1748,7 +2107,7 @@ class AutoTrader:
             self.day_start_equity_usd = float(payload.get("day_start_equity_usd", self.paper_balance_usd))
             self.day_realized_pnl_usd = float(payload.get("day_realized_pnl_usd", 0.0))
             raw_cooldowns = payload.get("token_cooldowns", {}) or {}
-            self.token_cooldowns = {str(k): float(v) for k, v in raw_cooldowns.items()}
+            self.token_cooldowns = {normalize_address(str(k)): float(v) for k, v in raw_cooldowns.items() if normalize_address(str(k))}
             raw_trade_ts = payload.get("trade_open_timestamps", []) or []
             self.trade_open_timestamps = []
             for value in raw_trade_ts:
@@ -1762,11 +2121,60 @@ class AutoTrader:
                 for address, record in pending_raw.items():
                     if not isinstance(record, dict):
                         continue
-                    self.price_guard_pending[str(address)] = {
+                    normalized = normalize_address(str(address))
+                    if not normalized:
+                        continue
+                    self.price_guard_pending[normalized] = {
                         "price": float(record.get("price", 0.0)),
                         "count": int(record.get("count", 0)),
                         "first_ts": float(record.get("first_ts", 0.0)),
                     }
+            self.recovery_queue = []
+            raw_recovery = payload.get("recovery_queue", []) or []
+            if isinstance(raw_recovery, list):
+                for value in raw_recovery:
+                    addr = normalize_address(value)
+                    if addr:
+                        self.recovery_queue.append(addr)
+            self.recovery_untracked = {}
+            raw_untracked = payload.get("recovery_untracked", {}) or {}
+            if isinstance(raw_untracked, dict):
+                for k, v in raw_untracked.items():
+                    addr = normalize_address(k)
+                    if not addr:
+                        continue
+                    try:
+                        amount = int(v)
+                    except Exception:
+                        amount = 0
+                    if amount > 0:
+                        self.recovery_untracked[addr] = amount
+            self._recovery_attempts = {}
+            raw_attempts = payload.get("recovery_attempts", {}) or {}
+            if isinstance(raw_attempts, dict):
+                for k, v in raw_attempts.items():
+                    addr = normalize_address(k)
+                    if not addr:
+                        continue
+                    try:
+                        self._recovery_attempts[addr] = int(v)
+                    except Exception:
+                        continue
+            self._recovery_last_attempt_ts = {}
+            raw_attempt_ts = payload.get("recovery_last_attempt_ts", {}) or {}
+            if isinstance(raw_attempt_ts, dict):
+                for k, v in raw_attempt_ts.items():
+                    addr = normalize_address(k)
+                    if not addr:
+                        continue
+                    try:
+                        self._recovery_last_attempt_ts[addr] = float(v)
+                    except Exception:
+                        continue
+            self.data_policy_mode = str(payload.get("data_policy_mode", self.data_policy_mode) or "OK").upper()
+            if self.data_policy_mode not in {"OK", "DEGRADED", "FAIL_CLOSED"}:
+                self.data_policy_mode = "OK"
+            self.data_policy_reason = str(payload.get("data_policy_reason", self.data_policy_reason) or "")
             self.emergency_halt_reason = str(payload.get("emergency_halt_reason", "") or "")
             self.emergency_halt_ts = float(payload.get("emergency_halt_ts", 0.0) or 0.0)
             self.stair_floor_usd = float(payload.get("stair_floor_usd", self.stair_floor_usd))
@@ -1780,7 +2188,7 @@ class AutoTrader:
             for row in payload.get("open_positions", []):
                 pos = self._deserialize_pos(row)
                 if pos and pos.status == "OPEN":
-                    self.open_positions[pos.token_address] = pos
+                    self.open_positions[normalize_address(pos.token_address)] = pos
 
             self.closed_positions.clear()
             for row in payload.get("closed_positions", []):
@@ -1802,7 +2210,7 @@ class AutoTrader:
     @staticmethod
     def _serialize_pos(pos: PaperPosition) -> dict[str, Any]:
         return {
-            "token_address": pos.token_address,
+            "token_address": normalize_address(pos.token_address),
             "symbol": pos.symbol,
             "entry_price_usd": pos.entry_price_usd,
             "current_price_usd": pos.current_price_usd,
@@ -1827,6 +2235,8 @@ class AutoTrader:
             "token_amount_raw": pos.token_amount_raw,
             "buy_tx_hash": pos.buy_tx_hash,
             "sell_tx_hash": pos.sell_tx_hash,
+            "buy_tx_status": pos.buy_tx_status,
+            "sell_tx_status": pos.sell_tx_status,
             "spent_eth": pos.spent_eth,
         }
 
@@ -1843,7 +2253,7 @@ class AutoTrader:
                 if closed_at.tzinfo is None:
                     closed_at = closed_at.replace(tzinfo=timezone.utc)
             return PaperPosition(
-                token_address=str(row.get("token_address", "")),
+                token_address=normalize_address(str(row.get("token_address", ""))),
                 symbol=str(row.get("symbol", "N/A")),
                 entry_price_usd=float(row.get("entry_price_usd", 0)),
                 current_price_usd=float(row.get("current_price_usd", 0)),
@@ -1868,6 +2278,8 @@ class AutoTrader:
                 token_amount_raw=int(row.get("token_amount_raw", 0)),
                 buy_tx_hash=str(row.get("buy_tx_hash", "")),
                 sell_tx_hash=str(row.get("sell_tx_hash", "")),
+                buy_tx_status=str(row.get("buy_tx_status", "none")),
+                sell_tx_status=str(row.get("sell_tx_status", "none")),
                 spent_eth=float(row.get("spent_eth", 0.0)),
             )
         except Exception:

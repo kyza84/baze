@@ -1,10 +1,9 @@
 ﻿"""Token monitor with DexScreener primary source and GeckoTerminal fallback."""
 
 import asyncio
+import logging
 from datetime import datetime, timezone
 from typing import Any
-
-import aiohttp
 
 from config import (
     CHAIN_ID,
@@ -23,6 +22,10 @@ from config import (
     SEEN_TOKEN_TTL,
     TOKEN_AGE_MAX,
 )
+from utils.addressing import normalize_address
+from utils.http_client import ResilientHttpClient
+
+logger = logging.getLogger(__name__)
 
 
 class DexScreenerMonitor:
@@ -38,6 +41,33 @@ class DexScreenerMonitor:
             "Accept-Language": "en-US,en;q=0.9",
             "Connection": "keep-alive",
         }
+        self._http = ResilientHttpClient(
+            timeout_seconds=float(DEX_TIMEOUT),
+            headers=self._headers,
+            source_limits={
+                "dexscreener": 8,
+                "geckoterminal": 5,
+                "dex_boosts": 5,
+            },
+        )
+
+    async def close(self) -> None:
+        await self._http.close()
+
+    def runtime_stats(self, reset: bool = False) -> dict[str, dict[str, int | float]]:
+        return self._http.snapshot_stats(reset=reset)
+
+    async def _fetch_json(self, url: str, source: str, retries: int | None = None) -> Any | None:
+        result = await self._http.get_json(
+            url,
+            source=source,
+            max_attempts=(retries if retries is not None else DEX_RETRIES),
+        )
+        if result.ok:
+            return result.data
+        if result.status == 429:
+            logger.warning("RATE_LIMIT source=%s status=429 url=%s", source, url)
+        return None
 
     async def fetch_new_tokens(self) -> list[dict[str, Any]]:
         self._prune_seen_tokens()
@@ -47,44 +77,40 @@ class DexScreenerMonitor:
         tasks = [dex_task, gecko_task]
         if DEX_BOOSTS_SOURCE_ENABLED and DEX_BOOSTS_MAX_TOKENS > 0:
             tasks.append(asyncio.create_task(self._fetch_from_dex_boosts()))
-        results = await asyncio.gather(*tasks)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
         dex_tokens = results[0] if len(results) > 0 else []
         gecko_tokens = results[1] if len(results) > 1 else []
         boost_tokens = results[2] if len(results) > 2 else []
+        if isinstance(dex_tokens, Exception):
+            logger.warning("DexScreener source failed: %s", dex_tokens)
+            dex_tokens = []
+        if isinstance(gecko_tokens, Exception):
+            logger.warning("Gecko source failed: %s", gecko_tokens)
+            gecko_tokens = []
+        if isinstance(boost_tokens, Exception):
+            logger.warning("Boost source failed: %s", boost_tokens)
+            boost_tokens = []
         return self._merge_tokens(dex_tokens, gecko_tokens, boost_tokens)
 
     async def _fetch_from_dexscreener(self) -> list[dict[str, Any]]:
         queries = DEX_SEARCH_QUERIES or [DEX_SEARCH_QUERY]
         tasks = [self._fetch_dex_query(query) for query in queries]
-        result_sets = await asyncio.gather(*tasks)
+        result_sets = await asyncio.gather(*tasks, return_exceptions=True)
         merged: list[dict[str, Any]] = []
         for rows in result_sets:
+            if isinstance(rows, Exception):
+                logger.warning("Dex query failed: %s", rows)
+                continue
             merged.extend(rows)
         return merged
 
     async def _fetch_dex_query(self, query: str) -> list[dict[str, Any]]:
         url = f"{DEXSCREENER_API}/search?q={query}"
-        timeout = aiohttp.ClientTimeout(total=DEX_TIMEOUT)
-
-        for attempt in range(1, DEX_RETRIES + 1):
-            try:
-                async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.get(url, headers=self._headers) as response:
-                        if response.status != 200:
-                            if attempt < DEX_RETRIES:
-                                await asyncio.sleep(attempt)
-                                continue
-                            return []
-                        data = await response.json()
-                        pairs = data.get("pairs", [])
-                        return self._filter_dex_pairs(pairs)
-            except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError, ValueError):
-                if attempt < DEX_RETRIES:
-                    await asyncio.sleep(attempt)
-                    continue
-                return []
-
-        return []
+        data = await self._fetch_json(url, source="dexscreener")
+        if not isinstance(data, dict):
+            return []
+        pairs = data.get("pairs", [])
+        return self._filter_dex_pairs(pairs)
 
     async def _fetch_from_geckoterminal(self) -> list[dict[str, Any]]:
         all_tokens: list[dict[str, Any]] = []
@@ -102,40 +128,17 @@ class DexScreenerMonitor:
             f"https://api.geckoterminal.com/api/v2/networks/{GECKO_NETWORK}/new_pools"
             f"?page={page}&include=base_token"
         )
-        timeout = aiohttp.ClientTimeout(total=DEX_TIMEOUT)
-
-        for attempt in range(1, DEX_RETRIES + 1):
-            try:
-                async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.get(gecko_url, headers=self._headers) as response:
-                        if response.status != 200:
-                            if attempt < DEX_RETRIES:
-                                await asyncio.sleep(attempt)
-                                continue
-                            return []
-
-                        data = await response.json()
-                        pools = data.get("data", [])
-                        included = data.get("included", [])
-                        return self._filter_gecko_pools(pools, included)
-            except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError, ValueError):
-                if attempt < DEX_RETRIES:
-                    await asyncio.sleep(attempt)
-                    continue
-                return []
-
-        return []
+        data = await self._fetch_json(gecko_url, source="geckoterminal")
+        if not isinstance(data, dict):
+            return []
+        pools = data.get("data", [])
+        included = data.get("included", [])
+        return self._filter_gecko_pools(pools, included)
 
     async def _fetch_from_dex_boosts(self) -> list[dict[str, Any]]:
         url = "https://api.dexscreener.com/token-boosts/latest/v1"
-        timeout = aiohttp.ClientTimeout(total=DEX_TIMEOUT)
-        try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(url, headers=self._headers) as response:
-                    if response.status != 200:
-                        return []
-                    data = await response.json()
-        except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError, ValueError):
+        data = await self._fetch_json(url, source="dex_boosts", retries=1)
+        if data is None:
             return []
 
         if not isinstance(data, list):
@@ -157,23 +160,23 @@ class DexScreenerMonitor:
             return []
 
         tasks = [self._fetch_token_by_address(addr) for addr in token_addresses]
-        rows = await asyncio.gather(*tasks)
+        rows = await asyncio.gather(*tasks, return_exceptions=True)
         out: list[dict[str, Any]] = []
         for row in rows:
+            if isinstance(row, Exception):
+                logger.warning("Boost token resolve failed: %s", row)
+                continue
             if row:
                 out.append(row)
         return out
 
     async def _fetch_token_by_address(self, token_address: str) -> dict[str, Any] | None:
+        token_address = normalize_address(token_address)
+        if not token_address:
+            return None
         url = f"{DEXSCREENER_API}/tokens/{token_address}"
-        timeout = aiohttp.ClientTimeout(total=DEX_TIMEOUT)
-        try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(url, headers=self._headers) as response:
-                    if response.status != 200:
-                        return None
-                    data = await response.json()
-        except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError, ValueError):
+        data = await self._fetch_json(url, source="dexscreener", retries=1)
+        if not isinstance(data, dict):
             return None
 
         pairs = data.get("pairs", []) or []
@@ -193,7 +196,7 @@ class DexScreenerMonitor:
         if not created_ms:
             return None
         created_at = datetime.fromtimestamp(float(created_ms) / 1000, tz=timezone.utc)
-        address = str((best_pair.get("baseToken") or {}).get("address") or "")
+        address = normalize_address(str((best_pair.get("baseToken") or {}).get("address") or ""))
         liquidity_usd = float((best_pair.get("liquidity") or {}).get("usd") or 0)
         if not self._passes_filters(address, liquidity_usd, created_at):
             return None
@@ -204,7 +207,7 @@ class DexScreenerMonitor:
         by_address: dict[str, dict[str, Any]] = {}
         for tokens in groups:
             for token in tokens:
-                address = str(token.get("address", "")).strip().lower()
+                address = normalize_address(str(token.get("address", "")))
                 if not address:
                     continue
                 existing = by_address.get(address)
@@ -223,7 +226,7 @@ class DexScreenerMonitor:
                 continue
 
             base_token = pair.get("baseToken", {})
-            address = base_token.get("address")
+            address = normalize_address(base_token.get("address"))
             if not address:
                 continue
 
@@ -250,7 +253,7 @@ class DexScreenerMonitor:
             base_data = (rel.get("base_token") or {}).get("data") or {}
             base_id = base_data.get("id", "")
             base_token = token_map.get(base_id, {})
-            address = base_token.get("address", "")
+            address = normalize_address(base_token.get("address", ""))
             if not address:
                 continue
 
@@ -293,6 +296,9 @@ class DexScreenerMonitor:
         return filtered
 
     def _passes_filters(self, address: str, liquidity_usd: float, created_at: datetime) -> bool:
+        address = normalize_address(address)
+        if not address:
+            return False
         if address in self.seen_tokens:
             return False
 
@@ -318,7 +324,7 @@ class DexScreenerMonitor:
         dex_labels_raw = pair.get("labels") or []
         dex_labels = [str(label) for label in dex_labels_raw] if isinstance(dex_labels_raw, list) else []
 
-        address = base.get("address", "")
+        address = normalize_address(base.get("address", ""))
         dexscreener_url = pair.get("url") or DEXSCREENER_TOKEN_URL_TEMPLATE.format(
             chain=CHAIN_NAME,
             token_address=address,
