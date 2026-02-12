@@ -1,10 +1,48 @@
 ﻿"""Application configuration."""
 
 import os
+from typing import Dict, Tuple
 
 from dotenv import load_dotenv
 
 load_dotenv()
+
+
+def _parse_source_rate_limits(raw: str) -> Dict[str, Tuple[int, float]]:
+    out: Dict[str, Tuple[int, float]] = {}
+    for chunk in str(raw or "").split(","):
+        item = chunk.strip()
+        if not item or ":" not in item:
+            continue
+        source_part, rate_part = item.split(":", 1)
+        source = source_part.strip().lower()
+        if not source or "/" not in rate_part:
+            continue
+        count_part, window_part = rate_part.split("/", 1)
+        try:
+            count = max(1, int(float(count_part.strip())))
+            window_seconds = max(1.0, float(window_part.strip()))
+        except Exception:
+            continue
+        out[source] = (count, window_seconds)
+    return out
+
+
+def _parse_source_float_map(raw: str) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    for chunk in str(raw or "").split(","):
+        item = chunk.strip()
+        if not item or ":" not in item:
+            continue
+        source_part, value_part = item.split(":", 1)
+        source = source_part.strip().lower()
+        if not source:
+            continue
+        try:
+            out[source] = max(0.0, float(value_part.strip()))
+        except Exception:
+            continue
+    return out
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CRYPTOBOT_TOKEN = os.getenv("CRYPTOBOT_TOKEN", "")
@@ -46,6 +84,14 @@ DEX_SEARCH_QUERIES = [
 if not DEX_SEARCH_QUERIES:
     DEX_SEARCH_QUERIES = [DEX_SEARCH_QUERY]
 GECKO_NEW_POOLS_PAGES = max(1, int(os.getenv("GECKO_NEW_POOLS_PAGES", "1")))
+GECKO_NEW_POOLS_INGEST_INTERVAL_SECONDS = max(15, int(os.getenv("GECKO_NEW_POOLS_INGEST_INTERVAL_SECONDS", "75")))
+GECKO_NEW_POOLS_QUEUE_MAX = max(50, int(os.getenv("GECKO_NEW_POOLS_QUEUE_MAX", "400")))
+GECKO_NEW_POOLS_DRAIN_MAX_PER_CYCLE = max(10, int(os.getenv("GECKO_NEW_POOLS_DRAIN_MAX_PER_CYCLE", "120")))
+GECKO_INGEST_DEDUP_TTL_SECONDS = max(60, int(os.getenv("GECKO_INGEST_DEDUP_TTL_SECONDS", "3600")))
+HEAVY_CHECK_DEDUP_TTL_SECONDS = max(0, int(os.getenv("HEAVY_CHECK_DEDUP_TTL_SECONDS", "900")))
+HEAVY_CHECK_OVERRIDE_LIQ_MULT = max(1.1, float(os.getenv("HEAVY_CHECK_OVERRIDE_LIQ_MULT", "2.0")))
+HEAVY_CHECK_OVERRIDE_VOL_MULT = max(1.1, float(os.getenv("HEAVY_CHECK_OVERRIDE_VOL_MULT", "3.0")))
+HEAVY_CHECK_OVERRIDE_VOL_MIN_ABS_USD = max(0.0, float(os.getenv("HEAVY_CHECK_OVERRIDE_VOL_MIN_ABS_USD", "500")))
 DEXSCREENER_TOKEN_URL_TEMPLATE = os.getenv(
     "DEXSCREENER_TOKEN_URL_TEMPLATE",
     "https://dexscreener.com/{chain}/{token_address}",
@@ -69,6 +115,19 @@ HTTP_BACKOFF_BASE_SECONDS = max(0.05, float(os.getenv("HTTP_BACKOFF_BASE_SECONDS
 HTTP_BACKOFF_MAX_SECONDS = max(0.10, float(os.getenv("HTTP_BACKOFF_MAX_SECONDS", "8.00")))
 HTTP_JITTER_SECONDS = max(0.0, float(os.getenv("HTTP_JITTER_SECONDS", "0.25")))
 HTTP_RATE_LIMIT_DELAY_SECONDS = max(0.0, float(os.getenv("HTTP_RATE_LIMIT_DELAY_SECONDS", "2.00")))
+HTTP_429_COOLDOWN_SECONDS = max(1.0, float(os.getenv("HTTP_429_COOLDOWN_SECONDS", "90")))
+HTTP_SOURCE_RATE_LIMITS = _parse_source_rate_limits(
+    os.getenv(
+        "HTTP_SOURCE_RATE_LIMITS",
+        "geckoterminal:20/60,watchlist_gecko:20/60,dexscreener:120/60,watchlist_dex:120/60,dex_boosts:30/60,goplus:40/60",
+    )
+)
+HTTP_SOURCE_429_COOLDOWNS = _parse_source_float_map(
+    os.getenv(
+        "HTTP_SOURCE_429_COOLDOWNS",
+        "geckoterminal:120,watchlist_gecko:120,dexscreener:20,watchlist_dex:20,dex_boosts:20,goplus:60",
+    )
+)
 DATA_POLICY_DEGRADED_ERROR_PERCENT = max(0.0, float(os.getenv("DATA_POLICY_DEGRADED_ERROR_PERCENT", "35")))
 DATA_POLICY_FAIL_CLOSED_FAIL_CLOSED_RATIO = max(0.0, float(os.getenv("DATA_POLICY_FAIL_CLOSED_FAIL_CLOSED_RATIO", "60")))
 DATA_POLICY_FAIL_CLOSED_API_ERROR_PERCENT = max(0.0, float(os.getenv("DATA_POLICY_FAIL_CLOSED_API_ERROR_PERCENT", "90")))
@@ -152,13 +211,34 @@ PERSONAL_TELEGRAM_ID = int(os.getenv("PERSONAL_TELEGRAM_ID", "0"))
 MIN_TOKEN_SCORE = int(os.getenv("MIN_TOKEN_SCORE", "70"))
 AUTO_FILTER_ENABLED = os.getenv("AUTO_FILTER_ENABLED", "true").lower() == "true"
 SAFE_TEST_MODE = os.getenv("SAFE_TEST_MODE", "true").lower() == "true"
-SAFE_MIN_LIQUIDITY_USD = float(os.getenv("SAFE_MIN_LIQUIDITY_USD", "20000"))
-SAFE_MIN_VOLUME_5M_USD = float(os.getenv("SAFE_MIN_VOLUME_5M_USD", "5000"))
-SAFE_MIN_AGE_SECONDS = int(os.getenv("SAFE_MIN_AGE_SECONDS", "120"))
+SAFE_MIN_LIQUIDITY_USD = float(os.getenv("SAFE_MIN_LIQUIDITY_USD", "5000"))
+SAFE_MIN_VOLUME_5M_USD = float(os.getenv("SAFE_MIN_VOLUME_5M_USD", "1200"))
+SAFE_MIN_AGE_SECONDS = int(os.getenv("SAFE_MIN_AGE_SECONDS", "300"))
 SAFE_MAX_PRICE_CHANGE_5M_ABS_PERCENT = float(os.getenv("SAFE_MAX_PRICE_CHANGE_5M_ABS_PERCENT", "18"))
 SAFE_REQUIRE_CONTRACT_SAFE = os.getenv("SAFE_REQUIRE_CONTRACT_SAFE", "true").lower() == "true"
 SAFE_REQUIRE_RISK_LEVEL = os.getenv("SAFE_REQUIRE_RISK_LEVEL", "MEDIUM").strip().upper()
 SAFE_MAX_WARNING_FLAGS = int(os.getenv("SAFE_MAX_WARNING_FLAGS", "1"))
+FILTER_THRESH_LOG_EVERY_CYCLES = max(1, int(os.getenv("FILTER_THRESH_LOG_EVERY_CYCLES", "30")))
+# Adaptive filters (paper calibration)
+ADAPTIVE_FILTERS_ENABLED = os.getenv("ADAPTIVE_FILTERS_ENABLED", "false").lower() == "true"
+ADAPTIVE_FILTERS_MODE = os.getenv("ADAPTIVE_FILTERS_MODE", "dry_run").strip().lower()  # off | dry_run | apply
+ADAPTIVE_FILTERS_PAPER_ONLY = os.getenv("ADAPTIVE_FILTERS_PAPER_ONLY", "true").lower() == "true"
+ADAPTIVE_FILTERS_INTERVAL_SECONDS = max(60, int(os.getenv("ADAPTIVE_FILTERS_INTERVAL_SECONDS", "900")))
+ADAPTIVE_FILTERS_MIN_WINDOW_CYCLES = max(1, int(os.getenv("ADAPTIVE_FILTERS_MIN_WINDOW_CYCLES", "5")))
+ADAPTIVE_FILTERS_TARGET_CAND_MIN = float(os.getenv("ADAPTIVE_FILTERS_TARGET_CAND_MIN", "2.0"))
+ADAPTIVE_FILTERS_TARGET_CAND_MAX = float(os.getenv("ADAPTIVE_FILTERS_TARGET_CAND_MAX", "12.0"))
+ADAPTIVE_FILTERS_TARGET_OPEN_MIN = float(os.getenv("ADAPTIVE_FILTERS_TARGET_OPEN_MIN", "0.10"))
+ADAPTIVE_FILTERS_NEG_REALIZED_TRIGGER_USD = float(os.getenv("ADAPTIVE_FILTERS_NEG_REALIZED_TRIGGER_USD", "0.60"))
+ADAPTIVE_FILTERS_NEG_CLOSED_MIN = max(1, int(os.getenv("ADAPTIVE_FILTERS_NEG_CLOSED_MIN", "3")))
+ADAPTIVE_SCORE_MIN = int(os.getenv("ADAPTIVE_SCORE_MIN", "60"))
+ADAPTIVE_SCORE_MAX = int(os.getenv("ADAPTIVE_SCORE_MAX", "72"))
+ADAPTIVE_SCORE_STEP = max(1, int(os.getenv("ADAPTIVE_SCORE_STEP", "1")))
+ADAPTIVE_SAFE_VOLUME_MIN = float(os.getenv("ADAPTIVE_SAFE_VOLUME_MIN", "150"))
+ADAPTIVE_SAFE_VOLUME_MAX = float(os.getenv("ADAPTIVE_SAFE_VOLUME_MAX", "1200"))
+ADAPTIVE_SAFE_VOLUME_STEP = max(10.0, float(os.getenv("ADAPTIVE_SAFE_VOLUME_STEP", "50")))
+ADAPTIVE_DEDUP_TTL_MIN = max(0, int(os.getenv("ADAPTIVE_DEDUP_TTL_MIN", "60")))
+ADAPTIVE_DEDUP_TTL_MAX = max(0, int(os.getenv("ADAPTIVE_DEDUP_TTL_MAX", "900")))
+ADAPTIVE_DEDUP_TTL_STEP = max(5, int(os.getenv("ADAPTIVE_DEDUP_TTL_STEP", "30")))
 
 # Optional extra token flow sources
 DEX_BOOSTS_SOURCE_ENABLED = os.getenv("DEX_BOOSTS_SOURCE_ENABLED", "true").lower() == "true"
@@ -177,7 +257,7 @@ LIVE_PRIVATE_KEY = os.getenv("LIVE_PRIVATE_KEY", "").strip()
 LIVE_CHAIN_ID = int(os.getenv("LIVE_CHAIN_ID", EVM_CHAIN_ID))
 LIVE_ROUTER_ADDRESS = os.getenv("LIVE_ROUTER_ADDRESS", "").strip()
 LIVE_SLIPPAGE_BPS = max(1, int(os.getenv("LIVE_SLIPPAGE_BPS", "200")))
-LIVE_SWAP_DEADLINE_SECONDS = max(30, int(os.getenv("LIVE_SWAP_DEADLINE_SECONDS", "120")))
+LIVE_SWAP_DEADLINE_SECONDS = max(30, int(os.getenv("LIVE_SWAP_DEADLINE_SECONDS", "45")))
 LIVE_TX_TIMEOUT_SECONDS = max(30, int(os.getenv("LIVE_TX_TIMEOUT_SECONDS", "180")))
 LIVE_MAX_GAS_GWEI = float(os.getenv("LIVE_MAX_GAS_GWEI", "2.0"))
 LIVE_PRIORITY_FEE_GWEI = float(os.getenv("LIVE_PRIORITY_FEE_GWEI", "0.02"))
@@ -243,6 +323,9 @@ MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "1"))
 MAX_BUY_AMOUNT = float(os.getenv("MAX_BUY_AMOUNT", "0.001"))
 WETH_PRICE_FALLBACK_USD = float(os.getenv("WETH_PRICE_FALLBACK_USD", "3000"))
 MAX_TRADES_PER_HOUR = max(0, int(os.getenv("MAX_TRADES_PER_HOUR", "3")))
+MAX_BUYS_PER_HOUR = max(0, int(os.getenv("MAX_BUYS_PER_HOUR", str(MAX_TRADES_PER_HOUR))))
+MIN_TRADE_USD = max(0.01, float(os.getenv("MIN_TRADE_USD", "0.25")))
+MAX_TX_PER_DAY = max(0, int(os.getenv("MAX_TX_PER_DAY", "8")))
 AUTO_TRADE_EXCLUDED_ADDRESSES = [
     x.strip().lower()
     for x in os.getenv("AUTO_TRADE_EXCLUDED_ADDRESSES", "").split(",")
@@ -290,6 +373,7 @@ PAPER_PRICE_GUARD_ENABLED = os.getenv("PAPER_PRICE_GUARD_ENABLED", "true").lower
 PAPER_PRICE_GUARD_MAX_JUMP_PERCENT = float(os.getenv("PAPER_PRICE_GUARD_MAX_JUMP_PERCENT", "250"))
 PAPER_PRICE_GUARD_CONFIRMATIONS = max(1, int(os.getenv("PAPER_PRICE_GUARD_CONFIRMATIONS", "2")))
 PAPER_PRICE_GUARD_WINDOW_SECONDS = max(5, int(os.getenv("PAPER_PRICE_GUARD_WINDOW_SECONDS", "90")))
+PAPER_METRICS_SUMMARY_SECONDS = max(60, int(os.getenv("PAPER_METRICS_SUMMARY_SECONDS", "900")))
 STAIR_STEP_ENABLED = os.getenv("STAIR_STEP_ENABLED", "false").lower() == "true"
 STAIR_STEP_START_BALANCE_USD = float(os.getenv("STAIR_STEP_START_BALANCE_USD", "0"))
 STAIR_STEP_SIZE_USD = float(os.getenv("STAIR_STEP_SIZE_USD", "5"))

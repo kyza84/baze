@@ -101,6 +101,10 @@ def _merge_source_stats(*parts: dict[str, dict[str, int | float]]) -> dict[str, 
                     "fail": 0,
                     "total": 0,
                     "rate_limited": 0,
+                    "limiter_waits": 0,
+                    "cooldown_waits": 0,
+                    "cooldown_active": 0,
+                    "cooldown_remaining_sec": 0.0,
                     "retries": 0,
                     "error_percent": 0.0,
                     "latency_avg_ms": 0.0,
@@ -113,6 +117,13 @@ def _merge_source_stats(*parts: dict[str, dict[str, int | float]]) -> dict[str, 
             cur["fail"] = int(cur["fail"]) + int(row.get("fail", 0))
             cur["total"] = int(cur["total"]) + int(row.get("total", 0))
             cur["rate_limited"] = int(cur["rate_limited"]) + int(row.get("rate_limited", 0))
+            cur["limiter_waits"] = int(cur["limiter_waits"]) + int(row.get("limiter_waits", 0))
+            cur["cooldown_waits"] = int(cur["cooldown_waits"]) + int(row.get("cooldown_waits", 0))
+            cur["cooldown_active"] = max(int(cur["cooldown_active"]), int(row.get("cooldown_active", 0)))
+            cur["cooldown_remaining_sec"] = max(
+                float(cur["cooldown_remaining_sec"]),
+                float(row.get("cooldown_remaining_sec", 0.0) or 0.0),
+            )
             cur["retries"] = int(cur["retries"]) + int(row.get("retries", 0))
             row_total = int(row.get("total", 0) or 0)
             row_avg = float(row.get("latency_avg_ms", 0.0) or 0.0)
@@ -200,8 +211,11 @@ def _format_source_stats_brief(source_stats: dict[str, dict[str, int | float]]) 
                 f"{source}:ok={int(row.get('ok', 0))}"
                 f"/fail={int(row.get('fail', 0))}"
                 f"/429={int(row.get('rate_limited', 0))}"
+                f"/lim_wait={int(row.get('limiter_waits', 0))}"
+                f"/cd_wait={int(row.get('cooldown_waits', 0))}"
                 f"/err={float(row.get('error_percent', 0.0)):.1f}%"
                 f"/avg={float(row.get('latency_avg_ms', 0.0)):.0f}ms"
+                f"{('/cd=' + str(int(float(row.get('cooldown_remaining_sec', 0.0) or 0.0))) + 's') if int(row.get('cooldown_active', 0)) else ''}"
             )
         )
     return "; ".join(parts)
@@ -221,6 +235,26 @@ def _format_safety_reasons_brief(safety_stats: dict[str, int | float]) -> str:
         return "none"
     pairs.sort(key=lambda kv: kv[1], reverse=True)
     return ",".join(f"{k}:{v}" for k, v in pairs[:4])
+
+
+def _format_ingest_stats_brief(ingest_stats: dict[str, int | float]) -> str:
+    if not ingest_stats:
+        return "none"
+    return (
+        f"q={int(ingest_stats.get('queue_size', 0))}"
+        f"/oldest={float(ingest_stats.get('oldest_item_age_sec', 0.0)):.1f}s"
+        f"/drop_old={int(ingest_stats.get('dropped_oldest_count', 0))}"
+        f"/dedup_skip={int(ingest_stats.get('ingest_dedup_skipped', 0))}"
+        f"/enq={int(ingest_stats.get('enqueued_count', 0))}"
+        f"/drain={int(ingest_stats.get('drained_count', 0))}"
+    )
+
+
+def _format_top_filter_reasons(filter_fail_reasons: dict[str, int], limit: int = 4) -> str:
+    if not filter_fail_reasons:
+        return "none"
+    rows = sorted(filter_fail_reasons.items(), key=lambda kv: int(kv[1]), reverse=True)
+    return ",".join(f"{k}:{int(v)}" for k, v in rows[: max(1, int(limit))])
 
 
 def _excluded_trade_addresses() -> set[str]:
@@ -259,6 +293,162 @@ def _merge_token_streams(*groups: list[dict]) -> list[dict]:
             if candidate_score > existing_score:
                 merged[address] = token
     return list(merged.values())
+
+
+class AdaptiveFilterController:
+    def __init__(self) -> None:
+        self.enabled = bool(getattr(config, "ADAPTIVE_FILTERS_ENABLED", False))
+        self.mode = str(getattr(config, "ADAPTIVE_FILTERS_MODE", "dry_run") or "dry_run").strip().lower()
+        self.paper_only = bool(getattr(config, "ADAPTIVE_FILTERS_PAPER_ONLY", True))
+        self.interval_seconds = int(getattr(config, "ADAPTIVE_FILTERS_INTERVAL_SECONDS", 900) or 900)
+        self.min_window_cycles = int(getattr(config, "ADAPTIVE_FILTERS_MIN_WINDOW_CYCLES", 5) or 5)
+        self.target_cand_min = float(getattr(config, "ADAPTIVE_FILTERS_TARGET_CAND_MIN", 2.0) or 2.0)
+        self.target_cand_max = float(getattr(config, "ADAPTIVE_FILTERS_TARGET_CAND_MAX", 12.0) or 12.0)
+        self.target_open_min = float(getattr(config, "ADAPTIVE_FILTERS_TARGET_OPEN_MIN", 0.10) or 0.10)
+        self.neg_realized_trigger = float(getattr(config, "ADAPTIVE_FILTERS_NEG_REALIZED_TRIGGER_USD", 0.60) or 0.60)
+        self.neg_closed_min = int(getattr(config, "ADAPTIVE_FILTERS_NEG_CLOSED_MIN", 3) or 3)
+
+        self.score_min_bound = int(getattr(config, "ADAPTIVE_SCORE_MIN", 60) or 60)
+        self.score_max_bound = int(getattr(config, "ADAPTIVE_SCORE_MAX", 72) or 72)
+        self.score_step = int(getattr(config, "ADAPTIVE_SCORE_STEP", 1) or 1)
+        self.volume_min_bound = float(getattr(config, "ADAPTIVE_SAFE_VOLUME_MIN", 150.0) or 150.0)
+        self.volume_max_bound = float(getattr(config, "ADAPTIVE_SAFE_VOLUME_MAX", 1200.0) or 1200.0)
+        self.volume_step = float(getattr(config, "ADAPTIVE_SAFE_VOLUME_STEP", 50.0) or 50.0)
+        self.ttl_min_bound = int(getattr(config, "ADAPTIVE_DEDUP_TTL_MIN", 60) or 60)
+        self.ttl_max_bound = int(getattr(config, "ADAPTIVE_DEDUP_TTL_MAX", 900) or 900)
+        self.ttl_step = int(getattr(config, "ADAPTIVE_DEDUP_TTL_STEP", 30) or 30)
+
+        self.last_eval_ts = time.time()
+        self.window_cycles = 0
+        self.window_candidates = 0
+        self.window_opened = 0
+        self.window_filter_fails: dict[str, int] = {}
+        self.prev_realized_usd = 0.0
+        self.prev_closed = 0
+
+    @staticmethod
+    def _clamp_int(value: int, lower: int, upper: int) -> int:
+        return max(lower, min(upper, value))
+
+    @staticmethod
+    def _clamp_float(value: float, lower: float, upper: float) -> float:
+        return max(lower, min(upper, value))
+
+    def _snapshot_thresholds(self) -> tuple[int, float, int]:
+        return (
+            int(getattr(config, "MIN_TOKEN_SCORE", 70)),
+            float(getattr(config, "SAFE_MIN_VOLUME_5M_USD", 1200.0)),
+            int(getattr(config, "HEAVY_CHECK_DEDUP_TTL_SECONDS", 900)),
+        )
+
+    def _apply_thresholds(self, score_min: int, safe_volume_5m_min: float, dedup_ttl: int) -> None:
+        setattr(config, "MIN_TOKEN_SCORE", int(score_min))
+        setattr(config, "SAFE_MIN_VOLUME_5M_USD", float(safe_volume_5m_min))
+        setattr(config, "HEAVY_CHECK_DEDUP_TTL_SECONDS", int(dedup_ttl))
+
+    def record_cycle(self, *, candidates: int, opened: int, filter_fails_cycle: dict[str, int]) -> None:
+        self.window_cycles += 1
+        self.window_candidates += int(candidates)
+        self.window_opened += int(opened)
+        for reason, count in (filter_fails_cycle or {}).items():
+            key = str(reason or "unknown").strip().lower() or "unknown"
+            self.window_filter_fails[key] = int(self.window_filter_fails.get(key, 0)) + int(count or 0)
+
+    def _reset_window(self, *, now_ts: float, realized_usd: float, closed: int) -> None:
+        self.last_eval_ts = now_ts
+        self.window_cycles = 0
+        self.window_candidates = 0
+        self.window_opened = 0
+        self.window_filter_fails = {}
+        self.prev_realized_usd = float(realized_usd)
+        self.prev_closed = int(closed)
+
+    def maybe_adapt(self, *, policy_state: str, auto_stats: dict[str, float | int]) -> None:
+        if not self.enabled:
+            return
+        if self.mode not in {"dry_run", "apply"}:
+            return
+        if self.paper_only and not bool(getattr(config, "AUTO_TRADE_PAPER", False)):
+            return
+
+        now_ts = time.time()
+        if (now_ts - float(self.last_eval_ts)) < float(self.interval_seconds):
+            return
+        if int(self.window_cycles) < int(self.min_window_cycles):
+            return
+
+        score_now, volume_now, ttl_now = self._snapshot_thresholds()
+        score_next, volume_next, ttl_next = score_now, volume_now, ttl_now
+        action = "hold"
+        reason = "steady_state"
+
+        avg_candidates = float(self.window_candidates) / max(1, int(self.window_cycles))
+        avg_opened = float(self.window_opened) / max(1, int(self.window_cycles))
+        fail_score = int(self.window_filter_fails.get("score_min", 0))
+        fail_volume = int(self.window_filter_fails.get("safe_volume", 0))
+        fail_dedup = int(self.window_filter_fails.get("heavy_dedup_ttl", 0))
+
+        closed_now = int(auto_stats.get("closed", 0) or 0)
+        realized_now = float(auto_stats.get("realized_pnl_usd", 0.0) or 0.0)
+        closed_delta = int(closed_now - int(self.prev_closed))
+        realized_delta = float(realized_now - float(self.prev_realized_usd))
+
+        if str(policy_state).upper() != "OK":
+            action = "hold"
+            reason = f"policy_{policy_state.lower()}"
+        elif closed_delta >= int(self.neg_closed_min) and realized_delta <= -abs(float(self.neg_realized_trigger)):
+            score_next = self._clamp_int(score_now + int(self.score_step), self.score_min_bound, self.score_max_bound)
+            volume_next = self._clamp_float(volume_now + float(self.volume_step), self.volume_min_bound, self.volume_max_bound)
+            ttl_next = self._clamp_int(ttl_now + int(self.ttl_step), self.ttl_min_bound, self.ttl_max_bound)
+            action = "tighten_all"
+            reason = f"negative_window realized_delta=${realized_delta:.2f} closed_delta={closed_delta}"
+        elif avg_candidates < float(self.target_cand_min) and avg_opened < float(self.target_open_min):
+            if fail_volume >= fail_score and volume_now > self.volume_min_bound:
+                volume_next = self._clamp_float(volume_now - float(self.volume_step), self.volume_min_bound, self.volume_max_bound)
+                action = "loosen_volume"
+                reason = f"low_flow avg_cand={avg_candidates:.2f} fail_safe_volume={fail_volume}"
+            elif fail_score > 0 and score_now > self.score_min_bound:
+                score_next = self._clamp_int(score_now - int(self.score_step), self.score_min_bound, self.score_max_bound)
+                action = "loosen_score"
+                reason = f"low_flow avg_cand={avg_candidates:.2f} fail_score_min={fail_score}"
+            elif fail_dedup > 0 and ttl_now > self.ttl_min_bound:
+                ttl_next = self._clamp_int(ttl_now - int(self.ttl_step), self.ttl_min_bound, self.ttl_max_bound)
+                action = "loosen_dedup_ttl"
+                reason = f"low_flow avg_cand={avg_candidates:.2f} fail_heavy_dedup={fail_dedup}"
+            else:
+                action = "hold"
+                reason = f"low_flow_no_movable_knob avg_cand={avg_candidates:.2f}"
+        elif avg_candidates > float(self.target_cand_max):
+            score_next = self._clamp_int(score_now + int(self.score_step), self.score_min_bound, self.score_max_bound)
+            action = "tighten_score"
+            reason = f"too_many_candidates avg_cand={avg_candidates:.2f}"
+
+        changed = (score_next != score_now) or (abs(volume_next - volume_now) >= 0.5) or (ttl_next != ttl_now)
+        if self.mode == "apply" and changed:
+            self._apply_thresholds(score_next, volume_next, ttl_next)
+
+        logger.warning(
+            "ADAPTIVE_FILTERS mode=%s action=%s changed=%s reason=%s avg_cand=%.2f avg_opened=%.2f closed_delta=%s realized_delta=$%.2f score=%s->%s volume=%.0f->%.0f dedup_ttl=%s->%s fails(score=%s,volume=%s,dedup=%s)",
+            self.mode,
+            action,
+            changed,
+            reason,
+            avg_candidates,
+            avg_opened,
+            closed_delta,
+            realized_delta,
+            score_now,
+            score_next,
+            volume_now,
+            volume_next,
+            ttl_now,
+            ttl_next,
+            fail_score,
+            fail_volume,
+            fail_dedup,
+        )
+
+        self._reset_window(now_ts=now_ts, realized_usd=realized_now, closed=closed_now)
 
 
 class InstanceLock:
@@ -392,10 +582,20 @@ async def run_local_loop() -> None:
     policy_mode_current = "OK"
     policy_bad_streak = 0
     policy_good_streak = 0
+    heavy_seen_until: dict[str, float] = {}
+    heavy_last_liquidity: dict[str, float] = {}
+    heavy_last_volume_5m: dict[str, float] = {}
+    filter_fail_reasons_session: dict[str, int] = {}
+    adaptive_filters = AdaptiveFilterController()
+    adaptive_init_stats = auto_trader.get_stats()
+    adaptive_filters.prev_closed = int(adaptive_init_stats.get("closed", 0) or 0)
+    adaptive_filters.prev_realized_usd = float(adaptive_init_stats.get("realized_pnl_usd", 0.0) or 0.0)
+    cycle_index = 0
 
     logger.info("Local mode started (Telegram disabled).")
     try:
         while True:
+            cycle_index += 1
             if _graceful_stop_requested():
                 logger.warning("GRACEFUL_STOP requested path=%s", _graceful_stop_file_path())
                 break
@@ -455,48 +655,108 @@ async def run_local_loop() -> None:
                 trade_candidates: list[tuple[dict, dict]] = []
                 safety_checked = 0
                 safety_fail_closed_hits = 0
+                heavy_dedup_skipped = 0
+                heavy_dedup_override = 0
                 excluded_addresses = _excluded_trade_addresses()
+                now_mono = time.monotonic()
+                if heavy_seen_until:
+                    expired = [a for a, ts in heavy_seen_until.items() if float(ts or 0.0) <= now_mono]
+                    for a in expired:
+                        heavy_seen_until.pop(a, None)
+                        heavy_last_liquidity.pop(a, None)
+                        heavy_last_volume_5m.pop(a, None)
                 if tokens:
+                    cycle_filter_fails: dict[str, int] = {}
+
+                    def _filter_fail(reason: str, token: dict, extra: str = "") -> None:
+                        key = str(reason or "unknown").strip().lower() or "unknown"
+                        filter_fail_reasons_session[key] = int(filter_fail_reasons_session.get(key, 0)) + 1
+                        cycle_filter_fails[key] = int(cycle_filter_fails.get(key, 0)) + 1
+                        if extra:
+                            logger.info(
+                                "FILTER_FAIL token=%s reason=%s %s",
+                                token.get("symbol", "N/A"),
+                                reason,
+                                extra,
+                            )
+                        else:
+                            logger.info(
+                                "FILTER_FAIL token=%s reason=%s",
+                                token.get("symbol", "N/A"),
+                                reason,
+                            )
+
                     for token in tokens:
                         token_address = normalize_address(token.get("address", ""))
                         if token_address in excluded_addresses:
-                            logger.info(
-                                "FILTER_FAIL token=%s reason=excluded_base_token",
-                                token.get("symbol", "N/A"),
-                            )
+                            _filter_fail("excluded_base_token", token)
                             continue
                         score_data = scorer.calculate_score(token)
                         token["score_data"] = score_data
                         if int(score_data.get("score", 0)) >= 70:
                             high_quality += 1
                         if config.AUTO_FILTER_ENABLED and int(score_data.get("score", 0)) < int(config.MIN_TOKEN_SCORE):
-                            logger.info(
-                                "FILTER_FAIL token=%s reason=score_min score=%s min=%s",
-                                token.get("symbol", "N/A"),
-                                score_data.get("score", 0),
-                                int(config.MIN_TOKEN_SCORE),
+                            _filter_fail(
+                                "score_min",
+                                token,
+                                f"score={score_data.get('score', 0)} min={int(config.MIN_TOKEN_SCORE)}",
                             )
                             continue
 
                         if config.SAFE_TEST_MODE:
                             if float(token.get("liquidity") or 0) < float(config.SAFE_MIN_LIQUIDITY_USD):
-                                logger.info("FILTER_FAIL token=%s reason=safe_liquidity", token.get("symbol", "N/A"))
+                                _filter_fail("safe_liquidity", token)
                                 continue
                             if float(token.get("volume_5m") or 0) < float(config.SAFE_MIN_VOLUME_5M_USD):
-                                logger.info("FILTER_FAIL token=%s reason=safe_volume", token.get("symbol", "N/A"))
+                                _filter_fail("safe_volume", token)
                                 continue
                             if int(token.get("age_seconds") or 0) < int(config.SAFE_MIN_AGE_SECONDS):
-                                logger.info("FILTER_FAIL token=%s reason=safe_age", token.get("symbol", "N/A"))
+                                _filter_fail("safe_age", token)
                                 continue
                             if abs(float(token.get("price_change_5m") or 0)) > float(config.SAFE_MAX_PRICE_CHANGE_5M_ABS_PERCENT):
-                                logger.info("FILTER_FAIL token=%s reason=safe_change_5m", token.get("symbol", "N/A"))
+                                _filter_fail("safe_change_5m", token)
                                 continue
+
+                        # Heavy safety-check dedup: avoid re-checking same token address too often.
+                        heavy_ttl = int(getattr(config, "HEAVY_CHECK_DEDUP_TTL_SECONDS", 900) or 900)
+                        if heavy_ttl > 0 and token_address:
+                            now_mono = time.monotonic()
+                            until = float(heavy_seen_until.get(token_address, 0.0) or 0.0)
+                            token_liquidity = float(token.get("liquidity") or 0.0)
+                            token_volume_5m = float(token.get("volume_5m") or 0.0)
+                            prev_liquidity = float(heavy_last_liquidity.get(token_address, 0.0) or 0.0)
+                            prev_volume_5m = float(heavy_last_volume_5m.get(token_address, 0.0) or 0.0)
+                            override_mult = float(getattr(config, "HEAVY_CHECK_OVERRIDE_LIQ_MULT", 2.0) or 2.0)
+                            override_mult = max(1.1, override_mult)
+                            override_vol_mult = float(getattr(config, "HEAVY_CHECK_OVERRIDE_VOL_MULT", 3.0) or 3.0)
+                            override_vol_mult = max(1.1, override_vol_mult)
+                            override_vol_min_abs = float(
+                                getattr(config, "HEAVY_CHECK_OVERRIDE_VOL_MIN_ABS_USD", 500.0) or 500.0
+                            )
+                            override_vol_min_abs = max(0.0, override_vol_min_abs)
+                            if until > now_mono:
+                                liq_override = prev_liquidity > 0 and token_liquidity >= (prev_liquidity * override_mult)
+                                vol_override = (
+                                    prev_volume_5m > 0
+                                    and token_volume_5m >= (prev_volume_5m * override_vol_mult)
+                                    and token_volume_5m >= override_vol_min_abs
+                                )
+                                if liq_override or vol_override:
+                                    heavy_dedup_override += 1
+                                else:
+                                    heavy_dedup_skipped += 1
+                                    _filter_fail("heavy_dedup_ttl", token)
+                                    continue
 
                         # Expensive safety API check only after cheap filters.
                         safety = await checker.check_token_safety(
                             token.get("address", ""),
                             token.get("liquidity", 0),
                         )
+                        if heavy_ttl > 0 and token_address:
+                            heavy_seen_until[token_address] = time.monotonic() + float(heavy_ttl)
+                            heavy_last_liquidity[token_address] = float(token.get("liquidity") or 0.0)
+                            heavy_last_volume_5m[token_address] = float(token.get("volume_5m") or 0.0)
                         safety_checked += 1
                         if str((safety or {}).get("source", "")).lower() == "fail_closed":
                             safety_fail_closed_hits += 1
@@ -507,16 +767,16 @@ async def run_local_loop() -> None:
 
                         if config.SAFE_TEST_MODE:
                             if config.SAFE_REQUIRE_CONTRACT_SAFE and not bool(token.get("is_contract_safe", False)):
-                                logger.info("FILTER_FAIL token=%s reason=safe_contract", token.get("symbol", "N/A"))
+                                _filter_fail("safe_contract", token)
                                 continue
                             required_risk = str(config.SAFE_REQUIRE_RISK_LEVEL).upper()
                             risk = str(token.get("risk_level", "HIGH")).upper()
                             rank = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
                             if rank.get(risk, 2) > rank.get(required_risk, 1):
-                                logger.info("FILTER_FAIL token=%s reason=safe_risk", token.get("symbol", "N/A"))
+                                _filter_fail("safe_risk", token)
                                 continue
                             if int(token.get("warning_flags") or 0) > int(config.SAFE_MAX_WARNING_FLAGS):
-                                logger.info("FILTER_FAIL token=%s reason=safe_warnings", token.get("symbol", "N/A"))
+                                _filter_fail("safe_warnings", token)
                                 continue
 
                         logger.info(
@@ -535,8 +795,12 @@ async def run_local_loop() -> None:
                             pass
                         else:
                             alerts_sent += await local_alerter.send_alert(token, score_data, safety=safety)
+                else:
+                    cycle_filter_fails = {}
 
-                dex_stats = dex_monitor.runtime_stats(reset=True)
+                dex_stats_all = dex_monitor.runtime_stats(reset=True)
+                gecko_ingest_stats = dict(dex_stats_all.get("gecko_ingest", {}) or {})
+                dex_stats = {k: v for k, v in dex_stats_all.items() if k != "gecko_ingest"}
                 watch_stats = watchlist_monitor.runtime_stats(reset=True)
                 onchain_stats = onchain_monitor.runtime_stats(reset=True) if onchain_monitor is not None else {}
                 source_stats = _merge_source_stats(dex_stats, watch_stats, onchain_stats)
@@ -576,6 +840,13 @@ async def run_local_loop() -> None:
                         len(trade_candidates),
                     )
                 await auto_trader.process_open_positions(bot=None)
+                auto_stats = auto_trader.get_stats()
+                adaptive_filters.record_cycle(
+                    candidates=len(trade_candidates),
+                    opened=opened_trades,
+                    filter_fails_cycle=cycle_filter_fails,
+                )
+                adaptive_filters.maybe_adapt(policy_state=policy_state, auto_stats=auto_stats)
 
                 active_tasks = len(asyncio.all_tasks())
                 now_ts = time.time()
@@ -583,9 +854,18 @@ async def run_local_loop() -> None:
                 if (now_ts - last_rss_log_ts) >= int(getattr(config, "METRICS_RSS_LOG_SECONDS", 900)):
                     last_rss_log_ts = now_ts
                     rss_mb = _rss_memory_mb()
+                thresh_every = max(1, int(getattr(config, "FILTER_THRESH_LOG_EVERY_CYCLES", 30) or 30))
+                if cycle_index == 1 or (cycle_index % thresh_every) == 0:
+                    logger.info(
+                        "FILTER_THRESHOLDS safe_volume_5m_min=$%.0f safe_liquidity_min=$%.0f safe_age_min=%ss score_min=%s",
+                        float(config.SAFE_MIN_VOLUME_5M_USD),
+                        float(config.SAFE_MIN_LIQUIDITY_USD),
+                        int(config.SAFE_MIN_AGE_SECONDS),
+                        int(config.MIN_TOKEN_SCORE),
+                    )
 
                 logger.info(
-                    "Scanned %s tokens | High quality: %s | Alerts sent: %s | Trade candidates: %s | Opened: %s | Mode: local | Source: %s | Policy: %s(%s) | Safety: checked=%s fail_closed=%s reasons=%s | Sources: %s | Tasks: %s | RSS: %.1fMB | CycleAvg: %.2fs",
+                    "Scanned %s tokens | High quality: %s | Alerts sent: %s | Trade candidates: %s | Opened: %s | Mode: local | Source: %s | Policy: %s(%s) | Safety: checked=%s fail_closed=%s reasons=%s | FiltersTop(session): %s | Dedup: heavy_skip=%s override=%s | Ingest: %s | Sources: %s | Tasks: %s | RSS: %.1fMB | CycleAvg: %.2fs",
                     len(tokens or []),
                     high_quality,
                     alerts_sent,
@@ -597,6 +877,10 @@ async def run_local_loop() -> None:
                     safety_checked,
                     safety_fail_closed_hits,
                     _format_safety_reasons_brief(safety_stats),
+                    _format_top_filter_reasons(filter_fail_reasons_session),
+                    heavy_dedup_skipped,
+                    heavy_dedup_override,
+                    _format_ingest_stats_brief(gecko_ingest_stats),
                     _format_source_stats_brief(source_stats),
                     active_tasks,
                     rss_mb,

@@ -68,6 +68,7 @@ class AutoTrader:
         self.current_loss_streak = 0
         self.token_cooldowns: dict[str, float] = {}
         self.trade_open_timestamps: list[float] = []
+        self.tx_event_timestamps: list[float] = []
         self.price_guard_pending: dict[str, dict[str, float | int]] = {}
         self.trading_pause_until_ts = 0.0
         self.day_id = self._current_day_id()
@@ -104,7 +105,18 @@ class AutoTrader:
         self.paper_balance_usd = float(config.WALLET_BALANCE_USD)
         self.realized_pnl_usd = 0.0
         self.live_executor: LiveExecutor | None = None
+        self._last_paper_summary_ts = 0.0
+        self._paper_summary_prev_closed = 0
+        self._paper_summary_prev_wins = 0
+        self._paper_summary_prev_losses = 0
+        self._paper_summary_prev_realized_usd = 0.0
         self._load_state()
+        now_ts = datetime.now(timezone.utc).timestamp()
+        self._last_paper_summary_ts = now_ts
+        self._paper_summary_prev_closed = int(self.total_closed)
+        self._paper_summary_prev_wins = int(self.total_wins)
+        self._paper_summary_prev_losses = int(self.total_losses)
+        self._paper_summary_prev_realized_usd = float(self.realized_pnl_usd)
         if bool(getattr(config, "LIVE_SESSION_RESET_ON_START", True)):
             # Reset baseline on each process start to make overnight runs predictable.
             self.live_start_ts = 0.0
@@ -230,8 +242,12 @@ class AutoTrader:
             logger.warning("KILL_SWITCH active path=%s", config.KILL_SWITCH_FILE)
             return False
         self._prune_hourly_window()
-        max_trades_per_hour = int(config.MAX_TRADES_PER_HOUR)
-        if max_trades_per_hour > 0 and len(self.trade_open_timestamps) >= max_trades_per_hour:
+        max_buys_per_hour = int(getattr(config, "MAX_BUYS_PER_HOUR", config.MAX_TRADES_PER_HOUR))
+        if max_buys_per_hour > 0 and len(self.trade_open_timestamps) >= max_buys_per_hour:
+            return False
+        self._prune_daily_tx_window()
+        max_tx_per_day = int(getattr(config, "MAX_TX_PER_DAY", 0) or 0)
+        if max_tx_per_day > 0 and len(self.tx_event_timestamps) >= max_tx_per_day:
             return False
         max_open = int(config.MAX_OPEN_TRADES)
         if max_open > 0 and len(self.open_positions) >= max_open:
@@ -269,9 +285,14 @@ class AutoTrader:
             return "kill_switch_file"
 
         self._prune_hourly_window()
-        max_trades_per_hour = int(config.MAX_TRADES_PER_HOUR)
-        if max_trades_per_hour > 0 and len(self.trade_open_timestamps) >= max_trades_per_hour:
-            return f"max_trades_per_hour {len(self.trade_open_timestamps)}/{max_trades_per_hour}"
+        max_buys_per_hour = int(getattr(config, "MAX_BUYS_PER_HOUR", config.MAX_TRADES_PER_HOUR))
+        if max_buys_per_hour > 0 and len(self.trade_open_timestamps) >= max_buys_per_hour:
+            return f"max_buys_per_hour {len(self.trade_open_timestamps)}/{max_buys_per_hour}"
+
+        self._prune_daily_tx_window()
+        max_tx_per_day = int(getattr(config, "MAX_TX_PER_DAY", 0) or 0)
+        if max_tx_per_day > 0 and len(self.tx_event_timestamps) >= max_tx_per_day:
+            return f"max_tx_per_day {len(self.tx_event_timestamps)}/{max_tx_per_day}"
 
         max_open = int(config.MAX_OPEN_TRADES)
         if max_open > 0 and len(self.open_positions) >= max_open:
@@ -423,6 +444,7 @@ class AutoTrader:
     def _refresh_daily_window(self) -> None:
         now_ts = datetime.now(timezone.utc).timestamp()
         self.token_cooldowns = {k: v for k, v in self.token_cooldowns.items() if v > now_ts}
+        self._prune_daily_tx_window()
         current_day = self._current_day_id()
         if self.day_id == current_day:
             return
@@ -441,6 +463,13 @@ class AutoTrader:
     def _prune_hourly_window(self) -> None:
         now_ts = datetime.now(timezone.utc).timestamp()
         self.trade_open_timestamps = [ts for ts in self.trade_open_timestamps if (now_ts - ts) <= 3600]
+
+    def _prune_daily_tx_window(self) -> None:
+        now_ts = datetime.now(timezone.utc).timestamp()
+        self.tx_event_timestamps = [ts for ts in self.tx_event_timestamps if (now_ts - ts) <= 86400]
+
+    def _record_tx_event(self) -> None:
+        self.tx_event_timestamps.append(datetime.now(timezone.utc).timestamp())
 
     def _equity_usd(self) -> float:
         # In live mode, sizing/risk caps should be based on real on-chain wallet balance,
@@ -866,6 +895,15 @@ class AutoTrader:
                 logger.info("AutoTrade skip token=%s reason=invalid_max_buy_cap", symbol)
                 return None
             position_size_usd = min(position_size_usd, cap_usd)
+        min_trade_usd = max(0.01, float(getattr(config, "MIN_TRADE_USD", 0.25) or 0.25))
+        if position_size_usd < min_trade_usd:
+            logger.info(
+                "AutoTrade skip token=%s reason=min_trade_size size=$%.2f min=$%.2f",
+                symbol,
+                position_size_usd,
+                min_trade_usd,
+            )
+            return None
         if position_size_usd < 0.1:
             logger.info("AutoTrade skip token=%s reason=low_balance", symbol)
             return None
@@ -1046,10 +1084,13 @@ class AutoTrader:
             try:
                 buy_result = await asyncio.to_thread(self.live_executor.buy_token, token_address, spend_eth)
             except Exception as exc:
+                # Conservative accounting: a failed live buy may still have consumed gas/nonce.
+                self._record_tx_event()
                 logger.error("AUTO_BUY live_failed token=%s err=%s", symbol, exc)
                 self._blacklist_add(token_address, f"live_buy_failed:{self._short_error_text(exc)}", ttl_seconds=6 * 3600)
                 return None
             if int(buy_result.token_amount_raw) <= 0:
+                self._record_tx_event()
                 logger.error(
                     "AUTO_BUY live_failed token=%s err=zero_token_amount tx=%s spent_eth=%.8f",
                     symbol,
@@ -1084,6 +1125,7 @@ class AutoTrader:
             self.total_plans += 1
             self.total_executed += 1
             self.trade_open_timestamps.append(datetime.now(timezone.utc).timestamp())
+            self._record_tx_event()
             logger.info(
                 "AUTO_BUY Live BUY token=%s address=%s spend=%.8f ETH score=%s edge=%.2f%% edge_usd=$%.3f size=$%.2f mult=%.2f(%s) hold=%ss tx=%s",
                 pos.symbol,
@@ -1124,6 +1166,7 @@ class AutoTrader:
         self.total_plans += 1
         self.total_executed += 1
         self.trade_open_timestamps.append(datetime.now(timezone.utc).timestamp())
+        self._record_tx_event()
         self.paper_balance_usd -= position_size_usd
 
         logger.info(
@@ -1193,6 +1236,7 @@ class AutoTrader:
     async def process_open_positions(self, bot=None) -> None:
         await self._process_recovery_queue()
         await self._check_critical_conditions()
+        self._maybe_log_paper_summary()
         if not self.open_positions:
             return
 
@@ -1526,6 +1570,7 @@ class AutoTrader:
         position.pnl_percent = pnl_percent
         position.sell_tx_hash = str(sell_result.tx_hash)
         position.sell_tx_status = "confirmed"
+        self._record_tx_event()
 
         self.open_positions.pop(position.token_address, None)
         self.price_guard_pending.pop(position.token_address, None)
@@ -1594,6 +1639,7 @@ class AutoTrader:
         position.pnl_usd = pnl_usd
         position.pnl_percent = pnl_percent
         position.sell_tx_status = "simulated"
+        self._record_tx_event()
 
         self.open_positions.pop(position.token_address, None)
         self.price_guard_pending.pop(position.token_address, None)
@@ -1673,6 +1719,43 @@ class AutoTrader:
             )
         except Exception as exc:
             logger.warning("Failed to send paper close message: %s", exc)
+
+    def _maybe_log_paper_summary(self, force: bool = False) -> None:
+        if self._is_live_mode():
+            return
+        interval = int(getattr(config, "PAPER_METRICS_SUMMARY_SECONDS", 900) or 900)
+        if interval <= 0:
+            return
+        now_ts = datetime.now(timezone.utc).timestamp()
+        if not force and (now_ts - float(self._last_paper_summary_ts)) < float(interval):
+            return
+
+        closed_delta = max(0, int(self.total_closed) - int(self._paper_summary_prev_closed))
+        wins_delta = max(0, int(self.total_wins) - int(self._paper_summary_prev_wins))
+        losses_delta = max(0, int(self.total_losses) - int(self._paper_summary_prev_losses))
+        realized_delta_usd = float(self.realized_pnl_usd) - float(self._paper_summary_prev_realized_usd)
+        win_rate_total = (float(self.total_wins) / float(self.total_closed) * 100.0) if int(self.total_closed) > 0 else 0.0
+
+        logger.info(
+            "PAPER_SUMMARY window=%ss closed_delta=%s wins_delta=%s losses_delta=%s realized_delta=$%.2f total_closed=%s winrate_total=%.1f%% realized_total=$%.2f balance=$%.2f equity=$%.2f open=%s",
+            interval,
+            closed_delta,
+            wins_delta,
+            losses_delta,
+            realized_delta_usd,
+            int(self.total_closed),
+            win_rate_total,
+            float(self.realized_pnl_usd),
+            float(self.paper_balance_usd),
+            float(self._equity_usd()),
+            len(self.open_positions),
+        )
+
+        self._last_paper_summary_ts = now_ts
+        self._paper_summary_prev_closed = int(self.total_closed)
+        self._paper_summary_prev_wins = int(self.total_wins)
+        self._paper_summary_prev_losses = int(self.total_losses)
+        self._paper_summary_prev_realized_usd = float(self.realized_pnl_usd)
 
     async def _fetch_current_price(self, token_address: str) -> tuple[str, float] | None:
         token_address = normalize_address(token_address)
@@ -1785,6 +1868,7 @@ class AutoTrader:
 
     def get_stats(self) -> dict[str, float]:
         self._prune_hourly_window()
+        self._prune_daily_tx_window()
         win_rate = (self.total_wins / self.total_closed * 100) if self.total_closed else 0.0
         unrealized_pnl = sum(pos.pnl_usd for pos in self.open_positions.values())
         equity = self.paper_balance_usd + sum(pos.position_size_usd + pos.pnl_usd for pos in self.open_positions.values())
@@ -1806,6 +1890,7 @@ class AutoTrader:
             "loss_streak": self.current_loss_streak,
             "trading_pause_until_ts": round(self.trading_pause_until_ts, 2),
             "trades_last_hour": len(self.trade_open_timestamps),
+            "tx_last_day": len(self.tx_event_timestamps),
             "stair_step_enabled": bool(config.STAIR_STEP_ENABLED),
             "stair_floor_usd": round(self.stair_floor_usd, 2),
             "stair_peak_balance_usd": round(self.stair_peak_balance_usd, 2),
@@ -1829,6 +1914,7 @@ class AutoTrader:
         self.trading_pause_until_ts = 0.0
         self.token_cooldowns.clear()
         self.trade_open_timestamps.clear()
+        self.tx_event_timestamps.clear()
         self.price_guard_pending.clear()
         self.emergency_halt_reason = ""
         self.emergency_halt_ts = 0.0
@@ -2065,6 +2151,7 @@ class AutoTrader:
                 "day_realized_pnl_usd": self.day_realized_pnl_usd,
                 "token_cooldowns": self.token_cooldowns,
                 "trade_open_timestamps": self.trade_open_timestamps[-500:],
+                "tx_event_timestamps": self.tx_event_timestamps[-1000:],
                 "price_guard_pending": self.price_guard_pending,
                 "recovery_queue": self.recovery_queue[-200:],
                 "recovery_untracked": self.recovery_untracked,
@@ -2113,6 +2200,13 @@ class AutoTrader:
             for value in raw_trade_ts:
                 try:
                     self.trade_open_timestamps.append(float(value))
+                except (TypeError, ValueError):
+                    continue
+            raw_tx_ts = payload.get("tx_event_timestamps", []) or []
+            self.tx_event_timestamps = []
+            for value in raw_tx_ts:
+                try:
+                    self.tx_event_timestamps.append(float(value))
                 except (TypeError, ValueError):
                     continue
             pending_raw = payload.get("price_guard_pending", {}) or {}

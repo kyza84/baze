@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -17,7 +18,11 @@ from config import (
     DEX_SEARCH_QUERIES,
     DEX_TIMEOUT,
     GECKO_NETWORK,
+    GECKO_INGEST_DEDUP_TTL_SECONDS,
+    GECKO_NEW_POOLS_DRAIN_MAX_PER_CYCLE,
+    GECKO_NEW_POOLS_INGEST_INTERVAL_SECONDS,
     GECKO_NEW_POOLS_PAGES,
+    GECKO_NEW_POOLS_QUEUE_MAX,
     MIN_LIQUIDITY,
     SEEN_TOKEN_TTL,
     TOKEN_AGE_MAX,
@@ -50,12 +55,57 @@ class DexScreenerMonitor:
                 "dex_boosts": 5,
             },
         )
+        self._gecko_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=int(GECKO_NEW_POOLS_QUEUE_MAX))
+        self._gecko_ingest_task: asyncio.Task | None = None
+        self._gecko_stop = asyncio.Event()
+        self._gecko_start_lock = asyncio.Lock()
+        self._gecko_enqueued_count = 0
+        self._gecko_drained_count = 0
+        self._gecko_dropped_oldest_count = 0
+        self._gecko_ingest_dedup_skipped = 0
+        self._gecko_ingest_seen_until: dict[str, float] = {}
 
     async def close(self) -> None:
+        self._gecko_stop.set()
+        task = self._gecko_ingest_task
+        self._gecko_ingest_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.debug("Gecko ingest task stopped with error", exc_info=True)
         await self._http.close()
 
     def runtime_stats(self, reset: bool = False) -> dict[str, dict[str, int | float]]:
-        return self._http.snapshot_stats(reset=reset)
+        stats = self._http.snapshot_stats(reset=reset)
+        qsize = int(self._gecko_queue.qsize())
+        oldest_age = 0.0
+        if qsize > 0:
+            try:
+                oldest = self._gecko_queue._queue[0]  # type: ignore[attr-defined]
+                oldest_ts = float(oldest.get("_enqueued_monotonic", 0.0) or 0.0)
+                if oldest_ts > 0:
+                    oldest_age = max(0.0, time.monotonic() - oldest_ts)
+            except Exception:
+                oldest_age = 0.0
+        stats["gecko_ingest"] = {
+            "queue_size": qsize,
+            "oldest_item_age_sec": round(oldest_age, 2),
+            "dropped_oldest_count": int(self._gecko_dropped_oldest_count),
+            "ingest_dedup_skipped": int(self._gecko_ingest_dedup_skipped),
+            "enqueued_count": int(self._gecko_enqueued_count),
+            "drained_count": int(self._gecko_drained_count),
+            "ingest_seen_keys": int(len(self._gecko_ingest_seen_until)),
+        }
+        if reset:
+            self._gecko_enqueued_count = 0
+            self._gecko_drained_count = 0
+            self._gecko_dropped_oldest_count = 0
+            self._gecko_ingest_dedup_skipped = 0
+        return stats
 
     async def _fetch_json(self, url: str, source: str, retries: int | None = None) -> Any | None:
         result = await self._http.get_json(
@@ -71,9 +121,10 @@ class DexScreenerMonitor:
 
     async def fetch_new_tokens(self) -> list[dict[str, Any]]:
         self._prune_seen_tokens()
+        await self._ensure_gecko_ingest_started()
 
         dex_task = asyncio.create_task(self._fetch_from_dexscreener())
-        gecko_task = asyncio.create_task(self._fetch_from_geckoterminal())
+        gecko_task = asyncio.create_task(self._drain_gecko_queue())
         tasks = [dex_task, gecko_task]
         if DEX_BOOSTS_SOURCE_ENABLED and DEX_BOOSTS_MAX_TOKENS > 0:
             tasks.append(asyncio.create_task(self._fetch_from_dex_boosts()))
@@ -112,7 +163,107 @@ class DexScreenerMonitor:
         pairs = data.get("pairs", [])
         return self._filter_dex_pairs(pairs)
 
-    async def _fetch_from_geckoterminal(self) -> list[dict[str, Any]]:
+    async def _ensure_gecko_ingest_started(self) -> None:
+        task = self._gecko_ingest_task
+        if task is not None and not task.done():
+            return
+        async with self._gecko_start_lock:
+            task = self._gecko_ingest_task
+            if task is not None and not task.done():
+                return
+            self._gecko_stop.clear()
+            # Prime queue once before background ingest starts.
+            await self._ingest_gecko_once()
+            self._gecko_ingest_task = asyncio.create_task(self._gecko_ingest_loop(), name="gecko_new_pools_ingest")
+
+    async def _gecko_ingest_loop(self) -> None:
+        interval = max(15, int(GECKO_NEW_POOLS_INGEST_INTERVAL_SECONDS))
+        while not self._gecko_stop.is_set():
+            try:
+                await self._ingest_gecko_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("Gecko ingest loop failed: %s", exc)
+            try:
+                await asyncio.wait_for(self._gecko_stop.wait(), timeout=float(interval))
+            except asyncio.TimeoutError:
+                continue
+
+    async def _ingest_gecko_once(self) -> None:
+        rows = await self._fetch_from_geckoterminal_api()
+        if not rows:
+            return
+        for row in rows:
+            await self._queue_gecko_token(row)
+
+    async def _queue_gecko_token(self, row: dict[str, Any]) -> None:
+        now_mono = time.monotonic()
+        self._prune_ingest_seen(now_mono)
+        ingest_key = self._ingest_key(row)
+        if ingest_key:
+            until = float(self._gecko_ingest_seen_until.get(ingest_key, 0.0) or 0.0)
+            if until > now_mono:
+                self._gecko_ingest_dedup_skipped += 1
+                return
+            self._gecko_ingest_seen_until[ingest_key] = now_mono + float(GECKO_INGEST_DEDUP_TTL_SECONDS)
+
+        payload = dict(row)
+        payload["_enqueued_monotonic"] = now_mono
+        try:
+            self._gecko_queue.put_nowait(payload)
+            self._gecko_enqueued_count += 1
+        except asyncio.QueueFull:
+            try:
+                _ = self._gecko_queue.get_nowait()
+                self._gecko_dropped_oldest_count += 1
+            except asyncio.QueueEmpty:
+                pass
+            try:
+                self._gecko_queue.put_nowait(payload)
+                self._gecko_enqueued_count += 1
+            except asyncio.QueueFull:
+                return
+
+    def _ingest_key(self, row: dict[str, Any]) -> str:
+        source = str(row.get("source") or "geckoterminal").strip().lower()
+        dex = str(row.get("dex") or "").strip().lower()
+        pair_address = str(row.get("pair_address") or "").strip().lower()
+        token_address = normalize_address(str(row.get("address") or ""))
+        if pair_address:
+            return f"{dex}:{pair_address}"
+        if token_address:
+            return f"{source}:{token_address}"
+        return ""
+
+    def _prune_ingest_seen(self, now_mono: float) -> None:
+        if not self._gecko_ingest_seen_until:
+            return
+        if len(self._gecko_ingest_seen_until) < 2000:
+            return
+        expired = [k for k, v in self._gecko_ingest_seen_until.items() if float(v or 0.0) <= now_mono]
+        for k in expired:
+            self._gecko_ingest_seen_until.pop(k, None)
+
+    async def _drain_gecko_queue(self) -> list[dict[str, Any]]:
+        max_items = max(10, int(GECKO_NEW_POOLS_DRAIN_MAX_PER_CYCLE))
+        out: list[dict[str, Any]] = []
+        seen_addr: set[str] = set()
+        for _ in range(max_items):
+            try:
+                row = self._gecko_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            address = normalize_address(str(row.get("address") or ""))
+            if not address or address in seen_addr:
+                continue
+            row.pop("_enqueued_monotonic", None)
+            seen_addr.add(address)
+            out.append(row)
+            self._gecko_drained_count += 1
+        return out
+
+    async def _fetch_from_geckoterminal_api(self) -> list[dict[str, Any]]:
         all_tokens: list[dict[str, Any]] = []
         for page in range(1, GECKO_NEW_POOLS_PAGES + 1):
             page_tokens = await self._fetch_gecko_page(page)

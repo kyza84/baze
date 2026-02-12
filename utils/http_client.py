@@ -6,6 +6,7 @@ import asyncio
 import logging
 import random
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
@@ -29,6 +30,8 @@ class HttpSourceStats:
     ok: int = 0
     fail: int = 0
     rate_limited: int = 0
+    limiter_waits: int = 0
+    cooldown_waits: int = 0
     retries: int = 0
     latency_total_ms: float = 0.0
     latency_max_ms: float = 0.0
@@ -48,6 +51,9 @@ class ResilientHttpClient:
         self._session: aiohttp.ClientSession | None = None
         self._semaphores: dict[str, asyncio.Semaphore] = {}
         self._stats: dict[str, HttpSourceStats] = {}
+        self._rate_windows: dict[str, deque[float]] = {}
+        self._rate_locks: dict[str, asyncio.Lock] = {}
+        self._cooldown_until: dict[str, float] = {}
 
     async def close(self) -> None:
         session = self._session
@@ -81,16 +87,119 @@ class ResilientHttpClient:
             self._stats[key] = row
         return row
 
+    @staticmethod
+    def _source_key(source: str) -> str:
+        return str(source or "default").strip().lower() or "default"
+
+    def _rate_limit_config(self, source_key: str) -> tuple[int, float]:
+        raw = getattr(config, "HTTP_SOURCE_RATE_LIMITS", {}) or {}
+        limit_data = raw.get(source_key)
+        if isinstance(limit_data, tuple) and len(limit_data) == 2:
+            try:
+                count = max(1, int(limit_data[0]))
+                window_seconds = max(1.0, float(limit_data[1]))
+                return count, window_seconds
+            except Exception:
+                pass
+        return (1_000_000, 1.0)
+
+    def _source_429_cooldown_seconds(self, source_key: str) -> float:
+        per_source = getattr(config, "HTTP_SOURCE_429_COOLDOWNS", {}) or {}
+        if source_key in per_source:
+            try:
+                return max(0.0, float(per_source[source_key]))
+            except Exception:
+                pass
+        return max(0.0, float(getattr(config, "HTTP_429_COOLDOWN_SECONDS", 90.0) or 90.0))
+
+    def _get_rate_lock(self, source_key: str) -> asyncio.Lock:
+        lock = self._rate_locks.get(source_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._rate_locks[source_key] = lock
+        return lock
+
+    async def _wait_rate_slot(self, source_key: str, stats: HttpSourceStats, url: str) -> None:
+        max_calls, window_seconds = self._rate_limit_config(source_key)
+        if max_calls >= 1_000_000:
+            return
+        lock = self._get_rate_lock(source_key)
+        while True:
+            wait_for = 0.0
+            async with lock:
+                now = time.monotonic()
+                window = self._rate_windows.get(source_key)
+                if window is None:
+                    window = deque()
+                    self._rate_windows[source_key] = window
+                cutoff = now - window_seconds
+                while window and window[0] <= cutoff:
+                    window.popleft()
+                if len(window) < max_calls:
+                    window.append(now)
+                    return
+                wait_for = max(0.01, (window[0] + window_seconds) - now)
+            stats.limiter_waits += 1
+            logger.debug(
+                "HTTP_RATE_WAIT source=%s wait=%.2fs window=%ss max_calls=%s url=%s",
+                source_key,
+                wait_for,
+                window_seconds,
+                max_calls,
+                url,
+            )
+            await asyncio.sleep(wait_for)
+
+    async def _wait_cooldown(self, source_key: str, stats: HttpSourceStats, url: str) -> None:
+        while True:
+            now = time.monotonic()
+            until = float(self._cooldown_until.get(source_key, 0.0) or 0.0)
+            if until <= now:
+                return
+            wait_for = max(0.01, until - now)
+            stats.cooldown_waits += 1
+            logger.debug("HTTP_COOLDOWN_WAIT source=%s wait=%.2fs url=%s", source_key, wait_for, url)
+            await asyncio.sleep(wait_for)
+
+    def _apply_source_cooldown(self, source_key: str, response: aiohttp.ClientResponse) -> None:
+        retry_after_raw = (response.headers or {}).get("Retry-After", "")
+        retry_after = 0.0
+        if retry_after_raw:
+            try:
+                retry_after = max(0.0, float(retry_after_raw))
+            except Exception:
+                retry_after = 0.0
+        cooldown_seconds = max(self._source_429_cooldown_seconds(source_key), retry_after)
+        if cooldown_seconds <= 0:
+            return
+        now = time.monotonic()
+        until = now + cooldown_seconds
+        prev = float(self._cooldown_until.get(source_key, 0.0) or 0.0)
+        self._cooldown_until[source_key] = max(prev, until)
+
     def snapshot_stats(self, reset: bool = False) -> dict[str, dict[str, int | float]]:
         out: dict[str, dict[str, int | float]] = {}
-        for source, row in self._stats.items():
+        now = time.monotonic()
+        all_sources = set(self._stats.keys()) | set(self._cooldown_until.keys())
+        for source in all_sources:
+            row = self._stats.get(source)
+            if row is None:
+                row = HttpSourceStats()
+                self._stats[source] = row
             total = int(row.ok + row.fail)
             err_pct = (float(row.fail) / total * 100.0) if total > 0 else 0.0
+            cooldown_until = float(self._cooldown_until.get(source, 0.0) or 0.0)
+            cooldown_remaining = max(0.0, cooldown_until - now)
             out[source] = {
                 "ok": int(row.ok),
                 "fail": int(row.fail),
                 "total": total,
                 "rate_limited": int(row.rate_limited),
+                "limiter_waits": int(row.limiter_waits),
+                "cooldown_waits": int(row.cooldown_waits),
+                "cooldown_active": 1 if cooldown_remaining > 0 else 0,
+                "cooldown_remaining_sec": round(cooldown_remaining, 2),
+                "cooldown_until_monotonic": round(cooldown_until, 3),
                 "retries": int(row.retries),
                 "error_percent": round(err_pct, 2),
                 "latency_avg_ms": round((row.latency_total_ms / row.latency_count), 2) if row.latency_count > 0 else 0.0,
@@ -126,10 +235,13 @@ class ResilientHttpClient:
         if headers:
             req_headers.update(headers)
 
-        sem = self._get_semaphore(source)
-        stats = self._stats_row(source)
+        source_key = self._source_key(source)
+        sem = self._get_semaphore(source_key)
+        stats = self._stats_row(source_key)
         for attempt in range(1, attempts + 1):
             status = 0
+            await self._wait_cooldown(source_key, stats, url)
+            await self._wait_rate_slot(source_key, stats, url)
             async with sem:
                 started = time.perf_counter()
                 try:
@@ -148,6 +260,7 @@ class ResilientHttpClient:
                         retryable = status == 429 or (500 <= status <= 599)
                         if status == 429:
                             stats.rate_limited += 1
+                            self._apply_source_cooldown(source_key, response)
                         if not retryable or attempt >= attempts:
                             stats.fail += 1
                             return HttpResult(ok=False, status=status, data=None, error=f"http_status_{status}")
