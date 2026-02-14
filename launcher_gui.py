@@ -614,6 +614,85 @@ def read_jsonl_tail(path: str, max_lines: int) -> list[dict]:
     return rows
 
 
+def _format_matrix_candidate_tail(log_dir: str, inst_id: str, max_rows: int = 80) -> list[str]:
+    path = os.path.join(log_dir, "candidates.jsonl")
+    rows = read_jsonl_tail(path, max_rows)
+    if not rows:
+        return []
+    out: list[str] = []
+    for row in rows[-max_rows:]:
+        stage = str(row.get("decision_stage", "") or "").strip() or "-"
+        decision = str(row.get("decision", "") or "").strip() or "-"
+        reason = str(row.get("reason", "") or "").strip() or "-"
+        symbol = str(row.get("symbol", "") or "").strip() or "-"
+        score = row.get("score", 0)
+        src = str(row.get("source_mode", "") or "").strip() or "-"
+        out.append(
+            f"[{inst_id}] cand stage={stage} decision={decision} reason={reason} symbol={symbol} score={score} src={src}"
+        )
+    return out
+
+
+def _format_matrix_alert_tail(log_dir: str, inst_id: str, max_rows: int = 40) -> list[str]:
+    path = os.path.join(log_dir, "local_alerts.jsonl")
+    rows = read_jsonl_tail(path, max_rows)
+    if not rows:
+        return []
+    out: list[str] = []
+    for row in rows[-max_rows:]:
+        symbol = str(row.get("symbol", "N/A"))
+        score = row.get("score", 0)
+        rec = str(row.get("recommendation", ""))
+        risk = str(row.get("risk_level", ""))
+        out.append(f"[{inst_id}] alert symbol={symbol} score={score} rec={rec} risk={risk}")
+    return out
+
+
+def _collect_matrix_runtime_sections(items: list[dict], max_lines_each: int = 120) -> list[tuple[str, list[str]]]:
+    sections: list[tuple[str, list[str]]] = []
+    for row in items:
+        if not isinstance(row, dict):
+            continue
+        inst_id = str(row.get("id", "") or "").strip() or "matrix"
+        log_dir = str(row.get("log_dir", "") or "").strip()
+        if not log_dir:
+            continue
+        abs_dir = log_dir if os.path.isabs(log_dir) else os.path.join(PROJECT_ROOT, log_dir)
+        block: list[str] = []
+
+        latest = latest_session_log(abs_dir)
+        if latest:
+            label = os.path.basename(latest)
+            block.append(f"--- session: {label} ---")
+            block.extend(compact_runtime_lines(read_tail(latest, max_lines_each))[-max_lines_each:])
+
+        for name in ("app.log", "out.log"):
+            p = os.path.join(abs_dir, name)
+            if not os.path.exists(p):
+                continue
+            try:
+                if os.path.getsize(p) <= 0:
+                    continue
+            except Exception:
+                continue
+            block.append(f"--- {name} ---")
+            block.extend(compact_runtime_lines(read_tail(p, max_lines_each))[-max_lines_each:])
+
+        cand_lines = _format_matrix_candidate_tail(abs_dir, inst_id, max_rows=80)
+        if cand_lines:
+            block.append("--- candidates.jsonl (tail) ---")
+            block.extend(cand_lines[-80:])
+
+        alert_lines = _format_matrix_alert_tail(abs_dir, inst_id, max_rows=40)
+        if alert_lines:
+            block.append("--- local_alerts.jsonl (tail) ---")
+            block.extend(alert_lines[-40:])
+
+        if block:
+            sections.append((inst_id, block))
+    return sections
+
+
 def parse_activity(lines: list[str]) -> list[tuple[str, str]]:
     events: list[tuple[str, str]] = []
     for line in lines:
@@ -1950,6 +2029,10 @@ class App(tk.Tk):
         if not log_paths:
             log_paths = [APP_LOG]
 
+        matrix_sections: list[tuple[str, list[str]]] = []
+        if matrix_alive > 0 and isinstance(items, list):
+            matrix_sections = _collect_matrix_runtime_sections(items, max_lines_each=120)
+
         feed_bottom = self._is_near_bottom(self.feed_text)
         feed_y = self.feed_text.yview()
         app_lines: list[str] = []
@@ -1967,12 +2050,18 @@ class App(tk.Tk):
         raw_bottom = self._is_near_bottom(self.raw_text)
         raw_y = self.raw_text.yview()
         combined = []
-        for path in log_paths:
-            label = os.path.basename(path)
-            lines = compact_runtime_lines(read_tail(path, 180))
-            combined.append(f"===== {label} LOG (clean) =====")
-            combined.extend(lines[-120:] or ["<empty>"])
-            combined.append("")
+        if matrix_sections:
+            for inst_id, lines in matrix_sections:
+                combined.append(f"===== MATRIX {inst_id} runtime =====")
+                combined.extend(lines[-220:] if lines else ["<empty>"])
+                combined.append("")
+        else:
+            for path in log_paths:
+                label = os.path.basename(path)
+                lines = compact_runtime_lines(read_tail(path, 180))
+                combined.append(f"===== {label} LOG (clean) =====")
+                combined.extend(lines[-120:] or ["<empty>"])
+                combined.append("")
         if not self._text_has_active_selection(self.raw_text):
             self.raw_text.delete("1.0", tk.END)
             self.raw_text.insert(tk.END, "\n".join(combined))

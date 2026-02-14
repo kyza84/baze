@@ -442,6 +442,14 @@ class AdaptiveFilterController:
         self.ttl_step = int(getattr(config, "ADAPTIVE_DEDUP_TTL_STEP", 30) or 30)
         self.ttl_step_pct = float(getattr(config, "ADAPTIVE_DEDUP_TTL_STEP_PCT", 25.0) or 25.0)
         self.dedup_relax_enabled = bool(getattr(config, "ADAPTIVE_DEDUP_RELAX_ENABLED", False))
+        self.dedup_dynamic_enabled = bool(getattr(config, "ADAPTIVE_DEDUP_DYNAMIC_ENABLED", False))
+        self.dedup_dynamic_min = int(getattr(config, "ADAPTIVE_DEDUP_DYNAMIC_MIN", 8) or 8)
+        self.dedup_dynamic_max = int(getattr(config, "ADAPTIVE_DEDUP_DYNAMIC_MAX", 30) or 30)
+        self.dedup_dynamic_target_percentile = float(
+            getattr(config, "ADAPTIVE_DEDUP_DYNAMIC_TARGET_PERCENTILE", 90.0) or 90.0
+        )
+        self.dedup_dynamic_factor = float(getattr(config, "ADAPTIVE_DEDUP_DYNAMIC_FACTOR", 1.2) or 1.2)
+        self.dedup_dynamic_min_samples = int(getattr(config, "ADAPTIVE_DEDUP_DYNAMIC_MIN_SAMPLES", 200) or 200)
         self.edge_enabled = bool(getattr(config, "ADAPTIVE_EDGE_ENABLED", True))
         self.edge_min_bound = float(getattr(config, "ADAPTIVE_EDGE_MIN", 1.5) or 1.5)
         self.edge_max_bound = float(getattr(config, "ADAPTIVE_EDGE_MAX", 4.0) or 4.0)
@@ -466,6 +474,7 @@ class AdaptiveFilterController:
         self.window_filter_fails: dict[str, int] = {}
         self.window_skip_reasons: dict[str, int] = {}
         self.window_regime_counts: dict[str, int] = {}
+        self.window_dedup_repeat_intervals_sec: list[float] = []
         self.prev_realized_usd = 0.0
         self.prev_closed = 0
         self.baseline_thresholds = self._snapshot_thresholds()
@@ -496,6 +505,18 @@ class AdaptiveFilterController:
         if pct <= 0.0:
             return max(1.0, float(fallback_abs))
         return max(1.0, float(value) * (pct / 100.0))
+
+    @staticmethod
+    def _percentile(values: list[float], p: float) -> float:
+        if not values:
+            return 0.0
+        vals = sorted(float(v) for v in values if float(v) >= 0.0)
+        if not vals:
+            return 0.0
+        pct = max(0.0, min(100.0, float(p)))
+        idx = int(round((pct / 100.0) * float(len(vals) - 1)))
+        idx = max(0, min(len(vals) - 1, idx))
+        return float(vals[idx])
 
     @staticmethod
     def _source_pressure(source_stats: dict[str, dict[str, int | float]]) -> bool:
@@ -536,6 +557,7 @@ class AdaptiveFilterController:
         filter_fails_cycle: dict[str, int],
         skip_reasons_cycle: dict[str, int],
         market_regime: str,
+        dedup_repeat_intervals_cycle: list[float] | None = None,
     ) -> None:
         self.window_cycles += 1
         self.window_candidates += int(candidates)
@@ -548,6 +570,11 @@ class AdaptiveFilterController:
             self.window_skip_reasons[key] = int(self.window_skip_reasons.get(key, 0)) + int(count or 0)
         regime_key = str(market_regime or "unknown").strip().upper() or "UNKNOWN"
         self.window_regime_counts[regime_key] = int(self.window_regime_counts.get(regime_key, 0)) + 1
+        if dedup_repeat_intervals_cycle:
+            for v in dedup_repeat_intervals_cycle:
+                fv = float(v or 0.0)
+                if 0.0 < fv <= 300.0:
+                    self.window_dedup_repeat_intervals_sec.append(fv)
 
     def _reset_window(self, *, now_ts: float, realized_usd: float, closed: int) -> None:
         self.last_eval_ts = now_ts
@@ -557,6 +584,7 @@ class AdaptiveFilterController:
         self.window_filter_fails = {}
         self.window_skip_reasons = {}
         self.window_regime_counts = {}
+        self.window_dedup_repeat_intervals_sec = []
         self.prev_realized_usd = float(realized_usd)
         self.prev_closed = int(closed)
 
@@ -628,6 +656,25 @@ class AdaptiveFilterController:
         vol_step = self._step_by_pct(volume_now, self.volume_step_pct, self.volume_step)
         ttl_step = self._step_by_pct(float(ttl_now), self.ttl_step_pct, float(self.ttl_step))
         edge_step = self._step_by_pct(float(edge_now), self.edge_step_pct, float(self.edge_step))
+        ttl_min_bound = int(self.ttl_min_bound)
+        ttl_max_bound = int(self.ttl_max_bound)
+        dedup_dyn_p = 0.0
+        dedup_dyn_target = 0
+        if (
+            self.dedup_dynamic_enabled
+            and len(self.window_dedup_repeat_intervals_sec) >= int(self.dedup_dynamic_min_samples)
+        ):
+            dedup_dyn_p = self._percentile(self.window_dedup_repeat_intervals_sec, self.dedup_dynamic_target_percentile)
+            raw_target = dedup_dyn_p * max(0.8, float(self.dedup_dynamic_factor))
+            dyn_floor = max(1, min(int(self.dedup_dynamic_min), int(self.dedup_dynamic_max)))
+            dyn_ceil = max(dyn_floor, int(self.dedup_dynamic_max))
+            dedup_dyn_target = self._clamp_int(int(round(raw_target)), dyn_floor, dyn_ceil)
+            ttl_min_bound = max(dyn_floor, self._clamp_int(dedup_dyn_target - 2, dyn_floor, dyn_ceil))
+            ttl_max_bound = max(ttl_min_bound, self._clamp_int(dedup_dyn_target + 8, dyn_floor, dyn_ceil))
+            if ttl_now < ttl_min_bound:
+                ttl_next = ttl_min_bound
+            elif ttl_now > ttl_max_bound:
+                ttl_next = ttl_max_bound
         edge_mode = str(getattr(config, "EDGE_FILTER_MODE", "usd") or "usd").strip().lower()
         edge_knob_movable = self.edge_enabled and bool(getattr(config, "EDGE_FILTER_ENABLED", True))
         edge_negative_blocked = (skip_negative_edge + skip_edge_low) > 0 and edge_mode in {"percent", "both"}
@@ -673,8 +720,8 @@ class AdaptiveFilterController:
         if str(policy_state).upper() != "OK":
             action = "hold"
             reason = f"policy_{policy_state.lower()}"
-        elif pressure and ttl_now < self.ttl_max_bound:
-            ttl_next = self._clamp_int(int(round(ttl_now + ttl_step)), self.ttl_min_bound, self.ttl_max_bound)
+        elif pressure and ttl_now < ttl_max_bound:
+            ttl_next = self._clamp_int(int(round(ttl_now + ttl_step)), ttl_min_bound, ttl_max_bound)
             action = "tighten_dedup_ttl"
             reason = "source_pressure_detected"
         elif (
@@ -684,7 +731,7 @@ class AdaptiveFilterController:
         ):
             score_next = self._clamp_int(score_now + int(self.score_step), self.score_min_bound, self.score_max_bound)
             volume_next = self._clamp_float(volume_now + float(vol_step), self.volume_min_bound, self.volume_max_bound)
-            ttl_next = self._clamp_int(int(round(ttl_now + ttl_step)), self.ttl_min_bound, self.ttl_max_bound)
+            ttl_next = self._clamp_int(int(round(ttl_now + ttl_step)), ttl_min_bound, ttl_max_bound)
             if edge_knob_movable and edge_now < self.edge_max_bound:
                 edge_next = self._clamp_float(edge_now + float(edge_step), self.edge_min_bound, self.edge_max_bound)
             action = "tighten_all"
@@ -704,9 +751,9 @@ class AdaptiveFilterController:
             if abs(target_volume - volume_now) < 0.5 and volume_now > self.volume_min_bound:
                 target_volume = self._clamp_float(volume_now - float(vol_step), self.volume_min_bound, self.volume_max_bound)
 
-            target_ttl = self._clamp_int(min(ttl_now, int(base_ttl)), self.ttl_min_bound, self.ttl_max_bound)
-            if target_ttl == ttl_now and self.dedup_relax_enabled and ttl_now > self.ttl_min_bound:
-                target_ttl = self._clamp_int(int(round(ttl_now - ttl_step)), self.ttl_min_bound, self.ttl_max_bound)
+            target_ttl = self._clamp_int(min(ttl_now, int(base_ttl)), ttl_min_bound, ttl_max_bound)
+            if target_ttl == ttl_now and self.dedup_relax_enabled and ttl_now > ttl_min_bound:
+                target_ttl = self._clamp_int(int(round(ttl_now - ttl_step)), ttl_min_bound, ttl_max_bound)
 
             target_edge = edge_now
             if edge_knob_movable:
@@ -745,8 +792,8 @@ class AdaptiveFilterController:
                 score_next = self._clamp_int(score_now - int(self.score_step), self.score_min_bound, self.score_max_bound)
                 action = "loosen_score"
                 reason = f"low_flow avg_cand={avg_candidates:.2f} fail_score_min={fail_score}"
-            elif self.dedup_relax_enabled and fail_dedup > 0 and ttl_now > self.ttl_min_bound:
-                ttl_next = self._clamp_int(int(round(ttl_now - ttl_step)), self.ttl_min_bound, self.ttl_max_bound)
+            elif self.dedup_relax_enabled and fail_dedup > 0 and ttl_now > ttl_min_bound:
+                ttl_next = self._clamp_int(int(round(ttl_now - ttl_step)), ttl_min_bound, ttl_max_bound)
                 action = "loosen_dedup_ttl"
                 reason = f"low_flow avg_cand={avg_candidates:.2f} fail_heavy_dedup={fail_dedup}"
             else:
@@ -783,7 +830,7 @@ class AdaptiveFilterController:
                 self.zero_open_streak = 0
 
         logger.warning(
-            "ADAPTIVE_FILTERS mode=%s action=%s changed=%s reason=%s regime=%s avg_cand=%.2f avg_opened=%.2f closed_delta=%s realized_delta=$%.2f pnl_signal=%s pressure=%s score=%s->%s volume=%.0f->%.0f dedup_ttl=%s->%s edge=%.2f->%.2f lock_floor=%.2f->%.2f no_mom_pnl=%.2f->%.2f weakness_pnl=%.2f->%.2f fails(score=%s,volume=%s,dedup=%s) skips(neg_edge=%s,edge_usd=%s,min_trade=%s) zero_open=%s/%s",
+            "ADAPTIVE_FILTERS mode=%s action=%s changed=%s reason=%s regime=%s avg_cand=%.2f avg_opened=%.2f closed_delta=%s realized_delta=$%.2f pnl_signal=%s pressure=%s score=%s->%s volume=%.0f->%.0f dedup_ttl=%s->%s dyn_dedup(p=%.1f,target=%s,range=%s-%s,samples=%s) edge=%.2f->%.2f lock_floor=%.2f->%.2f no_mom_pnl=%.2f->%.2f weakness_pnl=%.2f->%.2f fails(score=%s,volume=%s,dedup=%s) skips(neg_edge=%s,edge_usd=%s,min_trade=%s) zero_open=%s/%s",
             self.mode,
             action,
             changed,
@@ -801,6 +848,11 @@ class AdaptiveFilterController:
             volume_next,
             ttl_now,
             ttl_next,
+            dedup_dyn_p,
+            dedup_dyn_target,
+            ttl_min_bound,
+            ttl_max_bound,
+            len(self.window_dedup_repeat_intervals_sec),
             edge_now,
             edge_next,
             lock_floor_now,
@@ -1091,6 +1143,7 @@ async def run_local_loop() -> None:
     heavy_seen_until: dict[str, float] = {}
     heavy_last_liquidity: dict[str, float] = {}
     heavy_last_volume_5m: dict[str, float] = {}
+    heavy_last_seen_ts: dict[str, float] = {}
     filter_fail_reasons_session: dict[str, int] = {}
     adaptive_filters = AdaptiveFilterController()
     adaptive_init_stats = auto_trader.get_stats()
@@ -1173,6 +1226,7 @@ async def run_local_loop() -> None:
                 safety_fail_closed_hits = 0
                 heavy_dedup_skipped = 0
                 heavy_dedup_override = 0
+                dedup_repeat_intervals_cycle: list[float] = []
                 excluded_addresses = _excluded_trade_addresses()
                 now_mono = time.monotonic()
                 if heavy_seen_until:
@@ -1227,6 +1281,14 @@ async def run_local_loop() -> None:
 
                     for token in tokens:
                         token_address = normalize_address(token.get("address", ""))
+                        if token_address:
+                            seen_now = time.monotonic()
+                            prev_seen = float(heavy_last_seen_ts.get(token_address, 0.0) or 0.0)
+                            if prev_seen > 0.0:
+                                delta = float(seen_now - prev_seen)
+                                if 0.0 < delta <= 300.0:
+                                    dedup_repeat_intervals_cycle.append(delta)
+                            heavy_last_seen_ts[token_address] = seen_now
                         if token_address in excluded_addresses:
                             _filter_fail("excluded_base_token", token)
                             continue
@@ -1460,6 +1522,7 @@ async def run_local_loop() -> None:
                     filter_fails_cycle=cycle_filter_fails,
                     skip_reasons_cycle=skip_reasons_cycle,
                     market_regime=market_regime_current,
+                    dedup_repeat_intervals_cycle=dedup_repeat_intervals_cycle,
                 )
                 mini_analyzer.record(
                     scanned=len(tokens or []),

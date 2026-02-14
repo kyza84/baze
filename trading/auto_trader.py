@@ -41,7 +41,7 @@ class PaperPosition:
     opened_at: datetime
     max_hold_seconds: int
     take_profit_percent: int
-    stop_loss_percent: int
+    stop_loss_percent: float
     expected_edge_percent: float = 0.0
     buy_cost_percent: float = 0.0
     sell_cost_percent: float = 0.0
@@ -58,6 +58,9 @@ class PaperPosition:
     buy_tx_status: str = "none"
     sell_tx_status: str = "none"
     spent_eth: float = 0.0
+    original_position_size_usd: float = 0.0
+    partial_tp_done: bool = False
+    partial_realized_pnl_usd: float = 0.0
 
 
 class AutoTrader:
@@ -1279,6 +1282,7 @@ class AutoTrader:
                 buy_tx_hash=str(buy_result.tx_hash),
                 buy_tx_status="confirmed",
                 spent_eth=float(buy_result.spent_eth),
+                original_position_size_usd=position_size_usd,
             )
             self.open_positions[token_address] = pos
             self.total_plans += 1
@@ -1319,6 +1323,7 @@ class AutoTrader:
             buy_cost_percent=cost_profile["buy_percent"],
             sell_cost_percent=cost_profile["sell_percent"],
             gas_cost_usd=cost_profile["gas_usd"],
+            original_position_size_usd=position_size_usd,
         )
 
         self.open_positions[token_address] = pos
@@ -1399,37 +1404,50 @@ class AutoTrader:
         if not self.open_positions:
             return
 
-        updates = await asyncio.gather(
-            *[self._fetch_current_price(address) for address in list(self.open_positions.keys())]
-        )
+        addresses = list(self.open_positions.keys())
+        updates = await asyncio.gather(*[self._fetch_current_price(address) for address in addresses])
+        update_map: dict[str, float] = {}
         for update in updates:
             if not update:
                 continue
             address, price_usd = update
+            if price_usd > 0:
+                update_map[address] = price_usd
+
+        for address in addresses:
             position = self.open_positions.get(address)
             if not position:
                 continue
-            if price_usd <= 0:
-                continue
-            if not self._accept_price_update(position, price_usd):
-                continue
+            price_usd = float(update_map.get(address, 0.0) or 0.0)
+            has_price_update = price_usd > 0 and self._accept_price_update(position, price_usd)
+            if has_price_update:
+                position.current_price_usd = price_usd
+            base_price = float(position.current_price_usd if position.current_price_usd > 0 else position.entry_price_usd)
+            raw_price_pnl_percent = ((base_price - position.entry_price_usd) / position.entry_price_usd) * 100
+            if has_price_update:
+                position.pnl_percent = raw_price_pnl_percent
+                position.pnl_usd = (position.position_size_usd * raw_price_pnl_percent) / 100
+                position.peak_pnl_percent = max(float(position.peak_pnl_percent), float(position.pnl_percent))
 
-            position.current_price_usd = price_usd
-            raw_price_pnl_percent = ((price_usd - position.entry_price_usd) / position.entry_price_usd) * 100
-            position.pnl_percent = raw_price_pnl_percent
-            position.pnl_usd = (position.position_size_usd * raw_price_pnl_percent) / 100
-            position.peak_pnl_percent = max(float(position.peak_pnl_percent), float(position.pnl_percent))
+            if has_price_update and (not self._is_live_mode()):
+                self._maybe_partial_take_profit(position, raw_price_pnl_percent)
+                # Recompute MTM for remaining slice after partial TP.
+                position.pnl_percent = raw_price_pnl_percent
+                position.pnl_usd = (position.position_size_usd * raw_price_pnl_percent) / 100
+                position.peak_pnl_percent = max(float(position.peak_pnl_percent), float(position.pnl_percent))
 
             should_close = False
             close_reason = ""
 
-            if position.pnl_percent >= position.take_profit_percent:
+            if has_price_update and position.pnl_percent >= position.take_profit_percent:
                 should_close = True
                 close_reason = "TP"
-            elif position.pnl_percent <= -abs(position.stop_loss_percent):
+            elif has_price_update and position.pnl_percent <= -abs(position.stop_loss_percent):
                 should_close = True
                 close_reason = "SL"
             elif (
+                has_price_update
+                and
                 config.PROFIT_LOCK_ENABLED
                 and float(position.peak_pnl_percent) >= float(config.PROFIT_LOCK_TRIGGER_PERCENT)
                 and float(position.pnl_percent) <= float(config.PROFIT_LOCK_FLOOR_PERCENT)
@@ -1444,6 +1462,8 @@ class AutoTrader:
                 )
                 # Close "flat" positions early: token never showed real impulse and still sits near breakeven.
                 if (
+                    has_price_update
+                    and
                     config.NO_MOMENTUM_EXIT_ENABLED
                     and age_seconds >= no_momentum_age_gate
                     and float(position.peak_pnl_percent) <= float(config.NO_MOMENTUM_EXIT_MAX_PEAK_PERCENT)
@@ -1456,6 +1476,8 @@ class AutoTrader:
                 else:
                     min_age_ratio = max(0.0, min(100.0, float(config.WEAKNESS_EXIT_MIN_AGE_PERCENT))) / 100.0
                     if (
+                        has_price_update
+                        and
                         config.WEAKNESS_EXIT_ENABLED
                         and age_seconds >= int(position.max_hold_seconds * min_age_ratio)
                         and float(position.pnl_percent) <= float(config.WEAKNESS_EXIT_PNL_PERCENT)
@@ -1807,14 +1829,16 @@ class AutoTrader:
         else:
             final_value_usd = gross_value_usd
         final_value_usd = max(0.0, final_value_usd)
-        pnl_usd = final_value_usd - position.position_size_usd
-        pnl_percent = (pnl_usd / position.position_size_usd * 100) if position.position_size_usd > 0 else 0.0
+        pnl_usd_remaining = final_value_usd - position.position_size_usd
+        total_pnl_usd = float(pnl_usd_remaining) + float(position.partial_realized_pnl_usd)
+        base_size_usd = max(float(position.original_position_size_usd or 0.0), float(position.position_size_usd), 0.000001)
+        total_pnl_percent = (total_pnl_usd / base_size_usd * 100) if base_size_usd > 0 else 0.0
 
         position.status = "CLOSED"
         position.close_reason = reason
         position.closed_at = datetime.now(timezone.utc)
-        position.pnl_usd = pnl_usd
-        position.pnl_percent = pnl_percent
+        position.pnl_usd = total_pnl_usd
+        position.pnl_percent = total_pnl_percent
         position.sell_tx_status = "simulated"
         self._record_tx_event()
 
@@ -1827,32 +1851,100 @@ class AutoTrader:
 
         self.paper_balance_usd += final_value_usd
         self._update_stair_floor()
-        self.realized_pnl_usd += position.pnl_usd
-        self.day_realized_pnl_usd += position.pnl_usd
+        self.realized_pnl_usd += pnl_usd_remaining
+        self.day_realized_pnl_usd += pnl_usd_remaining
 
-        if position.pnl_usd >= 0:
+        if total_pnl_usd >= 0:
             self.total_wins += 1
             self.current_loss_streak = 0
         else:
             self.total_losses += 1
             self.current_loss_streak += 1
-        self._risk_governor_after_close(close_reason=reason, pnl_usd=float(position.pnl_usd))
+        self._risk_governor_after_close(close_reason=reason, pnl_usd=float(total_pnl_usd))
 
         token_cooldown = int(config.MAX_TOKEN_COOLDOWN_SECONDS)
         if token_cooldown > 0:
             self.token_cooldowns[normalize_address(position.token_address)] = datetime.now(timezone.utc).timestamp() + token_cooldown
 
         logger.info(
-            "AUTO_SELL Paper SELL token=%s reason=%s exit=$%.8f pnl=%.2f%% ($%.2f) raw=%.2f%% cost=%.2f%% gas=$%.2f balance=$%.2f",
+            "AUTO_SELL Paper SELL token=%s reason=%s exit=$%.8f pnl=%.2f%% ($%.2f) remaining=$%.2f partial=$%.2f raw=%.2f%% cost=%.2f%% gas=$%.2f balance=$%.2f",
             position.symbol,
             reason,
             position.current_price_usd,
             position.pnl_percent,
             position.pnl_usd,
+            pnl_usd_remaining,
+            float(position.partial_realized_pnl_usd),
             raw_price_pnl_percent,
             position.buy_cost_percent + position.sell_cost_percent,
             position.gas_cost_usd,
             self.paper_balance_usd,
+        )
+        self._save_state()
+
+    def _maybe_partial_take_profit(self, position: PaperPosition, raw_price_pnl_percent: float) -> None:
+        if not bool(getattr(config, "PAPER_PARTIAL_TP_ENABLED", False)):
+            return
+        if bool(position.partial_tp_done):
+            return
+        trigger = float(getattr(config, "PAPER_PARTIAL_TP_TRIGGER_PERCENT", 2.5) or 2.5)
+        if float(raw_price_pnl_percent) < trigger:
+            return
+
+        frac = float(getattr(config, "PAPER_PARTIAL_TP_SELL_FRACTION", 0.5) or 0.5)
+        frac = max(0.1, min(0.9, frac))
+        if float(position.position_size_usd) <= 0.0:
+            return
+
+        close_size_usd = float(position.position_size_usd) * frac
+        if close_size_usd < 0.05:
+            return
+
+        effective_price_pnl_percent = float(raw_price_pnl_percent)
+        if config.PAPER_REALISM_CAP_ENABLED:
+            max_gain = max(0.0, float(config.PAPER_REALISM_MAX_GAIN_PERCENT))
+            max_loss = max(0.0, float(config.PAPER_REALISM_MAX_LOSS_PERCENT))
+            effective_price_pnl_percent = max(-abs(max_loss), min(abs(max_gain), effective_price_pnl_percent))
+
+        gross_value_usd = close_size_usd * (1 + effective_price_pnl_percent / 100.0)
+        gas_slice_usd = float(position.gas_cost_usd) * frac
+        if config.PAPER_REALISM_ENABLED:
+            total_percent_cost = (float(position.buy_cost_percent) + float(position.sell_cost_percent)) / 100.0
+            final_value_usd = gross_value_usd * (1 - total_percent_cost) - gas_slice_usd
+        else:
+            final_value_usd = gross_value_usd
+        final_value_usd = max(0.0, final_value_usd)
+        realized_slice_pnl = final_value_usd - close_size_usd
+
+        old_size = float(position.position_size_usd)
+        position.position_size_usd = max(0.0, old_size - close_size_usd)
+        if float(position.original_position_size_usd or 0.0) <= 0.0:
+            position.original_position_size_usd = old_size
+        position.partial_realized_pnl_usd = float(position.partial_realized_pnl_usd) + float(realized_slice_pnl)
+        position.partial_tp_done = True
+        position.gas_cost_usd = max(0.0, float(position.gas_cost_usd) - gas_slice_usd)
+
+        if int(position.token_amount_raw or 0) > 0:
+            sold_raw = int(max(0, round(int(position.token_amount_raw) * frac)))
+            position.token_amount_raw = max(0, int(position.token_amount_raw) - sold_raw)
+
+        self.paper_balance_usd += final_value_usd
+        self.realized_pnl_usd += realized_slice_pnl
+        self.day_realized_pnl_usd += realized_slice_pnl
+        self._update_stair_floor()
+
+        if bool(getattr(config, "PAPER_PARTIAL_TP_MOVE_SL_TO_BREAK_EVEN", True)):
+            be_floor = max(0.0, float(getattr(config, "PAPER_PARTIAL_TP_BREAK_EVEN_BUFFER_PERCENT", 0.2) or 0.2))
+            position.stop_loss_percent = min(float(position.stop_loss_percent), be_floor)
+
+        logger.info(
+            "AUTO_SELL Paper PARTIAL token=%s reason=TP1_PARTIAL trigger=%.2f%% sold=%.0f%% realized=$%.4f remaining_size=$%.2f sl=%.2f",
+            position.symbol,
+            trigger,
+            frac * 100.0,
+            realized_slice_pnl,
+            position.position_size_usd,
+            float(position.stop_loss_percent),
         )
         self._save_state()
 
@@ -2538,6 +2630,9 @@ class AutoTrader:
             "buy_tx_status": pos.buy_tx_status,
             "sell_tx_status": pos.sell_tx_status,
             "spent_eth": pos.spent_eth,
+            "original_position_size_usd": pos.original_position_size_usd,
+            "partial_tp_done": pos.partial_tp_done,
+            "partial_realized_pnl_usd": pos.partial_realized_pnl_usd,
         }
 
     @staticmethod
@@ -2564,7 +2659,7 @@ class AutoTrader:
                 opened_at=opened_at,
                 max_hold_seconds=int(row.get("max_hold_seconds", config.PAPER_MAX_HOLD_SECONDS)),
                 take_profit_percent=int(row.get("take_profit_percent", 50)),
-                stop_loss_percent=int(row.get("stop_loss_percent", 30)),
+                stop_loss_percent=float(row.get("stop_loss_percent", 30)),
                 expected_edge_percent=float(row.get("expected_edge_percent", 0.0)),
                 buy_cost_percent=float(row.get("buy_cost_percent", 0.0)),
                 sell_cost_percent=float(row.get("sell_cost_percent", 0.0)),
@@ -2581,6 +2676,9 @@ class AutoTrader:
                 buy_tx_status=str(row.get("buy_tx_status", "none")),
                 sell_tx_status=str(row.get("sell_tx_status", "none")),
                 spent_eth=float(row.get("spent_eth", 0.0)),
+                original_position_size_usd=float(row.get("original_position_size_usd", row.get("position_size_usd", 0.0))),
+                partial_tp_done=bool(row.get("partial_tp_done", False)),
+                partial_realized_pnl_usd=float(row.get("partial_realized_pnl_usd", 0.0)),
             )
         except Exception:
             return None

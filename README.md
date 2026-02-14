@@ -127,7 +127,7 @@ python launcher_gui.py
 
 ---
 
-## 6) Matrix режим (2-4 инстанса)
+## 6) Matrix режим (1-4 инстанса)
 
 Нужен для быстрого сравнения пресетов в одинаковом рыночном окне.
 
@@ -149,7 +149,7 @@ python launcher_gui.py
 
 Запустить матрицу:
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File tools\matrix_paper_launcher.ps1 -Count 2 -Run
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\matrix_paper_launcher.ps1 -Count 1 -Run
 ```
 
 Остановить:
@@ -168,6 +168,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\matrix_paper_summary.p
 - `Matrix Stop`
 - `Matrix Сводка`
 - вкладка `Сделки` -> `Источник` (`single`, `mx1_*`, `mx2_*`, ...)
+- в `Сырые runtime-логи` теперь подтягиваются не только `app/session` логи, но и tail:
+  - `logs/matrix/<instance>/candidates.jsonl`
+  - `logs/matrix/<instance>/local_alerts.jsonl`
 
 ---
 
@@ -208,6 +211,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\matrix_paper_summary.p
 
 Это защищает от флаппинга и переоптимизации.
 
+Дополнительно поддерживается dynamic dedup-режим:
+- в окне адаптации собираются интервалы повторного появления токенов,
+- считается перцентиль и строится динамический target TTL,
+- итоговый `HEAVY_CHECK_DEDUP_TTL_SECONDS` зажимается в runtime-коридор вокруг target.
+
 ---
 
 ## 9) Ключевые env блоки
@@ -229,6 +237,11 @@ PAPER_MAX_HOLD_SECONDS=...
 DYNAMIC_HOLD_ENABLED=true|false
 HOLD_MIN_SECONDS=...
 HOLD_MAX_SECONDS=...
+PAPER_PARTIAL_TP_ENABLED=true|false
+PAPER_PARTIAL_TP_TRIGGER_PERCENT=...
+PAPER_PARTIAL_TP_SELL_FRACTION=...
+PAPER_PARTIAL_TP_MOVE_SL_TO_BREAK_EVEN=true|false
+PAPER_PARTIAL_TP_BREAK_EVEN_BUFFER_PERCENT=...
 NO_MOMENTUM_EXIT_MIN_AGE_PERCENT=...
 NO_MOMENTUM_EXIT_MAX_PNL_PERCENT=...
 WEAKNESS_EXIT_MIN_AGE_PERCENT=...
@@ -256,6 +269,17 @@ HTTP_BACKOFF_MAX_SECONDS=...
 HTTP_JITTER_SECONDS=...
 HTTP_SOURCE_RATE_LIMITS=...
 HTTP_SOURCE_429_COOLDOWNS=...
+```
+
+## 9.5 Adaptive dynamic dedup
+
+```env
+ADAPTIVE_DEDUP_DYNAMIC_ENABLED=true|false
+ADAPTIVE_DEDUP_DYNAMIC_MIN=...
+ADAPTIVE_DEDUP_DYNAMIC_MAX=...
+ADAPTIVE_DEDUP_DYNAMIC_TARGET_PERCENTILE=...
+ADAPTIVE_DEDUP_DYNAMIC_FACTOR=...
+ADAPTIVE_DEDUP_DYNAMIC_MIN_SAMPLES=...
 ```
 
 ---
