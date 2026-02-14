@@ -27,42 +27,76 @@ if ($Run) {
 }
 
 # Variant matrix:
-# - mx1_refine: close to current working profile with small exit corrections.
-# - mx2_explore_wide: wider parameter spread for faster discovery.
+# - mx1_refine: active-safe profile (priority: keep drawdown low, lock gains earlier).
+# - mx2_explore_wide: active-aggressive profile (priority: more flow, still risk-capped).
 # - mx3_explore_timeout / mx4_explore_momentum: optional extra probes for Count=3/4.
 $variants = @(
   @{ name='mx1_refine'; overrides=@{
-      PROFIT_LOCK_TRIGGER_PERCENT='10';
-      PROFIT_LOCK_FLOOR_PERCENT='1.7';
-      NO_MOMENTUM_EXIT_MIN_AGE_PERCENT='22';
-      NO_MOMENTUM_EXIT_MAX_PNL_PERCENT='0.6';
-      WEAKNESS_EXIT_MIN_AGE_PERCENT='22';
-      WEAKNESS_EXIT_PNL_PERCENT='-3.2';
-      PAPER_MAX_HOLD_SECONDS='300';
-      MIN_EXPECTED_EDGE_PERCENT='1.1';
-      MIN_TOKEN_SCORE='62';
-      SAFE_MIN_VOLUME_5M_USD='180';
+      ADAPTIVE_FILTERS_ENABLED='true';
+      ADAPTIVE_FILTERS_MODE='dry_run';
+      ADAPTIVE_FILTERS_INTERVAL_SECONDS='600';
+      PROFIT_LOCK_TRIGGER_PERCENT='6';
+      PROFIT_LOCK_FLOOR_PERCENT='1.0';
+      NO_MOMENTUM_EXIT_MIN_AGE_PERCENT='14';
+      NO_MOMENTUM_EXIT_MAX_PNL_PERCENT='0.4';
+      WEAKNESS_EXIT_MIN_AGE_PERCENT='12';
+      WEAKNESS_EXIT_PNL_PERCENT='-1.8';
+      PAPER_MAX_HOLD_SECONDS='240';
+      MIN_EXPECTED_EDGE_PERCENT='1.4';
+      MIN_TOKEN_SCORE='66';
+      SAFE_MIN_VOLUME_5M_USD='220';
+      SAFE_MIN_LIQUIDITY_USD='6000';
+      STOP_LOSS_PERCENT='4';
+      MAX_BUYS_PER_HOUR='8';
+      MAX_OPEN_TRADES='2';
+      PAPER_TRADE_SIZE_MIN_USD='0.7';
+      PAPER_TRADE_SIZE_MAX_USD='1.2';
+      WALLET_BALANCE_USD='7.00';
       DYNAMIC_HOLD_ENABLED='true';
-      HOLD_MIN_SECONDS='120';
-      HOLD_MAX_SECONDS='420';
+      HOLD_MIN_SECONDS='75';
+      HOLD_MAX_SECONDS='240';
     }
   },
   @{ name='mx2_explore_wide'; overrides=@{
+      ADAPTIVE_FILTERS_ENABLED='true';
+      ADAPTIVE_FILTERS_MODE='apply';
+      ADAPTIVE_FILTERS_INTERVAL_SECONDS='600';
+      ADAPTIVE_FILTERS_COOLDOWN_WINDOWS='1';
+      ADAPTIVE_FILTERS_TARGET_CAND_MIN='1.2';
+      ADAPTIVE_FILTERS_TARGET_CAND_MAX='8.0';
+      ADAPTIVE_FILTERS_TARGET_OPEN_MIN='0.05';
+      ADAPTIVE_ZERO_OPEN_RESET_ENABLED='true';
+      ADAPTIVE_ZERO_OPEN_WINDOWS_BEFORE_RESET='2';
+      ADAPTIVE_ZERO_OPEN_MIN_CANDIDATES='1.0';
+      ADAPTIVE_SCORE_MIN='58';
+      ADAPTIVE_SCORE_MAX='62';
+      ADAPTIVE_SAFE_VOLUME_MIN='120';
+      ADAPTIVE_SAFE_VOLUME_MAX='170';
+      ADAPTIVE_EDGE_MIN='1.0';
+      ADAPTIVE_EDGE_MAX='1.6';
+      ADAPTIVE_DEDUP_TTL_MIN='60';
+      ADAPTIVE_DEDUP_TTL_MAX='300';
+      ADAPTIVE_DEDUP_RELAX_ENABLED='true';
       MIN_TOKEN_SCORE='60';
-      SAFE_MIN_VOLUME_5M_USD='140';
-      SAFE_MIN_LIQUIDITY_USD='4000';
-      MIN_EXPECTED_EDGE_PERCENT='0.9';
-      PROFIT_LOCK_TRIGGER_PERCENT='9';
-      PROFIT_LOCK_FLOOR_PERCENT='2.0';
-      PAPER_MAX_HOLD_SECONDS='360';
-      NO_MOMENTUM_EXIT_MIN_AGE_PERCENT='18';
+      SAFE_MIN_VOLUME_5M_USD='150';
+      SAFE_MIN_LIQUIDITY_USD='3500';
+      MIN_EXPECTED_EDGE_PERCENT='1.1';
+      PROFIT_LOCK_TRIGGER_PERCENT='7';
+      PROFIT_LOCK_FLOOR_PERCENT='0.8';
+      PAPER_MAX_HOLD_SECONDS='300';
+      NO_MOMENTUM_EXIT_MIN_AGE_PERCENT='14';
       NO_MOMENTUM_EXIT_MAX_PNL_PERCENT='0.8';
-      WEAKNESS_EXIT_MIN_AGE_PERCENT='20';
-      WEAKNESS_EXIT_PNL_PERCENT='-3.0';
-      MAX_BUYS_PER_HOUR='10';
+      WEAKNESS_EXIT_MIN_AGE_PERCENT='12';
+      WEAKNESS_EXIT_PNL_PERCENT='-2.4';
+      MAX_BUYS_PER_HOUR='14';
+      MAX_OPEN_TRADES='3';
+      STOP_LOSS_PERCENT='5';
+      PAPER_TRADE_SIZE_MIN_USD='0.8';
+      PAPER_TRADE_SIZE_MAX_USD='1.8';
+      WALLET_BALANCE_USD='7.00';
       DYNAMIC_HOLD_ENABLED='true';
-      HOLD_MIN_SECONDS='90';
-      HOLD_MAX_SECONDS='330';
+      HOLD_MIN_SECONDS='60';
+      HOLD_MAX_SECONDS='240';
     }
   },
   @{ name='mx3_explore_timeout'; overrides=@{

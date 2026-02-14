@@ -359,6 +359,21 @@ def _detect_market_regime(
     return "BALANCED", f"avg_cand={avg_candidates_recent:.2f}"
 
 
+def _regime_entry_overrides(market_regime: str) -> tuple[int, float, float]:
+    mode = str(market_regime or "BALANCED").strip().upper()
+    # score_delta, volume_mult, edge_mult
+    if mode == "MOMENTUM":
+        # Slightly loosen thresholds to capture continuation bursts.
+        return -1, 0.90, 0.90
+    if mode == "THIN":
+        # Thin tape: be pickier, avoid low-energy chop.
+        return 2, 1.15, 1.10
+    if mode in {"FRAGILE", "CAUTION", "RISK_OFF"}:
+        # Source/safety unstable: strongly tighten BUY gate.
+        return 4, 1.30, 1.20
+    return 0, 1.00, 1.00
+
+
 def _excluded_trade_addresses() -> set[str]:
     out: set[str] = set()
     weth = normalize_address(getattr(config, "WETH_ADDRESS", ""))
@@ -408,6 +423,9 @@ class AdaptiveFilterController:
         self.target_cand_min = float(getattr(config, "ADAPTIVE_FILTERS_TARGET_CAND_MIN", 2.0) or 2.0)
         self.target_cand_max = float(getattr(config, "ADAPTIVE_FILTERS_TARGET_CAND_MAX", 12.0) or 12.0)
         self.target_open_min = float(getattr(config, "ADAPTIVE_FILTERS_TARGET_OPEN_MIN", 0.10) or 0.10)
+        self.zero_open_reset_enabled = bool(getattr(config, "ADAPTIVE_ZERO_OPEN_RESET_ENABLED", True))
+        self.zero_open_windows_before_reset = int(getattr(config, "ADAPTIVE_ZERO_OPEN_WINDOWS_BEFORE_RESET", 2) or 2)
+        self.zero_open_min_candidates = float(getattr(config, "ADAPTIVE_ZERO_OPEN_MIN_CANDIDATES", 1.0) or 1.0)
         self.neg_realized_trigger = float(getattr(config, "ADAPTIVE_FILTERS_NEG_REALIZED_TRIGGER_USD", 0.60) or 0.60)
         self.neg_closed_min = int(getattr(config, "ADAPTIVE_FILTERS_NEG_CLOSED_MIN", 3) or 3)
         self.pnl_min_closed = int(getattr(config, "ADAPTIVE_FILTERS_PNL_MIN_CLOSED", 2) or 2)
@@ -450,6 +468,8 @@ class AdaptiveFilterController:
         self.window_regime_counts: dict[str, int] = {}
         self.prev_realized_usd = 0.0
         self.prev_closed = 0
+        self.baseline_thresholds = self._snapshot_thresholds()
+        self.zero_open_streak = 0
 
     @staticmethod
     def _clamp_int(value: int, lower: int, upper: int) -> int:
@@ -611,6 +631,11 @@ class AdaptiveFilterController:
         edge_mode = str(getattr(config, "EDGE_FILTER_MODE", "usd") or "usd").strip().lower()
         edge_knob_movable = self.edge_enabled and bool(getattr(config, "EDGE_FILTER_ENABLED", True))
         edge_negative_blocked = (skip_negative_edge + skip_edge_low) > 0 and edge_mode in {"percent", "both"}
+        if str(policy_state).upper() == "OK" and int(self.window_opened) <= 0 and avg_candidates >= float(self.zero_open_min_candidates):
+            self.zero_open_streak += 1
+        elif int(self.window_opened) > 0:
+            self.zero_open_streak = 0
+
         if self.exit_enabled:
             if realized_delta <= -abs(float(self.neg_realized_trigger)) and closed_delta >= int(self.neg_closed_min):
                 lock_floor_next = self._clamp_float(
@@ -664,6 +689,40 @@ class AdaptiveFilterController:
                 edge_next = self._clamp_float(edge_now + float(edge_step), self.edge_min_bound, self.edge_max_bound)
             action = "tighten_all"
             reason = f"negative_window realized_delta=${realized_delta:.2f} closed_delta={closed_delta}"
+        elif (
+            self.zero_open_reset_enabled
+            and self.mode == "apply"
+            and self.zero_open_streak >= int(max(1, self.zero_open_windows_before_reset))
+            and avg_candidates >= float(self.zero_open_min_candidates)
+        ):
+            base_score, base_volume, base_ttl, base_edge, _, _, _ = self.baseline_thresholds
+            target_score = self._clamp_int(min(score_now, int(base_score)), self.score_min_bound, self.score_max_bound)
+            if target_score == score_now and score_now > self.score_min_bound:
+                target_score = self._clamp_int(score_now - int(self.score_step), self.score_min_bound, self.score_max_bound)
+
+            target_volume = self._clamp_float(min(volume_now, float(base_volume)), self.volume_min_bound, self.volume_max_bound)
+            if abs(target_volume - volume_now) < 0.5 and volume_now > self.volume_min_bound:
+                target_volume = self._clamp_float(volume_now - float(vol_step), self.volume_min_bound, self.volume_max_bound)
+
+            target_ttl = self._clamp_int(min(ttl_now, int(base_ttl)), self.ttl_min_bound, self.ttl_max_bound)
+            if target_ttl == ttl_now and self.dedup_relax_enabled and ttl_now > self.ttl_min_bound:
+                target_ttl = self._clamp_int(int(round(ttl_now - ttl_step)), self.ttl_min_bound, self.ttl_max_bound)
+
+            target_edge = edge_now
+            if edge_knob_movable:
+                target_edge = self._clamp_float(min(edge_now, float(base_edge)), self.edge_min_bound, self.edge_max_bound)
+                if abs(target_edge - edge_now) < 0.01 and edge_now > self.edge_min_bound:
+                    target_edge = self._clamp_float(edge_now - float(edge_step), self.edge_min_bound, self.edge_max_bound)
+
+            score_next = target_score
+            volume_next = target_volume
+            ttl_next = target_ttl
+            edge_next = target_edge
+            action = "anti_stall_reset"
+            reason = (
+                f"zero_open_windows={self.zero_open_streak}/{self.zero_open_windows_before_reset} "
+                f"avg_cand={avg_candidates:.2f}"
+            )
         elif (
             edge_knob_movable
             and edge_negative_blocked
@@ -720,9 +779,11 @@ class AdaptiveFilterController:
                 weakness_next,
             )
             self.cooldown_until_ts = now_ts + (max(0, self.cooldown_windows) * max(1, self.interval_seconds))
+            if action == "anti_stall_reset":
+                self.zero_open_streak = 0
 
         logger.warning(
-            "ADAPTIVE_FILTERS mode=%s action=%s changed=%s reason=%s regime=%s avg_cand=%.2f avg_opened=%.2f closed_delta=%s realized_delta=$%.2f pnl_signal=%s pressure=%s score=%s->%s volume=%.0f->%.0f dedup_ttl=%s->%s edge=%.2f->%.2f lock_floor=%.2f->%.2f no_mom_pnl=%.2f->%.2f weakness_pnl=%.2f->%.2f fails(score=%s,volume=%s,dedup=%s) skips(neg_edge=%s,edge_usd=%s,min_trade=%s)",
+            "ADAPTIVE_FILTERS mode=%s action=%s changed=%s reason=%s regime=%s avg_cand=%.2f avg_opened=%.2f closed_delta=%s realized_delta=$%.2f pnl_signal=%s pressure=%s score=%s->%s volume=%.0f->%.0f dedup_ttl=%s->%s edge=%.2f->%.2f lock_floor=%.2f->%.2f no_mom_pnl=%.2f->%.2f weakness_pnl=%.2f->%.2f fails(score=%s,volume=%s,dedup=%s) skips(neg_edge=%s,edge_usd=%s,min_trade=%s) zero_open=%s/%s",
             self.mode,
             action,
             changed,
@@ -754,6 +815,8 @@ class AdaptiveFilterController:
             (skip_negative_edge + skip_edge_low),
             skip_edge_usd_low,
             skip_min_trade,
+            self.zero_open_streak,
+            self.zero_open_windows_before_reset,
         )
 
         self._reset_window(now_ts=now_ts, realized_usd=realized_now, closed=closed_now)
@@ -1120,6 +1183,7 @@ async def run_local_loop() -> None:
                         heavy_last_volume_5m.pop(a, None)
                 if tokens:
                     cycle_filter_fails: dict[str, int] = {}
+                    regime_score_delta, regime_volume_mult, regime_edge_mult = _regime_entry_overrides(market_regime_current)
 
                     def _filter_fail(reason: str, token: dict, extra: str = "") -> None:
                         key = str(reason or "unknown").strip().lower() or "unknown"
@@ -1173,11 +1237,13 @@ async def run_local_loop() -> None:
                         token["score_data"] = score_data
                         if int(score_data.get("score", 0)) >= 70:
                             high_quality += 1
-                        if config.AUTO_FILTER_ENABLED and int(score_data.get("score", 0)) < int(config.MIN_TOKEN_SCORE):
+                        score_min_base = int(config.MIN_TOKEN_SCORE)
+                        score_min_regime = max(0, score_min_base + int(regime_score_delta))
+                        if config.AUTO_FILTER_ENABLED and int(score_data.get("score", 0)) < int(score_min_regime):
                             _filter_fail(
                                 "score_min",
                                 token,
-                                f"score={score_data.get('score', 0)} min={int(config.MIN_TOKEN_SCORE)}",
+                                f"score={score_data.get('score', 0)} min={int(score_min_regime)} regime={market_regime_current}",
                             )
                             continue
 
@@ -1185,8 +1251,13 @@ async def run_local_loop() -> None:
                             if float(token.get("liquidity") or 0) < float(config.SAFE_MIN_LIQUIDITY_USD):
                                 _filter_fail("safe_liquidity", token)
                                 continue
-                            if float(token.get("volume_5m") or 0) < float(config.SAFE_MIN_VOLUME_5M_USD):
-                                _filter_fail("safe_volume", token)
+                            safe_volume_floor = float(config.SAFE_MIN_VOLUME_5M_USD) * max(0.1, float(regime_volume_mult))
+                            if float(token.get("volume_5m") or 0) < safe_volume_floor:
+                                _filter_fail(
+                                    "safe_volume",
+                                    token,
+                                    f"vol5m={float(token.get('volume_5m') or 0):.0f} min={safe_volume_floor:.0f} regime={market_regime_current}",
+                                )
                                 continue
                             if int(token.get("age_seconds") or 0) < int(config.SAFE_MIN_AGE_SECONDS):
                                 _filter_fail("safe_age", token)
@@ -1256,6 +1327,9 @@ async def run_local_loop() -> None:
                             if int(token.get("warning_flags") or 0) > int(config.SAFE_MAX_WARNING_FLAGS):
                                 _filter_fail("safe_warnings", token)
                                 continue
+
+                        token["_regime_edge_mult"] = float(regime_edge_mult)
+                        token["_regime_name"] = str(market_regime_current)
 
                         logger.info(
                             "FILTER_PASS token=%s score=%s risk=%s liq=%.0f vol5m=%.0f",

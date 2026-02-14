@@ -554,6 +554,23 @@ def read_matrix_meta() -> dict:
     return read_json(MATRIX_ACTIVE_FILE)
 
 
+def matrix_alive_count() -> int:
+    meta = read_matrix_meta()
+    items = meta.get("items")
+    alive = 0
+    if isinstance(items, list):
+        for row in items:
+            if not isinstance(row, dict):
+                continue
+            try:
+                pid = int(row.get("pid", 0) or 0)
+            except Exception:
+                pid = 0
+            if pid > 0 and is_running(pid):
+                alive += 1
+    return alive
+
+
 def run_powershell_script(
     script_path: str,
     args: list[str] | None = None,
@@ -2587,13 +2604,27 @@ class App(tk.Tk):
             count = "3"
             self.matrix_count_var.set(count)
         self.hint_var.set(f"Matrix start in progress ({count})...")
-        self._run_background(
-            title="Matrix Start",
-            worker=lambda: run_powershell_script(
+
+        def _matrix_start_worker() -> tuple[bool, str]:
+            ok, msg = run_powershell_script(
                 MATRIX_LAUNCHER,
                 ["-Count", count, "-Run"],
                 timeout_seconds=180,
-            ),
+            )
+            if ok:
+                return ok, msg
+            # If launcher timed out but instances are already alive, treat as successful start.
+            txt = str(msg or "").lower()
+            if "timed out" in txt:
+                alive = matrix_alive_count()
+                target = int(count)
+                if alive >= target:
+                    return True, f"Matrix started (timeout fallback). Alive: {alive}/{target}"
+            return False, msg
+
+        self._run_background(
+            title="Matrix Start",
+            worker=_matrix_start_worker,
             on_success=lambda _msg: self.hint_var.set(f"Matrix started: {count} instances."),
             on_error=lambda _msg: self.hint_var.set("Matrix start failed. Check popup/logs."),
         )

@@ -21,6 +21,13 @@ logger = logging.getLogger(__name__)
 ADDRESS_RE = re.compile(r"^0x[a-f0-9]{40}$")
 
 
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
 @dataclass
 class PaperPosition:
     token_address: str
@@ -237,12 +244,84 @@ class AutoTrader:
             return
         self.reset_paper_state(keep_closed=True)
 
+    def _risk_drawdown_percent(self) -> float:
+        self._refresh_daily_window()
+        start = max(0.01, float(self.day_start_equity_usd or 0.01))
+        equity = float(self._equity_usd())
+        return ((equity - start) / start) * 100.0
+
+    def _risk_trigger_pause(self, *, reason: str, detail: str, pause_seconds: int) -> None:
+        pause_seconds = max(0, int(pause_seconds))
+        if pause_seconds <= 0:
+            return
+        now_ts = datetime.now(timezone.utc).timestamp()
+        until_ts = now_ts + pause_seconds
+        if until_ts <= float(self.trading_pause_until_ts or 0.0):
+            return
+        self.trading_pause_until_ts = until_ts
+        logger.warning(
+            "RISK_GOVERNOR pause reason=%s detail=%s pause=%ss until_ts=%s",
+            reason,
+            detail,
+            pause_seconds,
+            int(until_ts),
+        )
+
+    def _risk_governor_after_close(self, *, close_reason: str, pnl_usd: float) -> None:
+        if not bool(getattr(config, "RISK_GOVERNOR_ENABLED", True)):
+            return
+        max_streak = int(getattr(config, "RISK_GOVERNOR_MAX_LOSS_STREAK", config.MAX_CONSECUTIVE_LOSSES) or 0)
+        streak_pause = int(getattr(config, "RISK_GOVERNOR_STREAK_PAUSE_SECONDS", config.LOSS_STREAK_COOLDOWN_SECONDS) or 0)
+        if max_streak > 0 and int(self.current_loss_streak) >= max_streak:
+            self._risk_trigger_pause(
+                reason="loss_streak",
+                detail=f"loss_streak={self.current_loss_streak} close_reason={close_reason}",
+                pause_seconds=streak_pause,
+            )
+
+        dd_limit = float(getattr(config, "RISK_GOVERNOR_DRAWDOWN_LIMIT_PERCENT", config.DAILY_MAX_DRAWDOWN_PERCENT) or 0.0)
+        dd_pause = int(getattr(config, "RISK_GOVERNOR_DRAWDOWN_PAUSE_SECONDS", config.LOSS_STREAK_COOLDOWN_SECONDS) or 0)
+        if dd_limit > 0:
+            drawdown_pct = self._risk_drawdown_percent()
+            if drawdown_pct <= -abs(dd_limit):
+                self._risk_trigger_pause(
+                    reason="daily_drawdown",
+                    detail=f"drawdown={drawdown_pct:.2f}% limit={-abs(dd_limit):.2f}% pnl_usd={pnl_usd:.2f}",
+                    pause_seconds=dd_pause,
+                )
+
+    def _risk_governor_block_reason(self) -> str | None:
+        if not bool(getattr(config, "RISK_GOVERNOR_ENABLED", True)):
+            return None
+        now_ts = datetime.now(timezone.utc).timestamp()
+        pause_until = float(self.trading_pause_until_ts or 0.0)
+        if pause_until > now_ts:
+            rem = int(max(1, pause_until - now_ts))
+            return f"governor_pause {rem}s"
+
+        max_streak = int(getattr(config, "RISK_GOVERNOR_MAX_LOSS_STREAK", config.MAX_CONSECUTIVE_LOSSES) or 0)
+        if max_streak > 0 and int(self.current_loss_streak) >= max_streak:
+            return f"governor_loss_streak {self.current_loss_streak}/{max_streak}"
+
+        dd_limit = float(getattr(config, "RISK_GOVERNOR_DRAWDOWN_LIMIT_PERCENT", config.DAILY_MAX_DRAWDOWN_PERCENT) or 0.0)
+        if dd_limit > 0:
+            drawdown_pct = self._risk_drawdown_percent()
+            if drawdown_pct <= -abs(dd_limit):
+                return f"governor_drawdown {drawdown_pct:.2f}% <= {-abs(dd_limit):.2f}%"
+        return None
+
     def can_open_trade(self) -> bool:
         if self.data_policy_mode != "OK":
             return False
         self._refresh_daily_window()
-        # Manual control mode: no auto pause by daily drawdown or streak.
-        self.trading_pause_until_ts = 0.0
+        block_reason = self._risk_governor_block_reason()
+        if block_reason is not None:
+            now_ts = datetime.now(timezone.utc).timestamp()
+            interval = int(getattr(config, "RISK_GOVERNOR_LOG_INTERVAL_SECONDS", 30) or 30)
+            if (now_ts - self._last_guard_log_ts) >= interval:
+                self._last_guard_log_ts = now_ts
+                logger.warning("RISK_GOVERNOR block reason=%s", block_reason)
+            return False
         if self.emergency_halt_reason:
             return False
         if self._kill_switch_active():
@@ -285,7 +364,9 @@ class AutoTrader:
         if self.data_policy_mode != "OK":
             return f"data_policy:{self.data_policy_mode}:{self.data_policy_reason}"
         self._refresh_daily_window()
-        self.trading_pause_until_ts = 0.0
+        block_reason = self._risk_governor_block_reason()
+        if block_reason is not None:
+            return block_reason
         if self.emergency_halt_reason:
             return f"emergency_halt:{self.emergency_halt_reason}"
         if self._kill_switch_active():
@@ -915,6 +996,9 @@ class AutoTrader:
             return None
         cost_profile = self._estimate_cost_profile(liquidity_usd, risk_level, score)
         expected_edge_percent = self._estimate_edge_percent(score, tp, sl, cost_profile["total_percent"], risk_level)
+        regime_edge_mult = _safe_float(token_data.get("_regime_edge_mult"), 1.0)
+        regime_edge_mult = max(0.75, min(1.35, regime_edge_mult))
+        edge_percent_for_decision = float(expected_edge_percent) * float(regime_edge_mult)
 
         position_size_usd = self._choose_position_size(expected_edge_percent)
         if bool(getattr(config, "POSITION_SIZE_QUALITY_ENABLED", True)):
@@ -959,7 +1043,7 @@ class AutoTrader:
             logger.info("AutoTrade skip token=%s reason=low_balance", symbol)
             return None
 
-        expected_edge_usd = float(position_size_usd) * float(expected_edge_percent) / 100.0
+        expected_edge_usd = float(position_size_usd) * float(edge_percent_for_decision) / 100.0
         edge_dbg = self._edge_debug_components(
             score=score,
             tp_percent=tp,
@@ -971,14 +1055,16 @@ class AutoTrader:
             mode = str(getattr(config, "EDGE_FILTER_MODE", "usd") or "usd").strip().lower()
             min_edge_pct = float(getattr(config, "MIN_EXPECTED_EDGE_PERCENT", 0.0) or 0.0)
             min_edge_usd = float(getattr(config, "MIN_EXPECTED_EDGE_USD", 0.0) or 0.0)
-            pct_ok = expected_edge_percent >= float(min_edge_pct)
+            pct_ok = edge_percent_for_decision >= float(min_edge_pct)
             usd_ok = expected_edge_usd >= float(min_edge_usd)
             if mode == "percent" and not pct_ok:
                 self._bump_skip_reason("negative_edge")
                 logger.info(
-                    "AutoTrade skip token=%s reason=negative_edge edge=%.2f%% min=%.2f%% edge_usd=$%.3f size=$%.2f gross=%.2f%% costs=%.2f%% pwin=%.2f",
+                    "AutoTrade skip token=%s reason=negative_edge edge=%.2f%% raw=%.2f%% mult=%.2f min=%.2f%% edge_usd=$%.3f size=$%.2f gross=%.2f%% costs=%.2f%% pwin=%.2f",
                     symbol,
+                    edge_percent_for_decision,
                     expected_edge_percent,
+                    regime_edge_mult,
                     min_edge_pct,
                     expected_edge_usd,
                     position_size_usd,
@@ -990,11 +1076,13 @@ class AutoTrader:
             if mode == "usd" and not usd_ok:
                 self._bump_skip_reason("edge_usd_low")
                 logger.info(
-                    "AutoTrade skip token=%s reason=edge_usd_low edge_usd=$%.3f min=$%.3f edge=%.2f%% size=$%.2f gross=%.2f%% costs=%.2f%% pwin=%.2f",
+                    "AutoTrade skip token=%s reason=edge_usd_low edge_usd=$%.3f min=$%.3f edge=%.2f%% raw=%.2f%% mult=%.2f size=$%.2f gross=%.2f%% costs=%.2f%% pwin=%.2f",
                     symbol,
                     expected_edge_usd,
                     min_edge_usd,
+                    edge_percent_for_decision,
                     expected_edge_percent,
+                    regime_edge_mult,
                     position_size_usd,
                     float(edge_dbg["gross_percent"]),
                     cost_profile["total_percent"],
@@ -1004,9 +1092,11 @@ class AutoTrader:
             if mode == "both" and not (pct_ok and usd_ok):
                 self._bump_skip_reason("edge_low")
                 logger.info(
-                    "AutoTrade skip token=%s reason=edge_low mode=both edge=%.2f%% min=%.2f%% edge_usd=$%.3f min_usd=$%.3f size=$%.2f gross=%.2f%% costs=%.2f%% pwin=%.2f",
+                    "AutoTrade skip token=%s reason=edge_low mode=both edge=%.2f%% raw=%.2f%% mult=%.2f min=%.2f%% edge_usd=$%.3f min_usd=$%.3f size=$%.2f gross=%.2f%% costs=%.2f%% pwin=%.2f",
                     symbol,
+                    edge_percent_for_decision,
                     expected_edge_percent,
+                    regime_edge_mult,
                     min_edge_pct,
                     expected_edge_usd,
                     min_edge_usd,
@@ -1019,14 +1109,16 @@ class AutoTrader:
 
         breakdown = score_data.get("breakdown") if isinstance(score_data.get("breakdown"), dict) else {}
         logger.info(
-            "AUTO_DECISION token=%s score=%s src=%s liq=%.0f vol5m=%.0f chg5m=%.2f%% edge=%.2f%% edge_usd=$%.3f size=$%.2f mult=%.2f(%s) costs=%.2f%% gas=$%.3f breakdown=%s",
+            "AUTO_DECISION token=%s score=%s src=%s liq=%.0f vol5m=%.0f chg5m=%.2f%% edge=%.2f%% raw=%.2f%% regime_mult=%.2f edge_usd=$%.3f size=$%.2f mult=%.2f(%s) costs=%.2f%% gas=$%.3f breakdown=%s",
             symbol,
             score,
             str(token_data.get("source", "-")),
             liquidity_usd,
             volume_5m,
             price_change_5m,
+            edge_percent_for_decision,
             expected_edge_percent,
+            regime_edge_mult,
             expected_edge_usd,
             position_size_usd,
             float(mult),
@@ -1179,7 +1271,7 @@ class AutoTrader:
                 max_hold_seconds=max_hold_seconds,
                 take_profit_percent=tp,
                 stop_loss_percent=sl,
-                expected_edge_percent=expected_edge_percent,
+                expected_edge_percent=edge_percent_for_decision,
                 buy_cost_percent=cost_profile["buy_percent"],
                 sell_cost_percent=cost_profile["sell_percent"],
                 gas_cost_usd=cost_profile["gas_usd"],
@@ -1223,7 +1315,7 @@ class AutoTrader:
             max_hold_seconds=max_hold_seconds,
             take_profit_percent=tp,
             stop_loss_percent=sl,
-            expected_edge_percent=expected_edge_percent,
+            expected_edge_percent=edge_percent_for_decision,
             buy_cost_percent=cost_profile["buy_percent"],
             sell_cost_percent=cost_profile["sell_percent"],
             gas_cost_usd=cost_profile["gas_usd"],
@@ -1584,6 +1676,7 @@ class AutoTrader:
             # Clear halt so new entries are possible again.
             if self.emergency_halt_reason:
                 self._clear_emergency_halt(f"abandoned_position:{self._short_error_text(abandon_reason)}")
+            self._risk_governor_after_close(close_reason=f"ABANDON:{abandon_reason}", pnl_usd=float(position.pnl_usd))
 
             logger.error(
                 "AUTO_SELL Live ABANDON token=%s reason=%s detail=%s",
@@ -1670,6 +1763,7 @@ class AutoTrader:
         else:
             self.total_losses += 1
             self.current_loss_streak += 1
+        self._risk_governor_after_close(close_reason=reason, pnl_usd=float(position.pnl_usd))
 
         token_cooldown = int(config.MAX_TOKEN_COOLDOWN_SECONDS)
         if token_cooldown > 0:
@@ -1742,8 +1836,7 @@ class AutoTrader:
         else:
             self.total_losses += 1
             self.current_loss_streak += 1
-
-        self.trading_pause_until_ts = 0.0
+        self._risk_governor_after_close(close_reason=reason, pnl_usd=float(position.pnl_usd))
 
         token_cooldown = int(config.MAX_TOKEN_COOLDOWN_SECONDS)
         if token_cooldown > 0:
@@ -1955,6 +2048,8 @@ class AutoTrader:
         win_rate = (self.total_wins / self.total_closed * 100) if self.total_closed else 0.0
         unrealized_pnl = sum(pos.pnl_usd for pos in self.open_positions.values())
         equity = self.paper_balance_usd + sum(pos.position_size_usd + pos.pnl_usd for pos in self.open_positions.values())
+        drawdown_pct = self._risk_drawdown_percent()
+        risk_block_reason = self._risk_governor_block_reason() or ""
 
         return {
             "open_trades": len(self.open_positions),
@@ -1969,9 +2064,11 @@ class AutoTrader:
             "day_realized_pnl_usd": round(self.day_realized_pnl_usd, 2),
             "unrealized_pnl_usd": round(unrealized_pnl, 2),
             "equity_usd": round(equity, 2),
+            "day_drawdown_percent": round(drawdown_pct, 2),
             "initial_balance_usd": round(self.initial_balance_usd, 2),
             "loss_streak": self.current_loss_streak,
             "trading_pause_until_ts": round(self.trading_pause_until_ts, 2),
+            "risk_block_reason": risk_block_reason,
             "trades_last_hour": len(self.trade_open_timestamps),
             "tx_last_day": len(self.tx_event_timestamps),
             "stair_step_enabled": bool(config.STAIR_STEP_ENABLED),
