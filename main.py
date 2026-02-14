@@ -42,10 +42,16 @@ from trading.auto_trader import AutoTrader
 
 def configure_logging() -> None:
     os.makedirs(LOG_DIR, exist_ok=True)
+    session_logs_dir = os.path.join(LOG_DIR, "sessions")
+    os.makedirs(session_logs_dir, exist_ok=True)
     formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
     file_handler = RotatingFileHandler(APP_LOG_FILE, maxBytes=1_000_000, backupCount=5, encoding="utf-8")
     file_handler.setFormatter(formatter)
+    session_stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    session_log_file = os.path.join(session_logs_dir, f"main_{session_stamp}_pid{os.getpid()}.log")
+    session_handler = logging.FileHandler(session_log_file, encoding="utf-8")
+    session_handler.setFormatter(formatter)
 
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(formatter)
@@ -54,11 +60,13 @@ def configure_logging() -> None:
     root.setLevel(getattr(logging, LOG_LEVEL.upper(), logging.INFO))
     root.handlers.clear()
     root.addHandler(file_handler)
+    root.addHandler(session_handler)
     root.addHandler(console_handler)
 
     # Avoid leaking bot token in verbose transport logs.
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("telegram").setLevel(logging.INFO)
+    logging.getLogger(__name__).info("SESSION_LOG file=%s", session_log_file)
 
 
 logger = logging.getLogger(__name__)

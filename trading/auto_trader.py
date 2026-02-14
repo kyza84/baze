@@ -55,7 +55,13 @@ class PaperPosition:
 
 class AutoTrader:
     def __init__(self) -> None:
-        self.state_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "paper_state.json")
+        self.state_file = str(
+            getattr(
+                config,
+                "PAPER_STATE_FILE",
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "paper_state.json"),
+            )
+        )
         self._blacklist_file = str(getattr(config, "AUTOTRADE_BLACKLIST_FILE", os.path.join("data", "autotrade_blacklist.json")))
         self._blacklist: dict[str, dict[str, Any]] = {}
         self.open_positions: dict[str, PaperPosition] = {}
@@ -86,6 +92,7 @@ class AutoTrader:
         self.recovery_untracked: dict[str, int] = {}
         self._recovery_attempts: dict[str, int] = {}
         self._recovery_last_attempt_ts: dict[str, float] = {}
+        self._skip_reason_counts_window: dict[str, int] = {}
         self.data_policy_mode = "OK"
         self.data_policy_reason = ""
         self._http = ResilientHttpClient(
@@ -358,6 +365,15 @@ class AutoTrader:
         if not key:
             return
         self.recovery_queue = [a for a in self.recovery_queue if normalize_address(a) != key]
+
+    def _bump_skip_reason(self, reason: str) -> None:
+        key = str(reason or "unknown").strip().lower() or "unknown"
+        self._skip_reason_counts_window[key] = int(self._skip_reason_counts_window.get(key, 0)) + 1
+
+    def pop_skip_reason_counts_window(self) -> dict[str, int]:
+        out = dict(self._skip_reason_counts_window)
+        self._skip_reason_counts_window = {}
+        return out
         self.recovery_untracked.pop(key, None)
         self._recovery_clear_tracking(key)
 
@@ -809,6 +825,7 @@ class AutoTrader:
     async def plan_trade(self, token_data: dict[str, Any], score_data: dict[str, Any]) -> PaperPosition | None:
         symbol = str(token_data.get("symbol", "N/A"))
         if not self.can_open_trade():
+            self._bump_skip_reason("disabled_or_limits")
             logger.info("AutoTrade skip token=%s reason=disabled_or_limits detail=%s", symbol, self._cannot_open_trade_detail())
             return None
         if self._kill_switch_active():
@@ -818,6 +835,7 @@ class AutoTrader:
         recommendation = str(score_data.get("recommendation", "SKIP"))
         score = int(score_data.get("score", 0))
         if recommendation != "BUY" or score < int(config.MIN_TOKEN_SCORE):
+            self._bump_skip_reason("signal")
             logger.info(
                 "AutoTrade skip token=%s reason=signal recommendation=%s score=%s",
                 symbol,
@@ -830,9 +848,11 @@ class AutoTrader:
         token_address = normalize_address(raw_token_address)
         blocked, blk_reason = self._blacklist_is_blocked(token_address)
         if blocked:
+            self._bump_skip_reason("blacklist")
             logger.info("AutoTrade skip token=%s reason=blacklist detail=%s", symbol, self._short_error_text(blk_reason))
             return None
         if not token_address or token_address in self.open_positions:
+            self._bump_skip_reason("address_or_duplicate")
             logger.info(
                 "AutoTrade skip token=%s reason=address_or_duplicate raw_address=%s normalized=%s source=%s",
                 symbol,
@@ -844,6 +864,7 @@ class AutoTrader:
         cooldown_until = float(self.token_cooldowns.get(token_address, 0.0))
         now_ts = datetime.now(timezone.utc).timestamp()
         if cooldown_until > now_ts:
+            self._bump_skip_reason("cooldown")
             logger.info("AutoTrade skip token=%s reason=cooldown_left_%ss", symbol, int(cooldown_until - now_ts))
             return None
 
@@ -853,6 +874,7 @@ class AutoTrader:
             if fetched:
                 entry_price_usd = float(fetched[1])
         if entry_price_usd <= 0:
+            self._bump_skip_reason("no_price")
             logger.info("AutoTrade skip token=%s reason=no_price", symbol)
             return None
 
@@ -862,7 +884,33 @@ class AutoTrader:
         volume_5m = float(token_data.get("volume_5m") or 0)
         price_change_5m = float(token_data.get("price_change_5m") or 0)
         risk_level = str(token_data.get("risk_level", "MEDIUM")).upper()
+        if bool(getattr(config, "ENTRY_REQUIRE_POSITIVE_CHANGE_5M", False)):
+            min_change_5m = float(getattr(config, "ENTRY_MIN_PRICE_CHANGE_5M_PERCENT", 0.0) or 0.0)
+            if price_change_5m <= min_change_5m:
+                self._bump_skip_reason("entry_momentum")
+                logger.info(
+                    "AutoTrade skip token=%s reason=entry_momentum detail=price_change_5m %.2f%% <= %.2f%%",
+                    symbol,
+                    price_change_5m,
+                    min_change_5m,
+                )
+                return None
+        if bool(getattr(config, "ENTRY_REQUIRE_VOLUME_BUFFER", False)):
+            min_volume_abs = float(getattr(config, "ENTRY_MIN_VOLUME_5M_USD", 0.0) or 0.0)
+            min_volume_mult = float(getattr(config, "ENTRY_MIN_VOLUME_5M_MULT", 1.0) or 1.0)
+            safe_volume_floor = float(getattr(config, "SAFE_MIN_VOLUME_5M_USD", 0.0) or 0.0)
+            required_volume = max(min_volume_abs, safe_volume_floor * min_volume_mult)
+            if volume_5m < required_volume:
+                self._bump_skip_reason("entry_volume_buffer")
+                logger.info(
+                    "AutoTrade skip token=%s reason=entry_volume_buffer detail=vol5m %.0f < req %.0f",
+                    symbol,
+                    volume_5m,
+                    required_volume,
+                )
+                return None
         if not self._passes_token_guards(token_data):
+            self._bump_skip_reason("safety_guards")
             logger.info("AutoTrade skip token=%s reason=safety_guards", symbol)
             return None
         cost_profile = self._estimate_cost_profile(liquidity_usd, risk_level, score)
@@ -892,11 +940,13 @@ class AutoTrader:
             weth_price_usd = await self._resolve_weth_price_usd(token_data)
             cap_usd = max_buy_weth * weth_price_usd
             if cap_usd <= 0:
+                self._bump_skip_reason("invalid_max_buy_cap")
                 logger.info("AutoTrade skip token=%s reason=invalid_max_buy_cap", symbol)
                 return None
             position_size_usd = min(position_size_usd, cap_usd)
         min_trade_usd = max(0.01, float(getattr(config, "MIN_TRADE_USD", 0.25) or 0.25))
         if position_size_usd < min_trade_usd:
+            self._bump_skip_reason("min_trade_size")
             logger.info(
                 "AutoTrade skip token=%s reason=min_trade_size size=$%.2f min=$%.2f",
                 symbol,
@@ -905,10 +955,18 @@ class AutoTrader:
             )
             return None
         if position_size_usd < 0.1:
+            self._bump_skip_reason("low_balance")
             logger.info("AutoTrade skip token=%s reason=low_balance", symbol)
             return None
 
         expected_edge_usd = float(position_size_usd) * float(expected_edge_percent) / 100.0
+        edge_dbg = self._edge_debug_components(
+            score=score,
+            tp_percent=tp,
+            sl_percent=sl,
+            total_cost_percent=float(cost_profile["total_percent"]),
+            risk_level=risk_level,
+        )
         if config.EDGE_FILTER_ENABLED:
             mode = str(getattr(config, "EDGE_FILTER_MODE", "usd") or "usd").strip().lower()
             min_edge_pct = float(getattr(config, "MIN_EXPECTED_EDGE_PERCENT", 0.0) or 0.0)
@@ -916,37 +974,46 @@ class AutoTrader:
             pct_ok = expected_edge_percent >= float(min_edge_pct)
             usd_ok = expected_edge_usd >= float(min_edge_usd)
             if mode == "percent" and not pct_ok:
+                self._bump_skip_reason("negative_edge")
                 logger.info(
-                    "AutoTrade skip token=%s reason=negative_edge edge=%.2f%% min=%.2f%% edge_usd=$%.3f size=$%.2f costs=%.2f%%",
+                    "AutoTrade skip token=%s reason=negative_edge edge=%.2f%% min=%.2f%% edge_usd=$%.3f size=$%.2f gross=%.2f%% costs=%.2f%% pwin=%.2f",
                     symbol,
                     expected_edge_percent,
                     min_edge_pct,
                     expected_edge_usd,
                     position_size_usd,
+                    float(edge_dbg["gross_percent"]),
                     cost_profile["total_percent"],
+                    float(edge_dbg["p_win"]),
                 )
                 return None
             if mode == "usd" and not usd_ok:
+                self._bump_skip_reason("edge_usd_low")
                 logger.info(
-                    "AutoTrade skip token=%s reason=edge_usd_low edge_usd=$%.3f min=$%.3f edge=%.2f%% size=$%.2f costs=%.2f%%",
+                    "AutoTrade skip token=%s reason=edge_usd_low edge_usd=$%.3f min=$%.3f edge=%.2f%% size=$%.2f gross=%.2f%% costs=%.2f%% pwin=%.2f",
                     symbol,
                     expected_edge_usd,
                     min_edge_usd,
                     expected_edge_percent,
                     position_size_usd,
+                    float(edge_dbg["gross_percent"]),
                     cost_profile["total_percent"],
+                    float(edge_dbg["p_win"]),
                 )
                 return None
             if mode == "both" and not (pct_ok and usd_ok):
+                self._bump_skip_reason("edge_low")
                 logger.info(
-                    "AutoTrade skip token=%s reason=edge_low mode=both edge=%.2f%% min=%.2f%% edge_usd=$%.3f min_usd=$%.3f size=$%.2f costs=%.2f%%",
+                    "AutoTrade skip token=%s reason=edge_low mode=both edge=%.2f%% min=%.2f%% edge_usd=$%.3f min_usd=$%.3f size=$%.2f gross=%.2f%% costs=%.2f%% pwin=%.2f",
                     symbol,
                     expected_edge_percent,
                     min_edge_pct,
                     expected_edge_usd,
                     min_edge_usd,
                     position_size_usd,
+                    float(edge_dbg["gross_percent"]),
                     cost_profile["total_percent"],
+                    float(edge_dbg["p_win"]),
                 )
                 return None
 
@@ -1279,18 +1346,34 @@ class AutoTrader:
                 close_reason = "PROFIT_LOCK"
             else:
                 age_seconds = int((datetime.now(timezone.utc) - position.opened_at).total_seconds())
-                min_age_ratio = max(0.0, min(100.0, float(config.WEAKNESS_EXIT_MIN_AGE_PERCENT))) / 100.0
+                no_momentum_age_gate = max(
+                    int(position.max_hold_seconds * max(0.0, min(100.0, float(config.NO_MOMENTUM_EXIT_MIN_AGE_PERCENT))) / 100.0),
+                    int(config.NO_MOMENTUM_EXIT_MIN_HOLD_SECONDS),
+                )
+                # Close "flat" positions early: token never showed real impulse and still sits near breakeven.
                 if (
-                    config.WEAKNESS_EXIT_ENABLED
-                    and age_seconds >= int(position.max_hold_seconds * min_age_ratio)
-                    and float(position.pnl_percent) <= float(config.WEAKNESS_EXIT_PNL_PERCENT)
-                    and float(position.peak_pnl_percent) < float(config.PROFIT_LOCK_TRIGGER_PERCENT)
+                    config.NO_MOMENTUM_EXIT_ENABLED
+                    and age_seconds >= no_momentum_age_gate
+                    and float(position.peak_pnl_percent) <= float(config.NO_MOMENTUM_EXIT_MAX_PEAK_PERCENT)
+                    and float(position.pnl_percent) <= float(config.NO_MOMENTUM_EXIT_MAX_PNL_PERCENT)
                 ):
                     should_close = True
-                    close_reason = "WEAKNESS"
-                elif age_seconds >= int(position.max_hold_seconds):
-                    should_close = True
-                    close_reason = "TIMEOUT"
+                    close_reason = "NO_MOMENTUM"
+                if should_close:
+                    pass
+                else:
+                    min_age_ratio = max(0.0, min(100.0, float(config.WEAKNESS_EXIT_MIN_AGE_PERCENT))) / 100.0
+                    if (
+                        config.WEAKNESS_EXIT_ENABLED
+                        and age_seconds >= int(position.max_hold_seconds * min_age_ratio)
+                        and float(position.pnl_percent) <= float(config.WEAKNESS_EXIT_PNL_PERCENT)
+                        and float(position.peak_pnl_percent) < float(config.PROFIT_LOCK_TRIGGER_PERCENT)
+                    ):
+                        should_close = True
+                        close_reason = "WEAKNESS"
+                    elif age_seconds >= int(position.max_hold_seconds):
+                        should_close = True
+                        close_reason = "TIMEOUT"
 
             if should_close:
                 if self._is_live_mode():
@@ -1901,6 +1984,7 @@ class AutoTrader:
             "data_policy_reason": self.data_policy_reason,
             "recovery_queue": len(self.recovery_queue),
             "recovery_untracked": len(self.recovery_untracked),
+            "skip_reasons_window": dict(self._skip_reason_counts_window),
         }
 
     def reset_paper_state(self, keep_closed: bool = True) -> None:
@@ -2036,17 +2120,42 @@ class AutoTrader:
         total_cost_percent: float,
         risk_level: str,
     ) -> float:
-        # Score-driven win probability with risk adjustment.
-        p_win = max(0.1, min(0.9, (score - 50) / 50))
-        risk_level = str(risk_level).upper()
-        if risk_level == "HIGH":
-            p_win -= 0.12
-        elif risk_level == "MEDIUM":
-            p_win -= 0.05
-        p_win = max(0.05, min(0.95, p_win))
-
-        expected = (p_win * tp_percent) - ((1 - p_win) * sl_percent) - total_cost_percent
+        dbg = AutoTrader._edge_debug_components(
+            score=score,
+            tp_percent=tp_percent,
+            sl_percent=sl_percent,
+            total_cost_percent=total_cost_percent,
+            risk_level=risk_level,
+        )
+        expected = float(dbg["expected_percent"])
         return float(expected)
+
+    @staticmethod
+    def _edge_debug_components(
+        *,
+        score: int,
+        tp_percent: int,
+        sl_percent: int,
+        total_cost_percent: float,
+        risk_level: str,
+    ) -> dict[str, float]:
+        p_base = max(0.1, min(0.9, (score - 50) / 50))
+        risk_level = str(risk_level).upper()
+        risk_penalty = 0.0
+        if risk_level == "HIGH":
+            risk_penalty = 0.12
+        elif risk_level == "MEDIUM":
+            risk_penalty = 0.05
+        p_win = max(0.05, min(0.95, p_base - risk_penalty))
+        gross = (p_win * float(tp_percent)) - ((1.0 - p_win) * float(sl_percent))
+        expected = float(gross) - float(total_cost_percent)
+        return {
+            "p_base": float(p_base),
+            "p_win": float(p_win),
+            "risk_penalty": float(risk_penalty),
+            "gross_percent": float(gross),
+            "expected_percent": float(expected),
+        }
 
     def _choose_position_size(self, expected_edge_percent: float) -> float:
         min_size = max(0.1, float(config.PAPER_TRADE_SIZE_MIN_USD))

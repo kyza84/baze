@@ -5,7 +5,14 @@ from typing import Dict, Tuple
 
 from dotenv import load_dotenv
 
+# Load base environment first, then optional per-instance override env file.
 load_dotenv()
+_BOT_ENV_FILE = os.getenv("BOT_ENV_FILE", "").strip()
+if _BOT_ENV_FILE:
+    try:
+        load_dotenv(_BOT_ENV_FILE, override=True)
+    except Exception:
+        pass
 
 
 def _parse_source_rate_limits(raw: str) -> Dict[str, Tuple[int, float]]:
@@ -64,11 +71,13 @@ PLAN_DURATIONS_DAYS = {
 TRIAL_HOURS = int(os.getenv("TRIAL_HOURS", "6"))
 RUN_MODE = os.getenv("RUN_MODE", "local").strip().lower()
 SIGNAL_SOURCE = os.getenv("SIGNAL_SOURCE", "onchain").strip().lower()
+BOT_INSTANCE_ID = os.getenv("BOT_INSTANCE_ID", "").strip()
 
 CHAIN_NAME = os.getenv("CHAIN_NAME", "base")
 CHAIN_ID = os.getenv("CHAIN_ID", "base")
 EVM_CHAIN_ID = os.getenv("EVM_CHAIN_ID", "8453")
 GECKO_NETWORK = os.getenv("GECKO_NETWORK", "base")
+RUN_TAG = os.getenv("RUN_TAG", BOT_INSTANCE_ID).strip()
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "30"))
 ONCHAIN_POLL_INTERVAL_SECONDS = max(1, int(os.getenv("ONCHAIN_POLL_INTERVAL_SECONDS", "2")))
@@ -219,26 +228,57 @@ SAFE_REQUIRE_CONTRACT_SAFE = os.getenv("SAFE_REQUIRE_CONTRACT_SAFE", "true").low
 SAFE_REQUIRE_RISK_LEVEL = os.getenv("SAFE_REQUIRE_RISK_LEVEL", "MEDIUM").strip().upper()
 SAFE_MAX_WARNING_FLAGS = int(os.getenv("SAFE_MAX_WARNING_FLAGS", "1"))
 FILTER_THRESH_LOG_EVERY_CYCLES = max(1, int(os.getenv("FILTER_THRESH_LOG_EVERY_CYCLES", "30")))
+CANDIDATE_DECISIONS_LOG_ENABLED = os.getenv("CANDIDATE_DECISIONS_LOG_ENABLED", "true").lower() == "true"
+CANDIDATE_DECISIONS_LOG_FILE = os.getenv("CANDIDATE_DECISIONS_LOG_FILE", os.path.join("logs", "candidates.jsonl"))
+CANDIDATE_SHARD_MOD = max(1, int(os.getenv("CANDIDATE_SHARD_MOD", "1")))
+CANDIDATE_SHARD_SLOT = max(0, int(os.getenv("CANDIDATE_SHARD_SLOT", "0")))
+MINI_ANALYZER_ENABLED = os.getenv("MINI_ANALYZER_ENABLED", "true").lower() == "true"
+MINI_ANALYZER_INTERVAL_SECONDS = max(60, int(os.getenv("MINI_ANALYZER_INTERVAL_SECONDS", "900")))
+MARKET_REGIME_WINDOW_CYCLES = max(3, int(os.getenv("MARKET_REGIME_WINDOW_CYCLES", "12")))
+MARKET_REGIME_MOMENTUM_CANDIDATES = float(os.getenv("MARKET_REGIME_MOMENTUM_CANDIDATES", "2.5"))
+MARKET_REGIME_THIN_CANDIDATES = float(os.getenv("MARKET_REGIME_THIN_CANDIDATES", "0.8"))
+MARKET_REGIME_FAIL_CLOSED_RATIO = float(os.getenv("MARKET_REGIME_FAIL_CLOSED_RATIO", "20.0"))
+MARKET_REGIME_SOURCE_ERROR_PERCENT = float(os.getenv("MARKET_REGIME_SOURCE_ERROR_PERCENT", "20.0"))
 # Adaptive filters (paper calibration)
 ADAPTIVE_FILTERS_ENABLED = os.getenv("ADAPTIVE_FILTERS_ENABLED", "false").lower() == "true"
 ADAPTIVE_FILTERS_MODE = os.getenv("ADAPTIVE_FILTERS_MODE", "dry_run").strip().lower()  # off | dry_run | apply
 ADAPTIVE_FILTERS_PAPER_ONLY = os.getenv("ADAPTIVE_FILTERS_PAPER_ONLY", "true").lower() == "true"
 ADAPTIVE_FILTERS_INTERVAL_SECONDS = max(60, int(os.getenv("ADAPTIVE_FILTERS_INTERVAL_SECONDS", "900")))
 ADAPTIVE_FILTERS_MIN_WINDOW_CYCLES = max(1, int(os.getenv("ADAPTIVE_FILTERS_MIN_WINDOW_CYCLES", "5")))
+ADAPTIVE_FILTERS_COOLDOWN_WINDOWS = max(0, int(os.getenv("ADAPTIVE_FILTERS_COOLDOWN_WINDOWS", "1")))
 ADAPTIVE_FILTERS_TARGET_CAND_MIN = float(os.getenv("ADAPTIVE_FILTERS_TARGET_CAND_MIN", "2.0"))
 ADAPTIVE_FILTERS_TARGET_CAND_MAX = float(os.getenv("ADAPTIVE_FILTERS_TARGET_CAND_MAX", "12.0"))
 ADAPTIVE_FILTERS_TARGET_OPEN_MIN = float(os.getenv("ADAPTIVE_FILTERS_TARGET_OPEN_MIN", "0.10"))
 ADAPTIVE_FILTERS_NEG_REALIZED_TRIGGER_USD = float(os.getenv("ADAPTIVE_FILTERS_NEG_REALIZED_TRIGGER_USD", "0.60"))
 ADAPTIVE_FILTERS_NEG_CLOSED_MIN = max(1, int(os.getenv("ADAPTIVE_FILTERS_NEG_CLOSED_MIN", "3")))
+ADAPTIVE_FILTERS_PNL_MIN_CLOSED = max(1, int(os.getenv("ADAPTIVE_FILTERS_PNL_MIN_CLOSED", "2")))
 ADAPTIVE_SCORE_MIN = int(os.getenv("ADAPTIVE_SCORE_MIN", "60"))
-ADAPTIVE_SCORE_MAX = int(os.getenv("ADAPTIVE_SCORE_MAX", "72"))
+ADAPTIVE_SCORE_MAX = int(os.getenv("ADAPTIVE_SCORE_MAX", "85"))
 ADAPTIVE_SCORE_STEP = max(1, int(os.getenv("ADAPTIVE_SCORE_STEP", "1")))
-ADAPTIVE_SAFE_VOLUME_MIN = float(os.getenv("ADAPTIVE_SAFE_VOLUME_MIN", "150"))
-ADAPTIVE_SAFE_VOLUME_MAX = float(os.getenv("ADAPTIVE_SAFE_VOLUME_MAX", "1200"))
+ADAPTIVE_SAFE_VOLUME_MIN = float(os.getenv("ADAPTIVE_SAFE_VOLUME_MIN", "400"))
+ADAPTIVE_SAFE_VOLUME_MAX = float(os.getenv("ADAPTIVE_SAFE_VOLUME_MAX", "5000"))
 ADAPTIVE_SAFE_VOLUME_STEP = max(10.0, float(os.getenv("ADAPTIVE_SAFE_VOLUME_STEP", "50")))
-ADAPTIVE_DEDUP_TTL_MIN = max(0, int(os.getenv("ADAPTIVE_DEDUP_TTL_MIN", "60")))
-ADAPTIVE_DEDUP_TTL_MAX = max(0, int(os.getenv("ADAPTIVE_DEDUP_TTL_MAX", "900")))
+ADAPTIVE_SAFE_VOLUME_STEP_PCT = max(0.0, float(os.getenv("ADAPTIVE_SAFE_VOLUME_STEP_PCT", "12")))
+ADAPTIVE_DEDUP_TTL_MIN = max(0, int(os.getenv("ADAPTIVE_DEDUP_TTL_MIN", "120")))
+ADAPTIVE_DEDUP_TTL_MAX = max(0, int(os.getenv("ADAPTIVE_DEDUP_TTL_MAX", "3600")))
 ADAPTIVE_DEDUP_TTL_STEP = max(5, int(os.getenv("ADAPTIVE_DEDUP_TTL_STEP", "30")))
+ADAPTIVE_DEDUP_TTL_STEP_PCT = max(0.0, float(os.getenv("ADAPTIVE_DEDUP_TTL_STEP_PCT", "25")))
+ADAPTIVE_DEDUP_RELAX_ENABLED = os.getenv("ADAPTIVE_DEDUP_RELAX_ENABLED", "false").lower() == "true"
+ADAPTIVE_EDGE_ENABLED = os.getenv("ADAPTIVE_EDGE_ENABLED", "true").lower() == "true"
+ADAPTIVE_EDGE_MIN = float(os.getenv("ADAPTIVE_EDGE_MIN", "1.5"))
+ADAPTIVE_EDGE_MAX = float(os.getenv("ADAPTIVE_EDGE_MAX", "4.0"))
+ADAPTIVE_EDGE_STEP = max(0.05, float(os.getenv("ADAPTIVE_EDGE_STEP", "0.25")))
+ADAPTIVE_EDGE_STEP_PCT = max(0.0, float(os.getenv("ADAPTIVE_EDGE_STEP_PCT", "0")))
+ADAPTIVE_EXIT_ENABLED = os.getenv("ADAPTIVE_EXIT_ENABLED", "true").lower() == "true"
+ADAPTIVE_PROFIT_LOCK_FLOOR_MIN = float(os.getenv("ADAPTIVE_PROFIT_LOCK_FLOOR_MIN", "1.0"))
+ADAPTIVE_PROFIT_LOCK_FLOOR_MAX = float(os.getenv("ADAPTIVE_PROFIT_LOCK_FLOOR_MAX", "8.0"))
+ADAPTIVE_PROFIT_LOCK_FLOOR_STEP = max(0.1, float(os.getenv("ADAPTIVE_PROFIT_LOCK_FLOOR_STEP", "0.5")))
+ADAPTIVE_NO_MOMENTUM_MAX_PNL_MIN = float(os.getenv("ADAPTIVE_NO_MOMENTUM_MAX_PNL_MIN", "-0.5"))
+ADAPTIVE_NO_MOMENTUM_MAX_PNL_MAX = float(os.getenv("ADAPTIVE_NO_MOMENTUM_MAX_PNL_MAX", "1.5"))
+ADAPTIVE_NO_MOMENTUM_MAX_PNL_STEP = max(0.05, float(os.getenv("ADAPTIVE_NO_MOMENTUM_MAX_PNL_STEP", "0.2")))
+ADAPTIVE_WEAKNESS_PNL_MIN = float(os.getenv("ADAPTIVE_WEAKNESS_PNL_MIN", "-15.0"))
+ADAPTIVE_WEAKNESS_PNL_MAX = float(os.getenv("ADAPTIVE_WEAKNESS_PNL_MAX", "-2.0"))
+ADAPTIVE_WEAKNESS_PNL_STEP = max(0.1, float(os.getenv("ADAPTIVE_WEAKNESS_PNL_STEP", "0.5")))
 
 # Optional extra token flow sources
 DEX_BOOSTS_SOURCE_ENABLED = os.getenv("DEX_BOOSTS_SOURCE_ENABLED", "true").lower() == "true"
@@ -337,6 +377,7 @@ GRACEFUL_STOP_TIMEOUT_SECONDS = max(2, int(os.getenv("GRACEFUL_STOP_TIMEOUT_SECO
 WALLET_BALANCE_USD = float(os.getenv("WALLET_BALANCE_USD", "2.75"))
 PAPER_TRADE_SIZE_USD = float(os.getenv("PAPER_TRADE_SIZE_USD", "1.0"))
 PAPER_MAX_HOLD_SECONDS = int(os.getenv("PAPER_MAX_HOLD_SECONDS", "1800"))
+PAPER_STATE_FILE = os.getenv("PAPER_STATE_FILE", os.path.join("trading", "paper_state.json"))
 
 # Realistic paper simulation
 PAPER_REALISM_ENABLED = os.getenv("PAPER_REALISM_ENABLED", "true").lower() == "true"
@@ -352,6 +393,11 @@ PROFIT_LOCK_FLOOR_PERCENT = float(os.getenv("PROFIT_LOCK_FLOOR_PERCENT", "4"))
 WEAKNESS_EXIT_ENABLED = os.getenv("WEAKNESS_EXIT_ENABLED", "true").lower() == "true"
 WEAKNESS_EXIT_MIN_AGE_PERCENT = float(os.getenv("WEAKNESS_EXIT_MIN_AGE_PERCENT", "45"))
 WEAKNESS_EXIT_PNL_PERCENT = float(os.getenv("WEAKNESS_EXIT_PNL_PERCENT", "-9"))
+NO_MOMENTUM_EXIT_ENABLED = os.getenv("NO_MOMENTUM_EXIT_ENABLED", "true").lower() == "true"
+NO_MOMENTUM_EXIT_MIN_AGE_PERCENT = float(os.getenv("NO_MOMENTUM_EXIT_MIN_AGE_PERCENT", "45"))
+NO_MOMENTUM_EXIT_MIN_HOLD_SECONDS = max(0, int(os.getenv("NO_MOMENTUM_EXIT_MIN_HOLD_SECONDS", "180")))
+NO_MOMENTUM_EXIT_MAX_PEAK_PERCENT = float(os.getenv("NO_MOMENTUM_EXIT_MAX_PEAK_PERCENT", "1.0"))
+NO_MOMENTUM_EXIT_MAX_PNL_PERCENT = float(os.getenv("NO_MOMENTUM_EXIT_MAX_PNL_PERCENT", "0.3"))
 
 # Position sizing and edge filtering
 DYNAMIC_POSITION_SIZING_ENABLED = os.getenv("DYNAMIC_POSITION_SIZING_ENABLED", "true").lower() == "true"
@@ -359,6 +405,11 @@ EDGE_FILTER_ENABLED = os.getenv("EDGE_FILTER_ENABLED", "true").lower() == "true"
 MIN_EXPECTED_EDGE_PERCENT = float(os.getenv("MIN_EXPECTED_EDGE_PERCENT", "2.0"))
 EDGE_FILTER_MODE = os.getenv("EDGE_FILTER_MODE", "usd").strip().lower()
 MIN_EXPECTED_EDGE_USD = float(os.getenv("MIN_EXPECTED_EDGE_USD", "0.10"))
+ENTRY_REQUIRE_POSITIVE_CHANGE_5M = os.getenv("ENTRY_REQUIRE_POSITIVE_CHANGE_5M", "false").lower() == "true"
+ENTRY_MIN_PRICE_CHANGE_5M_PERCENT = float(os.getenv("ENTRY_MIN_PRICE_CHANGE_5M_PERCENT", "0.0"))
+ENTRY_REQUIRE_VOLUME_BUFFER = os.getenv("ENTRY_REQUIRE_VOLUME_BUFFER", "false").lower() == "true"
+ENTRY_MIN_VOLUME_5M_MULT = float(os.getenv("ENTRY_MIN_VOLUME_5M_MULT", "1.0"))
+ENTRY_MIN_VOLUME_5M_USD = float(os.getenv("ENTRY_MIN_VOLUME_5M_USD", "0.0"))
 
 # Position sizing quality multiplier (score/liquidity/volume/volatility).
 POSITION_SIZE_QUALITY_ENABLED = os.getenv("POSITION_SIZE_QUALITY_ENABLED", "true").lower() == "true"

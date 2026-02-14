@@ -47,6 +47,10 @@ ERR_LOG = os.path.join(LOG_DIR, "bot.err.log")
 APP_LOG = os.path.join(LOG_DIR, "app.log")
 LOCAL_ALERTS_FILE = os.path.join(LOG_DIR, "local_alerts.jsonl")
 PAPER_STATE_FILE = os.path.join(PROJECT_ROOT, "trading", "paper_state.json")
+MATRIX_ACTIVE_FILE = os.path.join(PROJECT_ROOT, "data", "matrix", "runs", "active_matrix.json")
+MATRIX_LAUNCHER = os.path.join(PROJECT_ROOT, "tools", "matrix_paper_launcher.ps1")
+MATRIX_STOPPER = os.path.join(PROJECT_ROOT, "tools", "matrix_paper_stop.ps1")
+MATRIX_SUMMARY = os.path.join(PROJECT_ROOT, "tools", "matrix_paper_summary.ps1")
 GRACEFUL_STOP_FILE_DEFAULT = os.path.join(PROJECT_ROOT, "data", "graceful_stop.signal")
 GRACEFUL_STOP_TIMEOUT_SECONDS_DEFAULT = 12
 WALLET_MODE_KEY = "WALLET_MODE"
@@ -507,6 +511,26 @@ def read_tail(path: str, max_lines: int) -> list[str]:
         return [line.rstrip("\n") for line in f.readlines()[-max_lines:]]
 
 
+def latest_session_log(log_dir: str) -> str | None:
+    sessions_dir = os.path.join(log_dir, "sessions")
+    if not os.path.isdir(sessions_dir):
+        return None
+    files: list[tuple[float, str]] = []
+    try:
+        for name in os.listdir(sessions_dir):
+            if not name.lower().endswith(".log"):
+                continue
+            full = os.path.join(sessions_dir, name)
+            if os.path.isfile(full):
+                files.append((os.path.getmtime(full), full))
+    except Exception:
+        return None
+    if not files:
+        return None
+    files.sort(key=lambda x: x[0], reverse=True)
+    return files[0][1]
+
+
 def truncate_file(path: str) -> None:
     with open(path, "w", encoding="utf-8") as f:
         f.write("")
@@ -516,13 +540,47 @@ def read_json(path: str) -> dict:
     if not os.path.exists(path):
         return {}
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        # Accept files with or without UTF-8 BOM (PowerShell often writes BOM by default).
+        with open(path, "r", encoding="utf-8-sig") as f:
             payload = json.load(f)
         if isinstance(payload, dict):
             return payload
     except Exception:
         return {}
     return {}
+
+
+def read_matrix_meta() -> dict:
+    return read_json(MATRIX_ACTIVE_FILE)
+
+
+def run_powershell_script(
+    script_path: str,
+    args: list[str] | None = None,
+    *,
+    timeout_seconds: int = 90,
+) -> tuple[bool, str]:
+    if not os.path.exists(script_path):
+        return False, f"Script not found: {script_path}"
+    cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script_path]
+    if args:
+        cmd.extend(args)
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=max(10, int(timeout_seconds)),
+        )
+    except Exception as exc:
+        return False, str(exc)
+    out = (proc.stdout or "").strip()
+    err = (proc.stderr or "").strip()
+    msg = out or err or f"exit={proc.returncode}"
+    if proc.returncode != 0:
+        return False, msg
+    return True, msg
 
 
 def read_jsonl_tail(path: str, max_lines: int) -> list[dict]:
@@ -718,6 +776,9 @@ class App(tk.Tk):
 
         self.status_var = tk.StringVar(value="Статус: неизвестно")
         self.hint_var = tk.StringVar(value="Подсказка: сначала тестируй в paper-режиме, потом подключай live.")
+        self.matrix_count_var = tk.StringVar(value="2")
+        self.positions_source_var = tk.StringVar(value="single")
+        self.positions_source_map: dict[str, str] = {"single": PAPER_STATE_FILE}
 
         self._build_header()
         self._build_tabs()
@@ -796,6 +857,18 @@ class App(tk.Tk):
         right.pack(side=tk.RIGHT)
         ttk.Button(right, text="Старт", command=self.on_start).pack(side=tk.LEFT, padx=4)
         ttk.Button(right, text="Стоп", command=self.on_stop).pack(side=tk.LEFT, padx=4)
+        ttk.Separator(right, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
+        ttk.Label(right, text="Matrix").pack(side=tk.LEFT, padx=(0, 3))
+        ttk.Combobox(
+            right,
+            width=3,
+            state="readonly",
+            textvariable=self.matrix_count_var,
+            values=("2", "3", "4"),
+        ).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(right, text="Matrix Start", command=self.on_matrix_start).pack(side=tk.LEFT, padx=4)
+        ttk.Button(right, text="Matrix Stop", command=self.on_matrix_stop).pack(side=tk.LEFT, padx=4)
+        ttk.Button(right, text="Matrix Сводка", command=self.on_matrix_summary).pack(side=tk.LEFT, padx=4)
         ttk.Button(right, text="Сохранить", command=self._save_settings).pack(side=tk.LEFT, padx=4)
         ttk.Button(right, text="Сохранить + Рестарт", command=self._save_restart).pack(side=tk.LEFT, padx=4)
         ttk.Button(right, text="Рестарт", command=self.on_restart).pack(side=tk.LEFT, padx=4)
@@ -1139,6 +1212,16 @@ class App(tk.Tk):
         ttk.Label(top, textvariable=self.pos_summary_var, foreground="#93c5fd").pack(anchor="w", pady=(4, 0))
         actions = ttk.Frame(top, style="Card.TFrame")
         actions.pack(anchor="w", pady=(8, 0))
+        ttk.Label(actions, text="Источник:").pack(side=tk.LEFT)
+        self.positions_source_combo = ttk.Combobox(
+            actions,
+            width=22,
+            state="readonly",
+            textvariable=self.positions_source_var,
+            values=("single",),
+        )
+        self.positions_source_combo.pack(side=tk.LEFT, padx=(6, 10))
+        self.positions_source_combo.bind("<<ComboboxSelected>>", lambda _e: self.refresh())
         ttk.Button(actions, text="Удалить старые закрытые", command=self.on_prune_closed_trades).pack(side=tk.LEFT)
         ttk.Button(actions, text="Очистить все закрытые", command=self.on_clear_closed_trades).pack(side=tk.LEFT, padx=8)
 
@@ -1806,15 +1889,55 @@ class App(tk.Tk):
         self.on_restart()
 
     def refresh(self) -> None:
+        self._refresh_positions_source_options()
         pid = read_pid()
+        matrix_alive = 0
+        meta = read_matrix_meta()
+        items = meta.get("items")
+        if isinstance(items, list):
+            for row in items:
+                if not isinstance(row, dict):
+                    continue
+                try:
+                    p = int(row.get("pid", 0) or 0)
+                except Exception:
+                    p = 0
+                if p > 0 and is_running(p):
+                    matrix_alive += 1
         if pid and is_running(pid):
-            self.status_var.set(f"Статус: ЗАПУЩЕН (PID {pid})")
+            if matrix_alive > 0:
+                self.status_var.set(f"Статус: ЗАПУЩЕН (PID {pid}) | Matrix alive: {matrix_alive}")
+            else:
+                self.status_var.set(f"Статус: ЗАПУЩЕН (PID {pid})")
         else:
-            self.status_var.set("Статус: ОСТАНОВЛЕН")
+            if matrix_alive > 0:
+                self.status_var.set(f"Статус: Matrix mode ({matrix_alive} instance)")
+            else:
+                self.status_var.set("Статус: ОСТАНОВЛЕН")
+
+        log_paths: list[str] = []
+        if pid and is_running(pid):
+            log_paths = [APP_LOG]
+        elif matrix_alive > 0:
+            if isinstance(items, list):
+                for row in items:
+                    if not isinstance(row, dict):
+                        continue
+                    log_dir = str(row.get("log_dir", "") or "").strip()
+                    if not log_dir:
+                        continue
+                    abs_dir = log_dir if os.path.isabs(log_dir) else os.path.join(PROJECT_ROOT, log_dir)
+                    latest = latest_session_log(abs_dir)
+                    if latest:
+                        log_paths.append(latest)
+        if not log_paths:
+            log_paths = [APP_LOG]
 
         feed_bottom = self._is_near_bottom(self.feed_text)
         feed_y = self.feed_text.yview()
-        app_lines = read_tail(APP_LOG, 220)
+        app_lines: list[str] = []
+        for path in log_paths:
+            app_lines.extend(read_tail(path, 140))
         events = parse_activity(app_lines)
         if not self._text_has_active_selection(self.feed_text):
             self.feed_text.delete("1.0", tk.END)
@@ -1827,7 +1950,8 @@ class App(tk.Tk):
         raw_bottom = self._is_near_bottom(self.raw_text)
         raw_y = self.raw_text.yview()
         combined = []
-        for label, path in (("APP", APP_LOG),):
+        for path in log_paths:
+            label = os.path.basename(path)
             lines = compact_runtime_lines(read_tail(path, 180))
             combined.append(f"===== {label} LOG (clean) =====")
             combined.extend(lines[-120:] or ["<empty>"])
@@ -1840,6 +1964,33 @@ class App(tk.Tk):
         self._refresh_wallet()
         self._refresh_positions(app_lines)
         self._refresh_emergency_tab(app_lines)
+
+    def _refresh_positions_source_options(self) -> None:
+        source_map: dict[str, str] = {"single": PAPER_STATE_FILE}
+        meta = read_matrix_meta()
+        items = meta.get("items")
+        if isinstance(items, list):
+            for row in items:
+                if not isinstance(row, dict):
+                    continue
+                inst = str(row.get("id", "")).strip()
+                path = str(row.get("paper_state_file", "")).strip()
+                if not inst or not path:
+                    continue
+                abs_path = path if os.path.isabs(path) else os.path.join(PROJECT_ROOT, path)
+                source_map[inst] = abs_path
+        self.positions_source_map = source_map
+        labels = tuple(source_map.keys())
+        if hasattr(self, "positions_source_combo"):
+            self.positions_source_combo.configure(values=labels)
+        cur = str(self.positions_source_var.get() or "single")
+        if cur not in source_map:
+            self.positions_source_var.set("single")
+
+    def _selected_positions_state_file(self) -> str:
+        self._refresh_positions_source_options()
+        key = str(self.positions_source_var.get() or "single")
+        return str(self.positions_source_map.get(key, PAPER_STATE_FILE))
 
     @staticmethod
     def _kill_switch_path() -> str:
@@ -1946,9 +2097,13 @@ class App(tk.Tk):
             widget.yview_moveto(prev_y[0])
 
     def _refresh_positions(self, app_lines: list[str]) -> None:
-        state = read_json(PAPER_STATE_FILE)
+        state_file = self._selected_positions_state_file()
+        state = read_json(state_file)
+        src = str(self.positions_source_var.get() or "single")
         if state:
             self._refresh_positions_from_state(state)
+            if hasattr(self, "pos_summary_var"):
+                self.pos_summary_var.set(f"[{src}] {self.pos_summary_var.get()}")
             return
 
         # Fallback to log parsing if state file is missing.
@@ -2000,7 +2155,7 @@ class App(tk.Tk):
             self.closed_tree.insert("", tk.END, values=(pos["symbol"], pos["reason"], pos["pnl_pct"], pos["pnl_usd"]))
 
         self.pos_summary_var.set(
-            f"Открыто: {len(open_map)} | Закрыто: {len(closed)} | Побед/Поражений: {wins}/{losses} | Итог PnL: ${pnl_sum:+.2f}"
+            f"[{src}] Открыто: {len(open_map)} | Закрыто: {len(closed)} | Побед/Поражений: {wins}/{losses} | Итог PnL: ${pnl_sum:+.2f}"
         )
 
     def _refresh_signals(self) -> None:
@@ -2404,6 +2559,7 @@ class App(tk.Tk):
         self.after(2200, self.auto_refresh)
 
     def on_start(self) -> None:
+        # Avoid mixing single run with matrix mode.
         ok, msg = start_bot()
         if not ok:
             messagebox.showerror("Ошибка запуска", msg)
@@ -2411,8 +2567,11 @@ class App(tk.Tk):
 
     def on_stop(self) -> None:
         ok, msg = stop_bot()
+        m_ok, m_msg = run_powershell_script(MATRIX_STOPPER, ["-HardKill"])
         if not ok:
             messagebox.showerror("Ошибка остановки", msg)
+        elif not m_ok:
+            messagebox.showerror("Ошибка остановки Matrix", m_msg)
         self.refresh()
 
     def on_restart(self) -> None:
@@ -2421,6 +2580,77 @@ class App(tk.Tk):
         if not ok:
             messagebox.showerror("Ошибка рестарта", msg)
         self.refresh()
+
+    def on_matrix_start(self) -> None:
+        count = str(self.matrix_count_var.get() or "3").strip()
+        if count not in {"2", "3", "4"}:
+            count = "3"
+            self.matrix_count_var.set(count)
+        self.hint_var.set(f"Matrix start in progress ({count})...")
+        self._run_background(
+            title="Matrix Start",
+            worker=lambda: run_powershell_script(
+                MATRIX_LAUNCHER,
+                ["-Count", count, "-Run"],
+                timeout_seconds=180,
+            ),
+            on_success=lambda _msg: self.hint_var.set(f"Matrix started: {count} instances."),
+            on_error=lambda _msg: self.hint_var.set("Matrix start failed. Check popup/logs."),
+        )
+
+    def on_matrix_stop(self) -> None:
+        self.hint_var.set("Matrix stop in progress...")
+        self._run_background(
+            title="Matrix Stop",
+            worker=lambda: run_powershell_script(MATRIX_STOPPER, ["-HardKill"]),
+            on_success=lambda _msg: self.hint_var.set("Matrix stopped."),
+            on_error=lambda _msg: self.hint_var.set("Matrix stop failed. Check popup/logs."),
+        )
+
+    def on_matrix_summary(self) -> None:
+        self._run_background(
+            title="Matrix Summary",
+            worker=lambda: run_powershell_script(MATRIX_SUMMARY, []),
+            on_success=None,
+        )
+
+    def _run_background(
+        self,
+        *,
+        title: str,
+        worker,
+        on_success=None,
+        on_error=None,
+    ) -> None:
+        def _task() -> None:
+            try:
+                ok, msg = worker()
+            except Exception as exc:
+                ok, msg = False, str(exc)
+
+            def _finish() -> None:
+                try:
+                    self.refresh()
+                except Exception:
+                    pass
+                if ok:
+                    if callable(on_success):
+                        try:
+                            on_success(msg)
+                        except Exception:
+                            pass
+                    messagebox.showinfo(title, str(msg)[:4000])
+                else:
+                    if callable(on_error):
+                        try:
+                            on_error(msg)
+                        except Exception:
+                            pass
+                    messagebox.showerror(title, str(msg)[:4000])
+
+            self.after(0, _finish)
+
+        threading.Thread(target=_task, daemon=True).start()
 
     def on_reload_env(self) -> None:
         # GUI keeps values in memory; restarting the bot does not refresh input fields.
@@ -2555,18 +2785,26 @@ class App(tk.Tk):
             days = max(0, int(days_raw))
         except ValueError:
             days = 14
-        removed = self._cleanup_closed_trades(days=days, remove_all=False)
+        removed = self._cleanup_closed_trades(
+            days=days,
+            remove_all=False,
+            state_file=self._selected_positions_state_file(),
+        )
         messagebox.showinfo("Готово", f"Удалено закрытых сделок: {removed}")
         self.refresh()
 
     def on_clear_closed_trades(self) -> None:
-        removed = self._cleanup_closed_trades(days=0, remove_all=True)
+        removed = self._cleanup_closed_trades(
+            days=0,
+            remove_all=True,
+            state_file=self._selected_positions_state_file(),
+        )
         messagebox.showinfo("Готово", f"Удалено закрытых сделок: {removed}")
         self.refresh()
 
     @staticmethod
-    def _cleanup_closed_trades(days: int, remove_all: bool) -> int:
-        state = read_json(PAPER_STATE_FILE)
+    def _cleanup_closed_trades(days: int, remove_all: bool, state_file: str) -> int:
+        state = read_json(state_file)
         if not state:
             return 0
         closed_rows = state.get("closed_positions", []) or []
@@ -2604,7 +2842,7 @@ class App(tk.Tk):
                     kept.append(row)
             state["closed_positions"] = kept
 
-        with open(PAPER_STATE_FILE, "w", encoding="utf-8") as f:
+        with open(state_file, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
         return max(0, before - len(state.get("closed_positions", [])))
 
