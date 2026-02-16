@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import os
 import re
+import hashlib
+import math
 import subprocess
 import tkinter as tk
 import ctypes
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import ssl
 import urllib.request
@@ -58,6 +60,18 @@ LIVE_WALLET_BALANCE_KEY = "LIVE_WALLET_BALANCE_USD"
 STAIR_STEP_ENABLED_KEY = "STAIR_STEP_ENABLED"
 GUI_MUTEX_NAME = "Global\\solana_alert_bot_launcher_gui_single_instance"
 LIVE_BALANCE_POLL_SECONDS = 12
+GUI_INITIAL_REFRESH_DELAY_MS = 300
+try:
+    GUI_REFRESH_INTERVAL_MS = max(400, int(os.getenv("GUI_REFRESH_INTERVAL_MS", "500")))
+except Exception:
+    GUI_REFRESH_INTERVAL_MS = 500
+try:
+    GUI_UI_TICK_MS = max(120, int(os.getenv("GUI_UI_TICK_MS", "150")))
+except Exception:
+    GUI_UI_TICK_MS = 150
+UI_FONT_MAIN = "Bahnschrift"
+UI_FONT_MONO = "Cascadia Mono"
+GUI_STATS_EXCLUDED_SYMBOLS_DEFAULT = "ZORA"
 
 EVENT_KEYS = {
     "BUY": ("Paper BUY", "#67e8f9"),
@@ -117,6 +131,7 @@ SCAN_SUMMARY_RE = re.compile(
 AUTO_POLICY_RE = re.compile(
     r"AUTO_POLICY mode=(?P<policy>[A-Z_]+) action=(?P<action>[a-z_]+) reason=(?P<reason>.+?) candidates=(?P<candidates>\d+)"
 )
+AUTO_TRADE_SKIP_RE = re.compile(r"AutoTrade skip token=\S+ reason=(?P<reason>[a-zA-Z0-9_:-]+)")
 
 SETTINGS_FIELDS_RAW = [
     ("PERSONAL_MODE", "Личный режим"),
@@ -127,6 +142,21 @@ SETTINGS_FIELDS_RAW = [
     ("AUTO_TRADE_PAPER", "Бумажный режим"),
     ("AUTO_TRADE_ENTRY_MODE", "Режим входа"),
     ("AUTO_TRADE_TOP_N", "Топ N"),
+    ("AUTONOMOUS_CONTROL_ENABLED", "Автономный контроллер"),
+    ("AUTONOMOUS_CONTROL_MODE", "Режим автономного контроллера"),
+    ("AUTONOMOUS_CONTROL_INTERVAL_SECONDS", "Окно автоконтроля (сек)"),
+    ("AUTONOMOUS_CONTROL_MIN_WINDOW_CYCLES", "Мин. циклов в окне"),
+    ("AUTONOMOUS_CONTROL_TARGET_CANDIDATES_MIN", "Цель cand min"),
+    ("AUTONOMOUS_CONTROL_TARGET_CANDIDATES_HIGH", "Цель cand high"),
+    ("AUTONOMOUS_CONTROL_TARGET_OPENED_MIN", "Цель opened/cycle"),
+    ("AUTONOMOUS_CONTROL_NEG_REALIZED_TRIGGER_USD", "Порог лосса окна $"),
+    ("AUTONOMOUS_CONTROL_POS_REALIZED_TRIGGER_USD", "Порог профита окна $"),
+    ("AUTONOMOUS_CONTROL_MAX_OPEN_TRADES_MIN", "Граница open trades min"),
+    ("AUTONOMOUS_CONTROL_MAX_OPEN_TRADES_MAX", "Граница open trades max"),
+    ("AUTONOMOUS_CONTROL_TOP_N_MIN", "Граница top N min"),
+    ("AUTONOMOUS_CONTROL_TOP_N_MAX", "Граница top N max"),
+    ("AUTONOMOUS_CONTROL_MAX_BUYS_PER_HOUR_MIN", "Граница buys/hour min"),
+    ("AUTONOMOUS_CONTROL_MAX_BUYS_PER_HOUR_MAX", "Граница buys/hour max"),
     ("WALLET_BALANCE_USD", "Бумажный кошелек $"),
     ("PAPER_TRADE_SIZE_USD", "Базовый размер сделки $"),
     ("PAPER_TRADE_SIZE_MIN_USD", "Мин. размер сделки $"),
@@ -183,6 +213,21 @@ FIELD_OPTIONS = {
     "AUTO_TRADE_PAPER": ["true", "false"],
     "AUTO_TRADE_ENTRY_MODE": ["single", "all", "top_n"],
     "AUTO_TRADE_TOP_N": ["3", "5", "10", "20", "50"],
+    "AUTONOMOUS_CONTROL_ENABLED": ["false", "true"],
+    "AUTONOMOUS_CONTROL_MODE": ["off", "dry_run", "apply"],
+    "AUTONOMOUS_CONTROL_INTERVAL_SECONDS": ["120", "180", "240", "300", "600"],
+    "AUTONOMOUS_CONTROL_MIN_WINDOW_CYCLES": ["1", "2", "3", "4", "5"],
+    "AUTONOMOUS_CONTROL_TARGET_CANDIDATES_MIN": ["1.0", "1.5", "2.0", "3.0"],
+    "AUTONOMOUS_CONTROL_TARGET_CANDIDATES_HIGH": ["4.0", "6.0", "8.0", "12.0"],
+    "AUTONOMOUS_CONTROL_TARGET_OPENED_MIN": ["0.10", "0.15", "0.20", "0.30"],
+    "AUTONOMOUS_CONTROL_NEG_REALIZED_TRIGGER_USD": ["0.03", "0.05", "0.08", "0.12"],
+    "AUTONOMOUS_CONTROL_POS_REALIZED_TRIGGER_USD": ["0.03", "0.05", "0.08", "0.12"],
+    "AUTONOMOUS_CONTROL_MAX_OPEN_TRADES_MIN": ["1", "2", "3"],
+    "AUTONOMOUS_CONTROL_MAX_OPEN_TRADES_MAX": ["2", "3", "4", "5", "6"],
+    "AUTONOMOUS_CONTROL_TOP_N_MIN": ["1", "2", "4", "6", "8"],
+    "AUTONOMOUS_CONTROL_TOP_N_MAX": ["6", "8", "10", "12", "16", "20"],
+    "AUTONOMOUS_CONTROL_MAX_BUYS_PER_HOUR_MIN": ["6", "12", "18", "24", "36"],
+    "AUTONOMOUS_CONTROL_MAX_BUYS_PER_HOUR_MAX": ["24", "36", "48", "72", "96"],
     "MIN_TOKEN_SCORE": ["40", "50", "60", "70", "80", "90"],
     "WALLET_BALANCE_USD": ["2.75", "5", "10", "25", "50", "100"],
     "PAPER_TRADE_SIZE_USD": ["0.5", "0.75", "1.0", "1.5", "2.0", "3.0", "5.0"],
@@ -243,6 +288,33 @@ def is_running(pid: int | None) -> bool:
     return result.returncode == 0 and bool(result.stdout.strip())
 
 
+def process_commandline(pid: int | None) -> str:
+    if not pid:
+        return ""
+    cmd = (
+        "Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\" "
+        "| Select-Object -ExpandProperty CommandLine"
+    ).format(pid=int(pid))
+    result = subprocess.run(
+        ["powershell", "-NoProfile", "-Command", cmd],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return ""
+    return (result.stdout or "").strip()
+
+
+def is_main_local_process(pid: int | None) -> bool:
+    if not is_running(pid):
+        return False
+    cmd = process_commandline(pid)
+    if not cmd:
+        return False
+    lower = cmd.lower()
+    return "python" in lower and "main_local.py" in lower
+
+
 def list_main_local_pids() -> list[int]:
     cmd = (
         "Get-CimInstance Win32_Process -Filter \"name='python.exe'\" "
@@ -268,7 +340,7 @@ def _resolve_graceful_stop_file() -> str:
     raw = "data/graceful_stop.signal"
     try:
         if os.path.exists(ENV_FILE):
-            with open(ENV_FILE, "r", encoding="utf-8") as f:
+            with open(ENV_FILE, "r", encoding="utf-8-sig") as f:
                 for line in f:
                     s = line.strip()
                     if not s or s.startswith("#") or "=" not in s:
@@ -288,7 +360,7 @@ def _resolve_graceful_stop_timeout_seconds() -> int:
     value = GRACEFUL_STOP_TIMEOUT_SECONDS_DEFAULT
     try:
         if os.path.exists(ENV_FILE):
-            with open(ENV_FILE, "r", encoding="utf-8") as f:
+            with open(ENV_FILE, "r", encoding="utf-8-sig") as f:
                 for line in f:
                     s = line.strip()
                     if not s or s.startswith("#") or "=" not in s:
@@ -328,6 +400,8 @@ def _clear_graceful_stop_flag() -> None:
 def start_bot() -> tuple[bool, str]:
     if not os.path.exists(PYTHON_PATH):
         return False, f"Python not found: {PYTHON_PATH}"
+    if matrix_alive_count() > 0:
+        return False, "Matrix instances are running. Stop Matrix mode before starting single mode."
     _clear_graceful_stop_flag()
 
     existing = sorted(set(list_main_local_pids()))
@@ -343,8 +417,14 @@ def start_bot() -> tuple[bool, str]:
         return True, f"Already running main_local.py (PID {keep_pid})"
 
     pid = read_pid()
+    if pid and is_main_local_process(pid):
+        return True, f"Already running main_local.py (PID {pid})"
     if pid and is_running(pid):
-        return True, f"Already running (PID {pid})"
+        # Stale PID file pointing to unrelated process.
+        try:
+            os.remove(PID_FILE)
+        except OSError:
+            pass
 
     os.makedirs(LOG_DIR, exist_ok=True)
     out_file = open(OUT_LOG, "a", encoding="utf-8")
@@ -372,7 +452,7 @@ def stop_bot() -> tuple[bool, str]:
     pids = sorted(set(list_main_local_pids()))
     if not pids:
         pid = read_pid()
-        if pid and is_running(pid):
+        if pid and is_main_local_process(pid):
             pids = [pid]
         else:
             try:
@@ -385,7 +465,7 @@ def stop_bot() -> tuple[bool, str]:
     timeout_sec = _resolve_graceful_stop_timeout_seconds()
     deadline = time.time() + timeout_sec
     while time.time() < deadline:
-        alive = [pid for pid in pids if is_running(pid)]
+        alive = [pid for pid in pids if is_main_local_process(pid)]
         if not alive:
             try:
                 os.remove(PID_FILE)
@@ -398,10 +478,10 @@ def stop_bot() -> tuple[bool, str]:
     failed: list[int] = []
     hard_stopped: list[int] = []
     for pid in pids:
-        if not is_running(pid):
+        if not is_main_local_process(pid):
             continue
         result = subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, text=True)
-        if result.returncode != 0 and is_running(pid):
+        if result.returncode != 0 and is_main_local_process(pid):
             failed.append(pid)
         else:
             hard_stopped.append(pid)
@@ -511,6 +591,20 @@ def read_tail(path: str, max_lines: int) -> list[str]:
         return [line.rstrip("\n") for line in f.readlines()[-max_lines:]]
 
 
+def read_tail_bytes(path: str, max_bytes: int) -> str:
+    if not os.path.exists(path):
+        return ""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - max(0, int(max_bytes))))
+            blob = f.read()
+        return blob.decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+
 def latest_session_log(log_dir: str) -> str | None:
     sessions_dir = os.path.join(log_dir, "sessions")
     if not os.path.isdir(sessions_dir):
@@ -539,14 +633,20 @@ def truncate_file(path: str) -> None:
 def read_json(path: str) -> dict:
     if not os.path.exists(path):
         return {}
-    try:
-        # Accept files with or without UTF-8 BOM (PowerShell often writes BOM by default).
-        with open(path, "r", encoding="utf-8-sig") as f:
-            payload = json.load(f)
-        if isinstance(payload, dict):
-            return payload
-    except Exception:
-        return {}
+    for _ in range(3):
+        try:
+            # Accept files with or without UTF-8 BOM (PowerShell often writes BOM by default).
+            with open(path, "r", encoding="utf-8-sig") as f:
+                payload = json.load(f)
+            if isinstance(payload, dict):
+                return payload
+            return {}
+        except json.JSONDecodeError:
+            # State can be read mid-write; retry briefly before falling back.
+            time.sleep(0.05)
+            continue
+        except Exception:
+            return {}
     return {}
 
 
@@ -566,7 +666,7 @@ def matrix_alive_count() -> int:
                 pid = int(row.get("pid", 0) or 0)
             except Exception:
                 pid = 0
-            if pid > 0 and is_running(pid):
+            if pid > 0 and is_main_local_process(pid):
                 alive += 1
     return alive
 
@@ -612,6 +712,26 @@ def read_jsonl_tail(path: str, max_lines: int) -> list[dict]:
         if isinstance(row, dict):
             rows.append(row)
     return rows
+
+
+def _parse_ts(raw: object) -> float | None:
+    if raw is None or raw == "":
+        return None
+    if isinstance(raw, (int, float)):
+        try:
+            return float(raw)
+        except Exception:
+            return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        return None
 
 
 def _format_matrix_candidate_tail(log_dir: str, inst_id: str, max_rows: int = 80) -> list[str]:
@@ -821,15 +941,45 @@ def compact_runtime_lines(lines: list[str]) -> list[str]:
 
 
 def load_env_lines() -> list[str]:
-    if not os.path.exists(ENV_FILE):
+    return load_env_lines_from(ENV_FILE)
+
+
+def load_env_lines_from(path: str) -> list[str]:
+    if not os.path.exists(path):
         return []
-    with open(ENV_FILE, "r", encoding="utf-8", errors="ignore") as f:
+    with open(path, "r", encoding="utf-8-sig", errors="ignore") as f:
         return [line.rstrip("\n") for line in f.readlines()]
 
 
 def read_env_map() -> dict[str, str]:
+    return read_env_map_from(ENV_FILE)
+
+
+def resolve_runtime_env_file() -> str:
+    root_map = read_env_map_from(ENV_FILE)
+    raw = str(root_map.get("BOT_ENV_FILE", "") or "").strip()
+    if not raw:
+        return ENV_FILE
+    return raw if os.path.isabs(raw) else os.path.join(PROJECT_ROOT, raw)
+
+
+def read_runtime_env_map() -> dict[str, str]:
+    # Runtime can be redirected via BOT_ENV_FILE (used by live promotion).
+    env_map = read_env_map_from(ENV_FILE)
+    env_path = resolve_runtime_env_file()
+    if os.path.abspath(env_path) == os.path.abspath(ENV_FILE):
+        return env_map
+    if not os.path.exists(env_path):
+        return env_map
+    nested = read_env_map_from(env_path)
+    if nested:
+        env_map.update(nested)
+    return env_map
+
+
+def read_env_map_from(path: str) -> dict[str, str]:
     out: dict[str, str] = {}
-    for line in load_env_lines():
+    for line in load_env_lines_from(path):
         if not line or line.lstrip().startswith("#") or "=" not in line:
             continue
         k, v = line.split("=", 1)
@@ -838,7 +988,15 @@ def read_env_map() -> dict[str, str]:
 
 
 def save_env_map(values: dict[str, str]) -> None:
-    lines = load_env_lines()
+    save_env_map_to(ENV_FILE, values)
+
+
+def save_runtime_env_map(values: dict[str, str]) -> None:
+    save_env_map_to(resolve_runtime_env_file(), values)
+
+
+def save_env_map_to(path: str, values: dict[str, str]) -> None:
+    lines = load_env_lines_from(path)
     existing_keys = set()
     updated: list[str] = []
 
@@ -855,14 +1013,15 @@ def save_env_map(values: dict[str, str]) -> None:
         if key not in existing_keys:
             updated.append(f"{key}={value}")
 
-    with open(ENV_FILE, "w", encoding="utf-8") as f:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(updated).rstrip() + "\n")
 
 
 class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("Панель управления Base Bot")
+        self.title("Base Bot Control Center")
         self.geometry("1180x760")
         self.minsize(1020, 680)
         self.configure(bg="#0b1220")
@@ -870,18 +1029,30 @@ class App(tk.Tk):
         self._configure_theme()
         self.env_vars: dict[str, tk.StringVar] = {}
 
-        self.status_var = tk.StringVar(value="Статус: неизвестно")
-        self.hint_var = tk.StringVar(value="Подсказка: сначала тестируй в paper-режиме, потом подключай live.")
+        self.status_var = tk.StringVar(value="Status: unknown")
+        self.hint_var = tk.StringVar(value="Hint: validate in paper mode first, then enable live.")
         self.matrix_count_var = tk.StringVar(value="2")
         self.positions_source_var = tk.StringVar(value="single")
         self.positions_source_map: dict[str, str] = {"single": PAPER_STATE_FILE}
+        self.refresh_meta_var = tk.StringVar(value="Refresh: --")
+        self.header_limits_var = tk.StringVar(value="Limits: --")
+        self.header_health_var = tk.StringVar(value="Health: --")
 
         self._build_header()
         self._build_tabs()
         self._load_settings()
 
-        self.after(200, self.refresh)
-        self.after(2200, self.auto_refresh)
+        self._last_feed_signature = ""
+        self._last_raw_signature = ""
+        self._last_refresh_ts = 0.0
+        self._open_row_expiry_ts: dict[str, float] = {}
+        self._open_row_opened_ts: dict[str, float] = {}
+        self._open_row_pnl_usd: dict[str, float] = {}
+        self._open_ttl_col_idx = -1
+        self._open_pnl_hour_col_idx = -1
+        self.after(GUI_INITIAL_REFRESH_DELAY_MS, self.refresh)
+        self.after(GUI_REFRESH_INTERVAL_MS, self.auto_refresh)
+        self.after(GUI_UI_TICK_MS, self._ui_tick)
         self._live_wallet_eth = 0.0
         self._live_wallet_usd = 0.0
         self._live_wallet_last_ts = 0.0
@@ -892,19 +1063,25 @@ class App(tk.Tk):
     def _configure_theme(self) -> None:
         style = ttk.Style(self)
         style.theme_use("clam")
-        style.configure(".", background="#0b1220", foreground="#dbeafe", fieldbackground="#0f172a")
-        style.configure("Card.TFrame", background="#111827")
-        style.configure("Header.TFrame", background="#0f172a")
-        style.configure("Title.TLabel", font=("Segoe UI Semibold", 16), foreground="#f8fafc", background="#0f172a")
-        style.configure("Hint.TLabel", font=("Segoe UI", 9), foreground="#93c5fd", background="#0f172a")
-        style.configure("Status.TLabel", font=("Segoe UI", 10), foreground="#86efac", background="#0f172a")
-        style.configure("TLabel", font=("Segoe UI", 10))
-        style.configure("TButton", font=("Segoe UI Semibold", 10), padding=8)
+        style.configure(".", background="#080f1f", foreground="#dbe7ff", fieldbackground="#0d172d")
+        style.configure("Card.TFrame", background="#0d172d", borderwidth=1, relief="solid")
+        style.configure("Header.TFrame", background="#0a1326")
+        style.configure("Title.TLabel", font=(UI_FONT_MAIN, 18, "bold"), foreground="#f8fafc", background="#0f172a")
+        style.configure("Hint.TLabel", font=(UI_FONT_MAIN, 9), foreground="#8eb0e8", background="#0a1326")
+        style.configure("Status.TLabel", font=(UI_FONT_MAIN, 10, "bold"), foreground="#8df0b7", background="#0a1326")
+        style.configure("TLabel", font=(UI_FONT_MAIN, 10))
+        style.configure("TButton", font=(UI_FONT_MAIN, 10, "bold"), padding=9, borderwidth=1)
+        style.map("TButton", background=[("active", "#15325f"), ("pressed", "#0f2749")], foreground=[("active", "#f8fafc")])
+        style.configure("Accent.TButton", font=(UI_FONT_MAIN, 10, "bold"), padding=9, borderwidth=1, background="#14532d", foreground="#eafff1")
+        style.map("Accent.TButton", background=[("active", "#166534"), ("pressed", "#14532d")], foreground=[("active", "#f0fdf4")])
+        style.configure("KPI.TFrame", background="#0a1933")
+        style.configure("KPILabel.TLabel", font=(UI_FONT_MAIN, 9), foreground="#93a4c6", background="#0a1933")
+        style.configure("KPIValue.TLabel", font=(UI_FONT_MAIN, 13, "bold"), foreground="#e6efff", background="#0a1933")
         style.configure("TEntry", padding=6)
         style.configure(
             "TCombobox",
-            fieldbackground="#0f172a",
-            background="#0f172a",
+            fieldbackground="#0d172d",
+            background="#0d172d",
             foreground="#e5e7eb",
             arrowcolor="#93c5fd",
         )
@@ -915,23 +1092,24 @@ class App(tk.Tk):
             selectbackground=[("readonly", "#1e293b")],
             selectforeground=[("readonly", "#f8fafc")],
         )
-        style.configure("TNotebook", background="#0b1220", borderwidth=0)
-        style.configure("TNotebook.Tab", background="#1f2937", foreground="#d1d5db", padding=(12, 8))
-        style.map("TNotebook.Tab", background=[("selected", "#111827")], foreground=[("selected", "#f8fafc")])
+        style.configure("TNotebook", background="#080f1f", borderwidth=0)
+        style.configure("TNotebook.Tab", background="#152238", foreground="#b7c7e8", padding=(14, 10), font=(UI_FONT_MAIN, 10, "bold"))
+        style.map("TNotebook.Tab", background=[("selected", "#0d172d")], foreground=[("selected", "#f8fafc")])
         style.configure(
             "Treeview",
-            background="#0f172a",
-            fieldbackground="#0f172a",
+            background="#0b1428",
+            fieldbackground="#0b1428",
             foreground="#e5e7eb",
             borderwidth=0,
-            rowheight=26,
+            rowheight=32,
+            font=(UI_FONT_MAIN, 10),
         )
         style.configure(
             "Treeview.Heading",
-            background="#1f2937",
-            foreground="#bfdbfe",
+            background="#14243f",
+            foreground="#bfd9ff",
             borderwidth=0,
-            font=("Segoe UI Semibold", 10),
+            font=(UI_FONT_MAIN, 10, "bold"),
         )
         style.map(
             "Treeview",
@@ -945,14 +1123,20 @@ class App(tk.Tk):
 
         left = ttk.Frame(hdr, style="Header.TFrame")
         left.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Label(left, text="Панель управления Base Bot", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(left, text="Base Bot Control Center", style="Title.TLabel").pack(anchor="w")
         ttk.Label(left, textvariable=self.hint_var, style="Hint.TLabel").pack(anchor="w", pady=(3, 0))
         ttk.Label(left, textvariable=self.status_var, style="Status.TLabel").pack(anchor="w", pady=(6, 0))
+        ttk.Label(left, textvariable=self.refresh_meta_var, style="Hint.TLabel").pack(anchor="w", pady=(2, 0))
+        metrics = ttk.Frame(left, style="Header.TFrame")
+        metrics.pack(anchor="w", pady=(6, 0), fill=tk.X)
+        ttk.Label(metrics, textvariable=self.header_limits_var, style="Hint.TLabel").pack(anchor="w")
+        self.health_label = ttk.Label(metrics, textvariable=self.header_health_var, style="Hint.TLabel")
+        self.health_label.pack(anchor="w", pady=(2, 0))
 
         right = ttk.Frame(hdr, style="Header.TFrame")
         right.pack(side=tk.RIGHT)
-        ttk.Button(right, text="Старт", command=self.on_start).pack(side=tk.LEFT, padx=4)
-        ttk.Button(right, text="Стоп", command=self.on_stop).pack(side=tk.LEFT, padx=4)
+        ttk.Button(right, text="Start", command=self.on_start, style="Accent.TButton").pack(side=tk.LEFT, padx=4)
+        ttk.Button(right, text="Stop", command=self.on_stop).pack(side=tk.LEFT, padx=4)
         ttk.Separator(right, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
         ttk.Label(right, text="Matrix").pack(side=tk.LEFT, padx=(0, 3))
         ttk.Combobox(
@@ -962,15 +1146,16 @@ class App(tk.Tk):
             textvariable=self.matrix_count_var,
             values=("2", "3", "4"),
         ).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(right, text="Matrix Start", command=self.on_matrix_start).pack(side=tk.LEFT, padx=4)
+        ttk.Button(right, text="Matrix Start", command=self.on_matrix_start, style="Accent.TButton").pack(side=tk.LEFT, padx=4)
         ttk.Button(right, text="Matrix Stop", command=self.on_matrix_stop).pack(side=tk.LEFT, padx=4)
-        ttk.Button(right, text="Matrix Сводка", command=self.on_matrix_summary).pack(side=tk.LEFT, padx=4)
-        ttk.Button(right, text="Сохранить", command=self._save_settings).pack(side=tk.LEFT, padx=4)
-        ttk.Button(right, text="Сохранить + Рестарт", command=self._save_restart).pack(side=tk.LEFT, padx=4)
-        ttk.Button(right, text="Рестарт", command=self.on_restart).pack(side=tk.LEFT, padx=4)
-        ttk.Button(right, text="Перечитать .env", command=self.on_reload_env).pack(side=tk.LEFT, padx=4)
-        ttk.Button(right, text="Очистить логи", command=self.on_clear_logs).pack(side=tk.LEFT, padx=4)
-        ttk.Button(right, text="Обновить", command=self.refresh).pack(side=tk.LEFT, padx=4)
+        ttk.Button(right, text="Matrix Summary", command=self.on_matrix_summary).pack(side=tk.LEFT, padx=4)
+        ttk.Button(right, text="Session Snapshot", command=self.on_session_snapshot).pack(side=tk.LEFT, padx=4)
+        ttk.Button(right, text="Save", command=self._save_settings).pack(side=tk.LEFT, padx=4)
+        ttk.Button(right, text="Save + Restart", command=self._save_restart).pack(side=tk.LEFT, padx=4)
+        ttk.Button(right, text="Restart", command=self.on_restart).pack(side=tk.LEFT, padx=4)
+        ttk.Button(right, text="Reload .env", command=self.on_reload_env).pack(side=tk.LEFT, padx=4)
+        ttk.Button(right, text="Clear Logs", command=self.on_clear_logs).pack(side=tk.LEFT, padx=4)
+        ttk.Button(right, text="Refresh", command=self.refresh).pack(side=tk.LEFT, padx=4)
 
     def _build_tabs(self) -> None:
         self.tabs = ttk.Notebook(self)
@@ -982,12 +1167,12 @@ class App(tk.Tk):
         self.positions_tab = ttk.Frame(self.tabs, style="Card.TFrame", padding=12)
         self.settings_tab = ttk.Frame(self.tabs, style="Card.TFrame", padding=12)
         self.emergency_tab = ttk.Frame(self.tabs, style="Card.TFrame", padding=12)
-        self.tabs.add(self.activity_tab, text="Активность")
-        self.tabs.add(self.signals_tab, text="Сигналы")
-        self.tabs.add(self.wallet_tab, text="Кошелек")
-        self.tabs.add(self.positions_tab, text="Сделки")
-        self.tabs.add(self.settings_tab, text="Настройки")
-        self.tabs.add(self.emergency_tab, text="Аварийный")
+        self.tabs.add(self.activity_tab, text="Activity")
+        self.tabs.add(self.signals_tab, text="Signals")
+        self.tabs.add(self.wallet_tab, text="Wallet")
+        self.tabs.add(self.positions_tab, text="Trades")
+        self.tabs.add(self.settings_tab, text="Settings")
+        self.tabs.add(self.emergency_tab, text="Emergency")
 
         self._build_activity_tab()
         self._build_signals_tab()
@@ -1008,12 +1193,12 @@ class App(tk.Tk):
         ttk.Label(left_card, text="Лента сигналов и сделок", font=("Segoe UI Semibold", 12)).pack(anchor="w", pady=(0, 8))
         self.feed_text = tk.Text(
             left_card,
-            bg="#0b1220",
+            bg="#091224",
             fg="#e5e7eb",
             insertbackground="#e5e7eb",
             relief=tk.FLAT,
             wrap="word",
-            font=("Consolas", 10),
+            font=(UI_FONT_MONO, 10),
         )
         self.feed_text.pack(fill=tk.BOTH, expand=True)
         self._attach_text_copy_support(self.feed_text)
@@ -1039,12 +1224,12 @@ class App(tk.Tk):
         ttk.Label(right_card, text="Сырые runtime-логи", font=("Segoe UI Semibold", 12)).pack(anchor="w", pady=(0, 8))
         self.raw_text = tk.Text(
             right_card,
-            bg="#0b1220",
+            bg="#091224",
             fg="#cbd5e1",
             insertbackground="#e5e7eb",
             relief=tk.FLAT,
             wrap="none",
-            font=("Consolas", 9),
+            font=(UI_FONT_MONO, 9),
         )
         self.raw_text.pack(fill=tk.BOTH, expand=True)
         self._attach_text_copy_support(self.raw_text)
@@ -1083,6 +1268,8 @@ class App(tk.Tk):
             self.signals_tree.heading(col, text=title)
             self.signals_tree.column(col, width=width, anchor="center")
         self.signals_tree.pack(fill=tk.BOTH, expand=True)
+        self.signals_tree.tag_configure("row_even", background="#0b1428")
+        self.signals_tree.tag_configure("row_odd", background="#0d1a31")
 
     def _build_settings_tab(self) -> None:
         shell = ttk.Frame(self.settings_tab, style="Card.TFrame")
@@ -1268,12 +1455,12 @@ class App(tk.Tk):
 
         self.critical_text = tk.Text(
             self.emergency_tab,
-            bg="#0b1220",
+            bg="#091224",
             fg="#fecaca",
             insertbackground="#fecaca",
             relief=tk.FLAT,
             wrap="word",
-            font=("Consolas", 10),
+            font=(UI_FONT_MONO, 10),
         )
         self.critical_text.pack(fill=tk.BOTH, expand=True)
         self._attach_text_copy_support(self.critical_text)
@@ -1304,8 +1491,34 @@ class App(tk.Tk):
         top = ttk.Frame(self.positions_tab, style="Card.TFrame")
         top.pack(fill=tk.X, pady=(0, 10))
         self.pos_summary_var = tk.StringVar(value="Пока нет данных по сделкам.")
-        ttk.Label(top, text="Монитор бумажных сделок", font=("Segoe UI Semibold", 12)).pack(anchor="w")
+        self.positions_title_var = tk.StringVar(value="Монитор сделок")
+        ttk.Label(top, textvariable=self.positions_title_var, font=("Segoe UI Semibold", 12)).pack(anchor="w")
         ttk.Label(top, textvariable=self.pos_summary_var, foreground="#93c5fd").pack(anchor="w", pady=(4, 0))
+        self.untracked_summary_var = tk.StringVar(value="")
+        ttk.Label(top, textvariable=self.untracked_summary_var, foreground="#fcd34d").pack(anchor="w", pady=(2, 0))
+        kpi = ttk.Frame(top, style="Card.TFrame")
+        kpi.pack(fill=tk.X, pady=(8, 4))
+        for idx in range(6):
+            kpi.columnconfigure(idx, weight=1)
+        self.kpi_open_var = tk.StringVar(value="0")
+        self.kpi_closed_var = tk.StringVar(value="0")
+        self.kpi_winrate_var = tk.StringVar(value="0%")
+        self.kpi_pnl_var = tk.StringVar(value="$+0.00")
+        self.kpi_pnl_1h_var = tk.StringVar(value="$+0.00")
+        self.kpi_updated_var = tk.StringVar(value="--:--:--")
+        cards = (
+            ("Open", self.kpi_open_var),
+            ("Closed", self.kpi_closed_var),
+            ("Winrate", self.kpi_winrate_var),
+            ("Realized PnL", self.kpi_pnl_var),
+            ("PnL 1h", self.kpi_pnl_1h_var),
+            ("Updated", self.kpi_updated_var),
+        )
+        for idx, (title, var) in enumerate(cards):
+            card = ttk.Frame(kpi, style="KPI.TFrame", padding=(10, 8))
+            card.grid(row=0, column=idx, sticky="nsew", padx=(0 if idx == 0 else 6, 0))
+            ttk.Label(card, text=title, style="KPILabel.TLabel").pack(anchor="w")
+            ttk.Label(card, textvariable=var, style="KPIValue.TLabel").pack(anchor="w", pady=(3, 0))
         actions = ttk.Frame(top, style="Card.TFrame")
         actions.pack(anchor="w", pady=(8, 0))
         ttk.Label(actions, text="Источник:").pack(side=tk.LEFT)
@@ -1320,6 +1533,14 @@ class App(tk.Tk):
         self.positions_source_combo.bind("<<ComboboxSelected>>", lambda _e: self.refresh())
         ttk.Button(actions, text="Удалить старые закрытые", command=self.on_prune_closed_trades).pack(side=tk.LEFT)
         ttk.Button(actions, text="Очистить все закрытые", command=self.on_clear_closed_trades).pack(side=tk.LEFT, padx=8)
+        idle = ttk.Frame(top, style="Card.TFrame")
+        idle.pack(fill=tk.X, pady=(8, 0))
+        ttk.Label(idle, text="Причины простоя (15м)", font=("Segoe UI Semibold", 11)).pack(anchor="w")
+        self.idle_reasons_var = tk.StringVar(value="--")
+        ttk.Label(idle, textvariable=self.idle_reasons_var, foreground="#fcd34d").pack(anchor="w", pady=(4, 0))
+        ttk.Label(idle, text="Блок после pass (live 15м)", font=("Segoe UI Semibold", 10)).pack(anchor="w", pady=(6, 0))
+        self.live_block_reasons_var = tk.StringVar(value="--")
+        ttk.Label(idle, textvariable=self.live_block_reasons_var, foreground="#fda4af").pack(anchor="w", pady=(2, 0))
 
         panels = ttk.Frame(self.positions_tab, style="Card.TFrame")
         panels.pack(fill=tk.BOTH, expand=True)
@@ -1332,7 +1553,7 @@ class App(tk.Tk):
         ttk.Label(left, text="Открытые позиции", font=("Segoe UI Semibold", 11)).pack(anchor="w", pady=(0, 6))
         self.open_tree = ttk.Treeview(
             left,
-            columns=("symbol", "entry", "size", "score", "ttl"),
+            columns=("symbol", "entry", "size", "score", "opened", "pnl_pct", "pnl_usd", "pnl_hour", "peak_pct", "ttl"),
             show="headings",
             height=14,
         )
@@ -1341,30 +1562,59 @@ class App(tk.Tk):
             ("entry", "Вход $", 120),
             ("size", "Размер $", 90),
             ("score", "Скор", 80),
+            ("opened", "Opened", 130),
             ("ttl", "Осталось (сек)", 120),
         ):
             self.open_tree.heading(col, text=title)
             self.open_tree.column(col, width=width, anchor="center")
+        self.open_tree.heading("pnl_pct", text="PnL %")
+        self.open_tree.heading("pnl_usd", text="PnL $")
+        self.open_tree.heading("pnl_hour", text="PnL/hour $")
+        self.open_tree.heading("peak_pct", text="Peak %")
+        self.open_tree.column("pnl_pct", width=80, anchor="center")
+        self.open_tree.column("pnl_usd", width=80, anchor="center")
+        self.open_tree.column("pnl_hour", width=95, anchor="center")
+        self.open_tree.column("peak_pct", width=80, anchor="center")
+        try:
+            open_columns = list(self.open_tree["columns"])
+            self._open_ttl_col_idx = open_columns.index("ttl")
+            self._open_pnl_hour_col_idx = open_columns.index("pnl_hour")
+        except Exception:
+            self._open_ttl_col_idx = -1
+            self._open_pnl_hour_col_idx = -1
         self.open_tree.pack(fill=tk.BOTH, expand=True)
+        self.open_tree.tag_configure("row_even", background="#0b1428")
+        self.open_tree.tag_configure("row_odd", background="#0d1a31")
+        self.open_tree.tag_configure("open_pos", foreground="#86efac")
+        self.open_tree.tag_configure("open_neg", foreground="#fda4af")
+        self.open_tree.tag_configure("open_flat", foreground="#bfdbfe")
+        self.open_tree.tag_configure("open_untracked", foreground="#fcd34d")
 
         right = ttk.Frame(panels, style="Card.TFrame")
         right.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
         ttk.Label(right, text="Закрытые позиции", font=("Segoe UI Semibold", 11)).pack(anchor="w", pady=(0, 6))
         self.closed_tree = ttk.Treeview(
             right,
-            columns=("symbol", "reason", "pnl_pct", "pnl_usd"),
+            columns=("symbol", "reason", "opened", "closed", "pnl_pct", "pnl_usd"),
             show="headings",
             height=14,
         )
         for col, title, width in (
             ("symbol", "Символ", 110),
             ("reason", "Выход", 90),
+            ("opened", "Opened", 130),
+            ("closed", "Closed", 130),
             ("pnl_pct", "PnL %", 90),
             ("pnl_usd", "PnL $", 90),
         ):
             self.closed_tree.heading(col, text=title)
             self.closed_tree.column(col, width=width, anchor="center")
         self.closed_tree.pack(fill=tk.BOTH, expand=True)
+        self.closed_tree.tag_configure("row_even", background="#0b1428")
+        self.closed_tree.tag_configure("row_odd", background="#0d1a31")
+        self.closed_tree.tag_configure("closed_pos", foreground="#86efac")
+        self.closed_tree.tag_configure("closed_neg", foreground="#fda4af")
+        self.closed_tree.tag_configure("closed_flat", foreground="#bfdbfe")
 
     @staticmethod
     def _to_float(raw: str | None, default: float) -> float:
@@ -1375,13 +1625,43 @@ class App(tk.Tk):
         except (TypeError, ValueError):
             return default
 
+    @staticmethod
+    def _safe_float(raw: object, default: float = 0.0) -> float:
+        try:
+            value = float(raw)
+            if not math.isfinite(value):
+                return default
+            return value
+        except Exception:
+            return default
+
+    @staticmethod
+    def _parse_iso_ts(raw: object) -> datetime | None:
+        text = str(raw or "").strip()
+        if not text:
+            return None
+        try:
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            return None
+
+    @classmethod
+    def _format_local_ts(cls, raw: object) -> str:
+        dt = cls._parse_iso_ts(raw)
+        if dt is None:
+            return "--"
+        return dt.astimezone().strftime("%m-%d %H:%M:%S")
+
     def _effective_wallet_balance(self, preset: dict[str, str]) -> float:
         if "WALLET_BALANCE_USD" in preset:
             return max(0.1, self._to_float(preset.get("WALLET_BALANCE_USD"), 2.75))
         env_value = self.env_vars.get("WALLET_BALANCE_USD")
         if env_value and env_value.get().strip():
             return max(0.1, self._to_float(env_value.get(), 2.75))
-        env_map = read_env_map()
+        env_map = read_runtime_env_map()
         return max(0.1, self._to_float(env_map.get("WALLET_BALANCE_USD"), 2.75))
 
     def _adapt_preset_by_balance(self, preset: dict[str, str]) -> tuple[dict[str, str], float, str]:
@@ -1433,7 +1713,7 @@ class App(tk.Tk):
             else:
                 extra_env_values[key] = value
         if extra_env_values:
-            save_env_map(extra_env_values)
+            save_runtime_env_map(extra_env_values)
         if hasattr(self, "hint_var"):
             self.hint_var.set(f"Preset auto-tuned for balance ${balance:.2f} ({profile}).")
 
@@ -1621,6 +1901,21 @@ class App(tk.Tk):
                 "AUTO_FILTER_ENABLED": "true",
                 "AUTO_TRADE_ENTRY_MODE": "top_n",
                 "AUTO_TRADE_TOP_N": "3",
+                "AUTONOMOUS_CONTROL_ENABLED": "true",
+                "AUTONOMOUS_CONTROL_MODE": "apply",
+                "AUTONOMOUS_CONTROL_INTERVAL_SECONDS": "300",
+                "AUTONOMOUS_CONTROL_MIN_WINDOW_CYCLES": "2",
+                "AUTONOMOUS_CONTROL_TARGET_CANDIDATES_MIN": "1.2",
+                "AUTONOMOUS_CONTROL_TARGET_CANDIDATES_HIGH": "5.0",
+                "AUTONOMOUS_CONTROL_TARGET_OPENED_MIN": "0.12",
+                "AUTONOMOUS_CONTROL_NEG_REALIZED_TRIGGER_USD": "0.05",
+                "AUTONOMOUS_CONTROL_POS_REALIZED_TRIGGER_USD": "0.05",
+                "AUTONOMOUS_CONTROL_MAX_OPEN_TRADES_MIN": "1",
+                "AUTONOMOUS_CONTROL_MAX_OPEN_TRADES_MAX": "3",
+                "AUTONOMOUS_CONTROL_TOP_N_MIN": "2",
+                "AUTONOMOUS_CONTROL_TOP_N_MAX": "8",
+                "AUTONOMOUS_CONTROL_MAX_BUYS_PER_HOUR_MIN": "12",
+                "AUTONOMOUS_CONTROL_MAX_BUYS_PER_HOUR_MAX": "36",
                 "MAX_TRADES_PER_HOUR": "6",
                 "MAX_BUY_AMOUNT": "0.00025",
                 "MIN_TOKEN_SCORE": "70",
@@ -1675,6 +1970,21 @@ class App(tk.Tk):
                 "AUTO_FILTER_ENABLED": "true",
                 "AUTO_TRADE_ENTRY_MODE": "top_n",
                 "AUTO_TRADE_TOP_N": "3",
+                "AUTONOMOUS_CONTROL_ENABLED": "true",
+                "AUTONOMOUS_CONTROL_MODE": "apply",
+                "AUTONOMOUS_CONTROL_INTERVAL_SECONDS": "240",
+                "AUTONOMOUS_CONTROL_MIN_WINDOW_CYCLES": "2",
+                "AUTONOMOUS_CONTROL_TARGET_CANDIDATES_MIN": "1.5",
+                "AUTONOMOUS_CONTROL_TARGET_CANDIDATES_HIGH": "6.5",
+                "AUTONOMOUS_CONTROL_TARGET_OPENED_MIN": "0.15",
+                "AUTONOMOUS_CONTROL_NEG_REALIZED_TRIGGER_USD": "0.06",
+                "AUTONOMOUS_CONTROL_POS_REALIZED_TRIGGER_USD": "0.06",
+                "AUTONOMOUS_CONTROL_MAX_OPEN_TRADES_MIN": "1",
+                "AUTONOMOUS_CONTROL_MAX_OPEN_TRADES_MAX": "4",
+                "AUTONOMOUS_CONTROL_TOP_N_MIN": "2",
+                "AUTONOMOUS_CONTROL_TOP_N_MAX": "10",
+                "AUTONOMOUS_CONTROL_MAX_BUYS_PER_HOUR_MIN": "12",
+                "AUTONOMOUS_CONTROL_MAX_BUYS_PER_HOUR_MAX": "48",
                 "MAX_TRADES_PER_HOUR": "5",
                 "MAX_BUY_AMOUNT": "0.00035",
                 "MIN_TOKEN_SCORE": "72",
@@ -1780,7 +2090,7 @@ class App(tk.Tk):
             self.hint_var.set("Live Wallet preset applied (live profile + paper execution until live executor is enabled).")
 
     def _apply_ultra_safe_live_preset(self) -> None:
-        env_map = read_env_map()
+        env_map = read_runtime_env_map()
 
         # Prefer the most recent on-chain poll (non-blocking). If not available yet, fall back to .env value.
         live_eth = 0.0
@@ -1871,7 +2181,7 @@ class App(tk.Tk):
         }
 
         # Keep GUI and .env in sync.
-        save_env_map(preset)
+        save_runtime_env_map(preset)
         for k, v in preset.items():
             if k in self.env_vars:
                 self.env_vars[k].set(v)
@@ -1886,7 +2196,7 @@ class App(tk.Tk):
 
     def _apply_working_live_preset(self) -> None:
         # "Working" profile: keeps core safety checks but allows more entries than Ultra Safe.
-        env_map = read_env_map()
+        env_map = read_runtime_env_map()
         live_usd = self._to_float(env_map.get(LIVE_WALLET_BALANCE_KEY), 0.0)
         reserve_usd = self._to_float(env_map.get("AUTO_STOP_MIN_AVAILABLE_USD"), 0.25)
         tradable_usd = max(0.0, live_usd - reserve_usd)
@@ -1940,7 +2250,7 @@ class App(tk.Tk):
             "DEX_BOOSTS_SOURCE_ENABLED": "false",
         }
 
-        save_env_map(preset)
+        save_runtime_env_map(preset)
         for k, v in preset.items():
             if k in self.env_vars:
                 self.env_vars[k].set(v)
@@ -1951,7 +2261,7 @@ class App(tk.Tk):
             self.hint_var.set("Working Live applied. Safer core checks kept, entry flow widened moderately.")
 
     def _load_settings(self) -> None:
-        env_map = read_env_map()
+        env_map = read_runtime_env_map()
         for key, _ in SETTINGS_FIELDS:
             self.env_vars[key].set(env_map.get(key, ""))
         if hasattr(self, "wallet_mode_var"):
@@ -1974,7 +2284,7 @@ class App(tk.Tk):
         elif mode == "paper":
             values["AUTO_TRADE_PAPER"] = "true"
         try:
-            save_env_map(values)
+            save_runtime_env_map(values)
         except Exception as exc:
             messagebox.showerror("Ошибка сохранения", str(exc))
             return
@@ -1985,9 +2295,23 @@ class App(tk.Tk):
         self.on_restart()
 
     def refresh(self) -> None:
+        self._last_refresh_ts = time.time()
         self._refresh_positions_source_options()
         pid = read_pid()
+        single_alive = bool(pid and is_main_local_process(pid))
+        if not single_alive:
+            # Self-heal stale/missing bot.pid after manual restarts outside GUI.
+            live_pids = sorted(set(list_main_local_pids()))
+            if live_pids:
+                pid = int(live_pids[0])
+                try:
+                    with open(PID_FILE, "w", encoding="ascii") as f:
+                        f.write(str(pid))
+                except Exception:
+                    pass
+                single_alive = bool(is_main_local_process(pid))
         matrix_alive = 0
+        alive_ids: list[str] = []
         meta = read_matrix_meta()
         items = meta.get("items")
         if isinstance(items, list):
@@ -1998,22 +2322,29 @@ class App(tk.Tk):
                     p = int(row.get("pid", 0) or 0)
                 except Exception:
                     p = 0
-                if p > 0 and is_running(p):
+                if p > 0 and is_main_local_process(p):
                     matrix_alive += 1
-        if pid and is_running(pid):
+                    alive_ids.append(str(row.get("id", "") or "").strip())
+
+        if (not single_alive) and matrix_alive > 0 and str(self.positions_source_var.get() or "single") == "single":
+            first = next((x for x in alive_ids if x), "")
+            if first:
+                self.positions_source_var.set(first)
+
+        if single_alive:
             if matrix_alive > 0:
-                self.status_var.set(f"Статус: ЗАПУЩЕН (PID {pid}) | Matrix alive: {matrix_alive}")
+                self.status_var.set(f"Status: RUNNING (PID {pid}) | Matrix alive: {matrix_alive}")
             else:
-                self.status_var.set(f"Статус: ЗАПУЩЕН (PID {pid})")
+                self.status_var.set(f"Status: RUNNING (PID {pid})")
         else:
             if matrix_alive > 0:
-                self.status_var.set(f"Статус: Matrix mode ({matrix_alive} instance)")
+                self.status_var.set(f"Status: MATRIX MODE ({matrix_alive} instance)")
             else:
-                self.status_var.set("Статус: ОСТАНОВЛЕН")
+                self.status_var.set("Status: STOPPED")
 
         log_paths: list[str] = []
-        if pid and is_running(pid):
-            log_paths = [APP_LOG]
+        if single_alive:
+            log_paths = self._runtime_log_paths_for_signals()
         elif matrix_alive > 0:
             if isinstance(items, list):
                 for row in items:
@@ -2039,7 +2370,9 @@ class App(tk.Tk):
         for path in log_paths:
             app_lines.extend(read_tail(path, 140))
         events = parse_activity(app_lines)
-        if not self._text_has_active_selection(self.feed_text):
+        feed_signature = "\n".join(f"{lvl}|{ln}" for lvl, ln in events[-180:])
+        if feed_signature != self._last_feed_signature and (not self._text_has_active_selection(self.feed_text)):
+            self._last_feed_signature = feed_signature
             self.feed_text.delete("1.0", tk.END)
             if not events:
                 self.feed_text.insert(tk.END, "Пока нет активности. Запусти бота и дождись цикла сканирования.\n", ("INFO",))
@@ -2062,17 +2395,24 @@ class App(tk.Tk):
                 combined.append(f"===== {label} LOG (clean) =====")
                 combined.extend(lines[-120:] or ["<empty>"])
                 combined.append("")
-        if not self._text_has_active_selection(self.raw_text):
+        raw_blob = "\n".join(combined)
+        if raw_blob != self._last_raw_signature and (not self._text_has_active_selection(self.raw_text)):
+            self._last_raw_signature = raw_blob
             self.raw_text.delete("1.0", tk.END)
-            self.raw_text.insert(tk.END, "\n".join(combined))
+            self.raw_text.insert(tk.END, raw_blob)
             self._restore_scroll(self.raw_text, raw_y, raw_bottom)
+        self._refresh_header_metrics(app_lines)
+        self._refresh_idle_reasons(app_lines)
         self._refresh_signals()
         self._refresh_wallet()
         self._refresh_positions(app_lines)
         self._refresh_emergency_tab(app_lines)
 
     def _refresh_positions_source_options(self) -> None:
-        source_map: dict[str, str] = {"single": PAPER_STATE_FILE}
+        env_map = self._runtime_env_map()
+        single_state_raw = str(env_map.get("PAPER_STATE_FILE", PAPER_STATE_FILE) or "").strip() or PAPER_STATE_FILE
+        single_state_abs = single_state_raw if os.path.isabs(single_state_raw) else os.path.join(PROJECT_ROOT, single_state_raw)
+        source_map: dict[str, str] = {"single": single_state_abs}
         meta = read_matrix_meta()
         items = meta.get("items")
         if isinstance(items, list):
@@ -2098,9 +2438,249 @@ class App(tk.Tk):
         key = str(self.positions_source_var.get() or "single")
         return str(self.positions_source_map.get(key, PAPER_STATE_FILE))
 
+    def _runtime_state_file(self) -> str:
+        env_map = read_runtime_env_map()
+        raw = str(env_map.get("PAPER_STATE_FILE", PAPER_STATE_FILE) or "").strip() or PAPER_STATE_FILE
+        return raw if os.path.isabs(raw) else os.path.join(PROJECT_ROOT, raw)
+
+    def _matrix_items(self) -> list[dict]:
+        meta = read_matrix_meta()
+        items = meta.get("items")
+        if not isinstance(items, list):
+            return []
+        return [row for row in items if isinstance(row, dict)]
+
+    def _selected_matrix_item(self) -> dict | None:
+        selected = str(self.positions_source_var.get() or "single").strip()
+        if selected and selected != "single":
+            for row in self._matrix_items():
+                if str(row.get("id", "")).strip() == selected:
+                    return row
+        return None
+
+    def _runtime_env_map(self) -> dict[str, str]:
+        item = self._selected_matrix_item()
+        if isinstance(item, dict):
+            env_file = str(item.get("env_file", "") or "").strip()
+            if env_file:
+                env_abs = env_file if os.path.isabs(env_file) else os.path.join(PROJECT_ROOT, env_file)
+                env_map = read_env_map_from(env_abs)
+                if env_map:
+                    return env_map
+        return read_runtime_env_map()
+
+    def _selected_signals_file(self) -> tuple[str, str]:
+        item = self._selected_matrix_item()
+        if isinstance(item, dict):
+            inst = str(item.get("id", "matrix")).strip() or "matrix"
+            log_dir = str(item.get("log_dir", "") or "").strip()
+            if log_dir:
+                abs_dir = log_dir if os.path.isabs(log_dir) else os.path.join(PROJECT_ROOT, log_dir)
+                return inst, os.path.join(abs_dir, "local_alerts.jsonl")
+        env_map = self._runtime_env_map()
+        raw_log_dir = str(env_map.get("LOG_DIR", LOG_DIR) or "").strip() or LOG_DIR
+        abs_log_dir = raw_log_dir if os.path.isabs(raw_log_dir) else os.path.join(PROJECT_ROOT, raw_log_dir)
+        return "single", os.path.join(abs_log_dir, "local_alerts.jsonl")
+
+    def _runtime_log_paths_for_signals(self) -> list[str]:
+        item = self._selected_matrix_item()
+        if not isinstance(item, dict):
+            env_map = self._runtime_env_map()
+            raw_log_dir = str(env_map.get("LOG_DIR", LOG_DIR) or "").strip() or LOG_DIR
+            abs_log_dir = raw_log_dir if os.path.isabs(raw_log_dir) else os.path.join(PROJECT_ROOT, raw_log_dir)
+            paths: list[str] = []
+            latest = latest_session_log(abs_log_dir)
+            if latest:
+                paths.append(latest)
+            for name in ("app.log", "out.log"):
+                p = os.path.join(abs_log_dir, name)
+                if os.path.exists(p):
+                    paths.append(p)
+            if not paths:
+                paths.append(APP_LOG)
+            return paths
+        paths: list[str] = []
+        log_dir = str(item.get("log_dir", "") or "").strip()
+        if log_dir:
+            abs_dir = log_dir if os.path.isabs(log_dir) else os.path.join(PROJECT_ROOT, log_dir)
+            latest = latest_session_log(abs_dir)
+            if latest:
+                paths.append(latest)
+            for name in ("app.log", "out.log"):
+                p = os.path.join(abs_dir, name)
+                if os.path.exists(p):
+                    paths.append(p)
+        if not paths:
+            paths.append(APP_LOG)
+        return paths
+
+    def _resolve_candidates_log_path(self) -> str:
+        item = self._selected_matrix_item()
+        if isinstance(item, dict):
+            log_dir = str(item.get("log_dir", "") or "").strip()
+            if log_dir:
+                abs_dir = log_dir if os.path.isabs(log_dir) else os.path.join(PROJECT_ROOT, log_dir)
+                return os.path.join(abs_dir, "candidates.jsonl")
+        env_map = self._runtime_env_map()
+        raw = str(env_map.get("CANDIDATE_DECISIONS_LOG_FILE", "") or "").strip()
+        if not raw:
+            raw = CANDIDATE_DECISIONS_LOG_FILE
+        if os.path.isabs(raw):
+            return raw
+        return os.path.join(PROJECT_ROOT, raw)
+
+    def _read_candidate_rows_window(self, window_seconds: int, max_bytes: int = 2_000_000) -> list[dict]:
+        path = self._resolve_candidates_log_path()
+        blob = read_tail_bytes(path, max_bytes)
+        if not blob:
+            return []
+        rows: list[dict] = []
+        now_ts = time.time()
+        cutoff = now_ts - max(0, int(window_seconds))
+        for line in blob.splitlines():
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(row, dict):
+                continue
+            ts_raw = row.get("ts")
+            ts = _parse_ts(ts_raw)
+            if ts is not None and ts < cutoff:
+                continue
+            rows.append(row)
+        return rows
+
     @staticmethod
-    def _kill_switch_path() -> str:
-        env_map = read_env_map()
+    def _count_entries_since(state: dict, since_ts: float) -> int:
+        open_rows = state.get("open_positions", []) or []
+        closed_rows = state.get("closed_positions", []) or []
+        if not isinstance(open_rows, list):
+            open_rows = []
+        if not isinstance(closed_rows, list):
+            closed_rows = []
+        count = 0
+        for row in open_rows:
+            if not isinstance(row, dict):
+                continue
+            ts = _parse_ts(row.get("opened_at"))
+            if ts is not None and ts >= since_ts:
+                count += 1
+        for row in closed_rows:
+            if not isinstance(row, dict):
+                continue
+            ts = _parse_ts(row.get("opened_at"))
+            if ts is not None and ts >= since_ts:
+                count += 1
+        return count
+
+    @staticmethod
+    def _count_exits_since(state: dict, since_ts: float) -> int:
+        closed_rows = state.get("closed_positions", []) or []
+        if not isinstance(closed_rows, list):
+            closed_rows = []
+        count = 0
+        for row in closed_rows:
+            if not isinstance(row, dict):
+                continue
+            ts = _parse_ts(row.get("closed_at"))
+            if ts is not None and ts >= since_ts:
+                count += 1
+        return count
+
+    @staticmethod
+    def _extract_policy_state(app_lines: list[str]) -> str:
+        policy = ""
+        for line in app_lines:
+            if "DATA_POLICY mode=" in line:
+                policy = line
+        if policy:
+            try:
+                part = policy.split("DATA_POLICY mode=", 1)[1]
+                mode = part.split(" ", 1)[0].strip().upper()
+                return mode or "UNKNOWN"
+            except Exception:
+                pass
+        for line in app_lines[::-1]:
+            if "DATA_MODE degraded" in line:
+                return "DEGRADED"
+            if "FAIL_CLOSED" in line or "DATA_MODE fail_closed" in line:
+                return "FAIL_CLOSED"
+        return "UNKNOWN"
+
+    @staticmethod
+    def _extract_risk_governor_state(app_lines: list[str]) -> str:
+        last = ""
+        for line in app_lines:
+            if "RISK_GOVERNOR block reason=" in line:
+                last = line
+            elif "RISK_GOVERNOR pause reason=" in line:
+                last = line
+        if not last:
+            return "ok"
+        if "block reason=" in last:
+            return last.split("block reason=", 1)[1].strip()
+        if "pause reason=" in last:
+            return last.split("pause reason=", 1)[1].strip()
+        return "ok"
+
+    @staticmethod
+    def _extract_last_exception_age_seconds(app_lines: list[str]) -> float | None:
+        candidates = [line for line in app_lines if ("exception" in line.lower() or "[ERROR]" in line)]
+        if not candidates:
+            return None
+        last = candidates[-1]
+        ts = None
+        try:
+            head = last[:19].replace("T", " ")
+            dt = datetime.fromisoformat(head)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            ts = dt.timestamp()
+        except Exception:
+            ts = None
+        if ts is None:
+            return None
+        return max(0.0, time.time() - ts)
+
+    @staticmethod
+    def _estimate_latency_p95_ms(app_lines: list[str]) -> float | None:
+        vals: list[float] = []
+        for line in app_lines:
+            if "/avg=" in line and "ms" in line:
+                try:
+                    part = line.split("/avg=", 1)[1]
+                    num = part.split("ms", 1)[0]
+                    vals.append(float(num))
+                except Exception:
+                    continue
+        if not vals:
+            return None
+        vals.sort()
+        idx = int(round(0.95 * (len(vals) - 1)))
+        return vals[idx]
+
+    def _latest_candidate_age_seconds(self) -> float | None:
+        rows = self._read_candidate_rows_window(1800, max_bytes=2_000_000)
+        if not rows:
+            return None
+        ts_vals = [t for t in (_parse_ts(r.get("ts")) for r in rows) if t is not None]
+        if not ts_vals:
+            return None
+        latest = max(ts_vals)
+        return max(0.0, time.time() - float(latest))
+
+    def _stats_excluded_symbols(self) -> set[str]:
+        env_map = read_runtime_env_map()
+        raw = str(env_map.get("GUI_STATS_EXCLUDED_SYMBOLS", GUI_STATS_EXCLUDED_SYMBOLS_DEFAULT) or "").strip()
+        if not raw:
+            return set()
+        return {s.strip().upper() for s in raw.split(",") if s.strip()}
+
+    def _kill_switch_path(self) -> str:
+        env_map = read_runtime_env_map()
         raw = str(env_map.get("KILL_SWITCH_FILE", os.path.join("data", "kill.txt")) or "").strip()
         if not raw:
             raw = os.path.join("data", "kill.txt")
@@ -2135,6 +2715,192 @@ class App(tk.Tk):
                     f"KILL_SWITCH path: {kill_path}\n",
                 )
             self._restore_scroll(self.critical_text, critical_y, critical_bottom)
+
+    def _refresh_header_metrics(self, app_lines: list[str]) -> None:
+        try:
+            state = read_json(self._selected_positions_state_file())
+        except Exception:
+            state = {}
+        env_map = self._runtime_env_map()
+        open_rows = state.get("open_positions", []) or []
+        open_now = len(open_rows) if isinstance(open_rows, list) else 0
+
+        now_ts = time.time()
+        buys_1h = self._count_entries_since(state, now_ts - 3600)
+        buys_24h = self._count_entries_since(state, now_ts - 86400)
+        exits_24h = self._count_exits_since(state, now_ts - 86400)
+
+        def _limit_fmt(used: int, raw_max: str) -> str:
+            try:
+                max_val = int(float(raw_max))
+            except Exception:
+                max_val = 0
+            if max_val <= 0:
+                return f"{used}/∞"
+            return f"{used}/{max_val}"
+
+        max_buys = str(env_map.get("MAX_BUYS_PER_HOUR", "0") or "0")
+        max_tx_day = str(env_map.get("MAX_TX_PER_DAY", "0") or "0")
+        max_open = str(env_map.get("MAX_OPEN_TRADES", "0") or "0")
+
+        rows_10m = self._read_candidate_rows_window(600, max_bytes=1_000_000)
+        dedup_10m = sum(
+            1 for row in rows_10m if str(row.get("reason", "") or "").strip() == "heavy_dedup_ttl"
+        )
+        risk_state = self._extract_risk_governor_state(app_lines)
+
+        limits = (
+            f"Limits: buys/h {_limit_fmt(buys_1h, max_buys)} | "
+            f"tx/day {_limit_fmt(buys_24h + exits_24h, max_tx_day)} | "
+            f"open {_limit_fmt(open_now, max_open)} | "
+            f"dedup(10m) {dedup_10m} | risk {risk_state}"
+        )
+        if hasattr(self, "header_limits_var"):
+            self.header_limits_var.set(limits)
+
+        policy = str(state.get("data_policy_mode", "") or "").strip().upper()
+        if policy not in {"OK", "DEGRADED", "FAIL_CLOSED"}:
+            policy = self._extract_policy_state(app_lines)
+        latency_p95 = self._estimate_latency_p95_ms(app_lines)
+        exc_age = self._extract_last_exception_age_seconds(app_lines)
+        sync_delay = self._latest_candidate_age_seconds()
+
+        lat_text = f"{latency_p95:.0f}ms" if latency_p95 is not None else "--"
+        exc_text = f"{exc_age:.0f}s" if exc_age is not None else "--"
+        sync_text = f"{sync_delay:.0f}s" if sync_delay is not None else "--"
+        health = f"Health: policy {policy} | latency p95 {lat_text} | last exc {exc_text} | sync delay {sync_text}"
+        if hasattr(self, "header_health_var"):
+            self.header_health_var.set(health)
+
+        if hasattr(self, "health_label"):
+            color = "#cbd5e1"
+            if policy == "OK":
+                color = "#86efac"
+            elif policy == "DEGRADED":
+                color = "#fbbf24"
+            elif policy == "FAIL_CLOSED":
+                color = "#f87171"
+            try:
+                self.health_label.configure(foreground=color)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _line_ts_local(line: str) -> datetime | None:
+        text = str(line or "")
+        if len(text) < 19:
+            return None
+        head = text[:19]
+        try:
+            return datetime.strptime(head, "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return None
+
+    def _refresh_idle_reasons(self, app_lines: list[str]) -> None:
+        rows_15m = self._read_candidate_rows_window(900, max_bytes=1_500_000)
+        counts: dict[str, int] = {}
+        for row in rows_15m:
+            reason = str(row.get("reason", "") or "").strip()
+            if not reason:
+                continue
+            counts[reason] = int(counts.get(reason, 0)) + 1
+
+        def _pick(label: str, key: str) -> str:
+            return f"{label}={int(counts.get(key, 0))}"
+
+        summary = " | ".join(
+            [
+                _pick("safe_volume", "safe_volume"),
+                _pick("score_min", "score_min"),
+                _pick("safe_risk", "safe_contract"),
+                _pick("dedup_ttl", "heavy_dedup_ttl"),
+                _pick("shard_skip", "shard_skip"),
+            ]
+        )
+        if hasattr(self, "idle_reasons_var"):
+            self.idle_reasons_var.set(summary or "--")
+
+        # Live execution blockers after candidate pass (from runtime app logs).
+        cutoff = datetime.now() - timedelta(minutes=15)
+        live_counts: dict[str, int] = {}
+        for line in app_lines:
+            m = AUTO_TRADE_SKIP_RE.search(line)
+            if not m:
+                continue
+            ts = self._line_ts_local(line)
+            if ts is not None and ts < cutoff:
+                continue
+            reason = str(m.group("reason") or "").strip()
+            if not reason:
+                continue
+            live_counts[reason] = int(live_counts.get(reason, 0)) + 1
+        top = sorted(live_counts.items(), key=lambda kv: kv[1], reverse=True)[:5]
+        live_summary = " | ".join(f"{k}={v}" for k, v in top) if top else "--"
+        if hasattr(self, "live_block_reasons_var"):
+            self.live_block_reasons_var.set(live_summary)
+
+    def on_session_snapshot(self) -> None:
+        env_map = self._runtime_env_map()
+        state_path = self._selected_positions_state_file()
+        state = read_json(state_path)
+        closed_rows = [x for x in (state.get("closed_positions") or []) if isinstance(x, dict)]
+        closed_rows.sort(key=lambda r: str(r.get("closed_at", "")))
+        last_closed = closed_rows[-50:]
+
+        rows_15m = self._read_candidate_rows_window(900, max_bytes=2_000_000)
+        rows_1h = self._read_candidate_rows_window(3600, max_bytes=3_000_000)
+
+        def _skip_stats(rows: list[dict]) -> dict[str, int]:
+            out: dict[str, int] = {}
+            for row in rows:
+                reason = str(row.get("reason", "") or "").strip()
+                if not reason:
+                    continue
+                out[reason] = int(out.get(reason, 0)) + 1
+            return dict(sorted(out.items(), key=lambda kv: kv[1], reverse=True)[:20])
+
+        commit = "unknown"
+        try:
+            proc = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+                timeout=6,
+            )
+            if proc.returncode == 0:
+                commit = (proc.stdout or "").strip()[:12] or commit
+        except Exception:
+            pass
+
+        summary = {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "source": str(self.positions_source_var.get() or "single"),
+            "state_file": state_path,
+            "commit": commit,
+            "effective_env": env_map,
+            "state_summary": {
+                "open_count": len(state.get("open_positions", []) or []),
+                "closed_count": len(closed_rows),
+                "realized_pnl_usd": float(state.get("realized_pnl_usd") or 0.0),
+                "wins": sum(1 for x in closed_rows if float(x.get("pnl_usd") or 0.0) > 0),
+                "losses": sum(1 for x in closed_rows if float(x.get("pnl_usd") or 0.0) < 0),
+            },
+            "last_closed": last_closed,
+            "skip_stats_15m": _skip_stats(rows_15m),
+            "skip_stats_1h": _skip_stats(rows_1h),
+        }
+
+        out_dir = os.path.join(PROJECT_ROOT, "snapshots")
+        os.makedirs(out_dir, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_path = os.path.join(out_dir, f"session_snapshot_{stamp}.json")
+        try:
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(summary, f, ensure_ascii=False, indent=2)
+            messagebox.showinfo("Session Snapshot", f"Snapshot saved:\n{out_path}")
+        except Exception as exc:
+            messagebox.showerror("Session Snapshot", f"Snapshot failed:\n{exc}")
 
     def on_enable_kill_switch(self) -> None:
         path = self._kill_switch_path()
@@ -2202,10 +2968,114 @@ class App(tk.Tk):
         if prev_y:
             widget.yview_moveto(prev_y[0])
 
+    @staticmethod
+    def _stable_iid(prefix: str, raw_key: str) -> str:
+        digest = hashlib.md5(raw_key.encode("utf-8", errors="ignore")).hexdigest()[:16]
+        return f"{prefix}_{digest}"
+
+    def _sync_tree_rows(
+        self,
+        tree: ttk.Treeview,
+        rows: list[tuple[str, tuple[str, ...], tuple[str, ...]]],
+    ) -> None:
+        wanted_ids: list[str] = []
+        wanted_set: set[str] = set()
+        for idx, (iid, values, tags) in enumerate(rows):
+            sid = str(iid)
+            wanted_ids.append(sid)
+            wanted_set.add(sid)
+            base_tags = tuple(tags or ())
+            stripe_tag = "row_even" if (idx % 2 == 0) else "row_odd"
+            final_tags = base_tags + (stripe_tag,)
+            if tree.exists(sid):
+                tree.item(sid, values=values, tags=final_tags)
+            else:
+                tree.insert("", tk.END, iid=sid, values=values, tags=final_tags)
+
+        for existing in tree.get_children():
+            if existing not in wanted_set:
+                tree.delete(existing)
+
+        for idx, sid in enumerate(wanted_ids):
+            tree.move(sid, "", idx)
+
+    def _update_positions_kpi(
+        self,
+        open_count: int,
+        closed_count: int,
+        wins: int,
+        losses: int,
+        realized_pnl: float,
+        realized_pnl_1h: float = 0.0,
+    ) -> None:
+        if hasattr(self, "kpi_open_var"):
+            self.kpi_open_var.set(str(open_count))
+        if hasattr(self, "kpi_closed_var"):
+            self.kpi_closed_var.set(str(closed_count))
+        total = wins + losses
+        winrate = (wins * 100.0 / total) if total > 0 else 0.0
+        if hasattr(self, "kpi_winrate_var"):
+            self.kpi_winrate_var.set(f"{winrate:.1f}%")
+        if hasattr(self, "kpi_pnl_var"):
+            self.kpi_pnl_var.set(f"${realized_pnl:+.2f}")
+        if hasattr(self, "kpi_pnl_1h_var"):
+            self.kpi_pnl_1h_var.set(f"${realized_pnl_1h:+.2f}")
+        if hasattr(self, "kpi_updated_var"):
+            self.kpi_updated_var.set(datetime.now().strftime("%H:%M:%S"))
+
+    def _ui_tick(self) -> None:
+        now_ts = time.time()
+        age = max(0.0, now_ts - float(self._last_refresh_ts or 0.0))
+        if hasattr(self, "refresh_meta_var"):
+            if self._last_refresh_ts > 0:
+                self.refresh_meta_var.set(f"Refresh: {age:.1f}s ago | full sync {GUI_REFRESH_INTERVAL_MS}ms")
+            else:
+                self.refresh_meta_var.set("Refresh: --")
+
+        if hasattr(self, "open_tree"):
+            for iid in self.open_tree.get_children():
+                vals = list(self.open_tree.item(iid, "values") or ())
+                if not vals:
+                    continue
+                changed = False
+
+                ttl_idx = int(getattr(self, "_open_ttl_col_idx", -1))
+                expiry_ts = self._open_row_expiry_ts.get(iid)
+                if expiry_ts is not None and ttl_idx >= 0 and ttl_idx < len(vals):
+                    left = max(0, int(expiry_ts - now_ts))
+                    ttl_text = f"{left} sec"
+                    if vals[ttl_idx] != ttl_text:
+                        vals[ttl_idx] = ttl_text
+                        changed = True
+
+                pnl_hour_idx = int(getattr(self, "_open_pnl_hour_col_idx", -1))
+                opened_ts = self._open_row_opened_ts.get(iid)
+                pnl_usd = self._open_row_pnl_usd.get(iid)
+                if pnl_hour_idx >= 0 and pnl_hour_idx < len(vals):
+                    pnl_hour_text = "--"
+                    if opened_ts is not None and pnl_usd is not None and opened_ts > 0.0:
+                        age_hours = max(1.0 / 3600.0, (now_ts - float(opened_ts)) / 3600.0)
+                        pnl_hour_text = f"{(float(pnl_usd) / age_hours):+.2f}"
+                    if vals[pnl_hour_idx] != pnl_hour_text:
+                        vals[pnl_hour_idx] = pnl_hour_text
+                        changed = True
+
+                if changed:
+                    self.open_tree.item(iid, values=tuple(vals))
+
+        self.after(GUI_UI_TICK_MS, self._ui_tick)
+
     def _refresh_positions(self, app_lines: list[str]) -> None:
         state_file = self._selected_positions_state_file()
         state = read_json(state_file)
         src = str(self.positions_source_var.get() or "single")
+        excluded_symbols = self._stats_excluded_symbols()
+        if hasattr(self, "positions_title_var"):
+            env_map = self._runtime_env_map()
+            mode = str(env_map.get(WALLET_MODE_KEY, "paper") or "paper").strip().lower()
+            prefix = "Монитор live-сделок" if mode == "live" else "Монитор бумажных сделок"
+            suffix = "" if src == "single" else f" [{src}]"
+            self.positions_title_var.set(f"{prefix}{suffix}")
         if state:
             self._refresh_positions_from_state(state)
             if hasattr(self, "pos_summary_var"):
@@ -2223,6 +3093,9 @@ class App(tk.Tk):
             b = BUY_RE.search(line)
             if b:
                 address = b.group("address")
+                symbol = str(b.group("symbol") or "").upper()
+                if symbol in excluded_symbols:
+                    continue
                 open_map[address] = {
                     "symbol": b.group("symbol"),
                     "entry": b.group("entry"),
@@ -2232,6 +3105,9 @@ class App(tk.Tk):
                 continue
             s = SELL_RE.search(line)
             if s:
+                symbol = str(s.group("symbol") or "").upper()
+                if symbol in excluded_symbols:
+                    continue
                 pnl_usd = float(s.group("pnl_usd"))
                 pnl_sum += pnl_usd
                 if pnl_usd >= 0:
@@ -2252,28 +3128,49 @@ class App(tk.Tk):
                         open_map.pop(addr, None)
                         break
 
-        self.open_tree.delete(*self.open_tree.get_children())
-        for _, pos in open_map.items():
-            self.open_tree.insert("", tk.END, values=(pos["symbol"], pos["entry"], pos["size"], pos["score"], "--:--"))
+        open_tree_rows: list[tuple[str, tuple[str, ...], tuple[str, ...]]] = []
+        self._open_row_expiry_ts = {}
+        self._open_row_opened_ts = {}
+        self._open_row_pnl_usd = {}
+        for addr, pos in open_map.items():
+            iid = self._stable_iid("open_fallback", f"{addr}:{pos['symbol']}")
+            open_tree_rows.append(
+                (
+                    iid,
+                    (pos["symbol"], pos["entry"], pos["size"], pos["score"], "--", "--", "--", "--", "--", "--"),
+                    ("open_flat",),
+                )
+            )
+        self._sync_tree_rows(self.open_tree, open_tree_rows)
 
-        self.closed_tree.delete(*self.closed_tree.get_children())
-        for pos in closed[-200:]:
-            self.closed_tree.insert("", tk.END, values=(pos["symbol"], pos["reason"], pos["pnl_pct"], pos["pnl_usd"]))
+        closed_tree_rows: list[tuple[str, tuple[str, ...], tuple[str, ...]]] = []
+        for idx, pos in enumerate(closed[-200:]):
+            raw_key = f"{idx}:{pos['symbol']}:{pos['reason']}:{pos['pnl_pct']}:{pos['pnl_usd']}"
+            iid = self._stable_iid("closed_fallback", raw_key)
+            pnl = self._to_float(pos.get("pnl_usd"), 0.0)
+            closed_tag = "closed_pos" if pnl > 0 else ("closed_neg" if pnl < 0 else "closed_flat")
+            closed_tree_rows.append((iid, (pos["symbol"], pos["reason"], "--", "--", pos["pnl_pct"], pos["pnl_usd"]), (closed_tag,)))
+        self._sync_tree_rows(self.closed_tree, closed_tree_rows)
 
+        self._update_positions_kpi(len(open_map), len(closed), wins, losses, pnl_sum, 0.0)
+        excl_note = f" | excluded: {','.join(sorted(excluded_symbols))}" if excluded_symbols else ""
         self.pos_summary_var.set(
-            f"[{src}] Открыто: {len(open_map)} | Закрыто: {len(closed)} | Побед/Поражений: {wins}/{losses} | Итог PnL: ${pnl_sum:+.2f}"
+            f"[{src}] Open: {len(open_map)} | Closed: {len(closed)} | Wins/Losses: {wins}/{losses} | Total PnL: ${pnl_sum:+.2f}{excl_note}"
         )
 
     def _refresh_signals(self) -> None:
         if not hasattr(self, "signals_tree"):
             return
-        rows = read_jsonl_tail(LOCAL_ALERTS_FILE, 400)
-        self.signals_tree.delete(*self.signals_tree.get_children())
+        src_label, signals_file = self._selected_signals_file()
+        rows = read_jsonl_tail(signals_file, 400)
         if not rows:
-            self.signals_summary_var.set("Входящих сигналов пока нет.")
+            if hasattr(self, "signals_summary_var"):
+                self.signals_summary_var.set(f"[{src_label}] No incoming signals yet.")
+            self._sync_tree_rows(self.signals_tree, [])
             self._refresh_signal_sources()
             return
 
+        signal_rows: list[tuple[str, tuple[str, ...], tuple[str, ...]]] = []
         for row in reversed(rows[-250:]):
             ts = str(row.get("timestamp", ""))
             ts_text = "-"
@@ -2285,27 +3182,28 @@ class App(tk.Tk):
                     ts_text = dt.astimezone().strftime("%H:%M:%S")
                 except Exception:
                     ts_text = ts
-            self.signals_tree.insert(
-                "",
-                tk.END,
-                values=(
-                    ts_text,
-                    str(row.get("symbol", "N/A")),
-                    str(row.get("score", 0)),
-                    str(row.get("recommendation", "SKIP")),
-                    str(row.get("risk_level", "N/A")),
-                    f"{float(row.get('liquidity', 0) or 0):.0f}",
-                    f"{float(row.get('volume_5m', 0) or 0):.0f}",
-                    f"{float(row.get('price_change_5m', 0) or 0):+.2f}",
-                ),
-            )
-        self.signals_summary_var.set(f"Сигналов: {len(rows)} | Показано: {min(len(rows), 250)}")
+            symbol = str(row.get("symbol", "N/A"))
+            score = str(row.get("score", 0))
+            recommendation = str(row.get("recommendation", "SKIP"))
+            risk = str(row.get("risk_level", "N/A"))
+            liquidity = f"{float(row.get('liquidity', 0) or 0):.0f}"
+            volume = f"{float(row.get('volume_5m', 0) or 0):.0f}"
+            change = f"{float(row.get('price_change_5m', 0) or 0):+.2f}"
+            iid = self._stable_iid("sig", f"{ts}:{symbol}:{score}:{recommendation}:{risk}:{liquidity}:{volume}:{change}")
+            signal_rows.append((iid, (ts_text, symbol, score, recommendation, risk, liquidity, volume, change), ()))
+
+        self._sync_tree_rows(self.signals_tree, signal_rows)
+        if hasattr(self, "signals_summary_var"):
+            self.signals_summary_var.set(f"[{src_label}] Signals: {len(rows)} | Shown: {min(len(rows), 250)}")
         self._refresh_signal_sources()
 
     def _refresh_signal_sources(self) -> None:
         if not hasattr(self, "signals_sources_var"):
             return
-        lines = read_tail(APP_LOG, 500)
+        src_label, _signals_file = self._selected_signals_file()
+        lines: list[str] = []
+        for path in self._runtime_log_paths_for_signals():
+            lines.extend(read_tail(path, 360))
         counts: dict[str, int] = {}
         total = 0
         for line in lines:
@@ -2319,72 +3217,227 @@ class App(tk.Tk):
         v3_count = counts.get("uniswap_v3", 0)
         other_count = max(0, total - v2_count - v3_count)
         self.signals_sources_var.set(
-            f"Sources (tail): v2={v2_count} | v3={v3_count} | other={other_count} | total={total}"
+            f"Sources (tail, {src_label}): v2={v2_count} | v3={v3_count} | other={other_count} | total={total}"
         )
 
     def _refresh_positions_from_state(self, state: dict) -> None:
         open_rows = state.get("open_positions", []) or []
         closed_rows = state.get("closed_positions", []) or []
+        if not isinstance(open_rows, list):
+            open_rows = []
+        else:
+            open_rows = [row for row in open_rows if isinstance(row, dict)]
+        if not isinstance(closed_rows, list):
+            closed_rows = []
+        else:
+            closed_rows = [row for row in closed_rows if isinstance(row, dict)]
+        raw_untracked = state.get("recovery_untracked", {}) or {}
+        untracked_map: dict[str, int] = {}
+        if isinstance(raw_untracked, dict):
+            for key, value in raw_untracked.items():
+                addr = str(key or "").strip().lower()
+                if not addr:
+                    continue
+                try:
+                    amount_raw = int(value or 0)
+                except Exception:
+                    amount_raw = 0
+                if amount_raw > 0:
+                    untracked_map[addr] = amount_raw
+        tx_events = state.get("tx_event_timestamps", []) or []
+        tx_events_recent = 0
+        if isinstance(tx_events, list):
+            now_ts_recent = time.time()
+            for raw_ts in tx_events:
+                ts = _parse_ts(raw_ts)
+                if ts is None:
+                    continue
+                if (now_ts_recent - ts) <= 20 * 60:
+                    tx_events_recent += 1
 
-        wins = int(state.get("total_wins", 0))
-        losses = int(state.get("total_losses", 0))
-        realized_pnl = float(state.get("realized_pnl_usd", 0.0))
+        excluded_symbols = self._stats_excluded_symbols()
+        if excluded_symbols:
+            open_rows = [
+                row
+                for row in open_rows
+                if str((row or {}).get("symbol", "") or "").strip().upper() not in excluded_symbols
+            ]
+            closed_rows = [
+                row
+                for row in closed_rows
+                if str((row or {}).get("symbol", "") or "").strip().upper() not in excluded_symbols
+            ]
 
-        env_map = read_env_map()
-        fallback_hold = int(env_map.get("PAPER_MAX_HOLD_SECONDS", "1800") or "1800")
         now = datetime.now(timezone.utc)
+        cutoff_1h_ts = now.timestamp() - 3600.0
 
-        self.open_tree.delete(*self.open_tree.get_children())
+        wins = 0
+        losses = 0
+        realized_pnl = 0.0
+        realized_pnl_1h = 0.0
+        for row in closed_rows:
+            pnl_usd_v = self._safe_float((row or {}).get("pnl_usd", 0.0), 0.0)
+            realized_pnl += pnl_usd_v
+            if pnl_usd_v > 0.0:
+                wins += 1
+            elif pnl_usd_v < 0.0:
+                losses += 1
+            closed_dt = self._parse_iso_ts((row or {}).get("closed_at"))
+            if closed_dt is not None and closed_dt.timestamp() >= cutoff_1h_ts:
+                realized_pnl_1h += pnl_usd_v
+
+        env_map = self._runtime_env_map()
+        fallback_hold = int(max(1.0, self._safe_float(env_map.get("PAPER_MAX_HOLD_SECONDS", "1800"), 1800.0)))
+        breakeven_eps = max(0.0, self._safe_float(env_map.get("PNL_BREAKEVEN_EPSILON_USD", "0.0"), 0.0))
+
+        self._open_row_expiry_ts = {}
+        self._open_row_opened_ts = {}
+        self._open_row_pnl_usd = {}
+
+        addr_to_symbol: dict[str, str] = {}
+        for row in (open_rows + closed_rows):
+            addr = str((row or {}).get("token_address", "") or "").strip().lower()
+            sym = str((row or {}).get("symbol", "") or "").strip()
+            if addr and sym and addr not in addr_to_symbol:
+                addr_to_symbol[addr] = sym
+
+        open_tree_rows: list[tuple[str, tuple[str, ...], tuple[str, ...]]] = []
+        now_ts = now.timestamp()
         for row in open_rows:
-            opened_at_raw = str(row.get("opened_at", ""))
+            token_address = str(row.get("token_address", "") or "")
+            opened_at_raw = row.get("opened_at", "")
+            opened_dt = self._parse_iso_ts(opened_at_raw)
+            opened_ts = 0.0
+            opened_text = self._format_local_ts(opened_at_raw)
             ttl = "--"
-            try:
-                opened_at = datetime.fromisoformat(opened_at_raw)
-                if opened_at.tzinfo is None:
-                    opened_at = opened_at.replace(tzinfo=timezone.utc)
-                max_hold = int(row.get("max_hold_seconds", fallback_hold))
-                age = int((now - opened_at).total_seconds())
+            max_hold = int(max(1.0, self._safe_float(row.get("max_hold_seconds", fallback_hold), float(fallback_hold))))
+            if opened_dt is not None:
+                opened_ts = opened_dt.timestamp()
+                age = int(max(0.0, now_ts - opened_ts))
                 left = max(0, max_hold - age)
-                ttl = f"{left} сек"
-            except Exception:
-                ttl = "--"
+                ttl = f"{left} sec"
 
-            self.open_tree.insert(
-                "",
-                tk.END,
-                values=(
-                    str(row.get("symbol", "N/A")),
-                    f"{float(row.get('entry_price_usd', 0)):.8f}",
-                    f"{float(row.get('position_size_usd', 0)):.2f}",
-                    str(row.get("score", 0)),
-                    ttl,
-                ),
+            entry_price = self._safe_float(row.get("entry_price_usd", 0.0), 0.0)
+            current_price = self._safe_float(row.get("current_price_usd", 0.0), 0.0)
+            position_size = self._safe_float(row.get("position_size_usd", 0.0), 0.0)
+            pnl_pct = self._safe_float(row.get("pnl_percent", row.get("pnl_pct", 0.0)), 0.0)
+            pnl_usd = self._safe_float(row.get("pnl_usd", 0.0), 0.0)
+
+            if entry_price > 0.0 and current_price > 0.0 and position_size > 0.0:
+                derived_pct = ((current_price - entry_price) / entry_price) * 100.0
+                derived_usd = (position_size * derived_pct) / 100.0
+                if abs(pnl_pct) < 1e-9 and abs(derived_pct) > 1e-6:
+                    pnl_pct = derived_pct
+                if abs(pnl_usd) < 1e-9 and abs(derived_usd) > 1e-6:
+                    pnl_usd = derived_usd
+
+            peak_pct = self._safe_float(row.get("peak_pnl_percent", pnl_pct), pnl_pct)
+            if peak_pct < pnl_pct:
+                peak_pct = pnl_pct
+
+            if pnl_usd > breakeven_eps:
+                tag = "open_pos"
+            elif pnl_usd < -breakeven_eps:
+                tag = "open_neg"
+            else:
+                tag = "open_flat"
+
+            pnl_hour_text = "--"
+            if opened_ts > 0.0:
+                age_hours = max(1.0 / 3600.0, (now_ts - opened_ts) / 3600.0)
+                pnl_hour_text = f"{(pnl_usd / age_hours):+.2f}"
+
+            values = (
+                str(row.get("symbol", "N/A")),
+                f"{entry_price:.8f}",
+                f"{position_size:.2f}",
+                str(row.get("score", 0)),
+                opened_text,
+                f"{pnl_pct:+.2f}",
+                f"{pnl_usd:+.2f}",
+                pnl_hour_text,
+                f"{peak_pct:+.2f}",
+                ttl,
             )
+            key = token_address or f"{row.get('symbol', 'N/A')}|{str(opened_at_raw)}"
+            iid = self._stable_iid("open", key)
+            open_tree_rows.append((iid, values, (tag,)))
+            self._open_row_pnl_usd[iid] = pnl_usd
+            if opened_ts > 0.0:
+                self._open_row_opened_ts[iid] = opened_ts
+                self._open_row_expiry_ts[iid] = opened_ts + float(max_hold)
 
-        self.closed_tree.delete(*self.closed_tree.get_children())
+        for addr, amount_raw in sorted(untracked_map.items()):
+            symbol = addr_to_symbol.get(addr, "UNTRACKED")
+            if symbol.strip().upper() in excluded_symbols:
+                continue
+            values = (
+                symbol,
+                "--",
+                f"raw:{amount_raw}",
+                "wallet",
+                "--",
+                "--",
+                "--",
+                "--",
+                "--",
+                "wallet",
+            )
+            iid = self._stable_iid("open_untracked", addr)
+            open_tree_rows.append((iid, values, ("open_untracked",)))
+
+        self._sync_tree_rows(self.open_tree, open_tree_rows)
+
+        closed_tree_rows: list[tuple[str, tuple[str, ...], tuple[str, ...]]] = []
         for row in closed_rows[-200:]:
-            self.closed_tree.insert(
-                "",
-                tk.END,
-                values=(
-                    str(row.get("symbol", "N/A")),
-                    str(row.get("close_reason", "")),
-                    f"{float(row.get('pnl_percent', 0.0)):+.2f}",
-                    f"{float(row.get('pnl_usd', 0.0)):+.2f}",
-                ),
+            opened_at_raw = row.get("opened_at", "")
+            closed_at_raw = row.get("closed_at", "")
+            symbol = str(row.get("symbol", "N/A"))
+            reason = str(row.get("close_reason", row.get("reason", "")))
+            pnl_pct_v = self._safe_float(row.get("pnl_percent", row.get("pnl_pct", 0.0)), 0.0)
+            pnl_usd_v = self._safe_float(row.get("pnl_usd", 0.0), 0.0)
+            values = (
+                symbol,
+                reason,
+                self._format_local_ts(opened_at_raw),
+                self._format_local_ts(closed_at_raw),
+                f"{pnl_pct_v:+.2f}",
+                f"{pnl_usd_v:+.2f}",
             )
+            key = f"{closed_at_raw}|{symbol}|{reason}|{pnl_pct_v:.6f}|{pnl_usd_v:.6f}"
+            iid = self._stable_iid("closed", key)
+            if pnl_usd_v > breakeven_eps:
+                closed_tag = "closed_pos"
+            elif pnl_usd_v < -breakeven_eps:
+                closed_tag = "closed_neg"
+            else:
+                closed_tag = "closed_flat"
+            closed_tree_rows.append((iid, values, (closed_tag,)))
 
+        self._sync_tree_rows(self.closed_tree, closed_tree_rows)
+        self._update_positions_kpi(len(open_rows), len(closed_rows), wins, losses, realized_pnl, realized_pnl_1h)
+        excl_note = f" | excluded: {','.join(sorted(excluded_symbols))}" if excluded_symbols else ""
         self.pos_summary_var.set(
-            f"Открыто: {len(open_rows)} | Закрыто: {len(closed_rows)} | Побед/Поражений: {wins}/{losses} | Реализованный PnL: ${realized_pnl:+.2f}"
+            f"Open: {len(open_rows)} | Closed: {len(closed_rows)} | Wins/Losses: {wins}/{losses} | Realized PnL: ${realized_pnl:+.2f}{excl_note}"
         )
-
+        if hasattr(self, "untracked_summary_var"):
+            if untracked_map:
+                self.untracked_summary_var.set(
+                    f"Untracked in wallet: {len(untracked_map)} (present in wallet, missing in bot open_positions)"
+                )
+            elif len(open_rows) == 0 and tx_events_recent > 0:
+                self.untracked_summary_var.set(
+                    f"Visibility alert: recent live tx={tx_events_recent} in last 20m, but open_positions is empty"
+                )
+            else:
+                self.untracked_summary_var.set("")
     def _schedule_live_wallet_poll(self) -> None:
         # Keep UI responsive: RPC calls happen in a background thread.
         if getattr(self, "_live_wallet_polling", False):
             self.after(int(LIVE_BALANCE_POLL_SECONDS * 1000), self._schedule_live_wallet_poll)
             return
 
-        env_map = read_env_map()
+        env_map = read_runtime_env_map()
         address = str(env_map.get("LIVE_WALLET_ADDRESS", "") or "").strip()
         rpc_primary = str(env_map.get("RPC_PRIMARY", "") or "").strip()
         rpc_secondary = str(env_map.get("RPC_SECONDARY", "") or "").strip()
@@ -2457,11 +3510,11 @@ class App(tk.Tk):
             return
 
     def _refresh_wallet(self) -> None:
-        env_map = read_env_map()
+        env_map = read_runtime_env_map()
         mode = str(env_map.get(WALLET_MODE_KEY, self.wallet_mode_var.get() if hasattr(self, "wallet_mode_var") else "paper")).strip().lower()
         live_balance = float(env_map.get(LIVE_WALLET_BALANCE_KEY, "0") or 0)
 
-        state = read_json(PAPER_STATE_FILE)
+        state = read_json(self._runtime_state_file())
         paper_balance = float(state.get("paper_balance_usd", env_map.get("WALLET_BALANCE_USD", "0")) or 0)
         paper_open = len(state.get("open_positions", []) or [])
         paper_closed = len(state.get("closed_positions", []) or [])
@@ -2515,7 +3568,7 @@ class App(tk.Tk):
         if mode not in {"paper", "live"}:
             messagebox.showerror("Ошибка", "Режим кошелька должен быть paper или live.")
             return
-        save_env_map({WALLET_MODE_KEY: mode})
+        save_runtime_env_map({WALLET_MODE_KEY: mode})
         self._refresh_wallet()
         if mode == "live":
             messagebox.showinfo(
@@ -2528,7 +3581,7 @@ class App(tk.Tk):
         if mode not in {"true", "false"}:
             messagebox.showerror("Ошибка", "Step protection должен быть true или false.")
             return
-        save_env_map({STAIR_STEP_ENABLED_KEY: mode})
+        save_runtime_env_map({STAIR_STEP_ENABLED_KEY: mode})
         if STAIR_STEP_ENABLED_KEY in self.env_vars:
             self.env_vars[STAIR_STEP_ENABLED_KEY].set(mode)
         self._refresh_wallet()
@@ -2546,7 +3599,7 @@ class App(tk.Tk):
         if step_size <= 0:
             messagebox.showerror("Ошибка", "Step size должен быть больше 0.")
             return
-        save_env_map(
+        save_runtime_env_map(
             {
                 "STAIR_STEP_START_BALANCE_USD": f"{start_floor:.2f}",
                 "STAIR_STEP_SIZE_USD": f"{step_size:.2f}",
@@ -2567,7 +3620,7 @@ class App(tk.Tk):
         if val < 0:
             messagebox.showerror("Ошибка", "Live balance не может быть отрицательным.")
             return
-        save_env_map({LIVE_WALLET_BALANCE_KEY: f"{val:.2f}"})
+        save_runtime_env_map({LIVE_WALLET_BALANCE_KEY: f"{val:.2f}"})
         self._refresh_wallet()
 
     def on_set_paper_275(self) -> None:
@@ -2584,12 +3637,13 @@ class App(tk.Tk):
             messagebox.showerror("Ошибка", "Paper balance не может быть отрицательным.")
             return
 
-        state = read_json(PAPER_STATE_FILE)
+        state_file = self._runtime_state_file()
+        state = read_json(state_file)
         open_positions = state.get("open_positions", []) or []
         if open_positions:
             if not messagebox.askyesno(
                 "Open trades detected",
-                "Open paper trades exist in paper_state.json.\n\n"
+                "Open paper trades exist in the active state file.\n\n"
                 "To change paper balance, open trades must be cleared (removed from paper tracking).\n\n"
                 "Clear open trades and set the new paper balance?",
             ):
@@ -2609,9 +3663,9 @@ class App(tk.Tk):
         state["day_realized_pnl_usd"] = 0.0
         state["stair_floor_usd"] = 0.0
         state["stair_peak_balance_usd"] = float(val)
-        with open(PAPER_STATE_FILE, "w", encoding="utf-8") as f:
+        with open(state_file, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
-        save_env_map({"WALLET_BALANCE_USD": f"{val:.2f}"})
+        save_runtime_env_map({"WALLET_BALANCE_USD": f"{val:.2f}"})
         if "WALLET_BALANCE_USD" in self.env_vars:
             self.env_vars["WALLET_BALANCE_USD"].set(f"{val:.2f}")
         self._refresh_wallet()
@@ -2630,7 +3684,7 @@ class App(tk.Tk):
                 messagebox.showerror("Ошибка", f"Не удалось остановить бота перед сбросом: {msg}")
                 return
 
-        env_map = read_env_map()
+        env_map = read_runtime_env_map()
         try:
             balance = float(env_map.get("WALLET_BALANCE_USD", "2.75") or 2.75)
         except ValueError:
@@ -2650,10 +3704,11 @@ class App(tk.Tk):
             "open_positions": [],
             "closed_positions": [],
         }
-        os.makedirs(os.path.dirname(PAPER_STATE_FILE), exist_ok=True)
-        with open(PAPER_STATE_FILE, "w", encoding="utf-8") as f:
+        state_file = self._runtime_state_file()
+        os.makedirs(os.path.dirname(state_file), exist_ok=True)
+        with open(state_file, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
-        save_env_map({"WALLET_BALANCE_USD": f"{balance:.2f}"})
+        save_runtime_env_map({"WALLET_BALANCE_USD": f"{balance:.2f}"})
         if "WALLET_BALANCE_USD" in self.env_vars:
             self.env_vars["WALLET_BALANCE_USD"].set(f"{balance:.2f}")
         self._refresh_wallet()
@@ -2661,8 +3716,16 @@ class App(tk.Tk):
         messagebox.showinfo("Готово", f"Paper-состояние сброшено. Текущий баланс: ${balance:.2f}")
 
     def auto_refresh(self) -> None:
-        self.refresh()
-        self.after(2200, self.auto_refresh)
+        try:
+            self.refresh()
+        except Exception as exc:
+            # Keep periodic refresh alive even if one cycle fails.
+            try:
+                self.hint_var.set(f"Refresh error: {exc.__class__.__name__}. Retrying...")
+            except Exception:
+                pass
+        finally:
+            self.after(GUI_REFRESH_INTERVAL_MS, self.auto_refresh)
 
     def on_start(self) -> None:
         # Avoid mixing single run with matrix mode.
@@ -2784,7 +3847,13 @@ class App(tk.Tk):
         messagebox.showinfo("Готово", "Настройки перечитаны из .env.")
 
     def on_clear_logs(self) -> None:
-        for path in (APP_LOG, OUT_LOG, ERR_LOG):
+        paths = {APP_LOG, OUT_LOG, ERR_LOG}
+        for p in self._runtime_log_paths_for_signals():
+            paths.add(p)
+        paths.add(self._resolve_candidates_log_path())
+        _, signals_file = self._selected_signals_file()
+        paths.add(signals_file)
+        for path in paths:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             truncate_file(path)
         self.refresh()
@@ -2815,18 +3884,20 @@ class App(tk.Tk):
             self.hint_var.set("GUI очищен: логи/сигналы/таблицы. KILL SWITCH не тронут.")
 
     def on_clear_signals(self) -> None:
-        os.makedirs(os.path.dirname(LOCAL_ALERTS_FILE), exist_ok=True)
-        truncate_file(LOCAL_ALERTS_FILE)
+        src_label, signals_file = self._selected_signals_file()
+        os.makedirs(os.path.dirname(signals_file), exist_ok=True)
+        truncate_file(signals_file)
         if hasattr(self, "signals_tree"):
             self.signals_tree.delete(*self.signals_tree.get_children())
         if hasattr(self, "signals_summary_var"):
-            self.signals_summary_var.set("\u0412\u0445\u043e\u0434\u044f\u0449\u0438\u0445 \u0441\u0438\u0433\u043d\u0430\u043b\u043e\u0432 \u043f\u043e\u043a\u0430 \u043d\u0435\u0442.")
+            self.signals_summary_var.set(f"[{src_label}] No incoming signals yet.")
 
     def on_signal_check(self) -> None:
-        env_map = read_env_map()
+        env_map = self._runtime_env_map()
         signal_source = str(env_map.get("SIGNAL_SOURCE", "dexscreener") or "dexscreener").strip().lower()
 
-        rows = read_jsonl_tail(LOCAL_ALERTS_FILE, 400)
+        src_label, signals_file = self._selected_signals_file()
+        rows = read_jsonl_tail(signals_file, 400)
         last_alert = "-"
         if rows:
             ts = str(rows[-1].get("timestamp", "")).strip()
@@ -2839,7 +3910,9 @@ class App(tk.Tk):
                 except Exception:
                     last_alert = ts
 
-        app_lines = read_tail(APP_LOG, 260)
+        app_lines: list[str] = []
+        for path in self._runtime_log_paths_for_signals():
+            app_lines.extend(read_tail(path, 260))
         scan_count = sum(1 for line in app_lines if "Scanned " in line)
         pair_detected = sum(1 for line in app_lines if "PAIR_DETECTED" in line)
         filter_pass = sum(1 for line in app_lines if "FILTER_PASS" in line)
@@ -2848,7 +3921,7 @@ class App(tk.Tk):
         critical_events = sum(1 for line in app_lines if "CRITICAL_AUTO_RESET" in line)
         kill_events = sum(1 for line in app_lines if "KILL_SWITCH" in line)
 
-        state = read_json(PAPER_STATE_FILE)
+        state = read_json(self._selected_positions_state_file())
         paper_balance = float(state.get("paper_balance_usd", env_map.get("WALLET_BALANCE_USD", "0")) or 0)
         open_count = len(state.get("open_positions", []) or [])
         closed_count = len(state.get("closed_positions", []) or [])
@@ -2880,7 +3953,7 @@ class App(tk.Tk):
                     onchain_probe = f"error:{exc}"
 
         summary_line = (
-            f"signals={len(rows)} last={last_alert} scans={scan_count} "
+            f"source={src_label} signals={len(rows)} last={last_alert} scans={scan_count} "
             f"pair={pair_detected} pass={filter_pass} buy={auto_buy} sell={auto_sell} "
             f"paper=${paper_balance:.2f} open={open_count} closed={closed_count}"
         )
@@ -2899,7 +3972,7 @@ class App(tk.Tk):
         messagebox.showinfo("Signal Check", "\n".join(details))
 
     def on_prune_closed_trades(self) -> None:
-        env_map = read_env_map()
+        env_map = self._runtime_env_map()
         days_raw = env_map.get("CLOSED_TRADES_MAX_AGE_DAYS", "14").strip() or "14"
         try:
             days = max(0, int(days_raw))
@@ -2976,4 +4049,5 @@ if __name__ == "__main__":
             App().mainloop()
         finally:
             gui_lock.release()
+
 

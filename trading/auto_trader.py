@@ -8,6 +8,7 @@ import logging
 import math
 import os
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -127,6 +128,12 @@ class AutoTrader:
         self._paper_summary_prev_wins = 0
         self._paper_summary_prev_losses = 0
         self._paper_summary_prev_realized_usd = 0.0
+        self._last_state_flush_ts = 0.0
+        self._last_untracked_discovery_ts = 0.0
+        self._state_flush_interval_seconds = max(
+            0.2,
+            float(getattr(config, "PAPER_STATE_FLUSH_INTERVAL_SECONDS", 1.0) or 1.0),
+        )
         self._load_state()
         now_ts = datetime.now(timezone.utc).timestamp()
         self._last_paper_summary_ts = now_ts
@@ -149,6 +156,7 @@ class AutoTrader:
                 self.live_executor = LiveExecutor()
                 logger.info("Live executor ready wallet=%s", config.LIVE_WALLET_ADDRESS)
                 self._reconcile_live_state_on_startup()
+                self._prune_recovery_untracked_live()
             except Exception as exc:
                 self.live_executor = None
                 logger.error("Live executor init failed: %s", exc)
@@ -228,7 +236,7 @@ class AutoTrader:
         if not key:
             return
         now_ts = datetime.now(timezone.utc).timestamp()
-        ttl = int(ttl_seconds or int(getattr(config, "AUTOTRADE_BLACKLIST_TTL_SECONDS", 86400) or 86400))
+        ttl = int(ttl_seconds) if ttl_seconds is not None else self._blacklist_default_ttl_seconds(reason)
         ttl = max(300, ttl)
         self._blacklist[key] = {
             "reason": str(reason or "blacklisted"),
@@ -237,6 +245,27 @@ class AutoTrader:
         }
         self._blacklist_prune()
         self._save_blacklist()
+
+    @staticmethod
+    def _blacklist_default_ttl_seconds(reason: str) -> int:
+        """Shorten TTL for transient routing/quote failures to keep throughput healthy."""
+        base_ttl = int(getattr(config, "AUTOTRADE_BLACKLIST_TTL_SECONDS", 86400) or 86400)
+        key = str(reason or "").strip().lower()
+        if key.startswith("unsupported_buy_route:") or key.startswith("unsupported_sell_route:"):
+            tuned = int(getattr(config, "LIVE_BLACKLIST_UNSUPPORTED_ROUTE_TTL_SECONDS", 7200) or 7200)
+            return min(base_ttl, tuned)
+        if key.startswith("roundtrip_quote_failed:"):
+            tuned = int(getattr(config, "LIVE_BLACKLIST_ROUNDTRIP_FAIL_TTL_SECONDS", 21600) or 21600)
+            return min(base_ttl, tuned)
+        if key.startswith("roundtrip_ratio:"):
+            tuned = int(getattr(config, "LIVE_BLACKLIST_ROUNDTRIP_RATIO_TTL_SECONDS", 3600) or 3600)
+            return min(base_ttl, tuned)
+        if key.startswith("live_buy_zero_amount") or key.startswith("live_buy_failed:"):
+            tuned = int(getattr(config, "LIVE_BLACKLIST_ZERO_AMOUNT_TTL_SECONDS", 1800) or 1800)
+            return min(base_ttl, tuned)
+        if key.startswith("honeypot_guard:") or key.startswith("abandoned:"):
+            return max(base_ttl, 24 * 3600)
+        return base_ttl
 
     def _apply_startup_reset(self) -> None:
         if self.open_positions:
@@ -303,7 +332,8 @@ class AutoTrader:
             return f"governor_pause {rem}s"
 
         max_streak = int(getattr(config, "RISK_GOVERNOR_MAX_LOSS_STREAK", config.MAX_CONSECUTIVE_LOSSES) or 0)
-        if max_streak > 0 and int(self.current_loss_streak) >= max_streak:
+        hard_block_on_streak = bool(getattr(config, "RISK_GOVERNOR_HARD_BLOCK_ON_STREAK", False))
+        if hard_block_on_streak and max_streak > 0 and int(self.current_loss_streak) >= max_streak:
             return f"governor_loss_streak {self.current_loss_streak}/{max_streak}"
 
         dd_limit = float(getattr(config, "RISK_GOVERNOR_DRAWDOWN_LIMIT_PERCENT", config.DAILY_MAX_DRAWDOWN_PERCENT) or 0.0)
@@ -458,8 +488,6 @@ class AutoTrader:
         out = dict(self._skip_reason_counts_window)
         self._skip_reason_counts_window = {}
         return out
-        self.recovery_untracked.pop(key, None)
-        self._recovery_clear_tracking(key)
 
     @staticmethod
     def _is_live_mode() -> bool:
@@ -471,6 +499,20 @@ class AutoTrader:
         if len(text) <= limit:
             return text
         return f"{text[:limit]}..."
+
+    @staticmethod
+    def _pnl_outcome(pnl_usd: float) -> str:
+        """Classify trade outcome with a configurable break-even epsilon in USD."""
+        try:
+            eps = max(0.0, float(getattr(config, "PNL_BREAKEVEN_EPSILON_USD", 0.0) or 0.0))
+        except Exception:
+            eps = 0.0
+        p = float(pnl_usd or 0.0)
+        if p > eps:
+            return "win"
+        if p < -eps:
+            return "loss"
+        return "be"
 
     @staticmethod
     def _quality_size_multiplier(
@@ -582,7 +624,11 @@ class AutoTrader:
                     price_usd = float(getattr(config, "WETH_PRICE_FALLBACK_USD", 0.0) or 0.0)
                 if price_usd <= 0.0:
                     price_usd = 1.0
-                return max(0.0, balance_eth * price_usd)
+                native_usd = max(0.0, balance_eth * price_usd)
+                open_positions_usd = 0.0
+                for pos in self.open_positions.values():
+                    open_positions_usd += max(0.0, float(pos.position_size_usd) + float(pos.pnl_usd))
+                return max(0.0, native_usd + open_positions_usd)
             except Exception:
                 # Fall back to paper equity calculation below.
                 pass
@@ -908,6 +954,12 @@ class AutoTrader:
 
     async def plan_trade(self, token_data: dict[str, Any], score_data: dict[str, Any]) -> PaperPosition | None:
         symbol = str(token_data.get("symbol", "N/A"))
+        symbol_upper = symbol.strip().upper()
+        excluded_symbols = set(getattr(config, "AUTO_TRADE_EXCLUDED_SYMBOLS", []) or [])
+        if symbol_upper and symbol_upper in excluded_symbols:
+            self._bump_skip_reason("excluded_symbol")
+            logger.info("AutoTrade skip token=%s reason=excluded_symbol", symbol)
+            return None
         if not self.can_open_trade():
             self._bump_skip_reason("disabled_or_limits")
             logger.info("AutoTrade skip token=%s reason=disabled_or_limits detail=%s", symbol, self._cannot_open_trade_detail())
@@ -997,11 +1049,12 @@ class AutoTrader:
             self._bump_skip_reason("safety_guards")
             logger.info("AutoTrade skip token=%s reason=safety_guards", symbol)
             return None
+
+        # First pass cost model (neutral size), then re-price using actual position size below.
         cost_profile = self._estimate_cost_profile(liquidity_usd, risk_level, score)
         expected_edge_percent = self._estimate_edge_percent(score, tp, sl, cost_profile["total_percent"], risk_level)
         regime_edge_mult = _safe_float(token_data.get("_regime_edge_mult"), 1.0)
         regime_edge_mult = max(0.75, min(1.35, regime_edge_mult))
-        edge_percent_for_decision = float(expected_edge_percent) * float(regime_edge_mult)
 
         position_size_usd = self._choose_position_size(expected_edge_percent)
         if bool(getattr(config, "POSITION_SIZE_QUALITY_ENABLED", True)):
@@ -1031,6 +1084,32 @@ class AutoTrader:
                 logger.info("AutoTrade skip token=%s reason=invalid_max_buy_cap", symbol)
                 return None
             position_size_usd = min(position_size_usd, cap_usd)
+
+        # Recompute costs on actual size and re-apply risk cap with the size-aware cost model.
+        cost_profile = self._estimate_cost_profile(
+            liquidity_usd,
+            risk_level,
+            score,
+            position_size_usd=position_size_usd,
+        )
+        position_size_usd_capped = self._apply_max_loss_per_trade_cap(
+            position_size_usd=position_size_usd,
+            stop_loss_percent=sl,
+            total_cost_percent=cost_profile["total_percent"],
+            gas_usd=cost_profile["gas_usd"],
+        )
+        if position_size_usd_capped < position_size_usd:
+            position_size_usd = position_size_usd_capped
+            cost_profile = self._estimate_cost_profile(
+                liquidity_usd,
+                risk_level,
+                score,
+                position_size_usd=position_size_usd,
+            )
+
+        expected_edge_percent = self._estimate_edge_percent(score, tp, sl, cost_profile["total_percent"], risk_level)
+        edge_percent_for_decision = float(expected_edge_percent) * float(regime_edge_mult)
+
         min_trade_usd = max(0.01, float(getattr(config, "MIN_TRADE_USD", 0.25) or 0.25))
         if position_size_usd < min_trade_usd:
             self._bump_skip_reason("min_trade_size")
@@ -1140,15 +1219,24 @@ class AutoTrader:
 
         if self._is_live_mode():
             if self.live_executor is None:
+                self._bump_skip_reason("live_executor_unavailable")
                 logger.error("AutoTrade skip token=%s reason=live_executor_unavailable", symbol)
                 return None
             weth_price_usd = await self._resolve_weth_price_usd(token_data)
             if weth_price_usd <= 0:
+                self._bump_skip_reason("no_weth_price")
                 logger.info("AutoTrade skip token=%s reason=no_weth_price", symbol)
                 return None
             spend_eth = position_size_usd / weth_price_usd
+            # Route/roundtrip checks on tiny notional can false-fail due integer rounding/quote dust.
+            # Use a bounded probe size for prechecks, while keeping the real buy size unchanged.
+            probe_min_usd = float(getattr(config, "LIVE_PRECHECK_MIN_SPEND_USD", 2.0) or 2.0)
+            probe_max_eth = float(getattr(config, "LIVE_PRECHECK_MAX_SPEND_ETH", 0.0030) or 0.0030)
+            probe_spend_eth = max(float(spend_eth), float(probe_min_usd) / max(1e-9, float(weth_price_usd)))
+            probe_spend_eth = min(probe_spend_eth, max(1e-8, float(probe_max_eth)))
             inv_ok, inv_reason = self._pre_buy_invariants(token_address, spend_eth)
             if not inv_ok:
+                self._bump_skip_reason("pre_buy_invariants")
                 logger.warning(
                     "AutoTrade skip token=%s reason=pre_buy_invariants detail=%s raw_address=%s normalized=%s source=%s",
                     symbol,
@@ -1167,6 +1255,7 @@ class AutoTrader:
                 try:
                     bal_eth = float(self.live_executor.native_balance_eth())
                     if (bal_eth - float(spend_eth)) < reserve_eth:
+                        self._bump_skip_reason("gas_reserve")
                         logger.info(
                             "AutoTrade skip token=%s reason=gas_reserve balance_eth=%.6f spend_eth=%.6f reserve_eth=%.6f",
                             symbol,
@@ -1180,7 +1269,7 @@ class AutoTrader:
             route_ok, route_reason = await asyncio.to_thread(
                 self.live_executor.is_buy_route_supported,
                 token_address,
-                spend_eth,
+                probe_spend_eth,
             )
             if not route_ok:
                 dex = str(token_data.get("dex", "unknown"))
@@ -1193,6 +1282,7 @@ class AutoTrader:
                     labels_text or "-",
                     self._short_error_text(route_reason),
                 )
+                self._bump_skip_reason("unsupported_live_route")
                 self._blacklist_add(token_address, f"unsupported_buy_route:{self._short_error_text(route_reason)}")
                 return None
             if bool(getattr(config, "LIVE_SELLABILITY_CHECK_ENABLED", True)):
@@ -1208,13 +1298,14 @@ class AutoTrader:
                         symbol,
                         self._short_error_text(sell_reason),
                     )
+                    self._bump_skip_reason("unsellable_or_no_quote")
                     self._blacklist_add(token_address, f"unsupported_sell_route:{self._short_error_text(sell_reason)}")
                     return None
             if bool(getattr(config, "LIVE_ROUNDTRIP_CHECK_ENABLED", True)):
                 ok, rt_reason, rt_ratio = await asyncio.to_thread(
                     self.live_executor.roundtrip_quote,
                     token_address,
-                    spend_eth,
+                    probe_spend_eth,
                 )
                 if not ok:
                     logger.info(
@@ -1222,6 +1313,7 @@ class AutoTrader:
                         symbol,
                         self._short_error_text(rt_reason),
                     )
+                    self._bump_skip_reason("roundtrip_quote_failed")
                     self._blacklist_add(token_address, f"roundtrip_quote_failed:{self._short_error_text(rt_reason)}")
                     return None
                 min_ratio = float(getattr(config, "LIVE_ROUNDTRIP_MIN_RETURN_RATIO", 0.70) or 0.70)
@@ -1232,10 +1324,12 @@ class AutoTrader:
                         float(rt_ratio),
                         float(min_ratio),
                     )
+                    self._bump_skip_reason("roundtrip_ratio")
                     self._blacklist_add(token_address, f"roundtrip_ratio:{rt_ratio:.3f}")
                     return None
             hp_ok, hp_detail = await self._honeypot_guard_passes(token_address)
             if not hp_ok:
+                self._bump_skip_reason("honeypot_guard")
                 logger.warning(
                     "AutoTrade skip token=%s reason=honeypot_guard detail=%s",
                     symbol,
@@ -1248,18 +1342,59 @@ class AutoTrader:
             except Exception as exc:
                 # Conservative accounting: a failed live buy may still have consumed gas/nonce.
                 self._record_tx_event()
+                self._bump_skip_reason("live_buy_failed")
                 logger.error("AUTO_BUY live_failed token=%s err=%s", symbol, exc)
                 self._blacklist_add(token_address, f"live_buy_failed:{self._short_error_text(exc)}", ttl_seconds=6 * 3600)
                 return None
-            if int(buy_result.token_amount_raw) <= 0:
+            bought_raw = int(getattr(buy_result, "token_amount_raw", 0) or 0)
+            if bought_raw <= 0:
+                before_raw = int(getattr(buy_result, "balance_before_raw", 0) or 0)
+                after_raw = int(getattr(buy_result, "balance_after_raw", 0) or 0)
+                if after_raw > before_raw:
+                    bought_raw = int(after_raw - before_raw)
+                else:
+                    attempts = max(1, int(getattr(config, "LIVE_BUY_BALANCE_RECHECK_ATTEMPTS", 8) or 8))
+                    delay = max(
+                        0.05,
+                        float(getattr(config, "LIVE_BUY_BALANCE_RECHECK_DELAY_SECONDS", 0.30) or 0.30),
+                    )
+                    for idx in range(attempts):
+                        try:
+                            current_raw = int(await asyncio.to_thread(self.live_executor.token_balance_raw, token_address))
+                        except Exception:
+                            current_raw = 0
+                        delta = max(0, current_raw - before_raw)
+                        if delta > 0:
+                            bought_raw = int(delta)
+                            break
+                        if idx < (attempts - 1):
+                            await asyncio.sleep(delay)
+            if bought_raw <= 0:
                 self._record_tx_event()
+                self._bump_skip_reason("live_buy_zero_amount")
+                try:
+                    raw_balance = int(await asyncio.to_thread(self.live_executor.token_balance_raw, token_address))
+                except Exception:
+                    raw_balance = 0
+                if raw_balance > 0:
+                    prev = int(self.recovery_untracked.get(token_address, 0) or 0)
+                    self.recovery_untracked[token_address] = raw_balance
+                    if prev <= 0:
+                        logger.warning(
+                            "RECOVERY live_buy_untracked token=%s address=%s raw_balance=%s tx=%s",
+                            symbol,
+                            token_address,
+                            raw_balance,
+                            str(getattr(buy_result, "tx_hash", "")),
+                        )
+                    self._save_state()
                 logger.error(
                     "AUTO_BUY live_failed token=%s err=zero_token_amount tx=%s spent_eth=%.8f",
                     symbol,
                     str(getattr(buy_result, "tx_hash", "")),
                     float(getattr(buy_result, "spent_eth", 0.0) or 0.0),
                 )
-                self._blacklist_add(token_address, "live_buy_zero_amount", ttl_seconds=6 * 3600)
+                self._blacklist_add(token_address, "live_buy_zero_amount")
                 return None
             pos = PaperPosition(
                 token_address=token_address,
@@ -1278,7 +1413,7 @@ class AutoTrader:
                 buy_cost_percent=cost_profile["buy_percent"],
                 sell_cost_percent=cost_profile["sell_percent"],
                 gas_cost_usd=cost_profile["gas_usd"],
-                token_amount_raw=int(buy_result.token_amount_raw),
+                token_amount_raw=int(bought_raw),
                 buy_tx_hash=str(buy_result.tx_hash),
                 buy_tx_status="confirmed",
                 spent_eth=float(buy_result.spent_eth),
@@ -1401,9 +1536,12 @@ class AutoTrader:
         await self._process_recovery_queue()
         await self._check_critical_conditions()
         self._maybe_log_paper_summary()
+        if self._is_live_mode():
+            self._maybe_discover_untracked_live_positions()
         if not self.open_positions:
             return
 
+        state_dirty = False
         addresses = list(self.open_positions.keys())
         updates = await asyncio.gather(*[self._fetch_current_price(address) for address in addresses])
         update_map: dict[str, float] = {}
@@ -1422,6 +1560,7 @@ class AutoTrader:
             has_price_update = price_usd > 0 and self._accept_price_update(position, price_usd)
             if has_price_update:
                 position.current_price_usd = price_usd
+                state_dirty = True
             base_price = float(position.current_price_usd if position.current_price_usd > 0 else position.entry_price_usd)
             raw_price_pnl_percent = ((base_price - position.entry_price_usd) / position.entry_price_usd) * 100
             if has_price_update:
@@ -1497,6 +1636,12 @@ class AutoTrader:
                 if bot and int(config.PERSONAL_TELEGRAM_ID or 0) > 0:
                     await self._send_close_message(bot, position)
 
+        if state_dirty:
+            now_ts = time.time()
+            if (now_ts - float(self._last_state_flush_ts)) >= float(self._state_flush_interval_seconds):
+                self._save_state()
+                self._last_state_flush_ts = now_ts
+
     async def _process_recovery_queue(self) -> None:
         if (not self.recovery_queue) and (not self.recovery_untracked):
             return
@@ -1551,13 +1696,20 @@ class AutoTrader:
                 if not normalized:
                     self.recovery_untracked.pop(address, None)
                     continue
-                if not self._recovery_attempt_allowed(normalized):
-                    continue
 
+                # Keep recovery_untracked in sync with real on-chain balance to avoid
+                # stale "UNTRACKED" rows after a token has already been sold/transferred.
                 amount_raw = int(self.recovery_untracked.get(normalized, 0) or 0)
+                try:
+                    amount_raw = int(self.live_executor.token_balance_raw(normalized))
+                except Exception:
+                    pass
+                self.recovery_untracked[normalized] = amount_raw
                 if amount_raw <= 0:
                     self.recovery_untracked.pop(normalized, None)
                     self._recovery_clear_tracking(normalized)
+                    continue
+                if not self._recovery_attempt_allowed(normalized):
                     continue
 
                 attempts = self._recovery_record_attempt(normalized)
@@ -1756,7 +1908,9 @@ class AutoTrader:
             return
         self._live_sell_failures = 0
 
-        weth_price = max(1.0, float(self.last_weth_price_usd))
+        weth_price = await self._resolve_weth_price_usd({})
+        if weth_price <= 0:
+            weth_price = max(1.0, float(self.last_weth_price_usd))
         received_usd = float(sell_result.received_eth) * weth_price
         pnl_usd = received_usd - float(position.position_size_usd)
         pnl_percent = (pnl_usd / position.position_size_usd * 100) if position.position_size_usd > 0 else 0.0
@@ -1779,12 +1933,15 @@ class AutoTrader:
         self.realized_pnl_usd += position.pnl_usd
         self.day_realized_pnl_usd += position.pnl_usd
 
-        if position.pnl_usd >= 0:
+        outcome = self._pnl_outcome(position.pnl_usd)
+        if outcome == "win":
             self.total_wins += 1
             self.current_loss_streak = 0
-        else:
+        elif outcome == "loss":
             self.total_losses += 1
             self.current_loss_streak += 1
+        else:
+            self.current_loss_streak = 0
         self._risk_governor_after_close(close_reason=reason, pnl_usd=float(position.pnl_usd))
 
         token_cooldown = int(config.MAX_TOKEN_COOLDOWN_SECONDS)
@@ -1854,12 +2011,15 @@ class AutoTrader:
         self.realized_pnl_usd += pnl_usd_remaining
         self.day_realized_pnl_usd += pnl_usd_remaining
 
-        if total_pnl_usd >= 0:
+        outcome = self._pnl_outcome(total_pnl_usd)
+        if outcome == "win":
             self.total_wins += 1
             self.current_loss_streak = 0
-        else:
+        elif outcome == "loss":
             self.total_losses += 1
             self.current_loss_streak += 1
+        else:
+            self.current_loss_streak = 0
         self._risk_governor_after_close(close_reason=reason, pnl_usd=float(total_pnl_usd))
 
         token_cooldown = int(config.MAX_TOKEN_COOLDOWN_SECONDS)
@@ -2057,28 +2217,51 @@ class AutoTrader:
         return token_address, best_price
 
     async def _resolve_weth_price_usd(self, token_data: dict[str, Any]) -> float:
-        direct = float(token_data.get("weth_price_usd") or token_data.get("base_quote_price_usd") or 0)
-        if direct > 0:
+        direct = float(token_data.get("weth_price_usd") or 0.0)
+        if self._is_sane_weth_price_usd(direct):
             self.last_weth_price_usd = direct
             return direct
+        if direct > 0:
+            logger.warning("WETH price rejected as outlier source=token_data value=%.6f", direct)
 
-        if self.last_weth_price_usd > 0:
+        if self._is_sane_weth_price_usd(self.last_weth_price_usd):
             return self.last_weth_price_usd
+        if self.last_weth_price_usd > 0:
+            logger.warning(
+                "WETH price cache rejected as outlier value=%.6f; trying on-chain/fallback",
+                float(self.last_weth_price_usd),
+            )
 
         weth_address = str(config.WETH_ADDRESS or "").strip().lower()
         if weth_address:
             fetched = await self._fetch_current_price(weth_address)
-            if fetched and float(fetched[1]) > 0:
-                self.last_weth_price_usd = float(fetched[1])
-                return self.last_weth_price_usd
+            if fetched:
+                fetched_price = float(fetched[1] or 0.0)
+                if self._is_sane_weth_price_usd(fetched_price):
+                    self.last_weth_price_usd = fetched_price
+                    return self.last_weth_price_usd
+                if fetched_price > 0:
+                    logger.warning("WETH price rejected as outlier source=dex_fetch value=%.6f", fetched_price)
 
         fallback = max(0.0, float(config.WETH_PRICE_FALLBACK_USD))
-        if fallback > 0:
+        if self._is_sane_weth_price_usd(fallback):
             self.last_weth_price_usd = fallback
             logger.info("AutoTrade cap fallback weth_price=$%.2f", fallback)
             return fallback
 
         return 0.0
+
+    def _is_sane_weth_price_usd(self, price: float) -> bool:
+        p = float(price or 0.0)
+        if p <= 0:
+            return False
+        fallback = max(0.0, float(getattr(config, "WETH_PRICE_FALLBACK_USD", 0.0) or 0.0))
+        # Guard against accidental poisoning by token-level quote fields.
+        if fallback > 0:
+            low = max(50.0, fallback * 0.20)
+            high = max(low + 1.0, fallback * 5.00)
+            return low <= p <= high
+        return 50.0 <= p <= 20000.0
 
     def _accept_price_update(self, position: PaperPosition, next_price_usd: float) -> bool:
         if not config.PAPER_PRICE_GUARD_ENABLED:
@@ -2263,43 +2446,155 @@ class AutoTrader:
                     onchain_amount,
                 )
 
-        # Discover potentially untracked tokens from known address universe.
+        self._discover_untracked_live_positions()
+        self._save_state()
+
+    def _candidate_log_path(self) -> str:
+        raw = str(getattr(config, "CANDIDATE_DECISIONS_LOG_FILE", os.path.join("logs", "candidates.jsonl")) or "").strip()
+        if os.path.isabs(raw):
+            return raw
+        root = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+        return os.path.join(root, raw)
+
+    def _recent_candidate_addresses(self, max_rows: int = 500, max_bytes: int = 2_000_000) -> list[str]:
+        path = self._candidate_log_path()
+        if not os.path.exists(path):
+            return []
+        try:
+            with open(path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                start = max(0, size - int(max_bytes))
+                f.seek(start)
+                blob = f.read().decode("utf-8", errors="ignore")
+        except Exception:
+            return []
+        lines = blob.splitlines()
+        if len(lines) > max_rows:
+            lines = lines[-max_rows:]
+        out: list[str] = []
+        seen: set[str] = set()
+        for line in lines:
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(row, dict):
+                continue
+            addr = normalize_address(str(row.get("address", "") or ""))
+            if not addr or addr in seen:
+                continue
+            if not bool(ADDRESS_RE.match(addr)):
+                continue
+            seen.add(addr)
+            out.append(addr)
+        return out
+
+    def _discover_untracked_live_positions(self) -> None:
+        if not self._is_live_mode() or self.live_executor is None:
+            return
         max_discovery = int(getattr(config, "RECOVERY_DISCOVERY_MAX_ADDRESSES", 80) or 80)
-        if max_discovery > 0:
-            candidates: list[str] = []
-            seen: set[str] = set()
+        if max_discovery <= 0:
+            return
 
-            def _push(addr: str) -> None:
-                a = normalize_address(addr)
-                if not a or a in seen or a in self.open_positions:
-                    return
-                if not bool(ADDRESS_RE.match(a)):
-                    return
-                seen.add(a)
-                candidates.append(a)
+        candidates: list[str] = []
+        seen: set[str] = set()
 
-            for a in self._blacklist.keys():
-                _push(str(a))
-            for p in self.closed_positions[-300:]:
-                _push(str(p.token_address))
-            for a in self.token_cooldowns.keys():
-                _push(str(a))
+        def _push(addr: str) -> None:
+            a = normalize_address(addr)
+            if not a or a in seen or a in self.open_positions:
+                return
+            if not bool(ADDRESS_RE.match(a)):
+                return
+            seen.add(a)
+            candidates.append(a)
 
-            candidates = candidates[:max_discovery]
-            for addr in candidates:
-                try:
-                    amount_raw = int(self.live_executor.token_balance_raw(addr))
-                except Exception:
-                    continue
-                if amount_raw <= 0:
-                    continue
-                self.recovery_untracked[addr] = amount_raw
+        for a in self._blacklist.keys():
+            _push(str(a))
+        for p in self.closed_positions[-300:]:
+            _push(str(p.token_address))
+        for a in self.token_cooldowns.keys():
+            _push(str(a))
+        for a in self._recent_candidate_addresses():
+            _push(a)
+
+        candidates = candidates[:max_discovery]
+        for addr in candidates:
+            try:
+                amount_raw = int(self.live_executor.token_balance_raw(addr))
+            except Exception:
+                continue
+            if amount_raw <= 0:
+                continue
+            if self._estimate_untracked_value_usd(addr, amount_raw) < float(
+                getattr(config, "RECOVERY_UNTRACKED_MIN_VALUE_USD", 0.0) or 0.0
+            ):
+                continue
+            prev = int(self.recovery_untracked.get(addr, 0) or 0)
+            self.recovery_untracked[addr] = amount_raw
+            if prev <= 0:
                 logger.warning(
                     "RECOVERY untracked_detected address=%s amount_raw=%s",
                     addr,
                     amount_raw,
                 )
-        self._save_state()
+
+    def _prune_recovery_untracked_live(self) -> None:
+        if not self._is_live_mode() or self.live_executor is None:
+            return
+        if not self.recovery_untracked:
+            return
+        dirty = False
+        for address in list(self.recovery_untracked.keys()):
+            normalized = normalize_address(address)
+            if not normalized:
+                self.recovery_untracked.pop(address, None)
+                dirty = True
+                continue
+            amount_raw = int(self.recovery_untracked.get(normalized, 0) or 0)
+            try:
+                amount_raw = int(self.live_executor.token_balance_raw(normalized))
+            except Exception:
+                pass
+            if amount_raw <= 0:
+                self.recovery_untracked.pop(normalized, None)
+                self._recovery_clear_tracking(normalized)
+                dirty = True
+            else:
+                min_usd = float(getattr(config, "RECOVERY_UNTRACKED_MIN_VALUE_USD", 0.0) or 0.0)
+                if min_usd > 0 and self._estimate_untracked_value_usd(normalized, amount_raw) < min_usd:
+                    self.recovery_untracked.pop(normalized, None)
+                    self._recovery_clear_tracking(normalized)
+                    dirty = True
+                else:
+                    self.recovery_untracked[normalized] = amount_raw
+        if dirty:
+            self._save_state()
+
+    def _estimate_untracked_value_usd(self, token_address: str, amount_raw: int) -> float:
+        if (not self._is_live_mode()) or self.live_executor is None:
+            return 0.0
+        if int(amount_raw or 0) <= 0:
+            return 0.0
+        try:
+            out_eth = float(self.live_executor.quote_sell_eth(token_address, int(amount_raw)))
+        except Exception:
+            out_eth = 0.0
+        if out_eth <= 0:
+            return 0.0
+        weth_usd = max(0.0, float(getattr(config, "WETH_PRICE_FALLBACK_USD", 0.0) or 0.0))
+        return float(out_eth * weth_usd)
+
+    def _maybe_discover_untracked_live_positions(self) -> None:
+        now_ts = datetime.now(timezone.utc).timestamp()
+        interval = float(getattr(config, "RECOVERY_DISCOVERY_INTERVAL_SECONDS", 45) or 45)
+        if (now_ts - float(self._last_untracked_discovery_ts)) < max(10.0, interval):
+            return
+        self._last_untracked_discovery_ts = now_ts
+        before = len(self.recovery_untracked)
+        self._discover_untracked_live_positions()
+        if len(self.recovery_untracked) != before:
+            self._save_state()
 
     @staticmethod
     def _estimate_edge_percent(
@@ -2358,7 +2653,13 @@ class AutoTrader:
         return min_size + (max_size - min_size) * factor
 
     @staticmethod
-    def _estimate_cost_profile(liquidity_usd: float, risk_level: str, score: int) -> dict[str, float]:
+    def _estimate_cost_profile(
+        liquidity_usd: float,
+        risk_level: str,
+        score: int,
+        *,
+        position_size_usd: float | None = None,
+    ) -> dict[str, float]:
         buy_percent = float(config.PAPER_SWAP_FEE_BPS + config.PAPER_BASE_SLIPPAGE_BPS) / 100
         sell_percent = float(config.PAPER_SWAP_FEE_BPS + config.PAPER_BASE_SLIPPAGE_BPS) / 100
 
@@ -2389,7 +2690,12 @@ class AutoTrader:
 
         # buy + approve + sell tx in real mode
         gas_usd = float(config.PAPER_GAS_PER_TX_USD) * 3.0
-        total_percent = buy_percent + sell_percent + (gas_usd / max(float(config.PAPER_TRADE_SIZE_MAX_USD), 0.1) * 100)
+        if position_size_usd is None:
+            size_ref_usd = float(getattr(config, "PAPER_TRADE_SIZE_USD", config.PAPER_TRADE_SIZE_MAX_USD) or 0.0)
+        else:
+            size_ref_usd = float(position_size_usd or 0.0)
+        size_ref_usd = max(0.1, size_ref_usd)
+        total_percent = buy_percent + sell_percent + (gas_usd / size_ref_usd * 100)
 
         return {
             "buy_percent": buy_percent,
@@ -2431,6 +2737,7 @@ class AutoTrader:
         return int(min_hold + (span * max(0.0, min(1.0, quality))))
 
     def _save_state(self) -> None:
+        tmp_path = ""
         try:
             self._prune_closed_positions()
             payload = {
@@ -2467,9 +2774,24 @@ class AutoTrader:
                 "open_positions": [self._serialize_pos(p) for p in self.open_positions.values()],
                 "closed_positions": [self._serialize_pos(p) for p in self.closed_positions[-500:]],
             }
-            with open(self.state_file, "w", encoding="utf-8") as f:
+            state_dir = os.path.dirname(self.state_file) or "."
+            os.makedirs(state_dir, exist_ok=True)
+            tmp_path = f"{self.state_file}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False, indent=2)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except Exception:
+                    pass
+            os.replace(tmp_path, self.state_file)
+            self._last_state_flush_ts = time.time()
         except Exception as exc:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
             logger.warning("AutoTrade state save failed: %s", exc)
 
     def _load_state(self) -> None:

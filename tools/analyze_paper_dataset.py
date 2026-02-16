@@ -23,6 +23,8 @@ def _safe_int(v: Any, default: int = 0) -> int:
 
 def _profile_from_path(path: str) -> str:
     base = os.path.basename(path).lower()
+    if base.startswith("paper_state.") and base.endswith(".json"):
+        return base.replace("paper_state.", "").replace(".json", "")
     if "mx1_" in base:
         return "mx1_refine"
     if "mx2_" in base:

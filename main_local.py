@@ -32,13 +32,43 @@ from utils.addressing import normalize_address
 
 logger = logging.getLogger(__name__)
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-INSTANCE_ID = str(getattr(config, "BOT_INSTANCE_ID", "") or "").strip()
-RUN_TAG = str(getattr(config, "RUN_TAG", INSTANCE_ID) or INSTANCE_ID or "single").strip()
+_RAW_INSTANCE_ID = str(getattr(config, "BOT_INSTANCE_ID", "") or "").strip()
+RUN_TAG = str(getattr(config, "RUN_TAG", _RAW_INSTANCE_ID) or _RAW_INSTANCE_ID or "single").strip()
+INSTANCE_ID = _RAW_INSTANCE_ID or (RUN_TAG if RUN_TAG and RUN_TAG.lower() != "single" else "")
 WINDOWS_MUTEX_NAME = (
     f"Global\\solana_alert_bot_main_local_{INSTANCE_ID}"
     if INSTANCE_ID
     else "Global\\solana_alert_bot_main_local_single_instance"
 )
+PID_FILE = os.path.join(PROJECT_ROOT, "bot.pid")
+
+
+def _should_manage_single_pid_file() -> bool:
+    # Matrix workers use per-instance metadata, not shared bot.pid.
+    return not str(INSTANCE_ID or "").strip().lower().startswith("mx")
+
+
+def _write_single_pid_file() -> None:
+    if not _should_manage_single_pid_file():
+        return
+    try:
+        with open(PID_FILE, "w", encoding="ascii") as f:
+            f.write(str(os.getpid()))
+    except Exception:
+        pass
+
+
+def _clear_single_pid_file() -> None:
+    if not _should_manage_single_pid_file():
+        return
+    try:
+        if os.path.exists(PID_FILE):
+            with open(PID_FILE, "r", encoding="ascii") as f:
+                raw = str(f.read() or "").strip()
+            if raw.isdigit() and int(raw) == os.getpid():
+                os.remove(PID_FILE)
+    except Exception:
+        pass
 
 
 def _graceful_stop_file_path() -> str:
@@ -416,6 +446,9 @@ class AdaptiveFilterController:
     def __init__(self) -> None:
         self.enabled = bool(getattr(config, "ADAPTIVE_FILTERS_ENABLED", False))
         self.mode = str(getattr(config, "ADAPTIVE_FILTERS_MODE", "dry_run") or "dry_run").strip().lower()
+        if self.mode == "observe":
+            # Backward-compatible alias used by matrix presets.
+            self.mode = "dry_run"
         self.paper_only = bool(getattr(config, "ADAPTIVE_FILTERS_PAPER_ONLY", True))
         self.interval_seconds = int(getattr(config, "ADAPTIVE_FILTERS_INTERVAL_SECONDS", 900) or 900)
         self.min_window_cycles = int(getattr(config, "ADAPTIVE_FILTERS_MIN_WINDOW_CYCLES", 5) or 5)
@@ -502,9 +535,11 @@ class AdaptiveFilterController:
     @staticmethod
     def _step_by_pct(value: float, pct: float, fallback_abs: float) -> float:
         pct = max(0.0, float(pct))
+        fallback = max(0.0, float(fallback_abs))
         if pct <= 0.0:
-            return max(1.0, float(fallback_abs))
-        return max(1.0, float(value) * (pct / 100.0))
+            return fallback
+        step = max(0.0, float(value)) * (pct / 100.0)
+        return step if step > 0.0 else fallback
 
     @staticmethod
     def _percentile(values: list[float], p: float) -> float:
@@ -874,6 +909,440 @@ class AdaptiveFilterController:
         self._reset_window(now_ts=now_ts, realized_usd=realized_now, closed=closed_now)
 
 
+class AutonomousControlController:
+    def __init__(self) -> None:
+        self.enabled = bool(getattr(config, "AUTONOMOUS_CONTROL_ENABLED", False))
+        self.mode = str(getattr(config, "AUTONOMOUS_CONTROL_MODE", "dry_run") or "dry_run").strip().lower()
+        if self.mode == "observe":
+            self.mode = "dry_run"
+        self.paper_only = bool(getattr(config, "AUTONOMOUS_CONTROL_PAPER_ONLY", True))
+        self.interval_seconds = int(getattr(config, "AUTONOMOUS_CONTROL_INTERVAL_SECONDS", 300) or 300)
+        self.min_window_cycles = int(getattr(config, "AUTONOMOUS_CONTROL_MIN_WINDOW_CYCLES", 3) or 3)
+        self.cooldown_windows = int(getattr(config, "AUTONOMOUS_CONTROL_COOLDOWN_WINDOWS", 1) or 1)
+
+        self.target_candidates_min = float(getattr(config, "AUTONOMOUS_CONTROL_TARGET_CANDIDATES_MIN", 2.0) or 2.0)
+        self.target_candidates_high = float(getattr(config, "AUTONOMOUS_CONTROL_TARGET_CANDIDATES_HIGH", 8.0) or 8.0)
+        self.target_opened_min = float(getattr(config, "AUTONOMOUS_CONTROL_TARGET_OPENED_MIN", 0.18) or 0.18)
+
+        self.neg_realized_trigger = float(getattr(config, "AUTONOMOUS_CONTROL_NEG_REALIZED_TRIGGER_USD", 0.08) or 0.08)
+        self.pos_realized_trigger = float(getattr(config, "AUTONOMOUS_CONTROL_POS_REALIZED_TRIGGER_USD", 0.08) or 0.08)
+        self.max_loss_streak_trigger = int(getattr(config, "AUTONOMOUS_CONTROL_MAX_LOSS_STREAK_TRIGGER", 3) or 3)
+
+        self.step_open_trades = int(getattr(config, "AUTONOMOUS_CONTROL_STEP_OPEN_TRADES", 1) or 1)
+        self.step_top_n = int(getattr(config, "AUTONOMOUS_CONTROL_STEP_TOP_N", 1) or 1)
+        self.step_max_buys_per_hour = int(getattr(config, "AUTONOMOUS_CONTROL_STEP_MAX_BUYS_PER_HOUR", 6) or 6)
+        self.step_trade_size_max = float(getattr(config, "AUTONOMOUS_CONTROL_STEP_TRADE_SIZE_MAX_USD", 0.05) or 0.05)
+
+        self.max_open_min_bound = int(getattr(config, "AUTONOMOUS_CONTROL_MAX_OPEN_TRADES_MIN", 1) or 1)
+        self.max_open_max_bound = int(getattr(config, "AUTONOMOUS_CONTROL_MAX_OPEN_TRADES_MAX", 6) or 6)
+        self.top_n_min_bound = int(getattr(config, "AUTONOMOUS_CONTROL_TOP_N_MIN", 1) or 1)
+        self.top_n_max_bound = int(getattr(config, "AUTONOMOUS_CONTROL_TOP_N_MAX", 20) or 20)
+        self.max_buys_min_bound = int(getattr(config, "AUTONOMOUS_CONTROL_MAX_BUYS_PER_HOUR_MIN", 6) or 6)
+        self.max_buys_max_bound = int(getattr(config, "AUTONOMOUS_CONTROL_MAX_BUYS_PER_HOUR_MAX", 96) or 96)
+        self.size_max_min_bound = float(getattr(config, "AUTONOMOUS_CONTROL_TRADE_SIZE_MAX_MIN", 0.25) or 0.25)
+        self.size_max_max_bound = float(getattr(config, "AUTONOMOUS_CONTROL_TRADE_SIZE_MAX_MAX", 2.0) or 2.0)
+
+        self.risk_off_open_cap = int(getattr(config, "AUTONOMOUS_CONTROL_RISK_OFF_OPEN_TRADES_CAP", 2) or 2)
+        self.risk_off_top_n_cap = int(getattr(config, "AUTONOMOUS_CONTROL_RISK_OFF_TOP_N_CAP", 8) or 8)
+        self.risk_off_buys_cap = int(getattr(config, "AUTONOMOUS_CONTROL_RISK_OFF_MAX_BUYS_PER_HOUR_CAP", 24) or 24)
+        self.risk_off_size_cap = float(getattr(config, "AUTONOMOUS_CONTROL_RISK_OFF_TRADE_SIZE_MAX_CAP", 0.70) or 0.70)
+        self.anti_stall_enabled = bool(getattr(config, "AUTONOMOUS_CONTROL_ANTI_STALL_ENABLED", True))
+        self.anti_stall_min_candidates = float(getattr(config, "AUTONOMOUS_CONTROL_ANTI_STALL_MIN_CANDIDATES", 1.0) or 1.0)
+        self.anti_stall_min_utilization = float(getattr(config, "AUTONOMOUS_CONTROL_ANTI_STALL_MIN_UTILIZATION", 0.85) or 0.85)
+        self.anti_stall_limit_skip_min = int(getattr(config, "AUTONOMOUS_CONTROL_ANTI_STALL_LIMIT_SKIP_MIN", 1) or 1)
+        self.anti_stall_expand_mult = float(getattr(config, "AUTONOMOUS_CONTROL_ANTI_STALL_EXPAND_MULT", 1.0) or 1.0)
+        self.recovery_enabled = bool(getattr(config, "AUTONOMOUS_CONTROL_RECOVERY_ENABLED", True))
+        self.recovery_min_candidates = float(getattr(config, "AUTONOMOUS_CONTROL_RECOVERY_MIN_CANDIDATES", 0.8) or 0.8)
+        self.recovery_expand_mult = float(getattr(config, "AUTONOMOUS_CONTROL_RECOVERY_EXPAND_MULT", 1.2) or 1.2)
+        self.fragile_tighten_enabled = bool(getattr(config, "AUTONOMOUS_CONTROL_FRAGILE_TIGHTEN_ENABLED", True))
+
+        self.decisions_log_enabled = bool(getattr(config, "AUTONOMOUS_CONTROL_DECISIONS_LOG_ENABLED", True))
+        raw_log = str(
+            getattr(
+                config,
+                "AUTONOMOUS_CONTROL_DECISIONS_LOG_FILE",
+                os.path.join("logs", "autonomy_decisions.jsonl"),
+            )
+            or ""
+        ).strip()
+        if not raw_log:
+            raw_log = os.path.join("logs", "autonomy_decisions.jsonl")
+        self.decisions_log_file = raw_log if os.path.isabs(raw_log) else os.path.abspath(os.path.join(PROJECT_ROOT, raw_log))
+
+        self.last_eval_ts = time.time()
+        self.cooldown_until_ts = 0.0
+        self.window_cycles = 0
+        self.window_candidates = 0
+        self.window_opened = 0
+        self.window_skip_reasons: dict[str, int] = {}
+        self.window_regime_counts: dict[str, int] = {}
+        self.window_policy_counts: dict[str, int] = {}
+        self.prev_closed = 0
+        self.prev_wins = 0
+        self.prev_losses = 0
+        self.prev_realized_usd = 0.0
+
+        self.max_open_min_bound = max(1, int(self.max_open_min_bound))
+        self.max_open_max_bound = max(self.max_open_min_bound, int(self.max_open_max_bound))
+        self.top_n_min_bound = max(1, int(self.top_n_min_bound))
+        self.top_n_max_bound = max(self.top_n_min_bound, int(self.top_n_max_bound))
+        self.max_buys_min_bound = max(1, int(self.max_buys_min_bound))
+        self.max_buys_max_bound = max(self.max_buys_min_bound, int(self.max_buys_max_bound))
+        self.size_max_min_bound = max(0.05, float(self.size_max_min_bound))
+        self.size_max_max_bound = max(self.size_max_min_bound, float(self.size_max_max_bound))
+        self.step_open_trades = max(1, int(self.step_open_trades))
+        self.step_top_n = max(1, int(self.step_top_n))
+        self.step_max_buys_per_hour = max(1, int(self.step_max_buys_per_hour))
+        self.step_trade_size_max = max(0.01, float(self.step_trade_size_max))
+        self.max_loss_streak_trigger = max(1, int(self.max_loss_streak_trigger))
+        self.anti_stall_min_candidates = max(0.0, float(self.anti_stall_min_candidates))
+        self.anti_stall_min_utilization = max(0.5, min(1.0, float(self.anti_stall_min_utilization)))
+        self.anti_stall_limit_skip_min = max(0, int(self.anti_stall_limit_skip_min))
+        self.anti_stall_expand_mult = max(0.5, min(3.0, float(self.anti_stall_expand_mult)))
+        self.recovery_min_candidates = max(0.0, float(self.recovery_min_candidates))
+        self.recovery_expand_mult = max(0.5, min(3.0, float(self.recovery_expand_mult)))
+
+        base_open, base_top_n, base_buys, base_size = self._snapshot_controls()
+        self.base_max_open = self._clamp_int(base_open, self.max_open_min_bound, self.max_open_max_bound)
+        self.base_top_n = self._clamp_int(base_top_n, self.top_n_min_bound, self.top_n_max_bound)
+        self.base_buys_per_hour = self._clamp_int(base_buys, self.max_buys_min_bound, self.max_buys_max_bound)
+        self.base_trade_size_max = self._clamp_float(base_size, self.size_max_min_bound, self.size_max_max_bound)
+
+    @staticmethod
+    def _clamp_int(value: int, lower: int, upper: int) -> int:
+        return max(lower, min(upper, int(value)))
+
+    @staticmethod
+    def _clamp_float(value: float, lower: float, upper: float) -> float:
+        return max(lower, min(upper, float(value)))
+
+    def _snapshot_controls(self) -> tuple[int, int, int, float]:
+        max_open = int(getattr(config, "MAX_OPEN_TRADES", 1) or 1)
+        if max_open <= 0:
+            max_open = int(self.max_open_max_bound)
+        top_n = int(getattr(config, "AUTO_TRADE_TOP_N", 1) or 1)
+        max_buys = int(getattr(config, "MAX_BUYS_PER_HOUR", 1) or 1)
+        if max_buys <= 0:
+            max_buys = int(self.max_buys_max_bound)
+        size_max = float(getattr(config, "PAPER_TRADE_SIZE_MAX_USD", 1.0) or 1.0)
+        return max(1, max_open), max(1, top_n), max(1, max_buys), max(0.05, size_max)
+
+    def _apply_controls(self, *, max_open: int, top_n: int, max_buys_per_hour: int, trade_size_max_usd: float) -> None:
+        setattr(config, "MAX_OPEN_TRADES", int(max_open))
+        setattr(config, "AUTO_TRADE_TOP_N", int(top_n))
+        setattr(config, "MAX_BUYS_PER_HOUR", int(max_buys_per_hour))
+        setattr(config, "MAX_TRADES_PER_HOUR", int(max_buys_per_hour))
+        setattr(config, "PAPER_TRADE_SIZE_MAX_USD", float(trade_size_max_usd))
+
+    def _write_decision(self, event: dict[str, object]) -> None:
+        if not self.decisions_log_enabled:
+            return
+        try:
+            payload = dict(event or {})
+            payload.setdefault("run_tag", RUN_TAG)
+            os.makedirs(os.path.dirname(self.decisions_log_file) or ".", exist_ok=True)
+            with open(self.decisions_log_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False, sort_keys=False) + "\n")
+        except Exception:
+            logger.exception("AUTONOMY decision log write failed")
+
+    def prime(self, *, auto_stats: dict[str, float | int]) -> None:
+        self.prev_closed = int(auto_stats.get("closed", 0) or 0)
+        self.prev_wins = int(auto_stats.get("wins", 0) or 0)
+        self.prev_losses = int(auto_stats.get("losses", 0) or 0)
+        self.prev_realized_usd = float(auto_stats.get("realized_pnl_usd", 0.0) or 0.0)
+
+    def record_cycle(
+        self,
+        *,
+        candidates: int,
+        opened: int,
+        policy_state: str,
+        market_regime: str,
+        skip_reasons_cycle: dict[str, int] | None = None,
+    ) -> None:
+        self.window_cycles += 1
+        self.window_candidates += int(candidates)
+        self.window_opened += int(opened)
+        for reason, count in (skip_reasons_cycle or {}).items():
+            key = str(reason or "unknown").strip().lower() or "unknown"
+            self.window_skip_reasons[key] = int(self.window_skip_reasons.get(key, 0)) + int(count or 0)
+        pkey = str(policy_state or "UNKNOWN").strip().upper() or "UNKNOWN"
+        rkey = str(market_regime or "UNKNOWN").strip().upper() or "UNKNOWN"
+        self.window_policy_counts[pkey] = int(self.window_policy_counts.get(pkey, 0)) + 1
+        self.window_regime_counts[rkey] = int(self.window_regime_counts.get(rkey, 0)) + 1
+
+    def _reset_window(self, *, now_ts: float, auto_stats: dict[str, float | int]) -> None:
+        self.last_eval_ts = float(now_ts)
+        self.window_cycles = 0
+        self.window_candidates = 0
+        self.window_opened = 0
+        self.window_skip_reasons = {}
+        self.window_policy_counts = {}
+        self.window_regime_counts = {}
+        self.prev_closed = int(auto_stats.get("closed", 0) or 0)
+        self.prev_wins = int(auto_stats.get("wins", 0) or 0)
+        self.prev_losses = int(auto_stats.get("losses", 0) or 0)
+        self.prev_realized_usd = float(auto_stats.get("realized_pnl_usd", 0.0) or 0.0)
+
+    def maybe_adapt(self, *, policy_state: str, market_regime: str, auto_stats: dict[str, float | int]) -> None:
+        if not self.enabled:
+            return
+        if self.mode not in {"dry_run", "apply"}:
+            return
+        if self.paper_only and not bool(getattr(config, "AUTO_TRADE_PAPER", False)):
+            return
+
+        now_ts = time.time()
+        if (now_ts - float(self.last_eval_ts)) < float(self.interval_seconds):
+            return
+        if int(self.window_cycles) < int(self.min_window_cycles):
+            return
+
+        avg_candidates = float(self.window_candidates) / max(1, int(self.window_cycles))
+        avg_opened = float(self.window_opened) / max(1, int(self.window_cycles))
+        closed_now = int(auto_stats.get("closed", 0) or 0)
+        wins_now = int(auto_stats.get("wins", 0) or 0)
+        losses_now = int(auto_stats.get("losses", 0) or 0)
+        realized_now = float(auto_stats.get("realized_pnl_usd", 0.0) or 0.0)
+        loss_streak = int(auto_stats.get("loss_streak", 0) or 0)
+        open_now = int(auto_stats.get("open_trades", 0) or 0)
+        risk_block_reason = str(auto_stats.get("risk_block_reason", "") or "").strip()
+        trades_last_hour = int(auto_stats.get("trades_last_hour", 0) or 0)
+        skip_limits = int(self.window_skip_reasons.get("disabled_or_limits", 0))
+        skip_cooldown = int(self.window_skip_reasons.get("cooldown", 0))
+
+        closed_delta = int(closed_now - int(self.prev_closed))
+        wins_delta = int(wins_now - int(self.prev_wins))
+        losses_delta = int(losses_now - int(self.prev_losses))
+        realized_delta = float(realized_now - float(self.prev_realized_usd))
+        policy_now = str(policy_state or "UNKNOWN").strip().upper() or "UNKNOWN"
+        regime_now = str(market_regime or "UNKNOWN").strip().upper() or "UNKNOWN"
+
+        max_open_now, top_n_now, buys_now, size_max_now = self._snapshot_controls()
+        hourly_utilization = float(trades_last_hour) / float(max(1, int(buys_now)))
+        max_open_next, top_n_next, buys_next, size_max_next = max_open_now, top_n_now, buys_now, size_max_now
+        below_baseline = (
+            max_open_now < int(self.base_max_open)
+            or top_n_now < int(self.base_top_n)
+            or buys_now < int(self.base_buys_per_hour)
+            or (size_max_now + 1e-9) < float(self.base_trade_size_max)
+        )
+        action = "hold"
+        reason = "steady_state"
+
+        if now_ts < float(self.cooldown_until_ts):
+            remaining = max(0.0, float(self.cooldown_until_ts) - now_ts)
+            action = "hold"
+            reason = f"cooldown_active {remaining:.1f}s"
+        elif (
+            policy_now != "OK"
+            or regime_now in {"RISK_OFF", "CAUTION"}
+            or bool(risk_block_reason)
+        ):
+            max_open_next = min(max_open_next, int(self.risk_off_open_cap))
+            top_n_next = min(top_n_next, int(self.risk_off_top_n_cap))
+            buys_next = min(buys_next, int(self.risk_off_buys_cap))
+            size_max_next = min(size_max_next, float(self.risk_off_size_cap))
+            action = "risk_tighten"
+            reason = (
+                f"policy={policy_now} regime={regime_now}"
+                + (f" risk_block={risk_block_reason}" if risk_block_reason else "")
+            )
+        elif self.fragile_tighten_enabled and regime_now == "FRAGILE":
+            max_open_next -= int(self.step_open_trades)
+            top_n_next -= int(self.step_top_n)
+            buys_next -= int(self.step_max_buys_per_hour)
+            size_max_next -= float(self.step_trade_size_max) * 0.5
+            action = "fragile_tighten"
+            reason = "regime=FRAGILE mild_step_down"
+        elif (
+            closed_delta > 0
+            and (
+                realized_delta <= -abs(float(self.neg_realized_trigger))
+                or losses_delta > wins_delta
+                or loss_streak >= int(self.max_loss_streak_trigger)
+            )
+        ):
+            max_open_next -= int(self.step_open_trades)
+            top_n_next -= int(self.step_top_n)
+            buys_next -= int(self.step_max_buys_per_hour)
+            size_max_next -= float(self.step_trade_size_max)
+            action = "loss_tighten"
+            reason = (
+                f"realized_delta=${realized_delta:.3f} losses_delta={losses_delta} "
+                f"wins_delta={wins_delta} loss_streak={loss_streak}"
+            )
+        elif (
+            avg_candidates >= float(self.target_candidates_high)
+            and avg_opened < float(self.target_opened_min)
+            and realized_delta >= (-abs(float(self.neg_realized_trigger)) * 0.5)
+            and loss_streak <= 1
+        ):
+            max_open_next += int(self.step_open_trades)
+            top_n_next += int(self.step_top_n)
+            buys_next += int(self.step_max_buys_per_hour)
+            if realized_delta >= float(self.pos_realized_trigger):
+                size_max_next += float(self.step_trade_size_max)
+            action = "flow_expand"
+            reason = f"high_flow_no_fill avg_cand={avg_candidates:.2f} avg_opened={avg_opened:.2f}"
+        elif (
+            closed_delta > 0
+            and realized_delta >= abs(float(self.pos_realized_trigger))
+            and losses_delta <= wins_delta
+            and avg_candidates >= float(self.target_candidates_min)
+        ):
+            top_n_next += int(self.step_top_n)
+            buys_next += int(self.step_max_buys_per_hour)
+            action = "profit_expand"
+            reason = (
+                f"realized_delta=${realized_delta:.3f} wins_delta={wins_delta} "
+                f"losses_delta={losses_delta}"
+            )
+        elif (
+            self.anti_stall_enabled
+            and policy_now == "OK"
+            and regime_now not in {"RISK_OFF", "CAUTION"}
+            and avg_candidates >= max(float(self.anti_stall_min_candidates), float(self.target_candidates_min) * 0.60)
+            and avg_opened <= max(0.02, float(self.target_opened_min) * 0.35)
+            and (
+                hourly_utilization >= float(self.anti_stall_min_utilization)
+                or skip_limits >= int(self.anti_stall_limit_skip_min)
+                or skip_cooldown >= int(self.anti_stall_limit_skip_min)
+            )
+        ):
+            buy_step = max(1, int(round(float(self.step_max_buys_per_hour) * float(self.anti_stall_expand_mult))))
+            top_step = max(1, int(round(float(self.step_top_n) * max(1.0, float(self.anti_stall_expand_mult)))))
+            buys_next += buy_step
+            top_n_next += top_step
+            if open_now >= max_open_now and max_open_now < self.max_open_max_bound:
+                max_open_next += int(self.step_open_trades)
+            action = "anti_stall_expand"
+            reason = (
+                f"open_stall util={hourly_utilization:.2f} limits={skip_limits} cooldown={skip_cooldown} "
+                f"avg_cand={avg_candidates:.2f} avg_opened={avg_opened:.2f}"
+            )
+        elif (
+            self.recovery_enabled
+            and policy_now == "OK"
+            and regime_now not in {"RISK_OFF", "CAUTION"}
+            and below_baseline
+            and avg_candidates >= max(float(self.recovery_min_candidates), float(self.target_candidates_min) * 0.50)
+            and avg_opened <= max(0.08, float(self.target_opened_min))
+            and losses_delta <= (wins_delta + 1)
+        ):
+            buy_step = max(1, int(round(float(self.step_max_buys_per_hour) * float(self.recovery_expand_mult))))
+            top_step = max(1, int(round(float(self.step_top_n) * max(1.0, float(self.recovery_expand_mult)))))
+            max_open_next = min(int(self.base_max_open), max_open_now + int(self.step_open_trades))
+            top_n_next = min(int(self.base_top_n), top_n_now + top_step)
+            buys_next = min(int(self.base_buys_per_hour), buys_now + buy_step)
+            if realized_delta >= (-abs(float(self.neg_realized_trigger)) * 0.5):
+                size_max_next = min(float(self.base_trade_size_max), size_max_now + float(self.step_trade_size_max))
+            action = "recovery_expand"
+            reason = (
+                f"recover baseline={self.base_max_open}/{self.base_top_n}/{self.base_buys_per_hour} "
+                f"now={max_open_now}/{top_n_now}/{buys_now} avg_cand={avg_candidates:.2f}"
+            )
+        elif avg_candidates < float(self.target_candidates_min) and avg_opened <= 0.01:
+            top_n_next -= int(self.step_top_n)
+            buys_next -= int(self.step_max_buys_per_hour)
+            action = "thin_market_conserve"
+            reason = f"low_flow avg_cand={avg_candidates:.2f} avg_opened={avg_opened:.2f}"
+
+        max_open_next = self._clamp_int(max_open_next, self.max_open_min_bound, self.max_open_max_bound)
+        top_n_next = self._clamp_int(top_n_next, self.top_n_min_bound, self.top_n_max_bound)
+        buys_next = self._clamp_int(buys_next, self.max_buys_min_bound, self.max_buys_max_bound)
+        size_min_now = max(0.01, float(getattr(config, "PAPER_TRADE_SIZE_MIN_USD", 0.0) or 0.0))
+        size_lower_bound = max(self.size_max_min_bound, size_min_now)
+        size_max_next = self._clamp_float(size_max_next, size_lower_bound, self.size_max_max_bound)
+
+        changed = (
+            max_open_next != max_open_now
+            or top_n_next != top_n_now
+            or buys_next != buys_now
+            or abs(size_max_next - size_max_now) >= 0.01
+        )
+        if self.mode == "apply" and changed and now_ts >= float(self.cooldown_until_ts):
+            self._apply_controls(
+                max_open=max_open_next,
+                top_n=top_n_next,
+                max_buys_per_hour=buys_next,
+                trade_size_max_usd=size_max_next,
+            )
+            self.cooldown_until_ts = now_ts + (max(0, self.cooldown_windows) * max(1, self.interval_seconds))
+
+        logger.warning(
+            "AUTONOMY mode=%s action=%s changed=%s reason=%s regime_top=%s policy_top=%s avg_cand=%.2f avg_opened=%.2f util=%.2f skip_limits=%s skip_cooldown=%s open_now=%s closed_delta=%s wins_delta=%s losses_delta=%s realized_delta=$%.3f loss_streak=%s controls(open=%s->%s top_n=%s->%s buys_h=%s->%s size_max=%.2f->%.2f)",
+            self.mode,
+            action,
+            changed,
+            reason,
+            _format_top_counts(self.window_regime_counts, limit=1),
+            _format_top_counts(self.window_policy_counts, limit=1),
+            avg_candidates,
+            avg_opened,
+            hourly_utilization,
+            skip_limits,
+            skip_cooldown,
+            open_now,
+            closed_delta,
+            wins_delta,
+            losses_delta,
+            realized_delta,
+            loss_streak,
+            max_open_now,
+            max_open_next,
+            top_n_now,
+            top_n_next,
+            buys_now,
+            buys_next,
+            size_max_now,
+            size_max_next,
+        )
+        self._write_decision(
+            {
+                "ts": time.time(),
+                "mode": self.mode,
+                "action": action,
+                "changed": bool(changed),
+                "reason": reason,
+                "market_regime_top": _format_top_counts(self.window_regime_counts, limit=1),
+                "policy_top": _format_top_counts(self.window_policy_counts, limit=1),
+                "avg_candidates": round(avg_candidates, 4),
+                "avg_opened": round(avg_opened, 4),
+                "hourly_utilization": round(hourly_utilization, 4),
+                "skip_limits": int(skip_limits),
+                "skip_cooldown": int(skip_cooldown),
+                "below_baseline": bool(below_baseline),
+                "closed_delta": int(closed_delta),
+                "wins_delta": int(wins_delta),
+                "losses_delta": int(losses_delta),
+                "realized_delta_usd": round(realized_delta, 6),
+                "open_now": int(open_now),
+                "loss_streak": int(loss_streak),
+                "controls_baseline": {
+                    "MAX_OPEN_TRADES": int(self.base_max_open),
+                    "AUTO_TRADE_TOP_N": int(self.base_top_n),
+                    "MAX_BUYS_PER_HOUR": int(self.base_buys_per_hour),
+                    "PAPER_TRADE_SIZE_MAX_USD": round(float(self.base_trade_size_max), 6),
+                },
+                "controls_before": {
+                    "MAX_OPEN_TRADES": int(max_open_now),
+                    "AUTO_TRADE_TOP_N": int(top_n_now),
+                    "MAX_BUYS_PER_HOUR": int(buys_now),
+                    "PAPER_TRADE_SIZE_MAX_USD": round(size_max_now, 6),
+                },
+                "controls_after": {
+                    "MAX_OPEN_TRADES": int(max_open_next),
+                    "AUTO_TRADE_TOP_N": int(top_n_next),
+                    "MAX_BUYS_PER_HOUR": int(buys_next),
+                    "PAPER_TRADE_SIZE_MAX_USD": round(size_max_next, 6),
+                },
+            }
+        )
+        self._reset_window(now_ts=now_ts, auto_stats=auto_stats)
+
+
 class CandidateDecisionWriter:
     def __init__(self) -> None:
         self.enabled = bool(getattr(config, "CANDIDATE_DECISIONS_LOG_ENABLED", True))
@@ -1149,6 +1618,8 @@ async def run_local_loop() -> None:
     adaptive_init_stats = auto_trader.get_stats()
     adaptive_filters.prev_closed = int(adaptive_init_stats.get("closed", 0) or 0)
     adaptive_filters.prev_realized_usd = float(adaptive_init_stats.get("realized_pnl_usd", 0.0) or 0.0)
+    autonomy_controller = AutonomousControlController()
+    autonomy_controller.prime(auto_stats=adaptive_init_stats)
     mini_analyzer = MiniAnalyzer()
     mini_analyzer.prime(
         closed=int(adaptive_init_stats.get("closed", 0) or 0),
@@ -1524,6 +1995,13 @@ async def run_local_loop() -> None:
                     market_regime=market_regime_current,
                     dedup_repeat_intervals_cycle=dedup_repeat_intervals_cycle,
                 )
+                autonomy_controller.record_cycle(
+                    candidates=len(trade_candidates),
+                    opened=opened_trades,
+                    policy_state=policy_state,
+                    market_regime=market_regime_current,
+                    skip_reasons_cycle=skip_reasons_cycle,
+                )
                 mini_analyzer.record(
                     scanned=len(tokens or []),
                     candidates=len(trade_candidates),
@@ -1537,6 +2015,11 @@ async def run_local_loop() -> None:
                     policy_state=policy_state,
                     auto_stats=auto_stats,
                     source_stats=source_stats,
+                )
+                autonomy_controller.maybe_adapt(
+                    policy_state=policy_state,
+                    market_regime=market_regime_current,
+                    auto_stats=auto_stats,
                 )
                 mini_analyzer.maybe_emit(auto_stats=auto_stats)
 
@@ -1613,11 +2096,13 @@ def main() -> None:
         print("Another main_local.py instance is already running. Exit.")
         return
     atexit.register(lock.release)
+    _write_single_pid_file()
     configure_logging()
     _clear_graceful_stop_flag()
     try:
         asyncio.run(run_local_loop())
     finally:
+        _clear_single_pid_file()
         lock.release()
 
 

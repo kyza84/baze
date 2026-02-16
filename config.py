@@ -5,12 +5,22 @@ from typing import Dict, Tuple
 
 from dotenv import load_dotenv
 
+
+def _load_dotenv_safe(dotenv_path: str | None = None, *, override: bool = False) -> None:
+    """Load dotenv using UTF-8-SIG so BOM-prefixed files don't break first key parsing."""
+    try:
+        load_dotenv(dotenv_path=dotenv_path, override=override, encoding="utf-8-sig")
+    except TypeError:
+        # Older python-dotenv versions may not expose the `encoding` argument.
+        load_dotenv(dotenv_path=dotenv_path, override=override)
+
+
 # Load base environment first, then optional per-instance override env file.
-load_dotenv()
+_load_dotenv_safe()
 _BOT_ENV_FILE = os.getenv("BOT_ENV_FILE", "").strip()
 if _BOT_ENV_FILE:
     try:
-        load_dotenv(_BOT_ENV_FILE, override=True)
+        _load_dotenv_safe(_BOT_ENV_FILE, override=True)
     except Exception:
         pass
 
@@ -292,6 +302,86 @@ ADAPTIVE_WEAKNESS_PNL_MIN = float(os.getenv("ADAPTIVE_WEAKNESS_PNL_MIN", "-15.0"
 ADAPTIVE_WEAKNESS_PNL_MAX = float(os.getenv("ADAPTIVE_WEAKNESS_PNL_MAX", "-2.0"))
 ADAPTIVE_WEAKNESS_PNL_STEP = max(0.1, float(os.getenv("ADAPTIVE_WEAKNESS_PNL_STEP", "0.5")))
 
+# Autonomous controller (window-based throughput/risk balancing).
+AUTONOMOUS_CONTROL_ENABLED = os.getenv("AUTONOMOUS_CONTROL_ENABLED", "false").lower() == "true"
+AUTONOMOUS_CONTROL_MODE = os.getenv("AUTONOMOUS_CONTROL_MODE", "dry_run").strip().lower()  # off | dry_run | apply
+AUTONOMOUS_CONTROL_PAPER_ONLY = os.getenv("AUTONOMOUS_CONTROL_PAPER_ONLY", "true").lower() == "true"
+AUTONOMOUS_CONTROL_INTERVAL_SECONDS = max(60, int(os.getenv("AUTONOMOUS_CONTROL_INTERVAL_SECONDS", "300")))
+AUTONOMOUS_CONTROL_MIN_WINDOW_CYCLES = max(1, int(os.getenv("AUTONOMOUS_CONTROL_MIN_WINDOW_CYCLES", "3")))
+AUTONOMOUS_CONTROL_COOLDOWN_WINDOWS = max(0, int(os.getenv("AUTONOMOUS_CONTROL_COOLDOWN_WINDOWS", "1")))
+AUTONOMOUS_CONTROL_TARGET_CANDIDATES_MIN = float(os.getenv("AUTONOMOUS_CONTROL_TARGET_CANDIDATES_MIN", "2.0"))
+AUTONOMOUS_CONTROL_TARGET_CANDIDATES_HIGH = float(os.getenv("AUTONOMOUS_CONTROL_TARGET_CANDIDATES_HIGH", "8.0"))
+AUTONOMOUS_CONTROL_TARGET_OPENED_MIN = float(os.getenv("AUTONOMOUS_CONTROL_TARGET_OPENED_MIN", "0.18"))
+AUTONOMOUS_CONTROL_NEG_REALIZED_TRIGGER_USD = float(os.getenv("AUTONOMOUS_CONTROL_NEG_REALIZED_TRIGGER_USD", "0.08"))
+AUTONOMOUS_CONTROL_POS_REALIZED_TRIGGER_USD = float(os.getenv("AUTONOMOUS_CONTROL_POS_REALIZED_TRIGGER_USD", "0.08"))
+AUTONOMOUS_CONTROL_MAX_LOSS_STREAK_TRIGGER = max(1, int(os.getenv("AUTONOMOUS_CONTROL_MAX_LOSS_STREAK_TRIGGER", "3")))
+AUTONOMOUS_CONTROL_STEP_OPEN_TRADES = max(1, int(os.getenv("AUTONOMOUS_CONTROL_STEP_OPEN_TRADES", "1")))
+AUTONOMOUS_CONTROL_STEP_TOP_N = max(1, int(os.getenv("AUTONOMOUS_CONTROL_STEP_TOP_N", "1")))
+AUTONOMOUS_CONTROL_STEP_MAX_BUYS_PER_HOUR = max(1, int(os.getenv("AUTONOMOUS_CONTROL_STEP_MAX_BUYS_PER_HOUR", "6")))
+AUTONOMOUS_CONTROL_STEP_TRADE_SIZE_MAX_USD = max(0.01, float(os.getenv("AUTONOMOUS_CONTROL_STEP_TRADE_SIZE_MAX_USD", "0.05")))
+AUTONOMOUS_CONTROL_MAX_OPEN_TRADES_MIN = max(1, int(os.getenv("AUTONOMOUS_CONTROL_MAX_OPEN_TRADES_MIN", "1")))
+AUTONOMOUS_CONTROL_MAX_OPEN_TRADES_MAX = max(
+    AUTONOMOUS_CONTROL_MAX_OPEN_TRADES_MIN,
+    int(os.getenv("AUTONOMOUS_CONTROL_MAX_OPEN_TRADES_MAX", "6")),
+)
+AUTONOMOUS_CONTROL_TOP_N_MIN = max(1, int(os.getenv("AUTONOMOUS_CONTROL_TOP_N_MIN", "1")))
+AUTONOMOUS_CONTROL_TOP_N_MAX = max(AUTONOMOUS_CONTROL_TOP_N_MIN, int(os.getenv("AUTONOMOUS_CONTROL_TOP_N_MAX", "20")))
+AUTONOMOUS_CONTROL_MAX_BUYS_PER_HOUR_MIN = max(1, int(os.getenv("AUTONOMOUS_CONTROL_MAX_BUYS_PER_HOUR_MIN", "6")))
+AUTONOMOUS_CONTROL_MAX_BUYS_PER_HOUR_MAX = max(
+    AUTONOMOUS_CONTROL_MAX_BUYS_PER_HOUR_MIN,
+    int(os.getenv("AUTONOMOUS_CONTROL_MAX_BUYS_PER_HOUR_MAX", "96")),
+)
+AUTONOMOUS_CONTROL_TRADE_SIZE_MAX_MIN = max(0.05, float(os.getenv("AUTONOMOUS_CONTROL_TRADE_SIZE_MAX_MIN", "0.25")))
+AUTONOMOUS_CONTROL_TRADE_SIZE_MAX_MAX = max(
+    AUTONOMOUS_CONTROL_TRADE_SIZE_MAX_MIN,
+    float(os.getenv("AUTONOMOUS_CONTROL_TRADE_SIZE_MAX_MAX", "2.00")),
+)
+AUTONOMOUS_CONTROL_RISK_OFF_OPEN_TRADES_CAP = max(1, int(os.getenv("AUTONOMOUS_CONTROL_RISK_OFF_OPEN_TRADES_CAP", "2")))
+AUTONOMOUS_CONTROL_RISK_OFF_TOP_N_CAP = max(1, int(os.getenv("AUTONOMOUS_CONTROL_RISK_OFF_TOP_N_CAP", "8")))
+AUTONOMOUS_CONTROL_RISK_OFF_MAX_BUYS_PER_HOUR_CAP = max(
+    1,
+    int(os.getenv("AUTONOMOUS_CONTROL_RISK_OFF_MAX_BUYS_PER_HOUR_CAP", "24")),
+)
+AUTONOMOUS_CONTROL_RISK_OFF_TRADE_SIZE_MAX_CAP = max(
+    0.05,
+    float(os.getenv("AUTONOMOUS_CONTROL_RISK_OFF_TRADE_SIZE_MAX_CAP", "0.70")),
+)
+AUTONOMOUS_CONTROL_ANTI_STALL_ENABLED = os.getenv("AUTONOMOUS_CONTROL_ANTI_STALL_ENABLED", "true").lower() == "true"
+AUTONOMOUS_CONTROL_ANTI_STALL_MIN_CANDIDATES = max(
+    0.0,
+    float(os.getenv("AUTONOMOUS_CONTROL_ANTI_STALL_MIN_CANDIDATES", "1.0")),
+)
+AUTONOMOUS_CONTROL_ANTI_STALL_MIN_UTILIZATION = max(
+    0.5,
+    min(1.0, float(os.getenv("AUTONOMOUS_CONTROL_ANTI_STALL_MIN_UTILIZATION", "0.85"))),
+)
+AUTONOMOUS_CONTROL_ANTI_STALL_LIMIT_SKIP_MIN = max(
+    0,
+    int(os.getenv("AUTONOMOUS_CONTROL_ANTI_STALL_LIMIT_SKIP_MIN", "1")),
+)
+AUTONOMOUS_CONTROL_ANTI_STALL_EXPAND_MULT = max(
+    0.5,
+    min(3.0, float(os.getenv("AUTONOMOUS_CONTROL_ANTI_STALL_EXPAND_MULT", "1.0"))),
+)
+AUTONOMOUS_CONTROL_RECOVERY_ENABLED = os.getenv("AUTONOMOUS_CONTROL_RECOVERY_ENABLED", "true").lower() == "true"
+AUTONOMOUS_CONTROL_RECOVERY_MIN_CANDIDATES = max(
+    0.0,
+    float(os.getenv("AUTONOMOUS_CONTROL_RECOVERY_MIN_CANDIDATES", "0.8")),
+)
+AUTONOMOUS_CONTROL_RECOVERY_EXPAND_MULT = max(
+    0.5,
+    min(3.0, float(os.getenv("AUTONOMOUS_CONTROL_RECOVERY_EXPAND_MULT", "1.2"))),
+)
+AUTONOMOUS_CONTROL_FRAGILE_TIGHTEN_ENABLED = os.getenv(
+    "AUTONOMOUS_CONTROL_FRAGILE_TIGHTEN_ENABLED",
+    "true",
+).lower() == "true"
+AUTONOMOUS_CONTROL_DECISIONS_LOG_ENABLED = os.getenv("AUTONOMOUS_CONTROL_DECISIONS_LOG_ENABLED", "true").lower() == "true"
+AUTONOMOUS_CONTROL_DECISIONS_LOG_FILE = os.getenv(
+    "AUTONOMOUS_CONTROL_DECISIONS_LOG_FILE",
+    os.path.join("logs", "autonomy_decisions.jsonl"),
+)
+
 # Optional extra token flow sources
 DEX_BOOSTS_SOURCE_ENABLED = os.getenv("DEX_BOOSTS_SOURCE_ENABLED", "true").lower() == "true"
 DEX_BOOSTS_MAX_TOKENS = max(0, int(os.getenv("DEX_BOOSTS_MAX_TOKENS", "20")))
@@ -308,6 +398,14 @@ LIVE_WALLET_ADDRESS = os.getenv("LIVE_WALLET_ADDRESS", "").strip()
 LIVE_PRIVATE_KEY = os.getenv("LIVE_PRIVATE_KEY", "").strip()
 LIVE_CHAIN_ID = int(os.getenv("LIVE_CHAIN_ID", EVM_CHAIN_ID))
 LIVE_ROUTER_ADDRESS = os.getenv("LIVE_ROUTER_ADDRESS", "").strip()
+# Optional additional V2-compatible router addresses (comma-separated).
+LIVE_ROUTER_ADDRESSES = os.getenv("LIVE_ROUTER_ADDRESSES", "").strip()
+# Optional comma-separated intermediate tokens for V2 router paths in live mode.
+# Example (Base): USDC token address.
+LIVE_ROUTE_INTERMEDIATE_ADDRESSES = os.getenv(
+    "LIVE_ROUTE_INTERMEDIATE_ADDRESSES",
+    "0x833589fCD6eDb6E08f4c7C32D4f71b54bDa02913",
+).strip()
 LIVE_SLIPPAGE_BPS = max(1, int(os.getenv("LIVE_SLIPPAGE_BPS", "200")))
 LIVE_SWAP_DEADLINE_SECONDS = max(30, int(os.getenv("LIVE_SWAP_DEADLINE_SECONDS", "45")))
 LIVE_TX_TIMEOUT_SECONDS = max(30, int(os.getenv("LIVE_TX_TIMEOUT_SECONDS", "180")))
@@ -335,6 +433,31 @@ LIVE_ROUNDTRIP_CHECK_ENABLED = os.getenv("LIVE_ROUNDTRIP_CHECK_ENABLED", "true")
 LIVE_ROUNDTRIP_SELL_FRACTION = float(os.getenv("LIVE_ROUNDTRIP_SELL_FRACTION", "0.25"))
 # Minimum return ratio for the roundtrip quote (e.g. 0.70 means lose at most 30% to price impact/taxes).
 LIVE_ROUNDTRIP_MIN_RETURN_RATIO = float(os.getenv("LIVE_ROUNDTRIP_MIN_RETURN_RATIO", "0.70"))
+LIVE_PRECHECK_MIN_SPEND_USD = max(0.10, float(os.getenv("LIVE_PRECHECK_MIN_SPEND_USD", "2.00")))
+LIVE_PRECHECK_MAX_SPEND_ETH = max(0.00001, float(os.getenv("LIVE_PRECHECK_MAX_SPEND_ETH", "0.0030")))
+# Confirm bought token amount in wallet with short post-buy retries to avoid false zero-amount buys
+# on RPC laggy nodes.
+LIVE_BUY_BALANCE_RECHECK_ATTEMPTS = max(1, int(os.getenv("LIVE_BUY_BALANCE_RECHECK_ATTEMPTS", "8")))
+LIVE_BUY_BALANCE_RECHECK_DELAY_SECONDS = max(
+    0.05,
+    float(os.getenv("LIVE_BUY_BALANCE_RECHECK_DELAY_SECONDS", "0.30")),
+)
+LIVE_BLACKLIST_UNSUPPORTED_ROUTE_TTL_SECONDS = max(
+    300,
+    int(os.getenv("LIVE_BLACKLIST_UNSUPPORTED_ROUTE_TTL_SECONDS", "7200")),
+)
+LIVE_BLACKLIST_ROUNDTRIP_FAIL_TTL_SECONDS = max(
+    300,
+    int(os.getenv("LIVE_BLACKLIST_ROUNDTRIP_FAIL_TTL_SECONDS", "21600")),
+)
+LIVE_BLACKLIST_ROUNDTRIP_RATIO_TTL_SECONDS = max(
+    300,
+    int(os.getenv("LIVE_BLACKLIST_ROUNDTRIP_RATIO_TTL_SECONDS", "3600")),
+)
+LIVE_BLACKLIST_ZERO_AMOUNT_TTL_SECONDS = max(
+    300,
+    int(os.getenv("LIVE_BLACKLIST_ZERO_AMOUNT_TTL_SECONDS", "1800")),
+)
 
 # Live session profit stop (USD). If > 0, the bot will stop opening new trades when
 # wallet PnL since session start reaches the target.
@@ -352,6 +475,8 @@ LIVE_ABANDON_UNSELLABLE_POSITIONS = os.getenv("LIVE_ABANDON_UNSELLABLE_POSITIONS
     "on",
 )
 RECOVERY_DISCOVERY_MAX_ADDRESSES = max(0, int(os.getenv("RECOVERY_DISCOVERY_MAX_ADDRESSES", "80")))
+RECOVERY_DISCOVERY_INTERVAL_SECONDS = max(10, int(os.getenv("RECOVERY_DISCOVERY_INTERVAL_SECONDS", "45")))
+RECOVERY_UNTRACKED_MIN_VALUE_USD = max(0.0, float(os.getenv("RECOVERY_UNTRACKED_MIN_VALUE_USD", "0.05")))
 RECOVERY_ATTEMPT_INTERVAL_SECONDS = max(5, int(os.getenv("RECOVERY_ATTEMPT_INTERVAL_SECONDS", "30")))
 RECOVERY_MAX_ATTEMPTS = max(1, int(os.getenv("RECOVERY_MAX_ATTEMPTS", "8")))
 
@@ -383,6 +508,11 @@ AUTO_TRADE_EXCLUDED_ADDRESSES = [
     for x in os.getenv("AUTO_TRADE_EXCLUDED_ADDRESSES", "").split(",")
     if x.strip()
 ]
+AUTO_TRADE_EXCLUDED_SYMBOLS = [
+    x.strip().upper()
+    for x in os.getenv("AUTO_TRADE_EXCLUDED_SYMBOLS", "").split(",")
+    if x.strip()
+]
 KILL_SWITCH_FILE = os.getenv("KILL_SWITCH_FILE", os.path.join("data", "kill.txt"))
 GRACEFUL_STOP_FILE = os.getenv("GRACEFUL_STOP_FILE", os.path.join("data", "graceful_stop.signal"))
 GRACEFUL_STOP_TIMEOUT_SECONDS = max(2, int(os.getenv("GRACEFUL_STOP_TIMEOUT_SECONDS", "12")))
@@ -390,6 +520,7 @@ WALLET_BALANCE_USD = float(os.getenv("WALLET_BALANCE_USD", "2.75"))
 PAPER_TRADE_SIZE_USD = float(os.getenv("PAPER_TRADE_SIZE_USD", "1.0"))
 PAPER_MAX_HOLD_SECONDS = int(os.getenv("PAPER_MAX_HOLD_SECONDS", "1800"))
 PAPER_STATE_FILE = os.getenv("PAPER_STATE_FILE", os.path.join("trading", "paper_state.json"))
+PAPER_STATE_FLUSH_INTERVAL_SECONDS = max(0.2, float(os.getenv("PAPER_STATE_FLUSH_INTERVAL_SECONDS", "0.2")))
 
 # Realistic paper simulation
 PAPER_REALISM_ENABLED = os.getenv("PAPER_REALISM_ENABLED", "true").lower() == "true"
@@ -455,7 +586,13 @@ LOW_BALANCE_GUARD_ENABLED = os.getenv("LOW_BALANCE_GUARD_ENABLED", "true").lower
 # Trade risk controls
 MAX_TOKEN_PRICE_CHANGE_5M_ABS_PERCENT = float(os.getenv("MAX_TOKEN_PRICE_CHANGE_5M_ABS_PERCENT", "35"))
 MAX_TOKEN_COOLDOWN_SECONDS = max(0, int(os.getenv("MAX_TOKEN_COOLDOWN_SECONDS", "600")))
+# Cooldown after a stop-loss close to avoid immediate re-entries on the same token.
+AUTO_TRADE_SL_REENTRY_COOLDOWN_SECONDS = max(
+    0,
+    int(os.getenv("AUTO_TRADE_SL_REENTRY_COOLDOWN_SECONDS", "900")),
+)
 MAX_LOSS_PER_TRADE_PERCENT_BALANCE = float(os.getenv("MAX_LOSS_PER_TRADE_PERCENT_BALANCE", "1.2"))
+PNL_BREAKEVEN_EPSILON_USD = max(0.0, float(os.getenv("PNL_BREAKEVEN_EPSILON_USD", "0.0")))
 DAILY_MAX_DRAWDOWN_PERCENT = float(os.getenv("DAILY_MAX_DRAWDOWN_PERCENT", "5.0"))
 MAX_CONSECUTIVE_LOSSES = max(1, int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3")))
 LOSS_STREAK_COOLDOWN_SECONDS = max(0, int(os.getenv("LOSS_STREAK_COOLDOWN_SECONDS", "1800")))
@@ -475,6 +612,9 @@ RISK_GOVERNOR_DRAWDOWN_PAUSE_SECONDS = max(
     0,
     int(os.getenv("RISK_GOVERNOR_DRAWDOWN_PAUSE_SECONDS", str(LOSS_STREAK_COOLDOWN_SECONDS))),
 )
+# If enabled, keep blocking new entries while loss streak >= limit even after pause elapsed.
+# Default is false to avoid deadlocks where trading never resumes without manual intervention.
+RISK_GOVERNOR_HARD_BLOCK_ON_STREAK = os.getenv("RISK_GOVERNOR_HARD_BLOCK_ON_STREAK", "false").lower() == "true"
 RISK_GOVERNOR_LOG_INTERVAL_SECONDS = max(5, int(os.getenv("RISK_GOVERNOR_LOG_INTERVAL_SECONDS", "30")))
 
 GOPLUS_EVM_API = os.getenv(

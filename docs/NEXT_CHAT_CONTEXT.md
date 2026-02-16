@@ -1,103 +1,209 @@
-﻿# Fresh Review Context (Handoff)
+# NEXT CHAT CONTEXT (Tech Audit)
 
-## Goal
-Do a fresh, unbiased technical review of the bot core, execution logic, adaptive tuning, and dataset quality. Focus on why long runs often converge to near-zero PnL or low trade frequency.
+Дата среза: 2026-02-15 17:41 (локальное время)
+Проект: `d:\earnforme\solana-alert-bot`
+Цель этого файла: быстро войти в контекст в новом чате и не повторять диагностику заново.
 
-## Repo / Runtime
-- Project root: `d:\earnforme\solana-alert-bot`
-- GUI launcher: `launcher_gui.py`
-- Main loop: `main_local.py`
-- Trading core: `trading/auto_trader.py`
-- Config: `config.py`
-- Matrix launcher: `tools/matrix_paper_launcher.ps1`
+## 1) Краткий итог
 
-## Important Constraints
-- User starts/stops from GUI manually.
-- Current calibration mode uses matrix (2 profiles):
-  - `mx1_refine` (control, safer)
-  - `mx2_explore_wide` (aggressive, adaptive apply)
-- Paper calibration baseline balance target: `$7` per profile.
+Проблема не в одной настройке. Есть системный рассинхрон между:
+- фактическим рантаймом процесса,
+- метаданными matrix,
+- тем, что показывает GUI,
+- и тем, что реально лежит в on-chain кошельке.
 
-## What was added recently
-1. Adaptive anti-stall reset in `AdaptiveFilterController`:
-   - If windows keep producing candidates but open=0, controller performs `anti_stall_reset` and pulls thresholds back toward baseline.
-   - New config keys:
-     - `ADAPTIVE_ZERO_OPEN_RESET_ENABLED`
-     - `ADAPTIVE_ZERO_OPEN_WINDOWS_BEFORE_RESET`
-     - `ADAPTIVE_ZERO_OPEN_MIN_CANDIDATES`
+Из-за этого визуально кажется, что "бот тупит/стоит/не торгует", хотя часть данных пишется, часть процессов уже умерла, а GUI смотрит не туда.
 
-2. Matrix profile guardrails:
-   - `mx2_explore_wide` now uses bounded adaptive ranges and dedup relax to avoid self-choking.
-   - `mx1_refine` loosened one step (score/volume/edge/hourly cap) to avoid too-few trades.
+## 2) Что работает в коде (по архитектуре)
 
-3. Dataset tooling:
-   - `tools/analyze_paper_dataset.py` (aggregated paper-state analysis)
-   - `tools/fetch_open_market_dataset.py` (collect external market JSONL)
-   - `tools/analyze_open_market_dataset.py` (stats over external JSONL)
-
-4. Existing risk additions:
-   - `RISK_GOVERNOR_*` settings in `config.py`
-   - enforcement in `trading/auto_trader.py`
-
-## Current Key Files to inspect first
 - `main_local.py`:
-  - `AdaptiveFilterController`
-  - per-cycle filter pass/fail and policy logs
-  - candidate decision logging
+  - основной цикл сканирования и фильтрации,
+  - policy-гейтинг (`OK/DEGRADED/FAIL_CLOSED`),
+  - market regime,
+  - adaptive filters,
+  - запись candidate decisions в JSONL.
 - `trading/auto_trader.py`:
-  - `can_open_trade()` and `_cannot_open_trade_detail()`
-  - edge gating
-  - risk governor blocks
-- `tools/matrix_paper_launcher.ps1`:
-  - per-profile env overrides
+  - вход/выход (paper/live),
+  - risk governor,
+  - route/honeypot/roundtrip pre-checks в live,
+  - state persistence и recovery.
+- `trading/live_executor.py`:
+  - swap/approve/quote pipeline для Base.
 - `launcher_gui.py`:
-  - matrix start/stop behavior and timeout fallback handling
+  - управление single/matrix,
+  - отображение state и tail-логов.
 
-## Data locations
-- Matrix candidate logs:
-  - `logs/matrix/mx1_refine/candidates.jsonl`
-  - `logs/matrix/mx2_explore_wide/candidates.jsonl`
-- Matrix states:
-  - `trading/paper_state.mx1_refine.json`
-  - `trading/paper_state.mx2_explore_wide.json`
-- Analysis outputs:
-  - `data/analysis/paper_dataset_report_*.json|md`
-- External dataset:
-  - `data/external/open_market_dataset.jsonl`
+Архитектура в целом рабочая, но есть несколько критичных точек интеграции.
 
-## Known pain pattern to verify
-- High scan volume, but low opens due to combined gates:
-  - `heavy_dedup_ttl`
-  - `safe_volume`
-  - `score_min`
-  - occasional edge/risk gate
-- Adaptive `apply` may over-tighten if not bounded.
+## 3) Критичные проблемы (корень)
 
-## Review checklist (fresh look)
-1. Confirm trade suppression root-cause ordering:
-   - filter stage vs edge gate vs risk governor vs policy mode.
-2. Validate adaptive controller behavior over long windows:
-   - does anti-stall trigger when expected?
-   - does it actually reduce thresholds and restore opens?
-3. Validate matrix fairness:
-   - control profile stays stable
-   - aggressive profile explores but does not self-choke.
-4. Evaluate exit reason economics:
-   - contribution by `TIMEOUT/WEAKNESS/NO_MOMENTUM/SL/TP`.
-5. Recommend one nightly live profile only after paper evidence.
+### P0-1. Matrix считает, что запущен, хотя процесса уже нет
 
-## Useful commands
+Факты:
+- `data/matrix/runs/active_matrix.json` содержит `running=true` и `pid=15308`.
+- В системе `main_local.py` сейчас не запущен (виден только `launcher_gui.py`).
+
+Причина:
+- `active_matrix.json` не является источником истины, но GUI/скрипты на него сильно опираются.
+- stop/start pipeline не нормализует метаданные после падения/остановки.
+
+Эффект:
+- ложный статус "matrix mode",
+- ожидание входов при фактически мертвом трейдере.
+
+---
+
+### P0-2. BOM в `mx1_fragile_active.env` ломает `BOT_INSTANCE_ID`
+
+Факт:
+- `data/matrix/env/mx1_fragile_active.env` начинается с BOM (`EF BB BF`).
+- При тестовом импорте: `config.BOT_INSTANCE_ID == ""`, хотя в файле есть `BOT_INSTANCE_ID=mx1_fragile_active`.
+
+Почему важно:
+- lock/mutex идут по `INSTANCE_ID` в `main_local.py`.
+- При пустом `BOT_INSTANCE_ID` используется `main_local.lock` и "single-instance" mutex, а не `main_local.mx1_fragile_active.lock`.
+
+Эффект:
+- конфликт single/matrix lock-механики,
+- ложные старты/псевдозапуски,
+- тяжелая диагностика "почему то запускается, то нет".
+
+---
+
+### P0-3. Matrix stop/start pipeline хрупкий к stale PID
+
+Факты:
+- `tools/matrix_paper_launcher.ps1` пишет PID сразу после `Process::Start`, без проверки, что процесс реально вошел в рабочий цикл.
+- `tools/matrix_paper_stop.ps1` не переписывает `active_matrix.json` в "остановлено".
+
+Эффект:
+- stale PID остаются как "живые" метаданные,
+- GUI показывает режимы не по факту.
+
+---
+
+### P0-4. GUI в matrix режиме частично читает не те источники
+
+Факты:
+- `read_env_map()` в GUI читает только `.env`.
+- В matrix рантайм реально идет из `BOT_ENV_FILE` (`data/matrix/env/*.env`).
+- `Сигналы` таб читает `logs/local_alerts.jsonl` (single), а не matrix `logs/matrix/<id>/local_alerts.jsonl`.
+
+Эффект:
+- "лента пустая", хотя matrix пишет данные,
+- часть параметров/режимов в UI визуально не совпадает с рантаймом.
+
+## 4) Почему в кошельке есть токены, а в "Открытых позициях" пусто
+
+Это не фантазия UI, а текущая логика recovery:
+
+- `AutoTrader` ведет только `open_positions` из state.
+- On-chain токены, найденные без соответствующей open-позиции, пишутся в `recovery_untracked`.
+- Сейчас в `trading/paper_state.mx1_fragile_active.json`:
+  - `open_positions = 0`
+  - `recovery_untracked = 5` адресов.
+
+Дополнительно:
+- включен `LIVE_ABANDON_UNSELLABLE_POSITIONS=true`.
+- При проблемном SELL позиция может быть закрыта локально (ABANDON), но токен остается в кошельке.
+
+То есть "токен в кошельке, но не в сделках" сейчас возможно по дизайну recovery + abandon-логики.
+
+## 5) Почему входы резко были и потом пропали
+
+Не одна причина, а сумма:
+
+1. Жесткий live pre-check pipeline:
+  - `unsupported_buy_route`,
+  - `roundtrip_quote_failed`,
+  - `roundtrip_ratio:0.000`,
+  - `live_buy_zero_amount`.
+2. Эти токены попадают в `autotrade_blacklist` и перестают рассматриваться.
+3. При узком текущем market universe это быстро "выжигает" доступные входы.
+4. Если процесс вообще уже остановился, входов физически не будет.
+
+В blacklist на срезе есть множество именно таких причин.
+
+## 6) Риск-контур сейчас (по факту профиля `mx1_fragile_active`)
+
+Профиль сильно расслаблен относительно anti-scam:
+- `SAFE_REQUIRE_CONTRACT_SAFE=false`
+- `SAFE_REQUIRE_RISK_LEVEL=HIGH` (фактически пропуск и LOW/MEDIUM/HIGH)
+- `SAFE_MAX_WARNING_FLAGS=2`
+- `SAFE_MIN_VOLUME_5M_USD=30`
+- `SAFE_MIN_LIQUIDITY_USD=4000`
+
+Это дает больше кандидатов, но повышает вероятность мусорных/проблемных токенов в live.
+
+## 7) Текущее состояние запуска на момент среза
+
+- Процесс:
+  - `launcher_gui.py` запущен
+  - `main_local.py` не запущен
+- Matrix meta:
+  - `active_matrix.json` считает, что `running=true` и есть PID
+- State (`mx1_fragile_active`):
+  - `open=0`, `closed=8`, `realized=0`
+  - `recovery_untracked=5`
+
+## 8) Что чинить в первую очередь (порядок)
+
+### Фаза A (обязательная стабилизация, без тюнинга стратегии)
+
+1. Починить env encoding pipeline:
+   - гарантировать `UTF-8 without BOM` для `data/matrix/env/*.env`.
+2. Нормализовать lifecycle matrix:
+   - после stop/update корректно писать `active_matrix.json` (running/pid).
+   - после start делать health-check процесса (жив + commandline содержит `main_local.py`).
+3. В GUI проверять PID не только "процесс существует", но и что это именно `python ... main_local.py`.
+4. В GUI matrix-сигналы читать из выбранного matrix instance, а не только single `logs/local_alerts.jsonl`.
+
+### Фаза B (прозрачность состояния)
+
+1. Явно показывать в GUI:
+   - `open_positions`,
+   - `recovery_untracked`,
+   - `abandoned`,
+   - `policy mode`,
+   - `cannot_open_trade detail`.
+2. Добавить явный health-бейдж:
+   - `Trader process: alive/dead`,
+   - `Data stream: active/stale`.
+
+### Фаза C (только после A+B — повторная калибровка торговли)
+
+1. Отдельно калибровать live pre-check strictness (roundtrip/sellability), а не дергать все фильтры сразу.
+2. Развести профили:
+   - strict-safe,
+   - throughput-safe.
+3. Мерить причину пропуска входа по top-N reason distribution, а не по ощущениям.
+
+## 9) Быстрые команды для валидации в новом чате
+
+Проверка процессов:
 ```powershell
-python tools\analyze_paper_dataset.py
-python tools\fetch_open_market_dataset.py --cycles 120 --interval 30
-python tools\analyze_open_market_dataset.py --file data\external\open_market_dataset.jsonl
+Get-CimInstance Win32_Process | ? { $_.Name -eq 'python.exe' -and $_.CommandLine -match 'main_local.py|launcher_gui.py' } | select ProcessId,CommandLine
 ```
 
+Проверка BOM env:
 ```powershell
-rg -n "ADAPTIVE_FILTERS mode=|action=|anti_stall_reset|AUTO_POLICY|DATA_POLICY|AutoTrade skip" logs -S
+$b=[System.IO.File]::ReadAllBytes('data/matrix/env/mx1_fragile_active.env'); $b[0..2]
 ```
 
-## Expected output from fresh review
-- Clear ranking of bottlenecks (top 3) with evidence.
-- One conservative paper preset + one exploratory preset.
-- A narrow, testable 2-4 hour experiment plan with pass/fail thresholds.
+Проверка state:
+```powershell
+$j=Get-Content -Raw trading/paper_state.mx1_fragile_active.json | ConvertFrom-Json
+@($j.open_positions).Count
+@($j.recovery_untracked.PSObject.Properties).Count
+```
+
+Проверка последних candidate событий:
+```powershell
+Get-Content -Tail 120 logs/matrix/mx1_fragile_active/candidates.jsonl
+```
+
+## 10) Важное для нового чата
+
+- Сначала фиксируем инфраструктурную правду состояния (A+B), потом снова трогаем торговые параметры.
+- Без этого любые "подкрутки стратегии" будут давать ложную картину.
+- Текущий главный баг-узел: env/lock/lifecycle/GUI-source рассинхрон, а не "рынок полностью мертв".

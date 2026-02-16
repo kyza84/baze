@@ -1,4 +1,4 @@
-﻿param(
+param(
   [switch]$HardKill
 )
 
@@ -7,6 +7,23 @@ $root = Resolve-Path (Join-Path $PSScriptRoot '..')
 Set-Location $root
 
 $metaPath = Join-Path $root 'data\matrix\runs\active_matrix.json'
+
+function Test-MainLocalProcess {
+  param(
+    [int]$ProcessId
+  )
+  if ($ProcessId -le 0) { return $false }
+  try {
+    $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction SilentlyContinue
+    if (-not $proc) { return $false }
+    $cmd = [string]$proc.CommandLine
+    if ($cmd -notmatch 'main_local\.py') { return $false }
+    return $true
+  } catch {
+    return $false
+  }
+}
+
 $items = @()
 if (Test-Path $metaPath) {
   try {
@@ -26,10 +43,10 @@ foreach ($item in $items) {
 Start-Sleep -Seconds 8
 
 foreach ($item in $items) {
-  $procId = [int]($item.pid)
+  $procId = 0
+  try { $procId = [int]($item.pid) } catch { $procId = 0 }
   if ($procId -le 0) { continue }
-  $proc = Get-Process -Id $procId -ErrorAction SilentlyContinue
-  if (-not $proc) { continue }
+  if (-not (Test-MainLocalProcess -ProcessId $procId)) { continue }
   if ($HardKill) {
     Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
     Write-Host "Hard killed pid=$procId id=$($item.id)"
@@ -42,15 +59,18 @@ foreach ($item in $items) {
 $lockFiles = Get-ChildItem -Path $root -Filter 'main_local.mx*.lock' -File -ErrorAction SilentlyContinue
 foreach ($lf in $lockFiles) {
   $id = [System.IO.Path]::GetFileNameWithoutExtension($lf.Name).Replace('main_local.', '')
-  $pidText = (Get-Content $lf.FullName -Raw -ErrorAction SilentlyContinue).Trim()
+  $pidRaw = Get-Content $lf.FullName -Raw -ErrorAction SilentlyContinue
+  $pidText = ""
+  if ($null -ne $pidRaw) {
+    $pidText = ([string]$pidRaw).Trim()
+  }
   $procId = 0
   [void][int]::TryParse($pidText, [ref]$procId)
   if ($procId -le 0) {
     Remove-Item -Force -ErrorAction SilentlyContinue $lf.FullName
     continue
   }
-  $proc = Get-Process -Id $procId -ErrorAction SilentlyContinue
-  if (-not $proc) {
+  if (-not (Test-MainLocalProcess -ProcessId $procId)) {
     Remove-Item -Force -ErrorAction SilentlyContinue $lf.FullName
     continue
   }
@@ -61,3 +81,41 @@ foreach ($lf in $lockFiles) {
     Write-Host "Orphan instance still running pid=$procId id=$id"
   }
 }
+
+# Rebuild matrix metadata from facts after stop.
+$aliveCount = 0
+$updatedItems = @()
+foreach ($item in $items) {
+  $procId = 0
+  try { $procId = [int]($item.pid) } catch { $procId = 0 }
+  $alive = $false
+  if ($procId -gt 0) {
+    $alive = Test-MainLocalProcess -ProcessId $procId
+  }
+  if ($alive) { $aliveCount += 1 }
+
+  $updatedItems += [pscustomobject]([ordered]@{
+      id = $item.id
+      env_file = $item.env_file
+      log_dir = $item.log_dir
+      paper_state_file = $item.paper_state_file
+      graceful_stop_file = $item.graceful_stop_file
+      overrides = $item.overrides
+      pid = $(if ($alive) { $procId } else { $null })
+      status = $(if ($alive) { 'running' } else { 'stopped' })
+    })
+}
+
+$meta = [ordered]@{
+  updated_at = (Get-Date).ToString('s')
+  stopped_at = (Get-Date).ToString('s')
+  count = @($updatedItems).Count
+  requested_run = $false
+  running = [bool]($aliveCount -gt 0)
+  alive_count = $aliveCount
+  items = $updatedItems
+}
+$metaJson = $meta | ConvertTo-Json -Depth 8
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+New-Item -ItemType Directory -Force -Path (Split-Path -Parent $metaPath) | Out-Null
+[System.IO.File]::WriteAllText($metaPath, $metaJson, $utf8NoBom)
