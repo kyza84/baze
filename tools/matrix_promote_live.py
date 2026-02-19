@@ -1,4 +1,4 @@
-"""Build a guarded live env from a selected matrix paper profile."""
+"""Promote a matrix profile into live with strict config parity."""
 
 from __future__ import annotations
 
@@ -9,6 +9,19 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 LIVE_APPLY_CONFIRM_PHRASE = "CONFIRM_LIVE_SWITCH"
+_ALLOWED_PROMOTION_DIFF_KEYS = {
+    "BOT_INSTANCE_ID",
+    "RUN_TAG",
+    "WALLET_MODE",
+    "AUTO_TRADE_ENABLED",
+    "AUTO_TRADE_PAPER",
+    "PAPER_RESET_ON_START",
+    "CANDIDATE_SHARD_MOD",
+    "CANDIDATE_SHARD_SLOT",
+    "CANDIDATE_DECISIONS_LOG_FILE",
+    "AUTONOMOUS_CONTROL_DECISIONS_LOG_FILE",
+    "PAPER_STATE_FILE",
+}
 
 
 def _safe_float(value: Any, default: float) -> float:
@@ -158,6 +171,7 @@ def _window_rank_winner(root: str, *, lookback_hours: float, min_closed: int) ->
 
         wins = sum(1 for x in closed_window if _safe_float(x.get("pnl_usd"), 0.0) > 0.0)
         losses = sum(1 for x in closed_window if _safe_float(x.get("pnl_usd"), 0.0) < 0.0)
+        loss_share = (float(losses) / float(max(1, wins + losses))) if (wins + losses) > 0 else 0.0
         winrate = (wins / (wins + losses) * 100.0) if (wins + losses) > 0 else 0.0
         pnl = float(sum(_safe_float(x.get("pnl_usd"), 0.0) for x in closed_window))
         gains = float(sum(_safe_float(x.get("pnl_usd"), 0.0) for x in closed_window if _safe_float(x.get("pnl_usd"), 0.0) > 0))
@@ -166,17 +180,18 @@ def _window_rank_winner(root: str, *, lookback_hours: float, min_closed: int) ->
         worst = min((_safe_float(x.get("pnl_usd"), 0.0) for x in closed_window), default=0.0)
 
         score = 0.0
-        score += pnl * 120.0
-        score += (winrate - 50.0) * 0.6
+        score += pnl * 160.0
+        score += (winrate - 50.0) * 0.8
         if pf == float("inf"):
-            score += 15.0
+            score += 12.0
         else:
-            score += max(-18.0, min(18.0, (pf - 1.0) * 12.0))
-        score += min(36.0, float(entries_window + len(closed_window)) * 0.9)
-        score += min(10.0, len(closed_window) * 0.4)
-        score -= max(0.0, (abs(worst) - 0.09) * 80.0)
+            score += max(-16.0, min(16.0, (pf - 1.0) * 10.0))
+        score += min(14.0, float(entries_window + len(closed_window)) * 0.35)
+        score += min(14.0, len(closed_window) * 0.55)
+        score -= max(0.0, (abs(worst) - 0.08) * 110.0)
+        score -= max(0.0, (loss_share - 0.56) * 40.0)
         if len(closed_window) < int(min_closed):
-            score -= float(int(min_closed) - len(closed_window)) * 2.0
+            score -= float(int(min_closed) - len(closed_window)) * 2.5
 
         ranked.append(
             {
@@ -186,6 +201,7 @@ def _window_rank_winner(root: str, *, lookback_hours: float, min_closed: int) ->
                 "closed_window": len(closed_window),
                 "wins_window": wins,
                 "losses_window": losses,
+                "loss_share_window": loss_share,
                 "pnl_window_usd": pnl,
                 "winrate_window_pct": winrate,
                 "profit_factor_window": pf,
@@ -279,17 +295,8 @@ def _resolve_profile_env(
     raise RuntimeError("Cannot resolve source profile/env. Run matrix first or pass --profile-id.")
 
 
-def _build_live_overrides(source: dict[str, str], profile_id: str) -> dict[str, str]:
-    max_open = max(1, min(2, _safe_int(source.get("MAX_OPEN_TRADES"), 2)))
-    max_buys = max(6, min(24, _safe_int(source.get("MAX_BUYS_PER_HOUR"), 18)))
-    drawdown_limit = max(3.0, min(4.5, _safe_float(source.get("RISK_GOVERNOR_DRAWDOWN_LIMIT_PERCENT"), 4.5)))
-    streak_cap = max(2, min(3, _safe_int(source.get("RISK_GOVERNOR_MAX_LOSS_STREAK"), 3)))
-    size_max = max(0.35, min(0.65, _safe_float(source.get("PAPER_TRADE_SIZE_MAX_USD"), 0.60)))
-    size_min = max(0.25, min(size_max, _safe_float(source.get("PAPER_TRADE_SIZE_MIN_USD"), min(0.45, size_max))))
-    min_edge_usd = max(0.015, _safe_float(source.get("MIN_EXPECTED_EDGE_USD"), 0.015))
-    min_edge_pct = max(0.50, _safe_float(source.get("MIN_EXPECTED_EDGE_PERCENT"), 0.50))
-    live_roundtrip_ratio = max(0.72, _safe_float(source.get("LIVE_ROUNDTRIP_MIN_RETURN_RATIO"), 0.72))
-
+def _build_live_overrides(_source: dict[str, str], profile_id: str) -> dict[str, str]:
+    # Keep strategy mechanics untouched; only switch runtime/execution context to live.
     return {
         "BOT_INSTANCE_ID": f"live_{profile_id}",
         "RUN_TAG": f"live_{profile_id}",
@@ -297,30 +304,11 @@ def _build_live_overrides(source: dict[str, str], profile_id: str) -> dict[str, 
         "AUTO_TRADE_ENABLED": "true",
         "AUTO_TRADE_PAPER": "false",
         "PAPER_RESET_ON_START": "false",
-        "MAX_OPEN_TRADES": str(max_open),
-        "MAX_BUYS_PER_HOUR": str(max_buys),
-        "AUTO_TRADE_TOP_N": str(max(6, min(14, _safe_int(source.get("AUTO_TRADE_TOP_N"), 10)))),
-        "PAPER_TRADE_SIZE_MIN_USD": f"{size_min:.2f}",
-        "PAPER_TRADE_SIZE_MAX_USD": f"{size_max:.2f}",
-        "MIN_EXPECTED_EDGE_USD": f"{min_edge_usd:.3f}",
-        "MIN_EXPECTED_EDGE_PERCENT": f"{min_edge_pct:.2f}",
-        "EDGE_FILTER_MODE": "both",
-        "SAFE_TEST_MODE": "true",
-        "SAFE_REQUIRE_CONTRACT_SAFE": "true",
-        "SAFE_REQUIRE_RISK_LEVEL": "MEDIUM",
-        "SAFE_MAX_WARNING_FLAGS": "1",
-        "TOKEN_SAFETY_FAIL_CLOSED": "true",
-        "HONEYPOT_API_ENABLED": "true",
-        "HONEYPOT_API_FAIL_CLOSED": "true",
-        "LIVE_ROUNDTRIP_CHECK_ENABLED": "true",
-        "LIVE_ROUNDTRIP_MIN_RETURN_RATIO": f"{live_roundtrip_ratio:.2f}",
-        "LIVE_SELLABILITY_CHECK_ENABLED": "true",
-        "RISK_GOVERNOR_MAX_LOSS_STREAK": str(streak_cap),
-        "RISK_GOVERNOR_STREAK_PAUSE_SECONDS": "900",
-        "RISK_GOVERNOR_DRAWDOWN_LIMIT_PERCENT": f"{drawdown_limit:.2f}",
-        "RISK_GOVERNOR_DRAWDOWN_PAUSE_SECONDS": "1200",
-        "RISK_GOVERNOR_HARD_BLOCK_ON_STREAK": "false",
-        "AUTOTRADE_BLACKLIST_TTL_SECONDS": "21600",
+        "CANDIDATE_SHARD_MOD": "1",
+        "CANDIDATE_SHARD_SLOT": "0",
+        "CANDIDATE_DECISIONS_LOG_FILE": f"logs/live/{profile_id}/candidates.jsonl",
+        "AUTONOMOUS_CONTROL_DECISIONS_LOG_FILE": f"logs/live/{profile_id}/autonomy_decisions.jsonl",
+        "PAPER_STATE_FILE": f"trading/paper_state.live_{profile_id}.json",
     }
 
 
@@ -381,30 +369,46 @@ def _window_controls(
 
     out: dict[str, str] = {}
     if "MAX_OPEN_TRADES" in chosen:
-        out["MAX_OPEN_TRADES"] = str(max(1, min(2, _safe_int(chosen["MAX_OPEN_TRADES"], 2))))
+        out["MAX_OPEN_TRADES"] = str(max(1, _safe_int(chosen["MAX_OPEN_TRADES"], 1)))
     if "AUTO_TRADE_TOP_N" in chosen:
-        out["AUTO_TRADE_TOP_N"] = str(max(6, min(14, _safe_int(chosen["AUTO_TRADE_TOP_N"], 10))))
+        out["AUTO_TRADE_TOP_N"] = str(max(1, _safe_int(chosen["AUTO_TRADE_TOP_N"], 1)))
     if "MAX_BUYS_PER_HOUR" in chosen:
-        out["MAX_BUYS_PER_HOUR"] = str(max(6, min(24, _safe_int(chosen["MAX_BUYS_PER_HOUR"], 18))))
+        out["MAX_BUYS_PER_HOUR"] = str(max(1, _safe_int(chosen["MAX_BUYS_PER_HOUR"], 1)))
     if "PAPER_TRADE_SIZE_MAX_USD" in chosen:
-        size_max = max(0.35, min(0.65, _safe_float(chosen["PAPER_TRADE_SIZE_MAX_USD"], 0.60)))
+        size_max = max(0.05, _safe_float(chosen["PAPER_TRADE_SIZE_MAX_USD"], 0.60))
         out["PAPER_TRADE_SIZE_MAX_USD"] = f"{size_max:.2f}"
-        size_min = max(0.25, min(size_max, _safe_float(source_env.get("PAPER_TRADE_SIZE_MIN_USD"), 0.45)))
+        size_min = max(0.05, min(size_max, _safe_float(source_env.get("PAPER_TRADE_SIZE_MIN_USD"), 0.45)))
         out["PAPER_TRADE_SIZE_MIN_USD"] = f"{size_min:.2f}"
     return out
 
 
+def _diff_env(before: dict[str, str], after: dict[str, str]) -> list[tuple[str, str, str]]:
+    keys = sorted(set(before.keys()) | set(after.keys()))
+    out: list[tuple[str, str, str]] = []
+    for key in keys:
+        prev = str(before.get(key, ""))
+        cur = str(after.get(key, ""))
+        if prev != cur:
+            out.append((key, prev, cur))
+    return out
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Promote matrix profile into guarded live env.")
+    parser = argparse.ArgumentParser(description="Promote matrix profile into live env with strict parity.")
     parser.add_argument("--root", default=".", help="Project root")
     parser.add_argument("--profile-id", default="", help="Profile id to promote (optional)")
     parser.add_argument("--lookback-hours", type=float, default=4.0, help="Window for auto winner pick and runtime controls")
     parser.add_argument("--min-closed", type=int, default=10, help="Min closed trades for window winner confidence")
     parser.add_argument(
         "--window-controls",
-        default="median",
+        default="off",
         choices=["off", "last", "median"],
-        help="How to fold recent autonomy controls into live preset",
+        help="Optional fold of recent autonomy controls (default: off for strict parity)",
+    )
+    parser.add_argument(
+        "--allow-drift",
+        action="store_true",
+        help="Allow non-runtime parameter drift from source matrix profile (not recommended).",
     )
     parser.add_argument(
         "--confirm",
@@ -454,6 +458,15 @@ def main() -> int:
     if runtime_controls:
         target_map.update(runtime_controls)
 
+    diffs = _diff_env(source_map, target_map)
+    unexpected = [d for d in diffs if d[0] not in _ALLOWED_PROMOTION_DIFF_KEYS]
+    if unexpected and not args.allow_drift:
+        print("PROMOTION_BLOCKED unexpected parameter drift detected (strict parity).")
+        for key, prev, cur in unexpected[:40]:
+            print(f"DRIFT {key}: {prev} -> {cur}")
+        print("Re-run with --allow-drift to bypass, or disable drift sources (e.g. --window-controls off).")
+        return 3
+
     target_env = os.path.join(root, "data", "matrix", "env", f"live_from_{profile_id}.env")
     _write_env(target_env, order, target_map)
 
@@ -463,6 +476,12 @@ def main() -> int:
     if str(select_meta.get("window_pick_report", "")).strip():
         print(f"WINDOW_PICK_REPORT {select_meta['window_pick_report']}")
     print(f"WINDOW_CONTROLS_MODE {args.window_controls}")
+    print(f"PROMOTION_DIFFS {len(diffs)}")
+    if diffs:
+        for key, prev, cur in diffs:
+            print(f"DIFF {key}: {prev} -> {cur}")
+    if unexpected:
+        print(f"UNEXPECTED_DIFFS {len(unexpected)}")
     print(f"LIVE_ENV {target_env}")
 
     if args.apply:
@@ -486,4 +505,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

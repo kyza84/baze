@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from monitor.token_checker import TokenChecker
+from utils.log_contracts import local_alert_event
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +19,13 @@ class LocalAlerter:
         self.alerts_file = alerts_file
         self.token_checker = TokenChecker()
         os.makedirs(os.path.dirname(self.alerts_file), exist_ok=True)
+
+    @staticmethod
+    def _run_tag() -> str:
+        run_tag = str(os.getenv("RUN_TAG", "") or "").strip()
+        if run_tag:
+            return run_tag
+        return str(os.getenv("BOT_INSTANCE_ID", "") or "").strip()
 
     async def close(self) -> None:
         await self.token_checker.close()
@@ -52,6 +60,7 @@ class LocalAlerter:
             "warning_flags": warning_flags,
             "breakdown": score_data.get("breakdown", {}),
         }
+        record = local_alert_event(record, run_tag=self._run_tag())
 
         with open(self.alerts_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -66,5 +75,32 @@ class LocalAlerter:
             record["warning_flags"],
             record["liquidity"],
             record["volume_5m"],
+        )
+        return 1
+
+    async def send_event(self, event: dict[str, Any]) -> int:
+        now = datetime.now(timezone.utc)
+        payload = dict(event or {})
+        payload.setdefault("timestamp", now.isoformat())
+        payload.setdefault("name", "SYSTEM")
+        payload.setdefault("symbol", str(payload.get("symbol", "SYSTEM")))
+        payload.setdefault("address", "")
+        payload.setdefault("liquidity", 0.0)
+        payload.setdefault("volume_5m", 0.0)
+        payload.setdefault("price_change_5m", 0.0)
+        payload.setdefault("age_minutes", 0)
+        payload.setdefault("score", int(payload.get("score", 0) or 0))
+        payload.setdefault("recommendation", str(payload.get("recommendation", "INFO")))
+        payload.setdefault("risk_level", str(payload.get("risk_level", "INFO")))
+        payload.setdefault("warning_flags", int(payload.get("warning_flags", 0) or 0))
+        payload.setdefault("breakdown", {})
+        payload = local_alert_event(payload, run_tag=self._run_tag())
+        with open(self.alerts_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        logger.warning(
+            "Local event symbol=%s reco=%s risk=%s",
+            payload.get("symbol", "SYSTEM"),
+            payload.get("recommendation", "INFO"),
+            payload.get("risk_level", "INFO"),
         )
         return 1

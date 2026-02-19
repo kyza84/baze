@@ -2,9 +2,10 @@ param(
   [string]$ProfileId = "",
   [double]$LookbackHours = 4,
   [ValidateSet('off','last','median')]
-  [string]$WindowControls = 'median',
+  [string]$WindowControls = 'off',
   [int]$MinClosed = 10,
   [string]$Confirm = "",
+  [switch]$AllowDrift,
   [switch]$Apply
 )
 
@@ -22,6 +23,9 @@ if ($ProfileId -and $ProfileId.Trim().Length -gt 0) {
   $args += @('--profile-id', $ProfileId.Trim())
 }
 $args += @('--lookback-hours', [string]$LookbackHours, '--min-closed', [string]$MinClosed, '--window-controls', $WindowControls)
+if ($AllowDrift) {
+  $args += '--allow-drift'
+}
 if ($Confirm -and $Confirm.Trim().Length -gt 0) {
   $args += @('--confirm', $Confirm.Trim())
 }

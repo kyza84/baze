@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 import config
@@ -21,8 +22,11 @@ class TokenChecker:
         self._checks_total = 0
         self._api_ok = 0
         self._api_fail = 0
+        self._api_fail_total = 0
+        self._api_fail_transient = 0
         self._fail_closed = 0
         self._api_fail_reasons: dict[str, int] = {}
+        self._safety_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
     async def close(self) -> None:
         await self._http.close()
@@ -30,7 +34,10 @@ class TokenChecker:
     def runtime_stats(self, reset: bool = False) -> dict[str, int | float]:
         total = int(self._checks_total)
         fail = int(self._api_fail)
+        fail_total = int(self._api_fail_total)
+        fail_transient = int(self._api_fail_transient)
         err_pct = (float(fail) / total * 100.0) if total > 0 else 0.0
+        err_pct_total = (float(fail_total) / total * 100.0) if total > 0 else 0.0
         top_reason = "none"
         top_count = 0
         if self._api_fail_reasons:
@@ -39,8 +46,11 @@ class TokenChecker:
             "checks_total": total,
             "api_ok": int(self._api_ok),
             "api_fail": fail,
+            "api_fail_total": fail_total,
+            "api_fail_transient": fail_transient,
             "fail_closed": int(self._fail_closed),
             "api_error_percent": round(err_pct, 2),
+            "api_error_percent_total": round(err_pct_total, 2),
             "fail_reason_top": top_reason,
             "fail_reason_top_count": int(top_count),
             "fail_reason_counts": dict(self._api_fail_reasons),
@@ -49,6 +59,8 @@ class TokenChecker:
             self._checks_total = 0
             self._api_ok = 0
             self._api_fail = 0
+            self._api_fail_total = 0
+            self._api_fail_transient = 0
             self._fail_closed = 0
             self._api_fail_reasons = {}
         return out
@@ -58,31 +70,51 @@ class TokenChecker:
         self._api_fail_reasons[key] = int(self._api_fail_reasons.get(key, 0)) + 1
         return key
 
-    async def check_token_safety(self, token_address: str, liquidity: float | None = None) -> dict[str, Any]:
-        self._checks_total += 1
-        api_result, fail_reason = await self._check_with_goplus(token_address)
-        if api_result:
-            self._api_ok += 1
-            return api_result
+    @staticmethod
+    def _cache_key(token_address: str) -> str:
+        return str(token_address or "").strip().lower()
 
-        # Stability-first mode: if we cannot validate safety with an external API, do not trade.
-        if bool(getattr(config, "TOKEN_SAFETY_FAIL_CLOSED", False)):
-            self._api_fail += 1
-            self._fail_closed += 1
-            fail_key = self._mark_fail_reason(fail_reason)
-            return {
-                "token_address": token_address,
-                "is_safe": False,
-                "risk_level": "HIGH",
-                "warnings": [f"Safety API unavailable (fail-closed): {fail_key}"],
-                "warning_flags": 1,
-                "source": "fail_closed",
-                "fail_reason": fail_key,
-            }
+    def _remember_safety(self, token_address: str, result: dict[str, Any]) -> None:
+        key = self._cache_key(token_address)
+        if not key:
+            return
+        self._safety_cache[key] = (time.time(), dict(result or {}))
+        # Keep cache bounded to avoid uncontrolled growth on long 24/7 runs.
+        if len(self._safety_cache) > 5000:
+            try:
+                oldest_key = min(self._safety_cache.items(), key=lambda kv: float(kv[1][0]))[0]
+                self._safety_cache.pop(oldest_key, None)
+            except Exception:
+                self._safety_cache.clear()
 
-        # Fallback placeholder logic if external API is unavailable.
-        self._api_fail += 1
-        self._mark_fail_reason(fail_reason)
+    def _get_cached_safety(self, token_address: str) -> dict[str, Any] | None:
+        key = self._cache_key(token_address)
+        if not key:
+            return None
+        entry = self._safety_cache.get(key)
+        if not entry:
+            return None
+        ts, cached = entry
+        ttl = max(60, int(getattr(config, "V2_SAFETY_CACHE_TTL_SECONDS", 3600) or 3600))
+        if (time.time() - float(ts)) > float(ttl):
+            self._safety_cache.pop(key, None)
+            return None
+        return dict(cached or {})
+
+    def _is_transient_fail_reason(self, fail_reason: str | None) -> bool:
+        reason = str(fail_reason or "").strip().lower()
+        if not reason:
+            return False
+        transient_reasons = [str(x).strip().lower() for x in getattr(config, "TOKEN_SAFETY_TRANSIENT_REASONS", [])]
+        if reason in transient_reasons:
+            return True
+        # Keep 4029 as transient by default even if env override is missing.
+        if reason == "api_code_4029":
+            return True
+        return False
+
+    @staticmethod
+    def _fallback_assessment(token_address: str, liquidity: float | None = None) -> dict[str, Any]:
         warnings: list[str] = []
         risk_level = "MEDIUM"
         is_safe = True
@@ -106,6 +138,53 @@ class TokenChecker:
             "warning_flags": len(warnings),
             "source": "fallback",
         }
+
+    async def check_token_safety(self, token_address: str, liquidity: float | None = None) -> dict[str, Any]:
+        self._checks_total += 1
+        api_result, fail_reason = await self._check_with_goplus(token_address)
+        if api_result:
+            self._api_ok += 1
+            self._remember_safety(token_address, api_result)
+            return api_result
+
+        # Stability-first mode: if we cannot validate safety with an external API, do not trade.
+        if bool(getattr(config, "TOKEN_SAFETY_FAIL_CLOSED", False)):
+            fail_key = self._mark_fail_reason(fail_reason)
+            self._api_fail_total += 1
+            if bool(getattr(config, "TOKEN_SAFETY_TRANSIENT_DEGRADED_ENABLED", True)) and self._is_transient_fail_reason(
+                fail_key
+            ):
+                self._api_fail_transient += 1
+                if bool(getattr(config, "TOKEN_SAFETY_TRANSIENT_USE_CACHE", True)):
+                    cached = self._get_cached_safety(token_address)
+                    if isinstance(cached, dict) and cached:
+                        cached_out = dict(cached)
+                        cached_out["source"] = "cache_transient"
+                        cached_out["fail_reason"] = fail_key
+                        cached_out["warning_flags"] = int(cached_out.get("warning_flags", 0) or 0)
+                        return cached_out
+                if bool(getattr(config, "TOKEN_SAFETY_TRANSIENT_USE_FALLBACK", True)):
+                    fallback = self._fallback_assessment(token_address, liquidity=liquidity)
+                    fallback["source"] = "transient_fallback"
+                    fallback["fail_reason"] = fail_key
+                    return fallback
+            self._api_fail += 1
+            self._fail_closed += 1
+            return {
+                "token_address": token_address,
+                "is_safe": False,
+                "risk_level": "HIGH",
+                "warnings": [f"Safety API unavailable (fail-closed): {fail_key}"],
+                "warning_flags": 1,
+                "source": "fail_closed",
+                "fail_reason": fail_key,
+            }
+
+        # Fallback placeholder logic if external API is unavailable.
+        self._api_fail += 1
+        self._api_fail_total += 1
+        self._mark_fail_reason(fail_reason)
+        return self._fallback_assessment(token_address, liquidity=liquidity)
 
     async def _check_with_goplus(self, token_address: str) -> tuple[dict[str, Any] | None, str | None]:
         if not token_address:

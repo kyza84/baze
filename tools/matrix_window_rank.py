@@ -93,6 +93,7 @@ class ProfileWindowStats:
     closed_window: int
     wins_window: int
     losses_window: int
+    loss_share_window: float
     breakeven_window: int
     pnl_window_usd: float
     winrate_window_pct: float
@@ -113,6 +114,7 @@ class ProfileWindowStats:
             "closed_window": self.closed_window,
             "wins_window": self.wins_window,
             "losses_window": self.losses_window,
+            "loss_share_window": round(self.loss_share_window, 4),
             "breakeven_window": self.breakeven_window,
             "pnl_window_usd": round(self.pnl_window_usd, 6),
             "winrate_window_pct": round(self.winrate_window_pct, 2),
@@ -150,6 +152,7 @@ def _build_stats(profile_id: str, state_file: str, *, cutoff: datetime, min_clos
     losses = sum(1 for row in closed_window if _safe_float(row.get("pnl_usd"), 0.0) < 0.0)
     breakeven = max(0, len(closed_window) - wins - losses)
     pnl_window = float(sum(_safe_float(row.get("pnl_usd"), 0.0) for row in closed_window))
+    loss_share = (float(losses) / float(max(1, wins + losses))) if (wins + losses) > 0 else 0.0
 
     winrate = (wins / (wins + losses) * 100.0) if (wins + losses) > 0 else 0.0
     gains = float(sum(_safe_float(row.get("pnl_usd"), 0.0) for row in closed_window if _safe_float(row.get("pnl_usd"), 0.0) > 0.0))
@@ -164,19 +167,21 @@ def _build_stats(profile_id: str, state_file: str, *, cutoff: datetime, min_clos
     worst = min((_safe_float(row.get("pnl_usd"), 0.0) for row in closed_window), default=0.0)
     best = max((_safe_float(row.get("pnl_usd"), 0.0) for row in closed_window), default=0.0)
 
-    activity_score = min(36.0, float(entries_window + exits_window) * 0.9)
-    pnl_score = pnl_window * 120.0
-    quality_score = (winrate - 50.0) * 0.6
+    # Keep activity as a small tie-breaker, not a primary driver.
+    activity_score = min(14.0, float(entries_window + exits_window) * 0.35)
+    pnl_score = pnl_window * 160.0
+    quality_score = (winrate - 50.0) * 0.8
     if pf == float("inf"):
-        quality_score += 15.0
+        quality_score += 12.0
     else:
-        quality_score += max(-18.0, min(18.0, (pf - 1.0) * 12.0))
-    sample_score = min(10.0, len(closed_window) * 0.4)
+        quality_score += max(-16.0, min(16.0, (pf - 1.0) * 10.0))
+    sample_score = min(14.0, len(closed_window) * 0.55)
 
     risk_penalty = 0.0
-    risk_penalty += max(0.0, (abs(worst) - 0.09) * 80.0)
+    risk_penalty += max(0.0, (abs(worst) - 0.08) * 110.0)
+    risk_penalty += max(0.0, (loss_share - 0.56) * 40.0)
     if len(closed_window) < int(min_closed):
-        risk_penalty += float(int(min_closed) - len(closed_window)) * 2.0
+        risk_penalty += float(int(min_closed) - len(closed_window)) * 2.5
 
     total = activity_score + pnl_score + quality_score + sample_score - risk_penalty
     breakdown = {
@@ -196,6 +201,7 @@ def _build_stats(profile_id: str, state_file: str, *, cutoff: datetime, min_clos
         closed_window=len(closed_window),
         wins_window=wins,
         losses_window=losses,
+        loss_share_window=loss_share,
         breakeven_window=breakeven,
         pnl_window_usd=pnl_window,
         winrate_window_pct=winrate,
@@ -275,4 +281,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

@@ -17,6 +17,13 @@ import ssl
 import urllib.request
 from tkinter import messagebox, ttk
 
+from monitor.gui_engine_control import (
+    EngineContext,
+    run_powershell_script as engine_run_powershell_script,
+    start_bot as engine_start_bot,
+    stop_bot as engine_stop_bot,
+)
+
 try:
     import msvcrt  # Windows-only, used for a robust single-instance file lock.
 except Exception:  # pragma: no cover
@@ -48,6 +55,8 @@ OUT_LOG = os.path.join(LOG_DIR, "bot.out.log")
 ERR_LOG = os.path.join(LOG_DIR, "bot.err.log")
 APP_LOG = os.path.join(LOG_DIR, "app.log")
 LOCAL_ALERTS_FILE = os.path.join(LOG_DIR, "local_alerts.jsonl")
+CANDIDATE_DECISIONS_LOG_FILE = os.path.join("logs", "candidates.jsonl")
+TRADE_DECISIONS_LOG_FILE = os.path.join("logs", "trade_decisions.jsonl")
 PAPER_STATE_FILE = os.path.join(PROJECT_ROOT, "trading", "paper_state.json")
 MATRIX_ACTIVE_FILE = os.path.join(PROJECT_ROOT, "data", "matrix", "runs", "active_matrix.json")
 MATRIX_LAUNCHER = os.path.join(PROJECT_ROOT, "tools", "matrix_paper_launcher.ps1")
@@ -72,6 +81,14 @@ except Exception:
 UI_FONT_MAIN = "Bahnschrift"
 UI_FONT_MONO = "Cascadia Mono"
 GUI_STATS_EXCLUDED_SYMBOLS_DEFAULT = "ZORA"
+ENGINE_CONTEXT = EngineContext(
+    project_root=PROJECT_ROOT,
+    python_path=PYTHON_PATH,
+    pid_file=PID_FILE,
+    log_dir=LOG_DIR,
+    out_log=OUT_LOG,
+    err_log=ERR_LOG,
+)
 
 EVENT_KEYS = {
     "BUY": ("Paper BUY", "#67e8f9"),
@@ -205,8 +222,46 @@ SETTINGS_FIELDS_RAW = [
     ("AUTO_STOP_MIN_AVAILABLE_USD", "Stop min available $"),
 ]
 SETTINGS_FIELDS = [(k, _fix_mojibake(v)) for (k, v) in SETTINGS_FIELDS_RAW]
+GUI_SETTINGS_FIELDS = [
+    ("AUTO_TRADE_ENABLED", "Auto trade enabled"),
+    ("AUTO_TRADE_PAPER", "Paper mode"),
+    ("WALLET_MODE", "Wallet mode"),
+    ("WALLET_BALANCE_USD", "Paper wallet balance (USD)"),
+    ("LIVE_WALLET_BALANCE_USD", "Live wallet balance (USD)"),
+    ("MIN_TOKEN_SCORE", "Min token score"),
+    ("AUTO_TRADE_ENTRY_MODE", "Entry mode"),
+    ("AUTO_TRADE_TOP_N", "Top-N candidates"),
+    ("MAX_OPEN_TRADES", "Max open trades"),
+    ("MAX_BUYS_PER_HOUR", "Max buys per hour"),
+    ("MAX_TX_PER_DAY", "Max tx per day"),
+    ("PAPER_TRADE_SIZE_MIN_USD", "Trade size min (USD)"),
+    ("PAPER_TRADE_SIZE_MAX_USD", "Trade size max (USD)"),
+    ("MIN_EXPECTED_EDGE_PERCENT", "Min expected edge (%)"),
+    ("MIN_EXPECTED_EDGE_USD", "Min expected edge (USD)"),
+    ("PROFIT_TARGET_PERCENT", "TP percent"),
+    ("STOP_LOSS_PERCENT", "SL percent"),
+    ("PAPER_MAX_HOLD_SECONDS", "Max hold (seconds)"),
+    ("HOLD_MIN_SECONDS", "Hold min (seconds)"),
+    ("HOLD_MAX_SECONDS", "Hold max (seconds)"),
+    ("PAPER_PARTIAL_TP_ENABLED", "Partial TP enabled"),
+    ("PAPER_PARTIAL_TP_TRIGGER_PERCENT", "Partial TP trigger (%)"),
+    ("PAPER_PARTIAL_TP_SELL_FRACTION", "Partial TP sell fraction"),
+    ("NO_MOMENTUM_EXIT_MAX_PNL_PERCENT", "No-momentum exit max pnl (%)"),
+    ("WEAKNESS_EXIT_PNL_PERCENT", "Weakness exit pnl (%)"),
+    ("SAFE_MIN_LIQUIDITY_USD", "Safe min liquidity (USD)"),
+    ("SAFE_MIN_VOLUME_5M_USD", "Safe min volume 5m (USD)"),
+    ("SAFE_MAX_PRICE_CHANGE_5M_ABS_PERCENT", "Safe max 5m move (%)"),
+    ("MAX_TOKEN_COOLDOWN_SECONDS", "Token cooldown (seconds)"),
+    ("V2_POLICY_ROUTER_ENABLED", "V2 policy router"),
+    ("V2_POLICY_FAIL_CLOSED_ACTION", "V2 fail-closed action"),
+    ("V2_POLICY_DEGRADED_ACTION", "V2 degraded action"),
+    ("V2_ENTRY_DUAL_CHANNEL_ENABLED", "V2 dual entry"),
+    ("V2_ENTRY_EXPLORE_MAX_SHARE", "V2 explore share"),
+    ("V2_UNIVERSE_NOVELTY_MIN_SHARE", "V2 novelty min share"),
+]
 
 FIELD_OPTIONS = {
+    "WALLET_MODE": ["paper", "live"],
     "PERSONAL_MODE": ["true", "false"],
     "AUTO_FILTER_ENABLED": ["true", "false"],
     "AUTO_TRADE_ENABLED": ["false", "true"],
@@ -264,6 +319,10 @@ FIELD_OPTIONS = {
     "STAIR_STEP_SIZE_USD": ["2", "5", "10"],
     "STAIR_STEP_TRADABLE_BUFFER_USD": ["0.25", "0.35", "0.5", "0.75", "1.0"],
     "AUTO_STOP_MIN_AVAILABLE_USD": ["0.10", "0.25", "0.35", "0.50", "1.00"],
+    "V2_POLICY_ROUTER_ENABLED": ["true", "false"],
+    "V2_POLICY_FAIL_CLOSED_ACTION": ["limited", "block", "allow_all"],
+    "V2_POLICY_DEGRADED_ACTION": ["limited", "block", "allow_all"],
+    "V2_ENTRY_DUAL_CHANNEL_ENABLED": ["true", "false"],
 }
 
 
@@ -398,103 +457,27 @@ def _clear_graceful_stop_flag() -> None:
 
 
 def start_bot() -> tuple[bool, str]:
-    if not os.path.exists(PYTHON_PATH):
-        return False, f"Python not found: {PYTHON_PATH}"
-    if matrix_alive_count() > 0:
-        return False, "Matrix instances are running. Stop Matrix mode before starting single mode."
-    _clear_graceful_stop_flag()
-
-    existing = sorted(set(list_main_local_pids()))
-    if existing:
-        keep_pid = existing[0]
-        # Kill duplicated workers if any, keep one process alive.
-        for pid in existing[1:]:
-            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, text=True)
-        with open(PID_FILE, "w", encoding="ascii") as f:
-            f.write(str(keep_pid))
-        if len(existing) > 1:
-            return True, f"Already running main_local.py (PID {keep_pid}), duplicates removed: {len(existing) - 1}"
-        return True, f"Already running main_local.py (PID {keep_pid})"
-
-    pid = read_pid()
-    if pid and is_main_local_process(pid):
-        return True, f"Already running main_local.py (PID {pid})"
-    if pid and is_running(pid):
-        # Stale PID file pointing to unrelated process.
-        try:
-            os.remove(PID_FILE)
-        except OSError:
-            pass
-
-    os.makedirs(LOG_DIR, exist_ok=True)
-    out_file = open(OUT_LOG, "a", encoding="utf-8")
-    err_file = open(ERR_LOG, "a", encoding="utf-8")
-
-    creationflags = 0
-    if os.name == "nt":
-        creationflags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
-
-    proc = subprocess.Popen(
-        [PYTHON_PATH, "main_local.py"],
-        cwd=PROJECT_ROOT,
-        stdout=out_file,
-        stderr=err_file,
-        stdin=subprocess.DEVNULL,
-        creationflags=creationflags,
-        close_fds=True,
+    return engine_start_bot(
+        ENGINE_CONTEXT,
+        matrix_alive_count=matrix_alive_count,
+        list_main_local_pids=list_main_local_pids,
+        is_main_local_process=is_main_local_process,
+        read_pid=read_pid,
+        is_running=is_running,
+        clear_graceful_stop_flag=_clear_graceful_stop_flag,
     )
-    with open(PID_FILE, "w", encoding="ascii") as f:
-        f.write(str(proc.pid))
-    return True, f"Started main_local.py (PID {proc.pid})"
 
 
 def stop_bot() -> tuple[bool, str]:
-    pids = sorted(set(list_main_local_pids()))
-    if not pids:
-        pid = read_pid()
-        if pid and is_main_local_process(pid):
-            pids = [pid]
-        else:
-            try:
-                os.remove(PID_FILE)
-            except OSError:
-                pass
-            return True, "Already stopped"
-
-    graceful_ok, graceful_msg = _signal_graceful_stop()
-    timeout_sec = _resolve_graceful_stop_timeout_seconds()
-    deadline = time.time() + timeout_sec
-    while time.time() < deadline:
-        alive = [pid for pid in pids if is_main_local_process(pid)]
-        if not alive:
-            try:
-                os.remove(PID_FILE)
-            except OSError:
-                pass
-            _clear_graceful_stop_flag()
-            return True, f"Graceful stop completed in <= {timeout_sec}s."
-        time.sleep(0.25)
-
-    failed: list[int] = []
-    hard_stopped: list[int] = []
-    for pid in pids:
-        if not is_main_local_process(pid):
-            continue
-        result = subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, text=True)
-        if result.returncode != 0 and is_main_local_process(pid):
-            failed.append(pid)
-        else:
-            hard_stopped.append(pid)
-    try:
-        os.remove(PID_FILE)
-    except OSError:
-        pass
-    if failed:
-        return False, f"Graceful stop timeout={timeout_sec}s; hard-kill failed for PID(s): {', '.join(str(pid) for pid in failed)}"
-    _clear_graceful_stop_flag()
-    if graceful_ok:
-        return True, f"Graceful stop timeout={timeout_sec}s; hard-kill fallback for PID(s): {', '.join(str(pid) for pid in hard_stopped)}"
-    return True, f"Graceful signal failed ({graceful_msg}); hard-kill fallback for PID(s): {', '.join(str(pid) for pid in hard_stopped)}"
+    return engine_stop_bot(
+        ENGINE_CONTEXT,
+        list_main_local_pids=list_main_local_pids,
+        is_main_local_process=is_main_local_process,
+        read_pid=read_pid,
+        signal_graceful_stop=_signal_graceful_stop,
+        resolve_graceful_timeout=_resolve_graceful_stop_timeout_seconds,
+        clear_graceful_stop_flag=_clear_graceful_stop_flag,
+    )
 
 
 class GuiInstanceLock:
@@ -677,27 +660,12 @@ def run_powershell_script(
     *,
     timeout_seconds: int = 90,
 ) -> tuple[bool, str]:
-    if not os.path.exists(script_path):
-        return False, f"Script not found: {script_path}"
-    cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script_path]
-    if args:
-        cmd.extend(args)
-    try:
-        proc = subprocess.run(
-            cmd,
-            cwd=PROJECT_ROOT,
-            capture_output=True,
-            text=True,
-            timeout=max(10, int(timeout_seconds)),
-        )
-    except Exception as exc:
-        return False, str(exc)
-    out = (proc.stdout or "").strip()
-    err = (proc.stderr or "").strip()
-    msg = out or err or f"exit={proc.returncode}"
-    if proc.returncode != 0:
-        return False, msg
-    return True, msg
+    return engine_run_powershell_script(
+        ENGINE_CONTEXT,
+        script_path=script_path,
+        args=args,
+        timeout_seconds=timeout_seconds,
+    )
 
 
 def read_jsonl_tail(path: str, max_lines: int) -> list[dict]:
@@ -1149,11 +1117,8 @@ class App(tk.Tk):
         ttk.Button(right, text="Matrix Start", command=self.on_matrix_start, style="Accent.TButton").pack(side=tk.LEFT, padx=4)
         ttk.Button(right, text="Matrix Stop", command=self.on_matrix_stop).pack(side=tk.LEFT, padx=4)
         ttk.Button(right, text="Matrix Summary", command=self.on_matrix_summary).pack(side=tk.LEFT, padx=4)
-        ttk.Button(right, text="Session Snapshot", command=self.on_session_snapshot).pack(side=tk.LEFT, padx=4)
         ttk.Button(right, text="Save", command=self._save_settings).pack(side=tk.LEFT, padx=4)
-        ttk.Button(right, text="Save + Restart", command=self._save_restart).pack(side=tk.LEFT, padx=4)
         ttk.Button(right, text="Restart", command=self.on_restart).pack(side=tk.LEFT, padx=4)
-        ttk.Button(right, text="Reload .env", command=self.on_reload_env).pack(side=tk.LEFT, padx=4)
         ttk.Button(right, text="Clear Logs", command=self.on_clear_logs).pack(side=tk.LEFT, padx=4)
         ttk.Button(right, text="Refresh", command=self.refresh).pack(side=tk.LEFT, padx=4)
 
@@ -1190,7 +1155,7 @@ class App(tk.Tk):
 
         left_card = ttk.Frame(activity_top, style="Card.TFrame")
         left_card.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-        ttk.Label(left_card, text="Лента сигналов и сделок", font=("Segoe UI Semibold", 12)).pack(anchor="w", pady=(0, 8))
+        ttk.Label(left_card, text="Signal and Trade Feed", font=("Segoe UI Semibold", 12)).pack(anchor="w", pady=(0, 8))
         self.feed_text = tk.Text(
             left_card,
             bg="#091224",
@@ -1221,7 +1186,7 @@ class App(tk.Tk):
 
         right_card = ttk.Frame(activity_top, style="Card.TFrame")
         right_card.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
-        ttk.Label(right_card, text="Сырые runtime-логи", font=("Segoe UI Semibold", 12)).pack(anchor="w", pady=(0, 8))
+        ttk.Label(right_card, text="Raw runtime logs", font=("Segoe UI Semibold", 12)).pack(anchor="w", pady=(0, 8))
         self.raw_text = tk.Text(
             right_card,
             bg="#091224",
@@ -1303,23 +1268,14 @@ class App(tk.Tk):
         self.settings_canvas.bind("<Enter>", self._bind_settings_scroll)
         self.settings_canvas.bind("<Leave>", self._unbind_settings_scroll)
 
-        title = ttk.Label(self.settings_content, text="Настройки runtime (.env)", font=("Segoe UI Semibold", 12))
+        title = ttk.Label(self.settings_content, text="Runtime Settings (.env)", font=("Segoe UI Semibold", 12))
         title.pack(anchor="w", pady=(0, 10))
-
-        presets = ttk.Frame(self.settings_content, style="Card.TFrame")
-        presets.pack(fill=tk.X, pady=(0, 10))
-        ttk.Label(presets, text="Быстрые пресеты:", foreground="#93c5fd").pack(side=tk.LEFT)
-        ttk.Button(presets, text="Safe Flow", command=self._apply_safe_flow_preset).pack(side=tk.LEFT, padx=6)
-        ttk.Button(presets, text="Medium Flow", command=self._apply_medium_flow_preset).pack(side=tk.LEFT, padx=6)
-        ttk.Button(presets, text="Live Wallet", command=self._apply_live_wallet_preset).pack(side=tk.LEFT, padx=6)
-        ttk.Button(presets, text="Ultra Safe Live", command=self._apply_ultra_safe_live_preset).pack(side=tk.LEFT, padx=6)
-        ttk.Button(presets, text="Working Live", command=self._apply_working_live_preset).pack(side=tk.LEFT, padx=6)
 
         grid = ttk.Frame(self.settings_content, style="Card.TFrame")
         grid.pack(fill=tk.X)
         grid.columnconfigure(0, weight=1)
 
-        for idx, (key, label) in enumerate(SETTINGS_FIELDS):
+        for idx, (key, label) in enumerate(GUI_SETTINGS_FIELDS):
             row = idx * 2
             ttk.Label(
                 grid,
@@ -1343,16 +1299,16 @@ class App(tk.Tk):
 
         btns = ttk.Frame(self.settings_content, style="Card.TFrame")
         btns.pack(fill=tk.X, pady=(12, 0))
-        ttk.Button(btns, text="Перечитать .env", command=self._load_settings).pack(side=tk.LEFT)
-        ttk.Button(btns, text="Сохранить", command=self._save_settings).pack(side=tk.LEFT, padx=8)
-        ttk.Button(btns, text="Сохранить + Рестарт", command=self._save_restart).pack(side=tk.LEFT)
+        ttk.Button(btns, text="Reload .env", command=self._load_settings).pack(side=tk.LEFT)
+        ttk.Button(btns, text="Save", command=self._save_settings).pack(side=tk.LEFT, padx=8)
+        ttk.Button(btns, text="Save + Restart", command=self._save_restart).pack(side=tk.LEFT)
 
         tips = (
-            "Подсказка:\n"
-            "- Сначала используй paper-режим (AUTO_TRADE_PAPER=true).\n"
-            "- Для маленького баланса: Безопасный или Сбалансированный (3).\n"
-            "- Держи EDGE_FILTER_ENABLED=true, чтобы резать слабые входы.\n"
-            "- После изменений делай рестарт бота."
+            "Tips:\n"
+            "- Validate presets in matrix before live.\n"
+            "- Keep policy router enabled to avoid full dead-stop in degraded windows.\n"
+            "- Tune entry edge + exits together; isolated tweaks usually hurt EV.\n"
+            "- After changing runtime settings, restart the bot process."
         )
         ttk.Label(self.settings_content, text=tips, foreground="#94a3b8").pack(anchor="w", pady=(16, 0))
 
@@ -2262,7 +2218,7 @@ class App(tk.Tk):
 
     def _load_settings(self) -> None:
         env_map = read_runtime_env_map()
-        for key, _ in SETTINGS_FIELDS:
+        for key, _ in GUI_SETTINGS_FIELDS:
             self.env_vars[key].set(env_map.get(key, ""))
         if hasattr(self, "wallet_mode_var"):
             self.wallet_mode_var.set(str(env_map.get(WALLET_MODE_KEY, "paper")).strip().lower() or "paper")
@@ -2369,13 +2325,13 @@ class App(tk.Tk):
         app_lines: list[str] = []
         for path in log_paths:
             app_lines.extend(read_tail(path, 140))
-        events = parse_activity(app_lines)
+        events = self._activity_feed_events(app_lines)
         feed_signature = "\n".join(f"{lvl}|{ln}" for lvl, ln in events[-180:])
         if feed_signature != self._last_feed_signature and (not self._text_has_active_selection(self.feed_text)):
             self._last_feed_signature = feed_signature
             self.feed_text.delete("1.0", tk.END)
             if not events:
-                self.feed_text.insert(tk.END, "Пока нет активности. Запусти бота и дождись цикла сканирования.\n", ("INFO",))
+                self.feed_text.insert(tk.END, "No market mode changes or trade-open events yet.\n", ("INFO",))
             for level, line in events[-180:]:
                 self.feed_text.insert(tk.END, line + "\n", (level,))
             self._restore_scroll(self.feed_text, feed_y, feed_bottom)
@@ -2528,6 +2484,95 @@ class App(tk.Tk):
         if os.path.isabs(raw):
             return raw
         return os.path.join(PROJECT_ROOT, raw)
+
+    def _resolve_trade_decisions_log_path(self) -> str:
+        item = self._selected_matrix_item()
+        if isinstance(item, dict):
+            log_dir = str(item.get("log_dir", "") or "").strip()
+            if log_dir:
+                abs_dir = log_dir if os.path.isabs(log_dir) else os.path.join(PROJECT_ROOT, log_dir)
+                return os.path.join(abs_dir, "trade_decisions.jsonl")
+        env_map = self._runtime_env_map()
+        raw = str(env_map.get("TRADE_DECISIONS_LOG_FILE", "") or "").strip()
+        if not raw:
+            raw = TRADE_DECISIONS_LOG_FILE
+        if os.path.isabs(raw):
+            return raw
+        return os.path.join(PROJECT_ROOT, raw)
+
+    def _market_mode_activity_events(self, max_rows: int = 160) -> list[tuple[float, str, str]]:
+        _src, alerts_path = self._selected_signals_file()
+        rows = read_jsonl_tail(alerts_path, max_rows * 6)
+        out: list[tuple[float, str, str]] = []
+        for row in rows:
+            event_type = str(row.get("event_type", "") or "").strip().upper()
+            symbol = str(row.get("symbol", "") or "").strip().upper()
+            if event_type != "MARKET_MODE_CHANGE" and symbol != "MARKET_MODE":
+                continue
+            ts = _parse_ts(row.get("ts", row.get("timestamp")))
+            if ts is None:
+                ts = time.time()
+            breakdown = row.get("breakdown", {})
+            prev_mode = ""
+            new_mode = str(row.get("recommendation", "") or "").strip().upper()
+            reason = ""
+            if isinstance(breakdown, dict):
+                prev_mode = str(breakdown.get("previous_mode", "") or "").strip().upper()
+                if not new_mode:
+                    new_mode = str(breakdown.get("new_mode", "") or "").strip().upper()
+                reason = str(breakdown.get("reason", "") or "").strip()
+            if not new_mode:
+                new_mode = "UNKNOWN"
+            ts_text = datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+            if prev_mode:
+                msg = f"[{ts_text}] market mode {prev_mode}->{new_mode} reason={reason or '-'}"
+            else:
+                msg = f"[{ts_text}] market mode {new_mode} reason={reason or '-'}"
+            level = "INFO"
+            if new_mode == "GREEN":
+                level = "POLICY_OK"
+            elif new_mode == "YELLOW":
+                level = "POLICY_DEGRADED"
+            elif new_mode == "RED":
+                level = "POLICY_FAIL_CLOSED"
+            out.append((float(ts), level, msg))
+        return out[-max_rows:]
+
+    def _trade_activity_events(self, max_rows: int = 220) -> list[tuple[float, str, str]]:
+        path = self._resolve_trade_decisions_log_path()
+        rows = read_jsonl_tail(path, max_rows * 8)
+        out: list[tuple[float, str, str]] = []
+        for row in rows:
+            stage = str(row.get("decision_stage", "") or "").strip().lower()
+            if stage != "trade_open":
+                continue
+            ts = _parse_ts(row.get("ts", row.get("timestamp")))
+            if ts is None:
+                ts = time.time()
+            symbol = str(row.get("symbol", "N/A") or "N/A").strip() or "N/A"
+            mode = str(row.get("market_mode", "") or "").strip().upper() or "-"
+            tier = str(row.get("entry_tier", "") or "").strip().upper() or "-"
+            channel = str(row.get("entry_channel", "") or "").strip().lower() or "-"
+            score = int(self._safe_float(row.get("score", 0), 0.0))
+            size_usd = self._safe_float(row.get("position_size_usd", 0.0), 0.0)
+            edge_pct = self._safe_float(row.get("expected_edge_percent", 0.0), 0.0)
+            reason = str(row.get("reason", "") or "").strip().lower()
+            ts_text = datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+            msg = (
+                f"[{ts_text}] trade open {symbol} mode={mode} tier={tier}/{channel} "
+                f"size=${size_usd:.2f} score={score} edge={edge_pct:.2f}%"
+            )
+            if reason and reason not in {"-", "none", "ok"}:
+                msg = f"{msg} reason={reason}"
+            out.append((float(ts), "BUY", msg))
+        return out[-max_rows:]
+
+    def _activity_feed_events(self, app_lines: list[str]) -> list[tuple[str, str]]:
+        events = self._market_mode_activity_events(max_rows=160) + self._trade_activity_events(max_rows=240)
+        if not events:
+            return parse_activity(app_lines)
+        events.sort(key=lambda x: x[0])
+        return [(level, text) for _ts, level, text in events[-220:]]
 
     def _read_candidate_rows_window(self, window_seconds: int, max_bytes: int = 2_000_000) -> list[dict]:
         path = self._resolve_candidates_log_path()
@@ -3851,6 +3896,7 @@ class App(tk.Tk):
         for p in self._runtime_log_paths_for_signals():
             paths.add(p)
         paths.add(self._resolve_candidates_log_path())
+        paths.add(self._resolve_trade_decisions_log_path())
         _, signals_file = self._selected_signals_file()
         paths.add(signals_file)
         for path in paths:
@@ -3862,7 +3908,7 @@ class App(tk.Tk):
         # UI-only cleanup: clears views and truncates log files. Does not touch wallet state or KILL SWITCH.
         self.on_clear_logs()
         self.on_clear_signals()
-        for attr in ("log_text", "critical_text"):
+        for attr in ("feed_text", "raw_text", "critical_text", "log_text"):
             widget = getattr(self, attr, None)
             if widget is None:
                 continue
@@ -4049,5 +4095,3 @@ if __name__ == "__main__":
             App().mainloop()
         finally:
             gui_lock.release()
-
-

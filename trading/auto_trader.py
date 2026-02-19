@@ -14,9 +14,11 @@ from datetime import datetime, timezone
 from typing import Any
 
 import config
+from trading import auto_trader_state
 from trading.live_executor import LiveExecutor
 from utils.addressing import normalize_address
 from utils.http_client import ResilientHttpClient
+from utils.log_contracts import trade_decision_event
 
 logger = logging.getLogger(__name__)
 ADDRESS_RE = re.compile(r"^0x[a-f0-9]{40}$")
@@ -61,7 +63,10 @@ class PaperPosition:
     spent_eth: float = 0.0
     original_position_size_usd: float = 0.0
     partial_tp_done: bool = False
+    partial_tp_stage: int = 0
     partial_realized_pnl_usd: float = 0.0
+    last_partial_tp_trigger_percent: float = 0.0
+    timeout_extension_seconds: int = 0
     market_mode: str = ""
     entry_tier: str = ""
     entry_channel: str = ""
@@ -704,9 +709,7 @@ class AutoTrader:
         if not self.trade_decisions_log_enabled:
             return
         try:
-            payload = dict(event or {})
-            payload.setdefault("ts", time.time())
-            payload.setdefault("run_tag", self._decision_run_tag())
+            payload = trade_decision_event(dict(event or {}), run_tag=self._decision_run_tag())
             os.makedirs(os.path.dirname(self.trade_decisions_log_file) or ".", exist_ok=True)
             with open(self.trade_decisions_log_file, "a", encoding="utf-8") as f:
                 f.write(json.dumps(payload, ensure_ascii=False, sort_keys=False) + "\n")
@@ -1959,6 +1962,105 @@ class AutoTrader:
         max_size_by_risk = max(0.0, (max_allowed_loss_usd - gas_usd) / worst_loss_ratio)
         return max(0.0, min(position_size_usd, max_size_by_risk))
 
+    @staticmethod
+    def _partial_tp_stage(position: PaperPosition) -> int:
+        try:
+            stage = int(getattr(position, "partial_tp_stage", 0) or 0)
+        except Exception:
+            stage = 0
+        if stage <= 0 and bool(getattr(position, "partial_tp_done", False)):
+            stage = 1
+        return max(0, stage)
+
+    @staticmethod
+    def _set_partial_tp_stage(position: PaperPosition, stage: int, trigger_percent: float = 0.0) -> None:
+        safe_stage = max(0, int(stage))
+        position.partial_tp_stage = safe_stage
+        position.partial_tp_done = safe_stage > 0
+        position.last_partial_tp_trigger_percent = max(0.0, float(trigger_percent))
+
+    @staticmethod
+    def _partial_tp_be_protect_floor_percent(position: PaperPosition) -> float:
+        base_floor = float(getattr(config, "PAPER_PARTIAL_TP_BE_PROTECT_FLOOR_PERCENT", 0.05) or 0.05)
+        floor = base_floor
+        stage = AutoTrader._partial_tp_stage(position)
+        if stage >= 2:
+            floor += max(0.0, float(getattr(config, "PAPER_PARTIAL_TP_BE_PROTECT_STAGE2_BONUS_PERCENT", 0.10) or 0.10))
+        return float(floor)
+
+    def _effective_timeout_seconds(self, position: PaperPosition) -> int:
+        base_hold = max(1, int(position.max_hold_seconds or 1))
+        if not bool(getattr(config, "EXIT_TIMEOUT_EXTENSION_ENABLED", False)):
+            position.timeout_extension_seconds = 0
+            return base_hold
+
+        extension = 0
+        max_ext = max(0, int(getattr(config, "EXIT_TIMEOUT_EXTENSION_MAX_SECONDS", 0) or 0))
+        if max_ext <= 0:
+            position.timeout_extension_seconds = 0
+            return base_hold
+
+        edge_gate = float(getattr(config, "EXIT_TIMEOUT_EXTENSION_MIN_EDGE_PERCENT", 0.0) or 0.0)
+        if float(position.expected_edge_percent) >= edge_gate:
+            extension += max(0, int(getattr(config, "EXIT_TIMEOUT_EXTENSION_EDGE_SECONDS", 0) or 0))
+
+        peak_gate = float(getattr(config, "EXIT_TIMEOUT_EXTENSION_MIN_PEAK_PERCENT", 0.0) or 0.0)
+        pnl_gate = float(getattr(config, "EXIT_TIMEOUT_EXTENSION_MIN_PNL_PERCENT", -999.0) or -999.0)
+        if float(position.peak_pnl_percent) >= peak_gate and float(position.pnl_percent) >= pnl_gate:
+            extension += max(0, int(getattr(config, "EXIT_TIMEOUT_EXTENSION_MOMENTUM_SECONDS", 0) or 0))
+
+        if self._partial_tp_stage(position) > 0:
+            extension += max(0, int(getattr(config, "EXIT_TIMEOUT_EXTENSION_POST_PARTIAL_SECONDS", 0) or 0))
+
+        extension = max(0, min(max_ext, int(extension)))
+        position.timeout_extension_seconds = extension
+        return int(base_hold + extension)
+
+    def _trailing_floor_percent(self, position: PaperPosition) -> float | None:
+        if not bool(getattr(config, "PAPER_TRAILING_EXIT_ENABLED", False)):
+            return None
+
+        peak = float(position.peak_pnl_percent)
+        activate_peak = float(getattr(config, "PAPER_TRAILING_ACTIVATE_PEAK_PERCENT", 1.6) or 1.6)
+        if peak < activate_peak:
+            return None
+
+        giveback_abs = max(0.0, float(getattr(config, "PAPER_TRAILING_GIVEBACK_PERCENT", 1.1) or 1.1))
+        giveback_ratio = max(
+            0.05,
+            min(0.95, float(getattr(config, "PAPER_TRAILING_GIVEBACK_RATIO", 0.55) or 0.55)),
+        )
+        giveback = max(giveback_abs, peak * giveback_ratio)
+        min_floor = float(getattr(config, "PAPER_TRAILING_MIN_PNL_PERCENT", 0.2) or 0.2)
+        floor = max(min_floor, peak - giveback)
+        return float(floor)
+
+    def _should_exit_momentum_decay(self, position: PaperPosition, age_seconds: int) -> bool:
+        if not bool(getattr(config, "MOMENTUM_DECAY_EXIT_ENABLED", False)):
+            return False
+
+        age_ratio = max(0.0, min(100.0, float(getattr(config, "MOMENTUM_DECAY_MIN_AGE_PERCENT", 18.0) or 18.0))) / 100.0
+        min_age_by_ratio = int(position.max_hold_seconds * age_ratio)
+        min_age = max(min_age_by_ratio, int(getattr(config, "MOMENTUM_DECAY_MIN_HOLD_SECONDS", 60) or 60))
+        if int(age_seconds) < int(min_age):
+            return False
+
+        peak = float(position.peak_pnl_percent)
+        pnl = float(position.pnl_percent)
+        if peak < float(getattr(config, "MOMENTUM_DECAY_MIN_PEAK_PERCENT", 2.0) or 2.0):
+            return False
+        if pnl > float(getattr(config, "MOMENTUM_DECAY_MAX_PNL_PERCENT", 0.8) or 0.8):
+            return False
+
+        retain_ratio = max(0.0, min(1.0, float(getattr(config, "MOMENTUM_DECAY_RETAIN_RATIO", 0.35) or 0.35)))
+        min_drop = max(0.0, float(getattr(config, "MOMENTUM_DECAY_MIN_DROP_PERCENT", 1.0) or 1.0))
+        drop = peak - pnl
+        if drop < min_drop:
+            return False
+        if peak <= 0.0:
+            return False
+        return (pnl / peak) <= retain_ratio
+
     async def process_open_positions(self, bot=None) -> None:
         await self._process_recovery_queue()
         await self._check_critical_conditions()
@@ -2004,6 +2106,13 @@ class AutoTrader:
 
             should_close = False
             close_reason = ""
+            trailing_floor = self._trailing_floor_percent(position) if has_price_update else None
+            partial_stage = self._partial_tp_stage(position)
+            be_protect_floor = (
+                self._partial_tp_be_protect_floor_percent(position)
+                if (has_price_update and partial_stage > 0 and bool(getattr(config, "PAPER_PARTIAL_TP_BE_PROTECT_ENABLED", True)))
+                else None
+            )
 
             if has_price_update and position.pnl_percent >= position.take_profit_percent:
                 should_close = True
@@ -2020,8 +2129,23 @@ class AutoTrader:
             ):
                 should_close = True
                 close_reason = "PROFIT_LOCK"
+            elif (
+                has_price_update
+                and be_protect_floor is not None
+                and float(position.pnl_percent) <= float(be_protect_floor)
+            ):
+                should_close = True
+                close_reason = "BE_PROTECT"
+            elif (
+                has_price_update
+                and trailing_floor is not None
+                and float(position.pnl_percent) <= float(trailing_floor)
+            ):
+                should_close = True
+                close_reason = "TRAIL_FLOOR"
             else:
                 age_seconds = int((datetime.now(timezone.utc) - position.opened_at).total_seconds())
+                effective_hold_seconds = self._effective_timeout_seconds(position)
                 no_momentum_age_gate = max(
                     int(position.max_hold_seconds * max(0.0, min(100.0, float(config.NO_MOMENTUM_EXIT_MIN_AGE_PERCENT))) / 100.0),
                     int(config.NO_MOMENTUM_EXIT_MIN_HOLD_SECONDS),
@@ -2040,20 +2164,24 @@ class AutoTrader:
                 if should_close:
                     pass
                 else:
-                    min_age_ratio = max(0.0, min(100.0, float(config.WEAKNESS_EXIT_MIN_AGE_PERCENT))) / 100.0
-                    if (
-                        has_price_update
-                        and
-                        config.WEAKNESS_EXIT_ENABLED
-                        and age_seconds >= int(position.max_hold_seconds * min_age_ratio)
-                        and float(position.pnl_percent) <= float(config.WEAKNESS_EXIT_PNL_PERCENT)
-                        and float(position.peak_pnl_percent) < float(config.PROFIT_LOCK_TRIGGER_PERCENT)
-                    ):
+                    if has_price_update and self._should_exit_momentum_decay(position, age_seconds):
                         should_close = True
-                        close_reason = "WEAKNESS"
-                    elif age_seconds >= int(position.max_hold_seconds):
-                        should_close = True
-                        close_reason = "TIMEOUT"
+                        close_reason = "MOMENTUM_DECAY"
+                    else:
+                        min_age_ratio = max(0.0, min(100.0, float(config.WEAKNESS_EXIT_MIN_AGE_PERCENT))) / 100.0
+                        if (
+                            has_price_update
+                            and
+                            config.WEAKNESS_EXIT_ENABLED
+                            and age_seconds >= int(position.max_hold_seconds * min_age_ratio)
+                            and float(position.pnl_percent) <= float(config.WEAKNESS_EXIT_PNL_PERCENT)
+                            and float(position.peak_pnl_percent) < float(config.PROFIT_LOCK_TRIGGER_PERCENT)
+                        ):
+                            should_close = True
+                            close_reason = "WEAKNESS"
+                        elif age_seconds >= int(effective_hold_seconds):
+                            should_close = True
+                            close_reason = "TIMEOUT"
 
             if should_close:
                 if self._is_live_mode():
@@ -2506,25 +2634,26 @@ class AutoTrader:
         )
         self._save_state()
 
-    def _maybe_partial_take_profit(self, position: PaperPosition, raw_price_pnl_percent: float) -> None:
-        if not bool(getattr(config, "PAPER_PARTIAL_TP_ENABLED", False)):
-            return
-        if bool(position.partial_tp_done):
-            return
-        trigger = float(getattr(config, "PAPER_PARTIAL_TP_TRIGGER_PERCENT", 2.5) or 2.5)
-        trigger *= max(0.2, float(getattr(position, "partial_tp_trigger_mult", 1.0) or 1.0))
-        if float(raw_price_pnl_percent) < trigger:
-            return
-
-        frac = float(getattr(config, "PAPER_PARTIAL_TP_SELL_FRACTION", 0.5) or 0.5)
-        frac *= max(0.2, float(getattr(position, "partial_tp_sell_mult", 1.0) or 1.0))
-        frac = max(0.1, min(0.9, frac))
+    def _apply_partial_take_profit_slice(
+        self,
+        position: PaperPosition,
+        *,
+        stage: int,
+        reason: str,
+        trigger_percent: float,
+        raw_price_pnl_percent: float,
+        sell_fraction: float,
+    ) -> bool:
         if float(position.position_size_usd) <= 0.0:
-            return
+            return False
 
-        close_size_usd = float(position.position_size_usd) * frac
+        frac = max(0.05, min(0.95, float(sell_fraction)))
+        old_size = float(position.position_size_usd)
+        min_remaining_usd = max(0.0, float(getattr(config, "PAPER_PARTIAL_TP_MIN_REMAINING_USD", 0.10) or 0.10))
+        max_close_by_remaining = max(0.0, old_size - min_remaining_usd)
+        close_size_usd = min(old_size * frac, max_close_by_remaining)
         if close_size_usd < 0.05:
-            return
+            return False
 
         effective_price_pnl_percent = float(raw_price_pnl_percent)
         if config.PAPER_REALISM_CAP_ENABLED:
@@ -2533,7 +2662,8 @@ class AutoTrader:
             effective_price_pnl_percent = max(-abs(max_loss), min(abs(max_gain), effective_price_pnl_percent))
 
         gross_value_usd = close_size_usd * (1 + effective_price_pnl_percent / 100.0)
-        gas_slice_usd = float(position.gas_cost_usd) * frac
+        gas_fraction = 0.0 if old_size <= 0.0 else min(1.0, close_size_usd / old_size)
+        gas_slice_usd = float(position.gas_cost_usd) * gas_fraction
         if config.PAPER_REALISM_ENABLED:
             total_percent_cost = (float(position.buy_cost_percent) + float(position.sell_cost_percent)) / 100.0
             final_value_usd = gross_value_usd * (1 - total_percent_cost) - gas_slice_usd
@@ -2542,16 +2672,15 @@ class AutoTrader:
         final_value_usd = max(0.0, final_value_usd)
         realized_slice_pnl = final_value_usd - close_size_usd
 
-        old_size = float(position.position_size_usd)
         position.position_size_usd = max(0.0, old_size - close_size_usd)
         if float(position.original_position_size_usd or 0.0) <= 0.0:
             position.original_position_size_usd = old_size
         position.partial_realized_pnl_usd = float(position.partial_realized_pnl_usd) + float(realized_slice_pnl)
-        position.partial_tp_done = True
+        self._set_partial_tp_stage(position, stage=stage, trigger_percent=trigger_percent)
         position.gas_cost_usd = max(0.0, float(position.gas_cost_usd) - gas_slice_usd)
 
         if int(position.token_amount_raw or 0) > 0:
-            sold_raw = int(max(0, round(int(position.token_amount_raw) * frac)))
+            sold_raw = int(max(0, round(int(position.token_amount_raw) * gas_fraction)))
             position.token_amount_raw = max(0, int(position.token_amount_raw) - sold_raw)
 
         self.paper_balance_usd += final_value_usd
@@ -2561,13 +2690,20 @@ class AutoTrader:
 
         if bool(getattr(config, "PAPER_PARTIAL_TP_MOVE_SL_TO_BREAK_EVEN", True)):
             be_floor = max(0.0, float(getattr(config, "PAPER_PARTIAL_TP_BREAK_EVEN_BUFFER_PERCENT", 0.2) or 0.2))
+            if stage >= 2:
+                be_floor += max(
+                    0.0,
+                    float(getattr(config, "PAPER_PARTIAL_TP_BREAK_EVEN_STAGE2_BONUS_PERCENT", 0.10) or 0.10),
+                )
             position.stop_loss_percent = min(float(position.stop_loss_percent), be_floor)
 
         logger.info(
-            "AUTO_SELL Paper PARTIAL token=%s reason=TP1_PARTIAL trigger=%.2f%% sold=%.0f%% realized=$%.4f remaining_size=$%.2f sl=%.2f",
+            "AUTO_SELL Paper PARTIAL token=%s reason=%s stage=%s trigger=%.2f%% sold=%.0f%% realized=$%.4f remaining_size=$%.2f sl=%.2f",
             position.symbol,
-            trigger,
-            frac * 100.0,
+            reason,
+            int(stage),
+            float(trigger_percent),
+            (close_size_usd / max(0.0001, old_size)) * 100.0,
             realized_slice_pnl,
             position.position_size_usd,
             float(position.stop_loss_percent),
@@ -2577,7 +2713,10 @@ class AutoTrader:
                 "ts": time.time(),
                 "decision_stage": "trade_partial",
                 "decision": "partial_take_profit",
-                "reason": "TP1_PARTIAL",
+                "reason": str(reason),
+                "stage": int(stage),
+                "trigger_percent": float(trigger_percent),
+                "raw_price_pnl_percent": float(raw_price_pnl_percent),
                 "candidate_id": str(position.candidate_id or ""),
                 "token_address": position.token_address,
                 "symbol": position.symbol,
@@ -2590,6 +2729,53 @@ class AutoTrader:
             }
         )
         self._save_state()
+        return True
+
+    def _maybe_partial_take_profit(self, position: PaperPosition, raw_price_pnl_percent: float) -> None:
+        if not bool(getattr(config, "PAPER_PARTIAL_TP_ENABLED", False)):
+            return
+
+        trigger_1 = float(getattr(config, "PAPER_PARTIAL_TP_TRIGGER_PERCENT", 2.5) or 2.5)
+        trigger_1 *= max(0.2, float(getattr(position, "partial_tp_trigger_mult", 1.0) or 1.0))
+        if float(raw_price_pnl_percent) < trigger_1:
+            return
+
+        stage = self._partial_tp_stage(position)
+        if stage < 1:
+            frac_1 = float(getattr(config, "PAPER_PARTIAL_TP_SELL_FRACTION", 0.5) or 0.5)
+            frac_1 *= max(0.2, float(getattr(position, "partial_tp_sell_mult", 1.0) or 1.0))
+            if self._apply_partial_take_profit_slice(
+                position,
+                stage=1,
+                reason="TP1_PARTIAL",
+                trigger_percent=trigger_1,
+                raw_price_pnl_percent=raw_price_pnl_percent,
+                sell_fraction=frac_1,
+            ):
+                stage = self._partial_tp_stage(position)
+
+        if not bool(getattr(config, "PAPER_PARTIAL_TP_STAGE2_ENABLED", True)):
+            return
+
+        stage = self._partial_tp_stage(position)
+        if stage >= 2:
+            return
+
+        stage2_mult = max(1.05, float(getattr(config, "PAPER_PARTIAL_TP_STAGE2_TRIGGER_MULT", 1.9) or 1.9))
+        trigger_2 = trigger_1 * stage2_mult
+        if float(raw_price_pnl_percent) < trigger_2:
+            return
+
+        frac_2 = float(getattr(config, "PAPER_PARTIAL_TP_STAGE2_SELL_FRACTION", 0.35) or 0.35)
+        frac_2 *= max(0.2, float(getattr(position, "partial_tp_sell_mult", 1.0) or 1.0))
+        self._apply_partial_take_profit_slice(
+            position,
+            stage=2,
+            reason="TP2_PARTIAL",
+            trigger_percent=trigger_2,
+            raw_price_pnl_percent=raw_price_pnl_percent,
+            sell_fraction=frac_2,
+        )
 
     def clear_closed_positions(self, older_than_days: int = 0) -> int:
         before = len(self.closed_positions)
@@ -3263,205 +3449,10 @@ class AutoTrader:
         return int(min_hold + (span * max(0.0, min(1.0, quality))))
 
     def _save_state(self) -> None:
-        tmp_path = ""
-        try:
-            self._prune_closed_positions()
-            payload = {
-                "initial_balance_usd": self.initial_balance_usd,
-                "paper_balance_usd": self.paper_balance_usd,
-                "realized_pnl_usd": self.realized_pnl_usd,
-                "total_plans": self.total_plans,
-                "total_executed": self.total_executed,
-                "total_closed": self.total_closed,
-                "total_wins": self.total_wins,
-                "total_losses": self.total_losses,
-                "current_loss_streak": self.current_loss_streak,
-                "trading_pause_until_ts": self.trading_pause_until_ts,
-                "day_id": self.day_id,
-                "day_start_equity_usd": self.day_start_equity_usd,
-                "day_realized_pnl_usd": self.day_realized_pnl_usd,
-                "token_cooldowns": self.token_cooldowns,
-                "token_cooldown_strikes": self.token_cooldown_strikes,
-                "symbol_cooldowns": self.symbol_cooldowns,
-                "trade_open_timestamps": self.trade_open_timestamps[-500:],
-                "tx_event_timestamps": self.tx_event_timestamps[-1000:],
-                "price_guard_pending": self.price_guard_pending,
-                "recovery_queue": self.recovery_queue[-200:],
-                "recovery_untracked": self.recovery_untracked,
-                "recovery_attempts": self._recovery_attempts,
-                "recovery_last_attempt_ts": self._recovery_last_attempt_ts,
-                "data_policy_mode": self.data_policy_mode,
-                "data_policy_reason": self.data_policy_reason,
-                "emergency_halt_reason": self.emergency_halt_reason,
-                "emergency_halt_ts": self.emergency_halt_ts,
-                "stair_floor_usd": self.stair_floor_usd,
-                "stair_peak_balance_usd": self.stair_peak_balance_usd,
-                "last_reinvest_mult": self._last_reinvest_mult,
-                "live_start_ts": self.live_start_ts,
-                "live_start_balance_eth": self.live_start_balance_eth,
-                "live_start_balance_usd": self.live_start_balance_usd,
-                "open_positions": [self._serialize_pos(p) for p in self.open_positions.values()],
-                "closed_positions": [self._serialize_pos(p) for p in self.closed_positions[-500:]],
-            }
-            state_dir = os.path.dirname(self.state_file) or "."
-            os.makedirs(state_dir, exist_ok=True)
-            tmp_path = f"{self.state_file}.tmp"
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2)
-                f.flush()
-                try:
-                    os.fsync(f.fileno())
-                except Exception:
-                    pass
-            os.replace(tmp_path, self.state_file)
-            self._last_state_flush_ts = time.time()
-        except Exception as exc:
-            if tmp_path and os.path.exists(tmp_path):
-                try:
-                    os.remove(tmp_path)
-                except Exception:
-                    pass
-            logger.warning("AutoTrade state save failed: %s", exc)
+        auto_trader_state.save_state(self)
 
     def _load_state(self) -> None:
-        if not os.path.exists(self.state_file):
-            return
-        try:
-            with open(self.state_file, "r", encoding="utf-8-sig") as f:
-                payload = json.load(f)
-            self.initial_balance_usd = float(payload.get("initial_balance_usd", self.initial_balance_usd))
-            self.paper_balance_usd = float(payload.get("paper_balance_usd", self.paper_balance_usd))
-            self.realized_pnl_usd = float(payload.get("realized_pnl_usd", 0.0))
-            self.total_plans = int(payload.get("total_plans", 0))
-            self.total_executed = int(payload.get("total_executed", 0))
-            self.total_closed = int(payload.get("total_closed", 0))
-            self.total_wins = int(payload.get("total_wins", 0))
-            self.total_losses = int(payload.get("total_losses", 0))
-            self.current_loss_streak = int(payload.get("current_loss_streak", 0))
-            self.trading_pause_until_ts = 0.0
-            self.day_id = str(payload.get("day_id", self._current_day_id()))
-            self.day_start_equity_usd = float(payload.get("day_start_equity_usd", self.paper_balance_usd))
-            self.day_realized_pnl_usd = float(payload.get("day_realized_pnl_usd", 0.0))
-            raw_cooldowns = payload.get("token_cooldowns", {}) or {}
-            self.token_cooldowns = {normalize_address(str(k)): float(v) for k, v in raw_cooldowns.items() if normalize_address(str(k))}
-            raw_cooldown_strikes = payload.get("token_cooldown_strikes", {}) or {}
-            self.token_cooldown_strikes = {
-                normalize_address(str(k)): max(0, int(v))
-                for k, v in raw_cooldown_strikes.items()
-                if normalize_address(str(k))
-            }
-            raw_symbol_cooldowns = payload.get("symbol_cooldowns", {}) or {}
-            self.symbol_cooldowns = {
-                self._symbol_key(str(k)): float(v)
-                for k, v in raw_symbol_cooldowns.items()
-                if self._symbol_key(str(k))
-            }
-            raw_trade_ts = payload.get("trade_open_timestamps", []) or []
-            self.trade_open_timestamps = []
-            for value in raw_trade_ts:
-                try:
-                    self.trade_open_timestamps.append(float(value))
-                except (TypeError, ValueError):
-                    continue
-            raw_tx_ts = payload.get("tx_event_timestamps", []) or []
-            self.tx_event_timestamps = []
-            for value in raw_tx_ts:
-                try:
-                    self.tx_event_timestamps.append(float(value))
-                except (TypeError, ValueError):
-                    continue
-            pending_raw = payload.get("price_guard_pending", {}) or {}
-            self.price_guard_pending = {}
-            if isinstance(pending_raw, dict):
-                for address, record in pending_raw.items():
-                    if not isinstance(record, dict):
-                        continue
-                    normalized = normalize_address(str(address))
-                    if not normalized:
-                        continue
-                    self.price_guard_pending[normalized] = {
-                        "price": float(record.get("price", 0.0)),
-                        "count": int(record.get("count", 0)),
-                        "first_ts": float(record.get("first_ts", 0.0)),
-                    }
-            self.recovery_queue = []
-            raw_recovery = payload.get("recovery_queue", []) or []
-            if isinstance(raw_recovery, list):
-                for value in raw_recovery:
-                    addr = normalize_address(value)
-                    if addr:
-                        self.recovery_queue.append(addr)
-            self.recovery_untracked = {}
-            raw_untracked = payload.get("recovery_untracked", {}) or {}
-            if isinstance(raw_untracked, dict):
-                for k, v in raw_untracked.items():
-                    addr = normalize_address(k)
-                    if not addr:
-                        continue
-                    try:
-                        amount = int(v)
-                    except Exception:
-                        amount = 0
-                    if amount > 0:
-                        self.recovery_untracked[addr] = amount
-            self._recovery_attempts = {}
-            raw_attempts = payload.get("recovery_attempts", {}) or {}
-            if isinstance(raw_attempts, dict):
-                for k, v in raw_attempts.items():
-                    addr = normalize_address(k)
-                    if not addr:
-                        continue
-                    try:
-                        self._recovery_attempts[addr] = int(v)
-                    except Exception:
-                        continue
-            self._recovery_last_attempt_ts = {}
-            raw_attempt_ts = payload.get("recovery_last_attempt_ts", {}) or {}
-            if isinstance(raw_attempt_ts, dict):
-                for k, v in raw_attempt_ts.items():
-                    addr = normalize_address(k)
-                    if not addr:
-                        continue
-                    try:
-                        self._recovery_last_attempt_ts[addr] = float(v)
-                    except Exception:
-                        continue
-            self.data_policy_mode = str(payload.get("data_policy_mode", self.data_policy_mode) or "OK").upper()
-            if self.data_policy_mode not in {"OK", "DEGRADED", "FAIL_CLOSED", "LIMITED", "BLOCKED"}:
-                self.data_policy_mode = "OK"
-            self.data_policy_reason = str(payload.get("data_policy_reason", self.data_policy_reason) or "")
-            self.emergency_halt_reason = str(payload.get("emergency_halt_reason", "") or "")
-            self.emergency_halt_ts = float(payload.get("emergency_halt_ts", 0.0) or 0.0)
-            self.stair_floor_usd = float(payload.get("stair_floor_usd", self.stair_floor_usd))
-            self.stair_peak_balance_usd = float(payload.get("stair_peak_balance_usd", self.paper_balance_usd))
-            self._last_reinvest_mult = float(payload.get("last_reinvest_mult", self._last_reinvest_mult) or 1.0)
-            self.live_start_ts = float(payload.get("live_start_ts", self.live_start_ts) or 0.0)
-            self.live_start_balance_eth = float(payload.get("live_start_balance_eth", self.live_start_balance_eth) or 0.0)
-            self.live_start_balance_usd = float(payload.get("live_start_balance_usd", self.live_start_balance_usd) or 0.0)
-            self._prune_hourly_window()
-
-            self.open_positions.clear()
-            for row in payload.get("open_positions", []):
-                pos = self._deserialize_pos(row)
-                if pos and pos.status == "OPEN":
-                    self.open_positions[normalize_address(pos.token_address)] = pos
-
-            self.closed_positions.clear()
-            for row in payload.get("closed_positions", []):
-                pos = self._deserialize_pos(row)
-                if pos:
-                    self.closed_positions.append(pos)
-            self._prune_closed_positions()
-            self._sync_stair_state()
-
-            logger.info(
-                "AutoTrade state loaded open=%s closed=%s balance=$%.2f",
-                len(self.open_positions),
-                len(self.closed_positions),
-                self.paper_balance_usd,
-            )
-        except Exception as exc:
-            logger.warning("AutoTrade state load failed: %s", exc)
+        auto_trader_state.load_state(self)
 
     @staticmethod
     def _serialize_pos(pos: PaperPosition) -> dict[str, Any]:
@@ -3497,7 +3488,10 @@ class AutoTrader:
             "spent_eth": pos.spent_eth,
             "original_position_size_usd": pos.original_position_size_usd,
             "partial_tp_done": pos.partial_tp_done,
+            "partial_tp_stage": pos.partial_tp_stage,
             "partial_realized_pnl_usd": pos.partial_realized_pnl_usd,
+            "last_partial_tp_trigger_percent": pos.last_partial_tp_trigger_percent,
+            "timeout_extension_seconds": pos.timeout_extension_seconds,
             "market_mode": pos.market_mode,
             "entry_tier": pos.entry_tier,
             "entry_channel": pos.entry_channel,
@@ -3508,6 +3502,12 @@ class AutoTrader:
     @staticmethod
     def _deserialize_pos(row: dict[str, Any]) -> PaperPosition | None:
         try:
+            partial_stage_raw = row.get("partial_tp_stage", 1 if bool(row.get("partial_tp_done", False)) else 0)
+            try:
+                partial_stage = max(0, int(float(partial_stage_raw or 0)))
+            except Exception:
+                partial_stage = 1 if bool(row.get("partial_tp_done", False)) else 0
+
             opened_at = datetime.fromisoformat(str(row.get("opened_at")))
             if opened_at.tzinfo is None:
                 opened_at = opened_at.replace(tzinfo=timezone.utc)
@@ -3548,8 +3548,16 @@ class AutoTrader:
                 sell_tx_status=str(row.get("sell_tx_status", "none")),
                 spent_eth=float(row.get("spent_eth", 0.0)),
                 original_position_size_usd=float(row.get("original_position_size_usd", row.get("position_size_usd", 0.0))),
-                partial_tp_done=bool(row.get("partial_tp_done", False)),
+                partial_tp_done=bool(
+                    row.get(
+                        "partial_tp_done",
+                        bool(partial_stage > 0),
+                    )
+                ),
+                partial_tp_stage=partial_stage,
                 partial_realized_pnl_usd=float(row.get("partial_realized_pnl_usd", 0.0)),
+                last_partial_tp_trigger_percent=float(row.get("last_partial_tp_trigger_percent", 0.0)),
+                timeout_extension_seconds=max(0, int(row.get("timeout_extension_seconds", 0) or 0)),
                 market_mode=str(row.get("market_mode", "")),
                 entry_tier=str(row.get("entry_tier", "")),
                 entry_channel=str(row.get("entry_channel", "")),

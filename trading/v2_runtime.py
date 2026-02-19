@@ -441,6 +441,40 @@ class UnifiedCalibrator:
         self.smooth_alpha = _clamp(float(getattr(config, "V2_CALIBRATION_SMOOTH_ALPHA", 0.35) or 0.35), 0.05, 1.0)
         self.edge_usd_min = max(0.0, float(getattr(config, "V2_CALIBRATION_EDGE_USD_MIN", 0.010) or 0.010))
         self.edge_usd_max = max(self.edge_usd_min, float(getattr(config, "V2_CALIBRATION_EDGE_USD_MAX", 0.120) or 0.120))
+        self.edge_percent_min = max(0.0, float(getattr(config, "V2_CALIBRATION_EDGE_PERCENT_MIN", 0.35) or 0.35))
+        self.edge_percent_max = max(
+            self.edge_percent_min,
+            float(getattr(config, "V2_CALIBRATION_EDGE_PERCENT_MAX", 3.00) or 3.00),
+        )
+        self.edge_percent_step_max = max(
+            0.0,
+            float(getattr(config, "V2_CALIBRATION_EDGE_PERCENT_STEP_MAX", 0.06) or 0.06),
+        )
+        self.edge_usd_step_max = max(
+            0.0,
+            float(getattr(config, "V2_CALIBRATION_EDGE_USD_STEP_MAX", 0.0030) or 0.0030),
+        )
+        self.edge_percent_drift_up_24h = max(
+            0.0,
+            float(getattr(config, "V2_CALIBRATION_EDGE_PERCENT_DRIFT_UP_24H", 0.25) or 0.25),
+        )
+        self.edge_percent_drift_down_24h = max(
+            0.0,
+            float(getattr(config, "V2_CALIBRATION_EDGE_PERCENT_DRIFT_DOWN_24H", 0.20) or 0.20),
+        )
+        self.edge_usd_drift_up_24h = max(
+            0.0,
+            float(getattr(config, "V2_CALIBRATION_EDGE_USD_DRIFT_UP_24H", 0.0060) or 0.0060),
+        )
+        self.edge_usd_drift_down_24h = max(
+            0.0,
+            float(getattr(config, "V2_CALIBRATION_EDGE_USD_DRIFT_DOWN_24H", 0.0060) or 0.0060),
+        )
+        self.reanchor_interval_seconds = max(
+            1800,
+            int(getattr(config, "V2_CALIBRATION_REANCHOR_INTERVAL_SECONDS", 14400) or 14400),
+        )
+        self.reanchor_blend = _clamp(float(getattr(config, "V2_CALIBRATION_REANCHOR_BLEND", 0.22) or 0.22), 0.0, 1.0)
         self.volume_floor_min = max(0.0, float(getattr(config, "V2_CALIBRATION_VOLUME_MIN", 20.0) or 20.0))
         self.volume_floor_max = max(self.volume_floor_min, float(getattr(config, "V2_CALIBRATION_VOLUME_MAX", 450.0) or 450.0))
         self._next_eval_ts = time.time() + max(30, int(self.apply_interval_seconds))
@@ -450,6 +484,11 @@ class UnifiedCalibrator:
         out_default = os.path.join(root, "data", "analysis", "v2_calibration_latest.json")
         self.out_json_path = str(getattr(config, "V2_CALIBRATION_OUTPUT_JSON", out_default) or out_default)
         self._last_applied_signature = ""
+        self._baseline_edge_percent = _safe_float(getattr(config, "MIN_EXPECTED_EDGE_PERCENT", 1.0), 1.0)
+        self._baseline_edge_usd = _safe_float(getattr(config, "MIN_EXPECTED_EDGE_USD", 0.02), 0.02)
+        self._anchor_edge_percent = float(self._baseline_edge_percent)
+        self._anchor_edge_usd = float(self._baseline_edge_usd)
+        self._anchor_ts = time.time()
 
     def maybe_apply(self) -> dict[str, Any] | None:
         if not self.enabled:
@@ -461,6 +500,7 @@ class UnifiedCalibrator:
         if not os.path.exists(self.db_path):
             logger.warning("V2_CALIBRATION db not found path=%s", self.db_path)
             return None
+        self._maybe_reanchor(now_ts)
 
         payload = self._build_payload()
         if not payload:
@@ -519,7 +559,11 @@ class UnifiedCalibrator:
             if ev_proxy < 0:
                 edge_from_wins *= 1.15
             edge_target = _clamp(edge_from_wins, self.edge_usd_min, self.edge_usd_max)
-            edge_pct_target = _clamp((edge_target / max(0.1, size_median)) * 100.0, 0.35, 3.00)
+            edge_pct_target = _clamp(
+                (edge_target / max(0.1, size_median)) * 100.0,
+                self.edge_percent_min,
+                self.edge_percent_max,
+            )
 
             # Winner volume via candidates.raw_json (portable across schema migrations).
             winner_ids = [
@@ -598,9 +642,12 @@ class UnifiedCalibrator:
                 )
             )
 
+            edge_usd_next = self._bounded_edge_usd_target(edge_target)
+            edge_pct_next = self._bounded_edge_percent_target(edge_pct_target)
+
             applied = {
-                "MIN_EXPECTED_EDGE_USD": self._smooth("MIN_EXPECTED_EDGE_USD", edge_target),
-                "MIN_EXPECTED_EDGE_PERCENT": self._smooth("MIN_EXPECTED_EDGE_PERCENT", edge_pct_target),
+                "MIN_EXPECTED_EDGE_USD": float(edge_usd_next),
+                "MIN_EXPECTED_EDGE_PERCENT": float(edge_pct_next),
                 "SAFE_MIN_VOLUME_5M_USD": self._smooth("SAFE_MIN_VOLUME_5M_USD", vol_target),
                 "NO_MOMENTUM_EXIT_MAX_PNL_PERCENT": self._smooth("NO_MOMENTUM_EXIT_MAX_PNL_PERCENT", nm_target),
                 "WEAKNESS_EXIT_PNL_PERCENT": self._smooth("WEAKNESS_EXIT_PNL_PERCENT", weak_target),
@@ -614,10 +661,52 @@ class UnifiedCalibrator:
                 "p50_win_usd": round(p50_win, 6),
                 "p50_loss_usd": round(p50_loss, 6),
                 "ev_proxy_usd": round(ev_proxy, 6),
+                "anchor_edge_percent": round(self._anchor_edge_percent, 6),
+                "anchor_edge_usd": round(self._anchor_edge_usd, 6),
                 "applied": applied,
             }
         finally:
             conn.close()
+
+    def _maybe_reanchor(self, now_ts: float) -> None:
+        if (now_ts - float(self._anchor_ts)) < float(self.reanchor_interval_seconds):
+            return
+        edge_pct_now = _safe_float(getattr(config, "MIN_EXPECTED_EDGE_PERCENT", self._anchor_edge_percent), self._anchor_edge_percent)
+        edge_usd_now = _safe_float(getattr(config, "MIN_EXPECTED_EDGE_USD", self._anchor_edge_usd), self._anchor_edge_usd)
+        blend = float(self.reanchor_blend)
+        # Slow recentering toward baseline prevents long-run drift lock.
+        self._anchor_edge_percent = _clamp(
+            (edge_pct_now * (1.0 - blend)) + (float(self._baseline_edge_percent) * blend),
+            self.edge_percent_min,
+            self.edge_percent_max,
+        )
+        self._anchor_edge_usd = _clamp(
+            (edge_usd_now * (1.0 - blend)) + (float(self._baseline_edge_usd) * blend),
+            self.edge_usd_min,
+            self.edge_usd_max,
+        )
+        self._anchor_ts = float(now_ts)
+
+    def _bounded_edge_percent_target(self, target: float) -> float:
+        now_ts = time.time()
+        current = _safe_float(getattr(config, "MIN_EXPECTED_EDGE_PERCENT", target), target)
+        smoothed = self._smooth("MIN_EXPECTED_EDGE_PERCENT", target)
+        if self.edge_percent_step_max > 0.0:
+            smoothed = _clamp(smoothed, current - self.edge_percent_step_max, current + self.edge_percent_step_max)
+        drift_low = float(self._anchor_edge_percent) - float(self.edge_percent_drift_down_24h)
+        drift_high = float(self._anchor_edge_percent) + float(self.edge_percent_drift_up_24h)
+        out = _clamp(smoothed, max(self.edge_percent_min, drift_low), min(self.edge_percent_max, drift_high))
+        return _clamp(out, self.edge_percent_min, self.edge_percent_max)
+
+    def _bounded_edge_usd_target(self, target: float) -> float:
+        current = _safe_float(getattr(config, "MIN_EXPECTED_EDGE_USD", target), target)
+        smoothed = self._smooth("MIN_EXPECTED_EDGE_USD", target)
+        if self.edge_usd_step_max > 0.0:
+            smoothed = _clamp(smoothed, current - self.edge_usd_step_max, current + self.edge_usd_step_max)
+        drift_low = float(self._anchor_edge_usd) - float(self.edge_usd_drift_down_24h)
+        drift_high = float(self._anchor_edge_usd) + float(self.edge_usd_drift_up_24h)
+        out = _clamp(smoothed, max(self.edge_usd_min, drift_low), min(self.edge_usd_max, drift_high))
+        return _clamp(out, self.edge_usd_min, self.edge_usd_max)
 
     def _smooth(self, field: str, target: float) -> float:
         old = _safe_float(getattr(config, field, target), target)
@@ -1034,8 +1123,10 @@ class RollingEdgeGovernor:
         edge_pct_next = edge_pct_now
         action = "hold"
         reason = "steady"
+        relax_until_ts = _safe_float(getattr(config, "V2_RUNTIME_EDGE_RELAX_UNTIL_TS", 0.0), 0.0)
+        anti_stall_window = now_ts < float(relax_until_ts)
 
-        if loss_share >= float(self.loss_share_tighten) or avg_pnl < -0.0004:
+        if (loss_share >= float(self.loss_share_tighten) or avg_pnl < -0.0004) and (not anti_stall_window):
             edge_usd_next = _clamp(edge_usd_now + float(self.tighten_step_usd), self.min_usd, self.max_usd)
             edge_pct_next = _clamp(edge_pct_now + float(self.tighten_step_percent), self.min_percent, self.max_percent)
             action = "tighten"
@@ -1045,6 +1136,9 @@ class RollingEdgeGovernor:
             edge_pct_next = _clamp(edge_pct_now - float(self.relax_step_percent), self.min_percent, self.max_percent)
             action = "relax"
             reason = f"edge_low_share={edge_low_share:.3f} open_rate={open_rate:.3f}"
+        elif anti_stall_window:
+            action = "hold"
+            reason = "anti_stall_recovery_window"
 
         changed = (abs(edge_usd_next - edge_usd_now) >= 0.0001) or (abs(edge_pct_next - edge_pct_now) >= 0.0001)
         payload = {
@@ -1122,8 +1216,45 @@ class RuntimeKpiLoop:
             0.05,
             1.0,
         )
+        self.fast_antistall_enabled = bool(getattr(config, "V2_KPI_FAST_ANTISTALL_ENABLED", True))
+        self.fast_antistall_interval_seconds = max(
+            60,
+            int(getattr(config, "V2_KPI_FAST_ANTISTALL_INTERVAL_SECONDS", 900) or 900),
+        )
+        self.fast_antistall_streak_trigger = max(
+            1,
+            int(getattr(config, "V2_KPI_FAST_ANTISTALL_STREAK_TRIGGER", 2) or 2),
+        )
+        self.fast_antistall_edge_low_share_trigger = _clamp(
+            float(getattr(config, "V2_KPI_FAST_ANTISTALL_EDGE_LOW_SHARE_TRIGGER", 0.80) or 0.80),
+            0.0,
+            1.0,
+        )
+        self.fast_antistall_open_rate_trigger = max(
+            0.0,
+            float(getattr(config, "V2_KPI_FAST_ANTISTALL_OPEN_RATE_TRIGGER", 0.01) or 0.01),
+        )
+        self.fast_antistall_edge_percent_drop = max(
+            0.0,
+            float(getattr(config, "V2_KPI_FAST_ANTISTALL_EDGE_PERCENT_DROP", 0.12) or 0.12),
+        )
+        self.fast_antistall_edge_usd_drop = max(
+            0.0,
+            float(getattr(config, "V2_KPI_FAST_ANTISTALL_EDGE_USD_DROP", 0.0015) or 0.0015),
+        )
+        self.fast_antistall_recovery_window_seconds = max(
+            120,
+            int(getattr(config, "V2_KPI_FAST_ANTISTALL_RECOVERY_WINDOW_SECONDS", 1200) or 1200),
+        )
+        self.fast_antistall_max_apply_per_hour = max(
+            1,
+            int(getattr(config, "V2_KPI_FAST_ANTISTALL_MAX_APPLY_PER_HOUR", 2) or 2),
+        )
         self._rows: deque[dict[str, Any]] = deque(maxlen=self.window_cycles)
         self._next_eval_ts = time.time() + float(self.interval_seconds)
+        self._next_fast_eval_ts = time.time() + float(min(self.fast_antistall_interval_seconds, self.interval_seconds))
+        self._low_flow_streak = 0
+        self._fast_apply_ts: deque[float] = deque(maxlen=16)
 
     def record_cycle(
         self,
@@ -1149,6 +1280,9 @@ class RuntimeKpiLoop:
         if not self.enabled:
             return None
         now_ts = time.time()
+        fast_payload = self._maybe_apply_fast_antistall(now_ts=now_ts)
+        if isinstance(fast_payload, dict):
+            return fast_payload
         if now_ts < float(self._next_eval_ts):
             return None
         self._next_eval_ts = now_ts + float(self.interval_seconds)
@@ -1262,6 +1396,131 @@ class RuntimeKpiLoop:
             "novelty_share_prev": round(novelty_share_now, 6),
             "novelty_share_next": round(novelty_share_next, 6),
             "window_cycles": int(len(rows)),
+        }
+
+    def _recent_window_metrics(self) -> tuple[float, float, float]:
+        rows = list(self._rows)
+        if not rows:
+            return 0.0, 0.0, 0.0
+        cand_total = int(sum(int(row.get("candidates", 0) or 0) for row in rows))
+        opened_total = int(sum(int(row.get("opened", 0) or 0) for row in rows))
+        open_rate = (float(opened_total) / float(cand_total)) if cand_total > 0 else 0.0
+        skip_total = 0
+        skip_edge_low = 0
+        for row in rows:
+            skip_map = dict(row.get("skip_reasons", {}) or {})
+            for key, value in skip_map.items():
+                iv = int(value or 0)
+                skip_total += iv
+                kk = str(key or "").strip().lower()
+                if kk in {"negative_edge", "edge_low", "edge_usd_low"}:
+                    skip_edge_low += iv
+        edge_low_share = (float(skip_edge_low) / float(skip_total)) if skip_total > 0 else 0.0
+        policy_bad = sum(1 for row in rows if str(row.get("policy_state", "UNKNOWN")) != "OK")
+        policy_block_share = float(policy_bad) / float(max(1, len(rows)))
+        return open_rate, edge_low_share, policy_block_share
+
+    def _maybe_apply_fast_antistall(self, *, now_ts: float) -> dict[str, Any] | None:
+        if not self.fast_antistall_enabled:
+            return None
+        if now_ts < float(self._next_fast_eval_ts):
+            return None
+        self._next_fast_eval_ts = now_ts + float(self.fast_antistall_interval_seconds)
+        if len(self._rows) < max(3, min(self.window_cycles, 6)):
+            return None
+
+        open_rate, edge_low_share, policy_block_share = self._recent_window_metrics()
+        low_flow_now = (
+            open_rate <= float(self.fast_antistall_open_rate_trigger)
+            and edge_low_share >= float(self.fast_antistall_edge_low_share_trigger)
+        )
+        if low_flow_now:
+            self._low_flow_streak += 1
+        else:
+            self._low_flow_streak = 0
+            return None
+        if int(self._low_flow_streak) < int(self.fast_antistall_streak_trigger):
+            return None
+
+        keep: deque[float] = deque(maxlen=self._fast_apply_ts.maxlen)
+        for ts in self._fast_apply_ts:
+            if (now_ts - float(ts)) <= 3600.0:
+                keep.append(float(ts))
+        self._fast_apply_ts = keep
+        if len(self._fast_apply_ts) >= int(self.fast_antistall_max_apply_per_hour):
+            return None
+
+        edge_pct_now = _safe_float(getattr(config, "MIN_EXPECTED_EDGE_PERCENT", 1.0), 1.0)
+        edge_usd_now = _safe_float(getattr(config, "MIN_EXPECTED_EDGE_USD", 0.02), 0.02)
+        edge_pct_floor = max(
+            _safe_float(getattr(config, "V2_CALIBRATION_EDGE_PERCENT_MIN", 0.35), 0.35),
+            _safe_float(getattr(config, "V2_ROLLING_EDGE_MIN_PERCENT", 0.35), 0.35),
+        )
+        edge_usd_floor = max(
+            _safe_float(getattr(config, "V2_CALIBRATION_EDGE_USD_MIN", 0.008), 0.008),
+            _safe_float(getattr(config, "V2_ROLLING_EDGE_MIN_USD", 0.008), 0.008),
+        )
+        edge_pct_next = _clamp(
+            edge_pct_now - float(self.fast_antistall_edge_percent_drop),
+            edge_pct_floor,
+            _safe_float(getattr(config, "V2_CALIBRATION_EDGE_PERCENT_MAX", 3.0), 3.0),
+        )
+        edge_usd_next = _clamp(
+            edge_usd_now - float(self.fast_antistall_edge_usd_drop),
+            edge_usd_floor,
+            _safe_float(getattr(config, "V2_CALIBRATION_EDGE_USD_MAX", 0.12), 0.12),
+        )
+        max_buys_now = int(getattr(config, "MAX_BUYS_PER_HOUR", 24) or 24)
+        top_n_now = int(getattr(config, "AUTO_TRADE_TOP_N", 10) or 10)
+        max_buys_cap = max(1, int(getattr(config, "V2_KPI_MAX_BUYS_CAP", max_buys_now) or max_buys_now))
+        top_n_cap = max(1, int(getattr(config, "V2_KPI_TOPN_CAP", top_n_now) or top_n_now))
+        max_buys_next = min(max_buys_cap, max_buys_now + max(1, int(self.max_buys_boost_step)))
+        top_n_next = min(top_n_cap, top_n_now + max(1, int(self.topn_boost_step)))
+        recovery_until_ts = now_ts + float(self.fast_antistall_recovery_window_seconds)
+
+        setattr(config, "MIN_EXPECTED_EDGE_PERCENT", float(edge_pct_next))
+        setattr(config, "MIN_EXPECTED_EDGE_USD", float(edge_usd_next))
+        setattr(config, "MAX_BUYS_PER_HOUR", int(max_buys_next))
+        setattr(config, "AUTO_TRADE_TOP_N", int(top_n_next))
+        setattr(config, "V2_RUNTIME_EDGE_RELAX_UNTIL_TS", float(recovery_until_ts))
+        self._fast_apply_ts.append(float(now_ts))
+        self._low_flow_streak = 0
+
+        logger.warning(
+            (
+                "V2_FAST_ANTISTALL applied open_rate=%.3f edge_low_share=%.3f policy_share=%.3f "
+                "edge_pct=%.3f->%.3f edge_usd=%.4f->%.4f max_buys=%s->%s top_n=%s->%s recovery=%ss"
+            ),
+            open_rate,
+            edge_low_share,
+            policy_block_share,
+            edge_pct_now,
+            edge_pct_next,
+            edge_usd_now,
+            edge_usd_next,
+            max_buys_now,
+            max_buys_next,
+            top_n_now,
+            top_n_next,
+            int(self.fast_antistall_recovery_window_seconds),
+        )
+        return {
+            "event_type": "V2_FAST_ANTISTALL",
+            "action": "edge_relax_recovery",
+            "open_rate": round(open_rate, 6),
+            "edge_low_share": round(edge_low_share, 6),
+            "policy_block_share": round(policy_block_share, 6),
+            "streak_trigger": int(self.fast_antistall_streak_trigger),
+            "edge_percent_prev": round(edge_pct_now, 6),
+            "edge_percent_next": round(edge_pct_next, 6),
+            "edge_usd_prev": round(edge_usd_now, 6),
+            "edge_usd_next": round(edge_usd_next, 6),
+            "max_buys_prev": int(max_buys_now),
+            "max_buys_next": int(max_buys_next),
+            "top_n_prev": int(top_n_now),
+            "top_n_next": int(top_n_next),
+            "recovery_until_ts": float(recovery_until_ts),
+            "recovery_window_seconds": int(self.fast_antistall_recovery_window_seconds),
         }
 
 

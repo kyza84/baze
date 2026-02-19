@@ -35,5 +35,11 @@ Thumbs.db
 bot.pid
 launcher_gui.lock
 main_local.lock
+main_local*.lock
 trading/paper_state.json
+trading/paper_state*.json
+trading/paper_state*.bak
+trading/paper_state*.json.*
+snapshots/
+collected_info/
 data/
