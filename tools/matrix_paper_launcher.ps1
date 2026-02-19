@@ -2,6 +2,8 @@ param(
   [ValidateSet('1','2','3','4')]
   [string]$Count = '2',
   [string[]]$ProfileIds = @(),
+  [ValidateSet('shared','split')]
+  [string]$ShardMode = 'shared',
   [switch]$Run
 )
 
@@ -33,6 +35,31 @@ if ($Run) {
     try { Stop-Process -Id ([int]$procId) -Force -ErrorAction SilentlyContinue } catch {}
   }
   Start-Sleep -Milliseconds 800
+
+  # Ensure unified dataset sync worker is running (single process, incremental deduped ingest).
+  $syncScript = Join-Path $PSScriptRoot 'unified_dataset_sync.py'
+  if (Test-Path $syncScript) {
+    $syncExisting = Get-CimInstance Win32_Process -Filter "name='python.exe'" -ErrorAction SilentlyContinue |
+      Where-Object { [string]$_.CommandLine -match 'tools[\\\/]unified_dataset_sync\.py' -and [string]$_.CommandLine -match '--follow' } |
+      Select-Object -First 1
+    if (-not $syncExisting) {
+      try {
+        $syncPsi = New-Object System.Diagnostics.ProcessStartInfo
+        $syncPsi.FileName = $python
+        $syncPsi.Arguments = "tools/unified_dataset_sync.py --root . --follow --loop-seconds 45"
+        $syncPsi.WorkingDirectory = $root
+        $syncPsi.UseShellExecute = $false
+        $syncPsi.RedirectStandardOutput = $false
+        $syncPsi.RedirectStandardError = $false
+        $syncProc = [System.Diagnostics.Process]::Start($syncPsi)
+        if ($syncProc -and -not $syncProc.HasExited) {
+          Write-Host ("Unified dataset sync started pid={0}" -f [int]$syncProc.Id)
+        }
+      } catch {
+        Write-Warning ("Failed to start unified dataset sync: {0}" -f $_.Exception.Message)
+      }
+    }
+  }
 }
 
 function Test-MainLocalProcess {
@@ -54,7 +81,9 @@ function Test-MainLocalProcess {
 # Variant matrix:
 # - mx1_flow_balanced: stable high-flow profile (more quality guards, steady exits).
 # - mx2_flow_aggressive: higher-throughput profile (more entries, faster recycle).
-# - mx3_flow_compound / mx4_flow_guarded: winner-derived forks for Count=3/4.
+# - mx3_flow_compound / mx4_flow_guarded: winner-derived forks.
+# - mx5_mode_guarded / mx6_mode_flow: mx3-based parity tests for new market-mode controllers.
+# - mx11_baseline_adapted: current golden baseline for controlled A/B runs.
 $variants = @(
   @{ name='mx1_flow_balanced'; overrides=@{
       ADAPTIVE_FILTERS_ENABLED='true';
@@ -395,6 +424,709 @@ $variants = @(
       RISK_GOVERNOR_HARD_BLOCK_ON_STREAK='false';
       PAPER_RESET_ON_START='false';
     }
+  },
+  @{ name='mx5_mode_guarded'; base='mx3_flow_compound'; overrides=@{
+      # Keep new market-mode controller explicit and stricter in risk.
+      MARKET_MODE_OWNS_STRICTNESS='true';
+      MARKET_MODE_ENTER_STREAK='2';
+      MARKET_MODE_EXIT_STREAK='4';
+      MARKET_MODE_STRICT_SCORE='79';
+      MARKET_MODE_SOFT_SCORE='71';
+      MARKET_MODE_YELLOW_SOFT_CAP_PER_CYCLE='1';
+      MARKET_MODE_YELLOW_SIZE_MULT='0.72';
+      MARKET_MODE_RED_SIZE_MULT='0.50';
+      MARKET_MODE_YELLOW_HOLD_MULT='0.75';
+      MARKET_MODE_RED_HOLD_MULT='0.55';
+      MARKET_MODE_YELLOW_PARTIAL_TP_TRIGGER_MULT='0.88';
+      MARKET_MODE_RED_PARTIAL_TP_TRIGGER_MULT='0.70';
+      MARKET_MODE_YELLOW_PARTIAL_TP_SELL_MULT='1.25';
+      MARKET_MODE_RED_PARTIAL_TP_SELL_MULT='1.45';
+      MIN_TOKEN_SCORE='52';
+      SAFE_MIN_VOLUME_5M_USD='50';
+      AUTO_TRADE_TOP_N='12';
+      MAX_BUYS_PER_HOUR='50';
+      MAX_OPEN_TRADES='3';
+      PAPER_TRADE_SIZE_MIN_USD='0.45';
+      PAPER_TRADE_SIZE_MAX_USD='0.78';
+      HOLD_MIN_SECONDS='35';
+      HOLD_MAX_SECONDS='165';
+      PAPER_PARTIAL_TP_TRIGGER_PERCENT='1.30';
+      PAPER_PARTIAL_TP_SELL_FRACTION='0.36';
+      AUTONOMOUS_CONTROL_TARGET_CANDIDATES_MIN='1.2';
+      AUTONOMOUS_CONTROL_TARGET_CANDIDATES_HIGH='6.8';
+      AUTONOMOUS_CONTROL_MAX_BUYS_PER_HOUR_MAX='58';
+      AUTONOMOUS_CONTROL_TOP_N_MAX='16';
+      AUTONOMOUS_CONTROL_MAX_OPEN_TRADES_MAX='4';
+      ADAPTIVE_FILTERS_TARGET_CAND_MIN='1.5';
+      ADAPTIVE_FILTERS_TARGET_CAND_MAX='11.0';
+      ADAPTIVE_SAFE_VOLUME_MIN='36';
+      ADAPTIVE_SAFE_VOLUME_MAX='140';
+      ADAPTIVE_EDGE_MIN='0.65';
+      ADAPTIVE_DEDUP_TTL_MIN='10';
+      ADAPTIVE_DEDUP_TTL_MAX='45';
+      PAPER_RESET_ON_START='false';
+    }
+  },
+  @{ name='mx6_mode_flow'; base='mx3_flow_compound'; overrides=@{
+      # Same controller stack, but tuned for throughput under GREEN/YELLOW.
+      MARKET_MODE_OWNS_STRICTNESS='true';
+      MARKET_MODE_ENTER_STREAK='2';
+      MARKET_MODE_EXIT_STREAK='3';
+      MARKET_MODE_STRICT_SCORE='77';
+      MARKET_MODE_SOFT_SCORE='69';
+      MARKET_MODE_YELLOW_SOFT_CAP_PER_CYCLE='3';
+      MARKET_MODE_YELLOW_SIZE_MULT='0.86';
+      MARKET_MODE_RED_SIZE_MULT='0.58';
+      MARKET_MODE_YELLOW_HOLD_MULT='0.82';
+      MARKET_MODE_RED_HOLD_MULT='0.62';
+      MARKET_MODE_YELLOW_PARTIAL_TP_TRIGGER_MULT='0.92';
+      MARKET_MODE_RED_PARTIAL_TP_TRIGGER_MULT='0.78';
+      MARKET_MODE_YELLOW_PARTIAL_TP_SELL_MULT='1.15';
+      MARKET_MODE_RED_PARTIAL_TP_SELL_MULT='1.35';
+      MIN_TOKEN_SCORE='49';
+      SAFE_MIN_VOLUME_5M_USD='40';
+      AUTO_TRADE_TOP_N='17';
+      MAX_BUYS_PER_HOUR='64';
+      MAX_OPEN_TRADES='4';
+      PAPER_TRADE_SIZE_MIN_USD='0.52';
+      PAPER_TRADE_SIZE_MAX_USD='0.96';
+      HOLD_MIN_SECONDS='32';
+      HOLD_MAX_SECONDS='185';
+      PAPER_PARTIAL_TP_TRIGGER_PERCENT='1.45';
+      PAPER_PARTIAL_TP_SELL_FRACTION='0.33';
+      AUTONOMOUS_CONTROL_TARGET_CANDIDATES_MIN='1.0';
+      AUTONOMOUS_CONTROL_TARGET_CANDIDATES_HIGH='8.4';
+      AUTONOMOUS_CONTROL_MAX_BUYS_PER_HOUR_MAX='70';
+      AUTONOMOUS_CONTROL_TOP_N_MAX='20';
+      AUTONOMOUS_CONTROL_MAX_OPEN_TRADES_MAX='5';
+      ADAPTIVE_FILTERS_TARGET_CAND_MIN='1.7';
+      ADAPTIVE_FILTERS_TARGET_CAND_MAX='13.0';
+      ADAPTIVE_SAFE_VOLUME_MIN='30';
+      ADAPTIVE_SAFE_VOLUME_MAX='170';
+      ADAPTIVE_EDGE_MIN='0.58';
+      ADAPTIVE_DEDUP_TTL_MIN='7';
+      ADAPTIVE_DEDUP_TTL_MAX='35';
+      PAPER_RESET_ON_START='false';
+    }
+  },
+  @{ name='mx7_recover_balanced'; base='mx3_flow_compound'; overrides=@{
+      # Recovery profile: unlock flow, keep guardrails, disable shard split for parity.
+      CANDIDATE_SHARD_MOD='1';
+      CANDIDATE_SHARD_SLOT='0';
+      PAPER_RESET_ON_START='true';
+      MARKET_MODE_OWNS_STRICTNESS='true';
+      MARKET_MODE_ENTER_STREAK='2';
+      MARKET_MODE_EXIT_STREAK='3';
+      MARKET_MODE_STRICT_SCORE='73';
+      MARKET_MODE_SOFT_SCORE='66';
+      MARKET_MODE_YELLOW_SOFT_CAP_PER_CYCLE='4';
+      MIN_TOKEN_SCORE='47';
+      HEAVY_CHECK_DEDUP_TTL_SECONDS='6';
+      SAFE_MIN_VOLUME_5M_USD='38';
+      AUTO_TRADE_TOP_N='16';
+      MAX_BUYS_PER_HOUR='72';
+      MAX_OPEN_TRADES='4';
+      PAPER_TRADE_SIZE_MIN_USD='0.48';
+      PAPER_TRADE_SIZE_MAX_USD='0.90';
+      HOLD_MIN_SECONDS='30';
+      HOLD_MAX_SECONDS='170';
+      ADAPTIVE_FILTERS_TARGET_CAND_MIN='1.3';
+      ADAPTIVE_FILTERS_TARGET_CAND_MAX='14.0';
+      ADAPTIVE_SAFE_VOLUME_MIN='28';
+      ADAPTIVE_SAFE_VOLUME_MAX='180';
+      ADAPTIVE_DEDUP_TTL_MIN='6';
+      ADAPTIVE_DEDUP_TTL_MAX='30';
+    }
+  },
+  @{ name='mx8_recover_flow'; base='mx3_flow_compound'; overrides=@{
+      # Recovery flow profile: more throughput, still market-mode controlled.
+      CANDIDATE_SHARD_MOD='1';
+      CANDIDATE_SHARD_SLOT='0';
+      PAPER_RESET_ON_START='true';
+      MARKET_MODE_OWNS_STRICTNESS='true';
+      MARKET_MODE_ENTER_STREAK='2';
+      MARKET_MODE_EXIT_STREAK='3';
+      MARKET_MODE_STRICT_SCORE='74';
+      MARKET_MODE_SOFT_SCORE='65';
+      MARKET_MODE_YELLOW_SOFT_CAP_PER_CYCLE='5';
+      MIN_TOKEN_SCORE='46';
+      HEAVY_CHECK_DEDUP_TTL_SECONDS='5';
+      SAFE_MIN_VOLUME_5M_USD='34';
+      AUTO_TRADE_TOP_N='20';
+      MAX_BUYS_PER_HOUR='84';
+      MAX_OPEN_TRADES='5';
+      PAPER_TRADE_SIZE_MIN_USD='0.45';
+      PAPER_TRADE_SIZE_MAX_USD='0.88';
+      HOLD_MIN_SECONDS='26';
+      HOLD_MAX_SECONDS='155';
+      ADAPTIVE_FILTERS_TARGET_CAND_MIN='1.6';
+      ADAPTIVE_FILTERS_TARGET_CAND_MAX='16.0';
+      ADAPTIVE_SAFE_VOLUME_MIN='24';
+      ADAPTIVE_SAFE_VOLUME_MAX='190';
+      ADAPTIVE_DEDUP_TTL_MIN='5';
+      ADAPTIVE_DEDUP_TTL_MAX='24';
+      AUTONOMOUS_CONTROL_TARGET_CANDIDATES_MIN='1.4';
+      AUTONOMOUS_CONTROL_TARGET_CANDIDATES_HIGH='9.5';
+      AUTONOMOUS_CONTROL_MAX_BUYS_PER_HOUR_MAX='86';
+      AUTONOMOUS_CONTROL_TOP_N_MAX='22';
+    }
+  },
+  @{ name='mx9_exit_tight'; base='mx7_recover_balanced'; overrides=@{
+      # Exit-focused profile: cut weak/flat trades faster, keep entry quality.
+      CANDIDATE_SHARD_MOD='1';
+      CANDIDATE_SHARD_SLOT='0';
+      PAPER_RESET_ON_START='true';
+      MARKET_MODE_EXIT_STREAK='2';
+      MARKET_REGIME_FAIL_CLOSED_RATIO='45';
+      MARKET_REGIME_SOURCE_ERROR_PERCENT='38';
+      MARKET_MODE_STRICT_SCORE='72';
+      MARKET_MODE_SOFT_SCORE='65';
+      MARKET_MODE_YELLOW_SOFT_CAP_PER_CYCLE='5';
+      NO_MOMENTUM_EXIT_ENABLED='true';
+      NO_MOMENTUM_EXIT_MIN_AGE_PERCENT='8';
+      NO_MOMENTUM_EXIT_MIN_HOLD_SECONDS='35';
+      NO_MOMENTUM_EXIT_MAX_PEAK_PERCENT='0.85';
+      NO_MOMENTUM_EXIT_MAX_PNL_PERCENT='0.20';
+      WEAKNESS_EXIT_ENABLED='true';
+      WEAKNESS_EXIT_MIN_AGE_PERCENT='10';
+      WEAKNESS_EXIT_PNL_PERCENT='-2.2';
+      PAPER_MAX_HOLD_SECONDS='130';
+      HOLD_MIN_SECONDS='24';
+      HOLD_MAX_SECONDS='125';
+      STOP_LOSS_PERCENT='3';
+      PAPER_PARTIAL_TP_TRIGGER_PERCENT='1.10';
+      PAPER_PARTIAL_TP_SELL_FRACTION='0.42';
+      PAPER_PARTIAL_TP_BREAK_EVEN_BUFFER_PERCENT='0.08';
+      SAFE_MIN_VOLUME_5M_USD='42';
+      AUTO_TRADE_TOP_N='14';
+      MAX_OPEN_TRADES='3';
+      MAX_BUYS_PER_HOUR='56';
+      PAPER_TRADE_SIZE_MIN_USD='0.46';
+      PAPER_TRADE_SIZE_MAX_USD='0.82';
+      ADAPTIVE_FILTERS_TARGET_CAND_MIN='1.1';
+      ADAPTIVE_FILTERS_TARGET_CAND_MAX='12.0';
+      ADAPTIVE_DEDUP_TTL_MIN='5';
+      ADAPTIVE_DEDUP_TTL_MAX='22';
+      HEAVY_CHECK_DEDUP_TTL_SECONDS='5';
+    }
+  },
+  @{ name='mx10_exit_adaptive'; base='mx8_recover_flow'; overrides=@{
+      # Adaptive exit profile: keep throughput, but force earlier cleanup and faster TP capture.
+      CANDIDATE_SHARD_MOD='1';
+      CANDIDATE_SHARD_SLOT='0';
+      PAPER_RESET_ON_START='true';
+      MARKET_MODE_EXIT_STREAK='2';
+      MARKET_REGIME_FAIL_CLOSED_RATIO='46';
+      MARKET_REGIME_SOURCE_ERROR_PERCENT='40';
+      MARKET_MODE_STRICT_SCORE='73';
+      MARKET_MODE_SOFT_SCORE='64';
+      MARKET_MODE_YELLOW_SOFT_CAP_PER_CYCLE='6';
+      NO_MOMENTUM_EXIT_ENABLED='true';
+      NO_MOMENTUM_EXIT_MIN_AGE_PERCENT='7';
+      NO_MOMENTUM_EXIT_MIN_HOLD_SECONDS='30';
+      NO_MOMENTUM_EXIT_MAX_PEAK_PERCENT='0.90';
+      NO_MOMENTUM_EXIT_MAX_PNL_PERCENT='0.15';
+      WEAKNESS_EXIT_ENABLED='true';
+      WEAKNESS_EXIT_MIN_AGE_PERCENT='9';
+      WEAKNESS_EXIT_PNL_PERCENT='-2.0';
+      PAPER_MAX_HOLD_SECONDS='120';
+      HOLD_MIN_SECONDS='22';
+      HOLD_MAX_SECONDS='118';
+      STOP_LOSS_PERCENT='3';
+      PAPER_PARTIAL_TP_TRIGGER_PERCENT='1.00';
+      PAPER_PARTIAL_TP_SELL_FRACTION='0.46';
+      PAPER_PARTIAL_TP_BREAK_EVEN_BUFFER_PERCENT='0.08';
+      SAFE_MIN_VOLUME_5M_USD='36';
+      AUTO_TRADE_TOP_N='18';
+      MAX_OPEN_TRADES='4';
+      MAX_BUYS_PER_HOUR='68';
+      PAPER_TRADE_SIZE_MIN_USD='0.44';
+      PAPER_TRADE_SIZE_MAX_USD='0.80';
+      ADAPTIVE_FILTERS_TARGET_CAND_MIN='1.3';
+      ADAPTIVE_FILTERS_TARGET_CAND_MAX='13.0';
+      ADAPTIVE_DEDUP_TTL_MIN='4';
+      ADAPTIVE_DEDUP_TTL_MAX='20';
+      HEAVY_CHECK_DEDUP_TTL_SECONDS='4';
+      AUTONOMOUS_CONTROL_TARGET_CANDIDATES_MIN='1.2';
+      AUTONOMOUS_CONTROL_TARGET_CANDIDATES_HIGH='8.8';
+      AUTONOMOUS_CONTROL_MAX_BUYS_PER_HOUR_MAX='72';
+      AUTONOMOUS_CONTROL_TOP_N_MAX='20';
+    }
+  },
+  @{ name='mx11_baseline_adapted'; base='mx3_flow_compound'; overrides=@{
+      # Last-known strong baseline, adapted to new market-mode controllers.
+      CANDIDATE_SHARD_MOD='1';
+      CANDIDATE_SHARD_SLOT='0';
+      PAPER_RESET_ON_START='true';
+      STRATEGY_ORCHESTRATOR_ENABLED='true';
+      STRATEGY_ORCHESTRATOR_MODE='apply';
+      STRATEGY_ORCHESTRATOR_LOCK_AUTONOMY_CONTROLS='true';
+      STRATEGY_ORCHESTRATOR_INTERVAL_SECONDS='300';
+      STRATEGY_ORCHESTRATOR_MIN_WINDOW_CYCLES='2';
+      STRATEGY_ORCHESTRATOR_MIN_CLOSED_DELTA='6';
+      STRATEGY_ORCHESTRATOR_DEFENSE_ENTER_STREAK='2';
+      STRATEGY_ORCHESTRATOR_HARVEST_ENTER_STREAK='2';
+      STRATEGY_ORCHESTRATOR_DEFENSE_TRIGGER_AVG_PNL_PER_TRADE_USD='-0.0020';
+      STRATEGY_ORCHESTRATOR_DEFENSE_TRIGGER_LOSS_SHARE='0.62';
+      STRATEGY_ORCHESTRATOR_HARVEST_TRIGGER_AVG_PNL_PER_TRADE_USD='0.0010';
+      STRATEGY_ORCHESTRATOR_HARVEST_TRIGGER_LOSS_SHARE='0.45';
+      STRATEGY_ORCHESTRATOR_INITIAL_PROFILE='harvest';
+      STRATEGY_ORCHESTRATOR_HARVEST_MAX_OPEN_TRADES='4';
+      STRATEGY_ORCHESTRATOR_HARVEST_TOP_N='15';
+      STRATEGY_ORCHESTRATOR_HARVEST_MAX_BUYS_PER_HOUR='60';
+      STRATEGY_ORCHESTRATOR_HARVEST_TRADE_SIZE_MAX_USD='0.86';
+      STRATEGY_ORCHESTRATOR_HARVEST_HOLD_MAX_SECONDS='145';
+      STRATEGY_ORCHESTRATOR_HARVEST_NO_MOMENTUM_MIN_AGE_PERCENT='12';
+      STRATEGY_ORCHESTRATOR_HARVEST_NO_MOMENTUM_MAX_PNL_PERCENT='0.25';
+      STRATEGY_ORCHESTRATOR_HARVEST_WEAKNESS_MIN_AGE_PERCENT='14';
+      STRATEGY_ORCHESTRATOR_HARVEST_WEAKNESS_PNL_PERCENT='-2.6';
+      STRATEGY_ORCHESTRATOR_HARVEST_PARTIAL_TP_TRIGGER_PERCENT='1.20';
+      STRATEGY_ORCHESTRATOR_HARVEST_PARTIAL_TP_SELL_FRACTION='0.40';
+      STRATEGY_ORCHESTRATOR_DEFENSE_MAX_OPEN_TRADES='3';
+      STRATEGY_ORCHESTRATOR_DEFENSE_TOP_N='11';
+      STRATEGY_ORCHESTRATOR_DEFENSE_MAX_BUYS_PER_HOUR='42';
+      STRATEGY_ORCHESTRATOR_DEFENSE_TRADE_SIZE_MAX_USD='0.72';
+      STRATEGY_ORCHESTRATOR_DEFENSE_HOLD_MAX_SECONDS='118';
+      STRATEGY_ORCHESTRATOR_DEFENSE_NO_MOMENTUM_MIN_AGE_PERCENT='9';
+      STRATEGY_ORCHESTRATOR_DEFENSE_NO_MOMENTUM_MAX_PNL_PERCENT='0.15';
+      STRATEGY_ORCHESTRATOR_DEFENSE_WEAKNESS_MIN_AGE_PERCENT='11';
+      STRATEGY_ORCHESTRATOR_DEFENSE_WEAKNESS_PNL_PERCENT='-2.0';
+      STRATEGY_ORCHESTRATOR_DEFENSE_PARTIAL_TP_TRIGGER_PERCENT='1.00';
+      STRATEGY_ORCHESTRATOR_DEFENSE_PARTIAL_TP_SELL_FRACTION='0.50';
+      MARKET_MODE_OWNS_STRICTNESS='true';
+      MARKET_MODE_ENTER_STREAK='2';
+      MARKET_MODE_EXIT_STREAK='2';
+      MARKET_MODE_STRICT_SCORE='74';
+      MARKET_MODE_SOFT_SCORE='66';
+      MARKET_MODE_YELLOW_SOFT_CAP_PER_CYCLE='4';
+      MARKET_REGIME_FAIL_CLOSED_RATIO='42';
+      MARKET_REGIME_SOURCE_ERROR_PERCENT='36';
+      MIN_TOKEN_SCORE='48';
+      HEAVY_CHECK_DEDUP_TTL_SECONDS='6';
+      NO_MOMENTUM_EXIT_ENABLED='true';
+      NO_MOMENTUM_EXIT_MIN_AGE_PERCENT='12';
+      NO_MOMENTUM_EXIT_MIN_HOLD_SECONDS='45';
+      NO_MOMENTUM_EXIT_MAX_PEAK_PERCENT='0.95';
+      NO_MOMENTUM_EXIT_MAX_PNL_PERCENT='0.25';
+      WEAKNESS_EXIT_ENABLED='true';
+      WEAKNESS_EXIT_MIN_AGE_PERCENT='14';
+      WEAKNESS_EXIT_PNL_PERCENT='-2.6';
+      PAPER_MAX_HOLD_SECONDS='150';
+      HOLD_MIN_SECONDS='28';
+      HOLD_MAX_SECONDS='145';
+      STOP_LOSS_PERCENT='3';
+      PAPER_PARTIAL_TP_TRIGGER_PERCENT='1.20';
+      PAPER_PARTIAL_TP_SELL_FRACTION='0.40';
+      PAPER_PARTIAL_TP_BREAK_EVEN_BUFFER_PERCENT='0.08';
+      AUTO_TRADE_TOP_N='15';
+      MAX_BUYS_PER_HOUR='60';
+      MAX_OPEN_TRADES='4';
+      PAPER_TRADE_SIZE_MIN_USD='0.48';
+      PAPER_TRADE_SIZE_MAX_USD='0.86';
+      SAFE_MIN_VOLUME_5M_USD='40';
+      ADAPTIVE_FILTERS_TARGET_CAND_MIN='1.3';
+      ADAPTIVE_FILTERS_TARGET_CAND_MAX='12.5';
+      ADAPTIVE_DEDUP_TTL_MIN='5';
+      ADAPTIVE_DEDUP_TTL_MAX='26';
+    }
+  },
+  @{ name='mx12_guarded_delta'; base='mx11_baseline_adapted'; overrides=@{
+      # Small-step profile: minimal, measurable deltas from golden baseline.
+      PAPER_RESET_ON_START='true';
+      MARKET_MODE_STRICT_SCORE='73';
+      MARKET_MODE_SOFT_SCORE='65';
+      NO_MOMENTUM_EXIT_MIN_AGE_PERCENT='11';
+      NO_MOMENTUM_EXIT_MIN_HOLD_SECONDS='42';
+      WEAKNESS_EXIT_MIN_AGE_PERCENT='13';
+      WEAKNESS_EXIT_PNL_PERCENT='-2.5';
+      PAPER_PARTIAL_TP_TRIGGER_PERCENT='1.15';
+      PAPER_PARTIAL_TP_SELL_FRACTION='0.42';
+      PAPER_MAX_HOLD_SECONDS='145';
+      HOLD_MAX_SECONDS='140';
+      ADAPTIVE_FILTERS_TARGET_CAND_MIN='1.2';
+      ADAPTIVE_FILTERS_TARGET_CAND_MAX='12.2';
+      ADAPTIVE_DEDUP_TTL_MAX='24';
+      HEAVY_CHECK_DEDUP_TTL_SECONDS='5';
+      MAX_BUYS_PER_HOUR='62';
+      AUTO_TRADE_TOP_N='16';
+    }
+  },
+  @{ name='mx13_battle_full'; base='mx11_baseline_adapted'; overrides=@{
+      # Battle profile: full package tuned for stronger throughput + active risk exits.
+      PAPER_RESET_ON_START='true';
+      MARKET_MODE_EXIT_STREAK='1';
+      MARKET_MODE_STRICT_SCORE='72';
+      MARKET_MODE_SOFT_SCORE='64';
+      MARKET_MODE_YELLOW_SOFT_CAP_PER_CYCLE='6';
+      MARKET_REGIME_FAIL_CLOSED_RATIO='44';
+      MARKET_REGIME_SOURCE_ERROR_PERCENT='38';
+      NO_MOMENTUM_EXIT_MIN_AGE_PERCENT='9';
+      NO_MOMENTUM_EXIT_MIN_HOLD_SECONDS='32';
+      NO_MOMENTUM_EXIT_MAX_PNL_PERCENT='0.18';
+      WEAKNESS_EXIT_MIN_AGE_PERCENT='11';
+      WEAKNESS_EXIT_PNL_PERCENT='-2.1';
+      PAPER_MAX_HOLD_SECONDS='125';
+      HOLD_MIN_SECONDS='24';
+      HOLD_MAX_SECONDS='122';
+      PAPER_PARTIAL_TP_TRIGGER_PERCENT='1.00';
+      PAPER_PARTIAL_TP_SELL_FRACTION='0.48';
+      STOP_LOSS_PERCENT='3';
+      AUTO_TRADE_TOP_N='18';
+      MAX_BUYS_PER_HOUR='72';
+      MAX_OPEN_TRADES='5';
+      PAPER_TRADE_SIZE_MIN_USD='0.50';
+      PAPER_TRADE_SIZE_MAX_USD='0.92';
+      SAFE_MIN_VOLUME_5M_USD='38';
+      ADAPTIVE_FILTERS_TARGET_CAND_MIN='1.4';
+      ADAPTIVE_FILTERS_TARGET_CAND_MAX='13.8';
+      ADAPTIVE_DEDUP_TTL_MIN='4';
+      ADAPTIVE_DEDUP_TTL_MAX='20';
+      HEAVY_CHECK_DEDUP_TTL_SECONDS='4';
+      AUTONOMOUS_CONTROL_TARGET_CANDIDATES_MIN='1.3';
+      AUTONOMOUS_CONTROL_TARGET_CANDIDATES_HIGH='9.2';
+      AUTONOMOUS_CONTROL_MAX_BUYS_PER_HOUR_MAX='78';
+      AUTONOMOUS_CONTROL_TOP_N_MAX='22';
+    }
+  },
+  @{ name='mx14_cooldown_guard'; base='mx11_baseline_adapted'; overrides=@{
+      # Dynamic per-token cooldown escalation, minimal deltas from baseline.
+      PAPER_RESET_ON_START='true';
+      AUTO_TRADE_TOKEN_COOLDOWN_DYNAMIC_ENABLED='true';
+      AUTO_TRADE_TOKEN_COOLDOWN_STEP_SECONDS='300';
+      AUTO_TRADE_TOKEN_COOLDOWN_MAX_STRIKES='4';
+      AUTO_TRADE_TOKEN_COOLDOWN_RECOVERY_STEP='1';
+      AUTO_TRADE_TOKEN_COOLDOWN_MAX_SECONDS='2400';
+      AUTO_TRADE_TOKEN_COOLDOWN_ESCALATE_REASONS='SL,NO_MOMENTUM,TIMEOUT,WEAKNESS,ABANDON';
+      STRATEGY_ORCHESTRATOR_RED_FORCE_DEFENSE_ENABLED='true';
+      STRATEGY_ORCHESTRATOR_RED_FORCE_DEFENSE_REALIZED_DELTA_USD='-0.05';
+      NO_MOMENTUM_EXIT_MIN_AGE_PERCENT='12';
+      NO_MOMENTUM_EXIT_MIN_HOLD_SECONDS='48';
+      WEAKNESS_EXIT_MIN_AGE_PERCENT='15';
+      WEAKNESS_EXIT_PNL_PERCENT='-2.7';
+      PAPER_PARTIAL_TP_TRIGGER_PERCENT='1.15';
+      PAPER_PARTIAL_TP_SELL_FRACTION='0.43';
+    }
+  },
+  @{ name='mx15_cooldown_combat'; base='mx11_baseline_adapted'; overrides=@{
+      # Stronger cooldown escalation plus faster cleanup for repeat-losers.
+      PAPER_RESET_ON_START='true';
+      AUTO_TRADE_TOKEN_COOLDOWN_DYNAMIC_ENABLED='true';
+      AUTO_TRADE_TOKEN_COOLDOWN_STEP_SECONDS='420';
+      AUTO_TRADE_TOKEN_COOLDOWN_MAX_STRIKES='5';
+      AUTO_TRADE_TOKEN_COOLDOWN_RECOVERY_STEP='1';
+      AUTO_TRADE_TOKEN_COOLDOWN_MAX_SECONDS='3000';
+      AUTO_TRADE_TOKEN_COOLDOWN_ESCALATE_REASONS='SL,NO_MOMENTUM,TIMEOUT,WEAKNESS,ABANDON';
+      STRATEGY_ORCHESTRATOR_RED_FORCE_DEFENSE_ENABLED='true';
+      STRATEGY_ORCHESTRATOR_RED_FORCE_DEFENSE_REALIZED_DELTA_USD='-0.08';
+      MARKET_MODE_STRICT_SCORE='73';
+      MARKET_MODE_SOFT_SCORE='65';
+      NO_MOMENTUM_EXIT_MIN_AGE_PERCENT='10';
+      NO_MOMENTUM_EXIT_MIN_HOLD_SECONDS='38';
+      NO_MOMENTUM_EXIT_MAX_PNL_PERCENT='0.20';
+      WEAKNESS_EXIT_MIN_AGE_PERCENT='12';
+      WEAKNESS_EXIT_PNL_PERCENT='-2.3';
+      PAPER_MAX_HOLD_SECONDS='132';
+      HOLD_MAX_SECONDS='128';
+      PAPER_PARTIAL_TP_TRIGGER_PERCENT='1.05';
+      PAPER_PARTIAL_TP_SELL_FRACTION='0.47';
+      MAX_BUYS_PER_HOUR='66';
+      AUTO_TRADE_TOP_N='16';
+    }
+  },
+  @{ name='mx16_ev_floor'; base='mx14_cooldown_guard'; overrides=@{
+      # EV-focused: keep throughput close, but cut micro-edge noise and let winners breathe a bit longer.
+      PAPER_RESET_ON_START='true';
+      MIN_EXPECTED_EDGE_USD='0.028';
+      MIN_EXPECTED_EDGE_PERCENT='0.75';
+      AUTO_TRADE_TOP_N='17';
+      MAX_BUYS_PER_HOUR='64';
+      MARKET_MODE_STRICT_SCORE='73';
+      MARKET_MODE_SOFT_SCORE='65';
+      NO_MOMENTUM_EXIT_MIN_AGE_PERCENT='14';
+      NO_MOMENTUM_EXIT_MIN_HOLD_SECONDS='60';
+      NO_MOMENTUM_EXIT_MAX_PNL_PERCENT='0.18';
+      WEAKNESS_EXIT_MIN_AGE_PERCENT='16';
+      WEAKNESS_EXIT_PNL_PERCENT='-2.8';
+      HOLD_MAX_SECONDS='152';
+      PAPER_MAX_HOLD_SECONDS='158';
+      PAPER_PARTIAL_TP_TRIGGER_PERCENT='1.25';
+      PAPER_PARTIAL_TP_SELL_FRACTION='0.35';
+      AUTO_TRADE_TOKEN_COOLDOWN_STEP_SECONDS='360';
+      AUTO_TRADE_TOKEN_COOLDOWN_MAX_SECONDS='2600';
+      SYMBOL_EV_GUARD_ENABLED='true';
+      SYMBOL_EV_WINDOW_MINUTES='120';
+      SYMBOL_EV_MIN_TRADES='3';
+      SYMBOL_EV_MIN_AVG_PNL_USD='0.0005';
+      SYMBOL_EV_MAX_LOSS_SHARE='0.60';
+      SYMBOL_EV_BAD_TO_STRICT_ONLY='true';
+      SYMBOL_EV_BAD_COOLDOWN_SECONDS='1200';
+      SYMBOL_FATIGUE_MAX_TRADES_PER_WINDOW='4';
+      SYMBOL_FATIGUE_MAX_LOSS_STREAK='3';
+      SYMBOL_FATIGUE_COOLDOWN_SECONDS='1800';
+      PROFILE_AUTOSTOP_ENABLED='true';
+      PROFILE_AUTOSTOP_NOTIFY_ENABLED='true';
+      PROFILE_AUTOSTOP_EVAL_INTERVAL_SECONDS='120';
+      PROFILE_AUTOSTOP_MIN_RUNTIME_SECONDS='3600';
+      PROFILE_AUTOSTOP_MIN_CLOSED_TRADES='20';
+      PROFILE_AUTOSTOP_MIN_REALIZED_PNL_USD='0.00';
+      PROFILE_AUTOSTOP_MIN_AVG_PNL_PER_TRADE_USD='0.0005';
+      PROFILE_AUTOSTOP_MAX_LOSS_SHARE='0.58';
+      PROFILE_AUTOSTOP_MAX_DRAWDOWN_FROM_PEAK_USD='0.18';
+      PROFILE_AUTOSTOP_MIN_FAIL_SIGNALS='2';
+    }
+  },
+  @{ name='mx17_tp_bias'; base='mx15_cooldown_combat'; overrides=@{
+      # TP-bias: stronger anti-repeat-loser cooldown, higher edge floor, preserve entry flow via wider top_n/buys.
+      PAPER_RESET_ON_START='true';
+      MIN_EXPECTED_EDGE_USD='0.032';
+      MIN_EXPECTED_EDGE_PERCENT='0.85';
+      AUTO_TRADE_TOP_N='18';
+      MAX_BUYS_PER_HOUR='70';
+      MARKET_MODE_STRICT_SCORE='72';
+      MARKET_MODE_SOFT_SCORE='64';
+      NO_MOMENTUM_EXIT_MIN_AGE_PERCENT='13';
+      NO_MOMENTUM_EXIT_MIN_HOLD_SECONDS='55';
+      NO_MOMENTUM_EXIT_MAX_PNL_PERCENT='0.22';
+      WEAKNESS_EXIT_MIN_AGE_PERCENT='14';
+      WEAKNESS_EXIT_PNL_PERCENT='-2.5';
+      HOLD_MAX_SECONDS='148';
+      PAPER_MAX_HOLD_SECONDS='154';
+      PAPER_PARTIAL_TP_TRIGGER_PERCENT='1.30';
+      PAPER_PARTIAL_TP_SELL_FRACTION='0.30';
+      AUTO_TRADE_TOKEN_COOLDOWN_STEP_SECONDS='540';
+      AUTO_TRADE_TOKEN_COOLDOWN_MAX_SECONDS='3200';
+      AUTO_TRADE_TOKEN_COOLDOWN_MAX_STRIKES='5';
+      SYMBOL_EV_GUARD_ENABLED='true';
+      SYMBOL_EV_WINDOW_MINUTES='120';
+      SYMBOL_EV_MIN_TRADES='3';
+      SYMBOL_EV_MIN_AVG_PNL_USD='0.0008';
+      SYMBOL_EV_MAX_LOSS_SHARE='0.58';
+      SYMBOL_EV_BAD_TO_STRICT_ONLY='true';
+      SYMBOL_EV_BAD_COOLDOWN_SECONDS='1200';
+      SYMBOL_FATIGUE_MAX_TRADES_PER_WINDOW='4';
+      SYMBOL_FATIGUE_MAX_LOSS_STREAK='3';
+      SYMBOL_FATIGUE_COOLDOWN_SECONDS='1800';
+      PROFILE_AUTOSTOP_ENABLED='true';
+      PROFILE_AUTOSTOP_NOTIFY_ENABLED='true';
+      PROFILE_AUTOSTOP_EVAL_INTERVAL_SECONDS='120';
+      PROFILE_AUTOSTOP_MIN_RUNTIME_SECONDS='3600';
+      PROFILE_AUTOSTOP_MIN_CLOSED_TRADES='20';
+      PROFILE_AUTOSTOP_MIN_REALIZED_PNL_USD='0.00';
+      PROFILE_AUTOSTOP_MIN_AVG_PNL_PER_TRADE_USD='0.0005';
+      PROFILE_AUTOSTOP_MAX_LOSS_SHARE='0.58';
+      PROFILE_AUTOSTOP_MAX_DRAWDOWN_FROM_PEAK_USD='0.18';
+      PROFILE_AUTOSTOP_MIN_FAIL_SIGNALS='2';
+    }
+  },
+  @{ name='mx18_v2_balanced'; base='mx16_ev_floor'; overrides=@{
+      # V2 balanced: champion baseline + universe diversity + safety budget + reinvest + runtime calibration.
+      PAPER_RESET_ON_START='true';
+      V2_UNIVERSE_ENABLED='true';
+      V2_UNIVERSE_MAX_TOTAL_PER_CYCLE='140';
+      V2_UNIVERSE_NOVELTY_WINDOW_SECONDS='2100';
+      V2_UNIVERSE_NOVELTY_MIN_SHARE='0.34';
+      V2_UNIVERSE_NOVELTY_MIN_ABS='3';
+      V2_UNIVERSE_PASS_REPEAT_COOLDOWN_SECONDS='180';
+      V2_UNIVERSE_PASS_REPEAT_OVERRIDE_VOL_MULT='2.3';
+      V2_UNIVERSE_SOURCE_CAPS='onchain:120,onchain+market:120,dexscreener:100,geckoterminal:100,watchlist:30,dex_boosts:40';
+      V2_UNIVERSE_SOURCE_WEIGHTS='onchain:1.15,onchain+market:1.10,dexscreener:1.00,geckoterminal:1.05,watchlist:0.90,dex_boosts:1.10';
+      V2_UNIVERSE_SYMBOL_REPEAT_WINDOW_SECONDS='1800';
+      V2_UNIVERSE_SYMBOL_REPEAT_SOFT_CAP='4';
+      V2_UNIVERSE_SYMBOL_REPEAT_HARD_CAP='8';
+      V2_UNIVERSE_SYMBOL_REPEAT_PENALTY_MULT='0.72';
+      V2_UNIVERSE_SYMBOL_REPEAT_OVERRIDE_VOL_MULT='2.5';
+      DATA_POLICY_HARD_BLOCK_ENABLED='false';
+      V2_POLICY_ROUTER_ENABLED='true';
+      V2_POLICY_FAIL_CLOSED_ACTION='limited';
+      V2_POLICY_DEGRADED_ACTION='limited';
+      V2_POLICY_LIMITED_ENTRY_RATIO='0.38';
+      V2_POLICY_LIMITED_MIN_PER_CYCLE='2';
+      V2_POLICY_LIMITED_ONLY_STRICT='true';
+      V2_POLICY_LIMITED_ALLOW_EXPLORE_IN_RED='false';
+      V2_ENTRY_DUAL_CHANNEL_ENABLED='true';
+      V2_ENTRY_EXPLORE_MAX_SHARE='0.30';
+      V2_ENTRY_EXPLORE_MAX_PER_CYCLE='3';
+      V2_ENTRY_EXPLORE_ALLOW_IN_RED='false';
+      V2_ENTRY_CORE_MIN_PER_CYCLE='1';
+      V2_ENTRY_EXPLORE_SIZE_MULT='0.48';
+      V2_ENTRY_EXPLORE_HOLD_MULT='0.78';
+      V2_EXPLORE_EDGE_USD_MULT='0.78';
+      V2_EXPLORE_EDGE_PERCENT_MULT='0.84';
+      V2_SAFETY_BUDGET_ENABLED='true';
+      V2_SAFETY_BUDGET_MAX_PER_CYCLE='95';
+      V2_SAFETY_BUDGET_PER_SOURCE='onchain:52,onchain+market:52,dexscreener:46,geckoterminal:46,watchlist:18,dex_boosts:20';
+      V2_CALIBRATION_ENABLED='true';
+      V2_CALIBRATION_INTERVAL_SECONDS='900';
+      V2_CALIBRATION_MIN_CLOSED='120';
+      V2_CALIBRATION_LOOKBACK_ROWS='2200';
+      V2_CALIBRATION_SMOOTH_ALPHA='0.35';
+      V2_CALIBRATION_EDGE_USD_MIN='0.012';
+      V2_CALIBRATION_EDGE_USD_MAX='0.080';
+      V2_CALIBRATION_VOLUME_MIN='28';
+      V2_CALIBRATION_VOLUME_MAX='180';
+      V2_REINVEST_ENABLED='true';
+      V2_REINVEST_MIN_MULT='0.82';
+      V2_REINVEST_MAX_MULT='1.42';
+      V2_REINVEST_GROWTH_STEP_USD='0.55';
+      V2_REINVEST_STEP_MULT='0.05';
+      V2_REINVEST_DRAWDOWN_CUT_PERCENT='2.6';
+      V2_REINVEST_DRAWDOWN_MULT='0.82';
+      V2_REINVEST_LOSS_STREAK_STEP='0.08';
+      V2_REINVEST_HIGH_EDGE_THRESHOLD_PERCENT='1.30';
+      V2_REINVEST_HIGH_EDGE_BONUS='0.05';
+      V2_CHAMPION_GUARD_ENABLED='true';
+      V2_CHAMPION_GUARD_INTERVAL_SECONDS='120';
+      V2_CHAMPION_GUARD_MIN_RUNTIME_SECONDS='4200';
+      V2_CHAMPION_GUARD_MIN_CLOSED_TRADES='22';
+      V2_CHAMPION_GUARD_MAX_LAG_USD='0.28';
+      V2_CHAMPION_GUARD_FAIL_WINDOWS='3';
+      V2_ROLLING_EDGE_ENABLED='true';
+      V2_ROLLING_EDGE_INTERVAL_SECONDS='240';
+      V2_ROLLING_EDGE_MIN_CLOSED='24';
+      V2_ROLLING_EDGE_WINDOW_CLOSED='120';
+      V2_ROLLING_EDGE_RELAX_STEP_USD='0.0018';
+      V2_ROLLING_EDGE_TIGHTEN_STEP_USD='0.0023';
+      V2_ROLLING_EDGE_RELAX_STEP_PERCENT='0.07';
+      V2_ROLLING_EDGE_TIGHTEN_STEP_PERCENT='0.10';
+      V2_ROLLING_EDGE_MIN_USD='0.008';
+      V2_ROLLING_EDGE_MAX_USD='0.080';
+      V2_ROLLING_EDGE_MIN_PERCENT='0.35';
+      V2_ROLLING_EDGE_MAX_PERCENT='1.80';
+      V2_ROLLING_EDGE_EDGE_LOW_SHARE_RELAX='0.64';
+      V2_ROLLING_EDGE_LOSS_SHARE_TIGHTEN='0.58';
+      V2_KPI_LOOP_ENABLED='true';
+      V2_KPI_LOOP_INTERVAL_SECONDS='300';
+      V2_KPI_LOOP_WINDOW_CYCLES='20';
+      V2_KPI_EDGE_LOW_RELAX_TRIGGER='0.70';
+      V2_KPI_OPEN_RATE_LOW_TRIGGER='0.03';
+      V2_KPI_POLICY_BLOCK_TRIGGER='0.35';
+      V2_KPI_UNIQUE_SYMBOLS_MIN='7';
+      V2_KPI_MAX_BUYS_BOOST_STEP='4';
+      V2_KPI_MAX_BUYS_CAP='90';
+      V2_KPI_TOPN_BOOST_STEP='1';
+      V2_KPI_TOPN_CAP='22';
+      V2_KPI_EXPLORE_SHARE_STEP='0.03';
+      V2_KPI_EXPLORE_SHARE_MAX='0.50';
+      V2_KPI_NOVELTY_SHARE_STEP='0.03';
+      V2_KPI_NOVELTY_SHARE_MAX='0.55';
+      MIN_EXPECTED_EDGE_USD='0.0133';
+      MIN_EXPECTED_EDGE_PERCENT='0.90';
+      SAFE_MIN_VOLUME_5M_USD='44';
+      NO_MOMENTUM_EXIT_MAX_PNL_PERCENT='0.16';
+      WEAKNESS_EXIT_PNL_PERCENT='-2.90';
+      HOLD_MAX_SECONDS='175';
+      PAPER_MAX_HOLD_SECONDS='180';
+      MAX_BUYS_PER_HOUR='62';
+      AUTO_TRADE_TOP_N='17';
+      MAX_OPEN_TRADES='4';
+      PAPER_TRADE_SIZE_MIN_USD='0.50';
+      PAPER_TRADE_SIZE_MAX_USD='0.88';
+    }
+  },
+  @{ name='mx19_v2_aggressive'; base='mx16_ev_floor'; overrides=@{
+      # V2 aggressive: higher flow, same protections, stronger reinvest ceiling, faster calibration.
+      PAPER_RESET_ON_START='true';
+      V2_UNIVERSE_ENABLED='true';
+      V2_UNIVERSE_MAX_TOTAL_PER_CYCLE='180';
+      V2_UNIVERSE_NOVELTY_WINDOW_SECONDS='1500';
+      V2_UNIVERSE_NOVELTY_MIN_SHARE='0.28';
+      V2_UNIVERSE_NOVELTY_MIN_ABS='2';
+      V2_UNIVERSE_PASS_REPEAT_COOLDOWN_SECONDS='140';
+      V2_UNIVERSE_PASS_REPEAT_OVERRIDE_VOL_MULT='2.0';
+      V2_UNIVERSE_SOURCE_CAPS='onchain:145,onchain+market:145,dexscreener:120,geckoterminal:120,watchlist:34,dex_boosts:55';
+      V2_UNIVERSE_SOURCE_WEIGHTS='onchain:1.12,onchain+market:1.08,dexscreener:1.00,geckoterminal:1.05,watchlist:0.95,dex_boosts:1.15';
+      V2_UNIVERSE_SYMBOL_REPEAT_WINDOW_SECONDS='1500';
+      V2_UNIVERSE_SYMBOL_REPEAT_SOFT_CAP='5';
+      V2_UNIVERSE_SYMBOL_REPEAT_HARD_CAP='10';
+      V2_UNIVERSE_SYMBOL_REPEAT_PENALTY_MULT='0.78';
+      V2_UNIVERSE_SYMBOL_REPEAT_OVERRIDE_VOL_MULT='2.2';
+      DATA_POLICY_HARD_BLOCK_ENABLED='false';
+      V2_POLICY_ROUTER_ENABLED='true';
+      V2_POLICY_FAIL_CLOSED_ACTION='limited';
+      V2_POLICY_DEGRADED_ACTION='limited';
+      V2_POLICY_LIMITED_ENTRY_RATIO='0.46';
+      V2_POLICY_LIMITED_MIN_PER_CYCLE='2';
+      V2_POLICY_LIMITED_ONLY_STRICT='false';
+      V2_POLICY_LIMITED_ALLOW_EXPLORE_IN_RED='false';
+      V2_ENTRY_DUAL_CHANNEL_ENABLED='true';
+      V2_ENTRY_EXPLORE_MAX_SHARE='0.38';
+      V2_ENTRY_EXPLORE_MAX_PER_CYCLE='4';
+      V2_ENTRY_EXPLORE_ALLOW_IN_RED='false';
+      V2_ENTRY_CORE_MIN_PER_CYCLE='1';
+      V2_ENTRY_EXPLORE_SIZE_MULT='0.55';
+      V2_ENTRY_EXPLORE_HOLD_MULT='0.82';
+      V2_EXPLORE_EDGE_USD_MULT='0.72';
+      V2_EXPLORE_EDGE_PERCENT_MULT='0.80';
+      V2_SAFETY_BUDGET_ENABLED='true';
+      V2_SAFETY_BUDGET_MAX_PER_CYCLE='122';
+      V2_SAFETY_BUDGET_PER_SOURCE='onchain:64,onchain+market:64,dexscreener:54,geckoterminal:54,watchlist:22,dex_boosts:28';
+      V2_CALIBRATION_ENABLED='true';
+      V2_CALIBRATION_INTERVAL_SECONDS='600';
+      V2_CALIBRATION_MIN_CLOSED='110';
+      V2_CALIBRATION_LOOKBACK_ROWS='2600';
+      V2_CALIBRATION_SMOOTH_ALPHA='0.42';
+      V2_CALIBRATION_EDGE_USD_MIN='0.011';
+      V2_CALIBRATION_EDGE_USD_MAX='0.075';
+      V2_CALIBRATION_VOLUME_MIN='24';
+      V2_CALIBRATION_VOLUME_MAX='165';
+      V2_REINVEST_ENABLED='true';
+      V2_REINVEST_MIN_MULT='0.80';
+      V2_REINVEST_MAX_MULT='1.55';
+      V2_REINVEST_GROWTH_STEP_USD='0.45';
+      V2_REINVEST_STEP_MULT='0.06';
+      V2_REINVEST_DRAWDOWN_CUT_PERCENT='2.9';
+      V2_REINVEST_DRAWDOWN_MULT='0.78';
+      V2_REINVEST_LOSS_STREAK_STEP='0.09';
+      V2_REINVEST_HIGH_EDGE_THRESHOLD_PERCENT='1.20';
+      V2_REINVEST_HIGH_EDGE_BONUS='0.06';
+      V2_CHAMPION_GUARD_ENABLED='true';
+      V2_CHAMPION_GUARD_INTERVAL_SECONDS='120';
+      V2_CHAMPION_GUARD_MIN_RUNTIME_SECONDS='4200';
+      V2_CHAMPION_GUARD_MIN_CLOSED_TRADES='24';
+      V2_CHAMPION_GUARD_MAX_LAG_USD='0.30';
+      V2_CHAMPION_GUARD_FAIL_WINDOWS='3';
+      V2_ROLLING_EDGE_ENABLED='true';
+      V2_ROLLING_EDGE_INTERVAL_SECONDS='210';
+      V2_ROLLING_EDGE_MIN_CLOSED='24';
+      V2_ROLLING_EDGE_WINDOW_CLOSED='130';
+      V2_ROLLING_EDGE_RELAX_STEP_USD='0.0020';
+      V2_ROLLING_EDGE_TIGHTEN_STEP_USD='0.0026';
+      V2_ROLLING_EDGE_RELAX_STEP_PERCENT='0.08';
+      V2_ROLLING_EDGE_TIGHTEN_STEP_PERCENT='0.11';
+      V2_ROLLING_EDGE_MIN_USD='0.007';
+      V2_ROLLING_EDGE_MAX_USD='0.075';
+      V2_ROLLING_EDGE_MIN_PERCENT='0.32';
+      V2_ROLLING_EDGE_MAX_PERCENT='1.70';
+      V2_ROLLING_EDGE_EDGE_LOW_SHARE_RELAX='0.66';
+      V2_ROLLING_EDGE_LOSS_SHARE_TIGHTEN='0.60';
+      V2_KPI_LOOP_ENABLED='true';
+      V2_KPI_LOOP_INTERVAL_SECONDS='270';
+      V2_KPI_LOOP_WINDOW_CYCLES='18';
+      V2_KPI_EDGE_LOW_RELAX_TRIGGER='0.68';
+      V2_KPI_OPEN_RATE_LOW_TRIGGER='0.03';
+      V2_KPI_POLICY_BLOCK_TRIGGER='0.32';
+      V2_KPI_UNIQUE_SYMBOLS_MIN='7';
+      V2_KPI_MAX_BUYS_BOOST_STEP='5';
+      V2_KPI_MAX_BUYS_CAP='104';
+      V2_KPI_TOPN_BOOST_STEP='2';
+      V2_KPI_TOPN_CAP='26';
+      V2_KPI_EXPLORE_SHARE_STEP='0.04';
+      V2_KPI_EXPLORE_SHARE_MAX='0.55';
+      V2_KPI_NOVELTY_SHARE_STEP='0.04';
+      V2_KPI_NOVELTY_SHARE_MAX='0.60';
+      MIN_EXPECTED_EDGE_USD='0.0118';
+      MIN_EXPECTED_EDGE_PERCENT='0.84';
+      SAFE_MIN_VOLUME_5M_USD='40';
+      NO_MOMENTUM_EXIT_MAX_PNL_PERCENT='0.20';
+      WEAKNESS_EXIT_PNL_PERCENT='-2.70';
+      HOLD_MAX_SECONDS='165';
+      PAPER_MAX_HOLD_SECONDS='170';
+      MAX_BUYS_PER_HOUR='74';
+      AUTO_TRADE_TOP_N='20';
+      MAX_OPEN_TRADES='5';
+      PAPER_TRADE_SIZE_MIN_USD='0.48';
+      PAPER_TRADE_SIZE_MAX_USD='0.92';
+    }
   }
 )
 
@@ -466,10 +1198,10 @@ if ($ProfileIds -and @($ProfileIds).Count -gt 0) {
 } else {
   $take = [int]$Count
   $defaultByCount = @{
-    1 = @('mx3_flow_compound')
-    2 = @('mx3_flow_compound', 'mx4_flow_guarded')
-    3 = @('mx1_flow_balanced', 'mx3_flow_compound', 'mx4_flow_guarded')
-    4 = @('mx1_flow_balanced', 'mx2_flow_aggressive', 'mx3_flow_compound', 'mx4_flow_guarded')
+    1 = @('mx11_baseline_adapted')
+    2 = @('mx11_baseline_adapted', 'mx9_exit_tight')
+    3 = @('mx11_baseline_adapted', 'mx9_exit_tight', 'mx10_exit_adaptive')
+    4 = @('mx11_baseline_adapted', 'mx9_exit_tight', 'mx10_exit_adaptive', 'mx8_recover_flow')
   }
   if ($defaultByCount.ContainsKey($take)) {
     $selected = @()
@@ -512,6 +1244,7 @@ for ($i = 0; $i -lt $selected.Count; $i++) {
   $seenPairs = "data/seen_pairs_base.$id.json"
   $graceful = "data/graceful_stop.$id.signal"
   $candLog = "logs/matrix/$id/candidates.jsonl"
+  $tradeDecisionLog = "logs/matrix/$id/trade_decisions.jsonl"
   $snapshotDir = "snapshots/$id"
 
   $envPath = Join-Path $envDir "$id.env"
@@ -522,9 +1255,8 @@ for ($i = 0; $i -lt $selected.Count; $i++) {
     "LOG_DIR=$logDir",
     "PAPER_STATE_FILE=$paperState",
     "CANDIDATE_DECISIONS_LOG_FILE=$candLog",
+    "TRADE_DECISIONS_LOG_FILE=$tradeDecisionLog",
     "SNAPSHOT_DIR=$snapshotDir",
-    "CANDIDATE_SHARD_MOD=$take",
-    "CANDIDATE_SHARD_SLOT=$i",
     "AUTONOMOUS_CONTROL_DECISIONS_LOG_FILE=logs/matrix/$id/autonomy_decisions.jsonl",
     "AUTOTRADE_BLACKLIST_FILE=$blFile",
     "ONCHAIN_LAST_BLOCK_FILE=$lastBlock",
@@ -532,7 +1264,25 @@ for ($i = 0; $i -lt $selected.Count; $i++) {
     "GRACEFUL_STOP_FILE=$graceful"
   )
   foreach ($k in $v.overrides.Keys) {
+    if ($k -in @('CANDIDATE_SHARD_MOD', 'CANDIDATE_SHARD_SLOT')) { continue }
     $lines += "$k=$($v.overrides[$k])"
+  }
+  if ($ShardMode -eq 'split') {
+    # Optional strict split mode: each profile gets a unique shard.
+    $lines += "CANDIDATE_SHARD_MOD=$take"
+    $lines += "CANDIDATE_SHARD_SLOT=$i"
+  } else {
+    # Shared mode for fair A/B: all profiles see the same candidate stream.
+    if ($v.overrides.ContainsKey('CANDIDATE_SHARD_MOD')) {
+      $lines += "CANDIDATE_SHARD_MOD=$($v.overrides['CANDIDATE_SHARD_MOD'])"
+    } else {
+      $lines += "CANDIDATE_SHARD_MOD=1"
+    }
+    if ($v.overrides.ContainsKey('CANDIDATE_SHARD_SLOT')) {
+      $lines += "CANDIDATE_SHARD_SLOT=$($v.overrides['CANDIDATE_SHARD_SLOT'])"
+    } else {
+      $lines += "CANDIDATE_SHARD_SLOT=0"
+    }
   }
   $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
   [System.IO.File]::WriteAllLines($envPath, $lines, $utf8NoBom)
@@ -605,6 +1355,7 @@ foreach ($r in $records) {
 $meta = [ordered]@{
   created_at = (Get-Date).ToString('s')
   count = $take
+  candidate_shard_mode = [string]$ShardMode
   requested_run = [bool]$Run
   running = [bool]($aliveCount -gt 0)
   alive_count = $aliveCount

@@ -28,6 +28,16 @@ from monitor.token_checker import TokenChecker
 from monitor.token_scorer import TokenScorer
 from monitor.watchlist import WatchlistMonitor
 from trading.auto_trader import AutoTrader
+from trading.v2_runtime import (
+    DualEntryController,
+    MatrixChampionGuard,
+    PolicyEntryRouter,
+    RollingEdgeGovernor,
+    RuntimeKpiLoop,
+    SafetyBudgetController,
+    UnifiedCalibrator,
+    UniverseFlowController,
+)
 from utils.addressing import normalize_address
 
 logger = logging.getLogger(__name__)
@@ -363,9 +373,9 @@ def _detect_market_regime(
 ) -> tuple[str, str]:
     mode = str(policy_state).upper()
     if mode == "FAIL_CLOSED":
-        return "RISK_OFF", "policy_fail_closed"
+        return "RED", "policy_fail_closed"
     if mode == "DEGRADED":
-        return "CAUTION", "policy_degraded"
+        return "RED", "policy_degraded"
 
     checks_total = int(safety_stats.get("checks_total", 0) or 0)
     fail_closed = int(safety_stats.get("fail_closed", 0) or 0)
@@ -374,34 +384,90 @@ def _detect_market_regime(
     for row in (source_stats or {}).values():
         max_err = max(max_err, float((row or {}).get("error_percent", 0.0) or 0.0))
 
-    if (
-        fail_closed_ratio >= float(getattr(config, "MARKET_REGIME_FAIL_CLOSED_RATIO", 20.0))
-        or max_err >= float(getattr(config, "MARKET_REGIME_SOURCE_ERROR_PERCENT", 20.0))
-    ):
-        return "FRAGILE", f"fail_closed={fail_closed_ratio:.1f}% max_err={max_err:.1f}%"
+    if fail_closed_ratio >= float(getattr(config, "MARKET_REGIME_FAIL_CLOSED_RATIO", 20.0)):
+        return "RED", f"fail_closed={fail_closed_ratio:.1f}%"
+    if max_err >= float(getattr(config, "MARKET_REGIME_SOURCE_ERROR_PERCENT", 20.0)):
+        return "RED", f"max_err={max_err:.1f}%"
 
     if avg_candidates_recent >= float(getattr(config, "MARKET_REGIME_MOMENTUM_CANDIDATES", 2.5)):
-        return "MOMENTUM", f"avg_cand={avg_candidates_recent:.2f}"
+        return "GREEN", f"avg_cand={avg_candidates_recent:.2f}"
 
     if avg_candidates_recent <= float(getattr(config, "MARKET_REGIME_THIN_CANDIDATES", 0.8)):
-        return "THIN", f"avg_cand={avg_candidates_recent:.2f}"
+        return "YELLOW", f"avg_cand={avg_candidates_recent:.2f}"
 
-    return "BALANCED", f"avg_cand={avg_candidates_recent:.2f}"
+    return "YELLOW", f"avg_cand={avg_candidates_recent:.2f}"
 
 
-def _regime_entry_overrides(market_regime: str) -> tuple[int, float, float]:
-    mode = str(market_regime or "BALANCED").strip().upper()
-    # score_delta, volume_mult, edge_mult
-    if mode == "MOMENTUM":
-        # Slightly loosen thresholds to capture continuation bursts.
-        return -1, 0.90, 0.90
-    if mode == "THIN":
-        # Thin tape: be pickier, avoid low-energy chop.
-        return 2, 1.15, 1.10
-    if mode in {"FRAGILE", "CAUTION", "RISK_OFF"}:
-        # Source/safety unstable: strongly tighten BUY gate.
-        return 4, 1.30, 1.20
-    return 0, 1.00, 1.00
+def _market_mode_entry_profile(market_mode: str) -> dict[str, float | int | bool]:
+    mode = str(market_mode or "YELLOW").strip().upper()
+    if mode == "GREEN":
+        return {
+            "score_delta": int(getattr(config, "MARKET_MODE_GREEN_SCORE_DELTA", 0)),
+            "volume_mult": float(getattr(config, "MARKET_MODE_GREEN_VOLUME_MULT", 1.0)),
+            "edge_mult": float(getattr(config, "MARKET_MODE_GREEN_EDGE_MULT", 1.0)),
+            "size_mult": float(getattr(config, "MARKET_MODE_GREEN_SIZE_MULT", 1.0)),
+            "hold_mult": float(getattr(config, "MARKET_MODE_GREEN_HOLD_MULT", 1.0)),
+            "partial_tp_trigger_mult": float(getattr(config, "MARKET_MODE_GREEN_PARTIAL_TP_TRIGGER_MULT", 1.0)),
+            "partial_tp_sell_mult": float(getattr(config, "MARKET_MODE_GREEN_PARTIAL_TP_SELL_MULT", 1.0)),
+            "allow_soft": True,
+            "soft_cap": 0,
+        }
+    if mode == "RED":
+        return {
+            "score_delta": int(getattr(config, "MARKET_MODE_RED_SCORE_DELTA", 3)),
+            "volume_mult": float(getattr(config, "MARKET_MODE_RED_VOLUME_MULT", 1.3)),
+            "edge_mult": float(getattr(config, "MARKET_MODE_RED_EDGE_MULT", 1.2)),
+            "size_mult": float(getattr(config, "MARKET_MODE_RED_SIZE_MULT", 0.55)),
+            "hold_mult": float(getattr(config, "MARKET_MODE_RED_HOLD_MULT", 0.6)),
+            "partial_tp_trigger_mult": float(getattr(config, "MARKET_MODE_RED_PARTIAL_TP_TRIGGER_MULT", 0.75)),
+            "partial_tp_sell_mult": float(getattr(config, "MARKET_MODE_RED_PARTIAL_TP_SELL_MULT", 1.4)),
+            "allow_soft": False,
+            "soft_cap": 0,
+        }
+    return {
+        "score_delta": int(getattr(config, "MARKET_MODE_YELLOW_SCORE_DELTA", 1)),
+        "volume_mult": float(getattr(config, "MARKET_MODE_YELLOW_VOLUME_MULT", 1.1)),
+        "edge_mult": float(getattr(config, "MARKET_MODE_YELLOW_EDGE_MULT", 1.08)),
+        "size_mult": float(getattr(config, "MARKET_MODE_YELLOW_SIZE_MULT", 0.8)),
+        "hold_mult": float(getattr(config, "MARKET_MODE_YELLOW_HOLD_MULT", 0.8)),
+        "partial_tp_trigger_mult": float(getattr(config, "MARKET_MODE_YELLOW_PARTIAL_TP_TRIGGER_MULT", 0.9)),
+        "partial_tp_sell_mult": float(getattr(config, "MARKET_MODE_YELLOW_PARTIAL_TP_SELL_MULT", 1.2)),
+        "allow_soft": True,
+        "soft_cap": int(getattr(config, "MARKET_MODE_YELLOW_SOFT_CAP_PER_CYCLE", 2)),
+    }
+
+
+def _apply_market_mode_hysteresis(
+    *,
+    raw_mode: str,
+    raw_reason: str,
+    current_mode: str,
+    risk_streak: int,
+    recover_streak: int,
+) -> tuple[str, str, int, int]:
+    rank = {"GREEN": 0, "YELLOW": 1, "RED": 2}
+    raw = str(raw_mode or "YELLOW").strip().upper() or "YELLOW"
+    current = str(current_mode or "YELLOW").strip().upper() or "YELLOW"
+    raw_rank = rank.get(raw, 1)
+    cur_rank = rank.get(current, 1)
+    enter_req = max(1, int(getattr(config, "MARKET_MODE_ENTER_STREAK", 2) or 2))
+    exit_req = max(1, int(getattr(config, "MARKET_MODE_EXIT_STREAK", 3) or 3))
+
+    if raw_rank > cur_rank:
+        risk_streak += 1
+        recover_streak = 0
+        if risk_streak >= enter_req:
+            return raw, raw_reason, risk_streak, recover_streak
+        return current, f"hysteresis_risk_wait {risk_streak}/{enter_req} raw={raw}", risk_streak, recover_streak
+
+    if raw_rank < cur_rank:
+        recover_streak += 1
+        risk_streak = 0
+        if recover_streak >= exit_req:
+            return raw, raw_reason, risk_streak, recover_streak
+        return current, f"hysteresis_recover_wait {recover_streak}/{exit_req} raw={raw}", risk_streak, recover_streak
+
+    return current, raw_reason, 0, 0
 
 
 def _excluded_trade_addresses() -> set[str]:
@@ -489,6 +555,10 @@ class AdaptiveFilterController:
         self.edge_step = float(getattr(config, "ADAPTIVE_EDGE_STEP", 0.25) or 0.25)
         self.edge_step_pct = float(getattr(config, "ADAPTIVE_EDGE_STEP_PCT", 0.0) or 0.0)
         self.exit_enabled = bool(getattr(config, "ADAPTIVE_EXIT_ENABLED", True))
+        self.market_mode_owns_strictness = bool(getattr(config, "MARKET_MODE_OWNS_STRICTNESS", True))
+        self.orchestrator_lock_adaptive_filters = bool(
+            getattr(config, "STRATEGY_ORCHESTRATOR_LOCK_ADAPTIVE_FILTERS", True)
+        )
         self.profit_lock_floor_min = float(getattr(config, "ADAPTIVE_PROFIT_LOCK_FLOOR_MIN", 1.0) or 1.0)
         self.profit_lock_floor_max = float(getattr(config, "ADAPTIVE_PROFIT_LOCK_FLOOR_MAX", 8.0) or 8.0)
         self.profit_lock_floor_step = float(getattr(config, "ADAPTIVE_PROFIT_LOCK_FLOOR_STEP", 0.5) or 0.5)
@@ -633,6 +703,12 @@ class AdaptiveFilterController:
         if not self.enabled:
             return
         if self.mode not in {"dry_run", "apply"}:
+            return
+        if (
+            self.orchestrator_lock_adaptive_filters
+            and bool(getattr(config, "STRATEGY_ORCHESTRATOR_ENABLED", False))
+            and str(getattr(config, "STRATEGY_ORCHESTRATOR_MODE", "off") or "off").strip().lower() in {"dry_run", "apply"}
+        ):
             return
         if self.paper_only and not bool(getattr(config, "AUTO_TRADE_PAPER", False)):
             return
@@ -841,6 +917,21 @@ class AdaptiveFilterController:
             action = "tighten_score"
             reason = f"too_many_candidates avg_cand={avg_candidates:.2f}"
 
+        if self.market_mode_owns_strictness:
+            strictness_changed = (
+                (score_next != score_now)
+                or (abs(volume_next - volume_now) >= 0.5)
+                or (ttl_next != ttl_now)
+                or (abs(edge_next - edge_now) >= 0.01)
+            )
+            score_next = score_now
+            volume_next = volume_now
+            ttl_next = ttl_now
+            edge_next = edge_now
+            if strictness_changed and action != "hold":
+                action = "hold_market_mode_owned"
+                reason = "strictness_locked_to_market_mode"
+
         changed = (
             (score_next != score_now)
             or (abs(volume_next - volume_now) >= 0.5)
@@ -955,6 +1046,10 @@ class AutonomousControlController:
         self.recovery_min_candidates = float(getattr(config, "AUTONOMOUS_CONTROL_RECOVERY_MIN_CANDIDATES", 0.8) or 0.8)
         self.recovery_expand_mult = float(getattr(config, "AUTONOMOUS_CONTROL_RECOVERY_EXPAND_MULT", 1.2) or 1.2)
         self.fragile_tighten_enabled = bool(getattr(config, "AUTONOMOUS_CONTROL_FRAGILE_TIGHTEN_ENABLED", True))
+        self.market_mode_owns_strictness = bool(getattr(config, "MARKET_MODE_OWNS_STRICTNESS", True))
+        self.orchestrator_lock_controls = bool(
+            getattr(config, "STRATEGY_ORCHESTRATOR_LOCK_AUTONOMY_CONTROLS", True)
+        )
 
         self.decisions_log_enabled = bool(getattr(config, "AUTONOMOUS_CONTROL_DECISIONS_LOG_ENABLED", True))
         raw_log = str(
@@ -1090,6 +1185,12 @@ class AutonomousControlController:
             return
         if self.mode not in {"dry_run", "apply"}:
             return
+        if (
+            self.orchestrator_lock_controls
+            and bool(getattr(config, "STRATEGY_ORCHESTRATOR_ENABLED", False))
+            and str(getattr(config, "STRATEGY_ORCHESTRATOR_MODE", "off") or "off").strip().lower() in {"dry_run", "apply"}
+        ):
+            return
         if self.paper_only and not bool(getattr(config, "AUTO_TRADE_PAPER", False)):
             return
 
@@ -1131,13 +1232,16 @@ class AutonomousControlController:
         action = "hold"
         reason = "steady_state"
 
-        if now_ts < float(self.cooldown_until_ts):
+        if self.market_mode_owns_strictness:
+            action = "hold_market_mode_owned"
+            reason = "controls_locked_to_market_mode"
+        elif now_ts < float(self.cooldown_until_ts):
             remaining = max(0.0, float(self.cooldown_until_ts) - now_ts)
             action = "hold"
             reason = f"cooldown_active {remaining:.1f}s"
         elif (
             policy_now != "OK"
-            or regime_now in {"RISK_OFF", "CAUTION"}
+            or regime_now in {"RED", "YELLOW", "RISK_OFF", "CAUTION"}
             or bool(risk_block_reason)
         ):
             max_open_next = min(max_open_next, int(self.risk_off_open_cap))
@@ -1149,13 +1253,13 @@ class AutonomousControlController:
                 f"policy={policy_now} regime={regime_now}"
                 + (f" risk_block={risk_block_reason}" if risk_block_reason else "")
             )
-        elif self.fragile_tighten_enabled and regime_now == "FRAGILE":
+        elif self.fragile_tighten_enabled and regime_now in {"RED", "FRAGILE"}:
             max_open_next -= int(self.step_open_trades)
             top_n_next -= int(self.step_top_n)
             buys_next -= int(self.step_max_buys_per_hour)
             size_max_next -= float(self.step_trade_size_max) * 0.5
             action = "fragile_tighten"
-            reason = "regime=FRAGILE mild_step_down"
+            reason = f"regime={regime_now} mild_step_down"
         elif (
             closed_delta > 0
             and (
@@ -1202,7 +1306,7 @@ class AutonomousControlController:
         elif (
             self.anti_stall_enabled
             and policy_now == "OK"
-            and regime_now not in {"RISK_OFF", "CAUTION"}
+            and regime_now not in {"RED", "RISK_OFF", "CAUTION"}
             and avg_candidates >= max(float(self.anti_stall_min_candidates), float(self.target_candidates_min) * 0.60)
             and avg_opened <= max(0.02, float(self.target_opened_min) * 0.35)
             and (
@@ -1225,7 +1329,7 @@ class AutonomousControlController:
         elif (
             self.recovery_enabled
             and policy_now == "OK"
-            and regime_now not in {"RISK_OFF", "CAUTION"}
+            and regime_now not in {"RED", "RISK_OFF", "CAUTION"}
             and below_baseline
             and avg_candidates >= max(float(self.recovery_min_candidates), float(self.target_candidates_min) * 0.50)
             and avg_opened <= max(0.08, float(self.target_opened_min))
@@ -1343,6 +1447,247 @@ class AutonomousControlController:
         self._reset_window(now_ts=now_ts, auto_stats=auto_stats)
 
 
+class StrategyOrchestrator:
+    def __init__(self) -> None:
+        self.enabled = bool(getattr(config, "STRATEGY_ORCHESTRATOR_ENABLED", False))
+        self.mode = str(getattr(config, "STRATEGY_ORCHESTRATOR_MODE", "dry_run") or "dry_run").strip().lower()
+        self.interval_seconds = int(getattr(config, "STRATEGY_ORCHESTRATOR_INTERVAL_SECONDS", 300) or 300)
+        self.min_window_cycles = int(getattr(config, "STRATEGY_ORCHESTRATOR_MIN_WINDOW_CYCLES", 2) or 2)
+        self.cooldown_windows = int(getattr(config, "STRATEGY_ORCHESTRATOR_COOLDOWN_WINDOWS", 1) or 1)
+        self.min_closed_delta = int(getattr(config, "STRATEGY_ORCHESTRATOR_MIN_CLOSED_DELTA", 6) or 6)
+        self.defense_enter_streak = int(getattr(config, "STRATEGY_ORCHESTRATOR_DEFENSE_ENTER_STREAK", 2) or 2)
+        self.harvest_enter_streak = int(getattr(config, "STRATEGY_ORCHESTRATOR_HARVEST_ENTER_STREAK", 2) or 2)
+        self.defense_trigger_avg_pnl = float(
+            getattr(config, "STRATEGY_ORCHESTRATOR_DEFENSE_TRIGGER_AVG_PNL_PER_TRADE_USD", -0.002) or -0.002
+        )
+        self.defense_trigger_loss_share = float(
+            getattr(config, "STRATEGY_ORCHESTRATOR_DEFENSE_TRIGGER_LOSS_SHARE", 0.62) or 0.62
+        )
+        self.harvest_trigger_avg_pnl = float(
+            getattr(config, "STRATEGY_ORCHESTRATOR_HARVEST_TRIGGER_AVG_PNL_PER_TRADE_USD", 0.001) or 0.001
+        )
+        self.harvest_trigger_loss_share = float(
+            getattr(config, "STRATEGY_ORCHESTRATOR_HARVEST_TRIGGER_LOSS_SHARE", 0.45) or 0.45
+        )
+        self.red_force_defense_enabled = bool(
+            getattr(config, "STRATEGY_ORCHESTRATOR_RED_FORCE_DEFENSE_ENABLED", True)
+        )
+        self.red_force_defense_realized_delta_usd = float(
+            getattr(config, "STRATEGY_ORCHESTRATOR_RED_FORCE_DEFENSE_REALIZED_DELTA_USD", -0.02) or -0.02
+        )
+        initial_profile = str(getattr(config, "STRATEGY_ORCHESTRATOR_INITIAL_PROFILE", "harvest") or "harvest").strip().lower()
+        self.current_profile = "defense" if initial_profile == "defense" else "harvest"
+        self.bad_streak = 0
+        self.good_streak = 0
+        self.last_eval_ts = time.time()
+        self.cooldown_until_ts = 0.0
+        self.window_cycles = 0
+        self.window_candidates = 0
+        self.window_opened = 0
+        self.window_regime_counts: dict[str, int] = {}
+        self.prev_closed = 0
+        self.prev_wins = 0
+        self.prev_losses = 0
+        self.prev_realized_usd = 0.0
+        raw_log = str(
+            getattr(config, "AUTONOMOUS_CONTROL_DECISIONS_LOG_FILE", os.path.join("logs", "autonomy_decisions.jsonl")) or ""
+        ).strip()
+        if not raw_log:
+            raw_log = os.path.join("logs", "autonomy_decisions.jsonl")
+        base = raw_log if os.path.isabs(raw_log) else os.path.abspath(os.path.join(PROJECT_ROOT, raw_log))
+        self.decisions_log_file = os.path.abspath(
+            os.path.join(os.path.dirname(base) or PROJECT_ROOT, f"{RUN_TAG}_orchestrator_decisions.jsonl")
+        )
+        self.profiles = {
+            "harvest": self._load_profile("HARVEST"),
+            "defense": self._load_profile("DEFENSE"),
+        }
+        self._apply_profile(self.current_profile)
+
+    def _load_profile(self, prefix: str) -> dict[str, float]:
+        p = str(prefix or "").strip().upper()
+        return {
+            "max_open": float(getattr(config, f"STRATEGY_ORCHESTRATOR_{p}_MAX_OPEN_TRADES", 3)),
+            "top_n": float(getattr(config, f"STRATEGY_ORCHESTRATOR_{p}_TOP_N", 10)),
+            "max_buys": float(getattr(config, f"STRATEGY_ORCHESTRATOR_{p}_MAX_BUYS_PER_HOUR", 48)),
+            "size_max": float(getattr(config, f"STRATEGY_ORCHESTRATOR_{p}_TRADE_SIZE_MAX_USD", 1.0)),
+            "hold_max": float(getattr(config, f"STRATEGY_ORCHESTRATOR_{p}_HOLD_MAX_SECONDS", 180)),
+            "no_mom_age": float(getattr(config, f"STRATEGY_ORCHESTRATOR_{p}_NO_MOMENTUM_MIN_AGE_PERCENT", 12.0)),
+            "no_mom_max_pnl": float(getattr(config, f"STRATEGY_ORCHESTRATOR_{p}_NO_MOMENTUM_MAX_PNL_PERCENT", 0.25)),
+            "weak_age": float(getattr(config, f"STRATEGY_ORCHESTRATOR_{p}_WEAKNESS_MIN_AGE_PERCENT", 14.0)),
+            "weak_pnl": float(getattr(config, f"STRATEGY_ORCHESTRATOR_{p}_WEAKNESS_PNL_PERCENT", -2.6)),
+            "partial_tp_trigger": float(getattr(config, f"STRATEGY_ORCHESTRATOR_{p}_PARTIAL_TP_TRIGGER_PERCENT", 1.2)),
+            "partial_tp_fraction": float(getattr(config, f"STRATEGY_ORCHESTRATOR_{p}_PARTIAL_TP_SELL_FRACTION", 0.4)),
+        }
+
+    def _apply_profile(self, profile: str) -> None:
+        row = self.profiles.get(profile, self.profiles["harvest"])
+        setattr(config, "MAX_OPEN_TRADES", max(1, int(round(float(row["max_open"])))))
+        setattr(config, "AUTO_TRADE_TOP_N", max(1, int(round(float(row["top_n"])))))
+        buys = max(1, int(round(float(row["max_buys"]))))
+        setattr(config, "MAX_BUYS_PER_HOUR", buys)
+        setattr(config, "MAX_TRADES_PER_HOUR", buys)
+        size_max = max(0.05, float(row["size_max"]))
+        setattr(config, "PAPER_TRADE_SIZE_MAX_USD", size_max)
+        setattr(config, "PAPER_MAX_HOLD_SECONDS", max(30, int(round(float(row["hold_max"])))))
+        setattr(config, "HOLD_MAX_SECONDS", max(int(getattr(config, "HOLD_MIN_SECONDS", 30) or 30), int(round(float(row["hold_max"])))))
+        setattr(config, "NO_MOMENTUM_EXIT_MIN_AGE_PERCENT", max(1.0, float(row["no_mom_age"])))
+        setattr(config, "NO_MOMENTUM_EXIT_MAX_PNL_PERCENT", float(row["no_mom_max_pnl"]))
+        setattr(config, "WEAKNESS_EXIT_MIN_AGE_PERCENT", max(1.0, float(row["weak_age"])))
+        setattr(config, "WEAKNESS_EXIT_PNL_PERCENT", float(row["weak_pnl"]))
+        setattr(config, "PAPER_PARTIAL_TP_TRIGGER_PERCENT", max(0.1, float(row["partial_tp_trigger"])))
+        setattr(config, "PAPER_PARTIAL_TP_SELL_FRACTION", max(0.05, min(0.95, float(row["partial_tp_fraction"]))))
+
+    def _write_decision(self, event: dict[str, object]) -> None:
+        try:
+            payload = dict(event or {})
+            payload.setdefault("run_tag", RUN_TAG)
+            os.makedirs(os.path.dirname(self.decisions_log_file) or ".", exist_ok=True)
+            with open(self.decisions_log_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False, sort_keys=False) + "\n")
+        except Exception:
+            logger.exception("ORCHESTRATOR decision log write failed")
+
+    def prime(self, *, auto_stats: dict[str, float | int]) -> None:
+        self.prev_closed = int(auto_stats.get("closed", 0) or 0)
+        self.prev_wins = int(auto_stats.get("wins", 0) or 0)
+        self.prev_losses = int(auto_stats.get("losses", 0) or 0)
+        self.prev_realized_usd = float(auto_stats.get("realized_pnl_usd", 0.0) or 0.0)
+
+    def record_cycle(self, *, candidates: int, opened: int, market_regime: str) -> None:
+        self.window_cycles += 1
+        self.window_candidates += int(candidates)
+        self.window_opened += int(opened)
+        rkey = str(market_regime or "UNKNOWN").strip().upper() or "UNKNOWN"
+        self.window_regime_counts[rkey] = int(self.window_regime_counts.get(rkey, 0)) + 1
+
+    def _reset_window(self, *, now_ts: float, auto_stats: dict[str, float | int]) -> None:
+        self.last_eval_ts = float(now_ts)
+        self.window_cycles = 0
+        self.window_candidates = 0
+        self.window_opened = 0
+        self.window_regime_counts = {}
+        self.prev_closed = int(auto_stats.get("closed", 0) or 0)
+        self.prev_wins = int(auto_stats.get("wins", 0) or 0)
+        self.prev_losses = int(auto_stats.get("losses", 0) or 0)
+        self.prev_realized_usd = float(auto_stats.get("realized_pnl_usd", 0.0) or 0.0)
+
+    def maybe_adapt(self, *, policy_state: str, market_regime: str, auto_stats: dict[str, float | int]) -> None:
+        if not self.enabled:
+            return
+        if self.mode not in {"dry_run", "apply"}:
+            return
+        now_ts = time.time()
+        if (now_ts - float(self.last_eval_ts)) < float(self.interval_seconds):
+            return
+        if int(self.window_cycles) < int(self.min_window_cycles):
+            return
+
+        closed_now = int(auto_stats.get("closed", 0) or 0)
+        wins_now = int(auto_stats.get("wins", 0) or 0)
+        losses_now = int(auto_stats.get("losses", 0) or 0)
+        realized_now = float(auto_stats.get("realized_pnl_usd", 0.0) or 0.0)
+        closed_delta = int(closed_now - int(self.prev_closed))
+        wins_delta = int(wins_now - int(self.prev_wins))
+        losses_delta = int(losses_now - int(self.prev_losses))
+        realized_delta = float(realized_now - float(self.prev_realized_usd))
+        avg_pnl_trade = (realized_delta / float(closed_delta)) if closed_delta > 0 else 0.0
+        loss_share = (float(losses_delta) / float(closed_delta)) if closed_delta > 0 else 0.0
+        avg_candidates = float(self.window_candidates) / max(1, int(self.window_cycles))
+        avg_opened = float(self.window_opened) / max(1, int(self.window_cycles))
+        policy_now = str(policy_state or "UNKNOWN").strip().upper() or "UNKNOWN"
+        regime_now = str(market_regime or "UNKNOWN").strip().upper() or "UNKNOWN"
+
+        bad_signal = False
+        good_signal = False
+        if closed_delta >= int(self.min_closed_delta):
+            bad_signal = (
+                avg_pnl_trade <= float(self.defense_trigger_avg_pnl)
+                or loss_share >= float(self.defense_trigger_loss_share)
+            )
+            good_signal = (
+                avg_pnl_trade >= float(self.harvest_trigger_avg_pnl)
+                and loss_share <= float(self.harvest_trigger_loss_share)
+            )
+        if policy_now != "OK":
+            bad_signal = True
+        elif self.red_force_defense_enabled and regime_now in {"RED", "RISK_OFF"}:
+            # RED/RISK_OFF should not force DEFENSE when trade outcome remains positive.
+            red_window_bad = (
+                realized_delta <= float(self.red_force_defense_realized_delta_usd)
+                or (closed_delta >= int(self.min_closed_delta) and avg_pnl_trade <= float(self.defense_trigger_avg_pnl))
+                or (closed_delta >= int(self.min_closed_delta) and loss_share >= float(self.defense_trigger_loss_share))
+            )
+            if red_window_bad:
+                bad_signal = True
+
+        if self.current_profile == "harvest":
+            self.bad_streak = self.bad_streak + 1 if bad_signal else 0
+            self.good_streak = 0
+        else:
+            self.good_streak = self.good_streak + 1 if good_signal else 0
+            self.bad_streak = 0
+
+        target_profile = self.current_profile
+        reason = "hold"
+        if now_ts >= float(self.cooldown_until_ts):
+            if self.current_profile == "harvest" and self.bad_streak >= int(self.defense_enter_streak):
+                target_profile = "defense"
+                reason = "bad_window_streak"
+            elif self.current_profile == "defense" and self.good_streak >= int(self.harvest_enter_streak):
+                target_profile = "harvest"
+                reason = "good_window_streak"
+
+        changed = target_profile != self.current_profile
+        if self.mode == "apply" and changed:
+            self.current_profile = target_profile
+            self._apply_profile(self.current_profile)
+            self.cooldown_until_ts = now_ts + (max(0, self.cooldown_windows) * max(1, self.interval_seconds))
+            self.bad_streak = 0
+            self.good_streak = 0
+
+        logger.warning(
+            "ORCHESTRATOR mode=%s profile=%s target=%s changed=%s reason=%s policy=%s regime=%s avg_cand=%.2f avg_opened=%.2f closed_delta=%s wins_delta=%s losses_delta=%s avg_pnl_trade=$%.4f loss_share=%.2f",
+            self.mode,
+            self.current_profile,
+            target_profile,
+            changed,
+            reason,
+            policy_now,
+            regime_now,
+            avg_candidates,
+            avg_opened,
+            closed_delta,
+            wins_delta,
+            losses_delta,
+            avg_pnl_trade,
+            loss_share,
+        )
+        self._write_decision(
+            {
+                "ts": time.time(),
+                "mode": self.mode,
+                "profile_now": self.current_profile,
+                "profile_target": target_profile,
+                "changed": bool(changed),
+                "reason": reason,
+                "policy": policy_now,
+                "regime": regime_now,
+                "avg_candidates": round(avg_candidates, 4),
+                "avg_opened": round(avg_opened, 4),
+                "closed_delta": int(closed_delta),
+                "wins_delta": int(wins_delta),
+                "losses_delta": int(losses_delta),
+                "avg_pnl_trade_usd": round(avg_pnl_trade, 6),
+                "loss_share": round(loss_share, 6),
+                "regime_top": _format_top_counts(self.window_regime_counts, limit=1),
+                "bad_streak": int(self.bad_streak),
+                "good_streak": int(self.good_streak),
+            }
+        )
+        self._reset_window(now_ts=now_ts, auto_stats=auto_stats)
+
+
 class CandidateDecisionWriter:
     def __init__(self) -> None:
         self.enabled = bool(getattr(config, "CANDIDATE_DECISIONS_LOG_ENABLED", True))
@@ -1362,6 +1707,119 @@ class CandidateDecisionWriter:
                 f.write(json.dumps(event, ensure_ascii=False, sort_keys=False) + "\n")
         except Exception:
             logger.exception("CANDIDATE_LOG write failed")
+
+
+class ProfileAutoStopController:
+    def __init__(self) -> None:
+        self.enabled = bool(getattr(config, "PROFILE_AUTOSTOP_ENABLED", False))
+        self.notify_enabled = bool(getattr(config, "PROFILE_AUTOSTOP_NOTIFY_ENABLED", True))
+        self.interval_seconds = int(getattr(config, "PROFILE_AUTOSTOP_EVAL_INTERVAL_SECONDS", 120) or 120)
+        self.min_runtime_seconds = int(getattr(config, "PROFILE_AUTOSTOP_MIN_RUNTIME_SECONDS", 3600) or 3600)
+        self.min_closed_trades = int(getattr(config, "PROFILE_AUTOSTOP_MIN_CLOSED_TRADES", 24) or 24)
+        self.min_realized_pnl_usd = float(getattr(config, "PROFILE_AUTOSTOP_MIN_REALIZED_PNL_USD", 0.0) or 0.0)
+        self.min_avg_pnl_per_trade_usd = float(
+            getattr(config, "PROFILE_AUTOSTOP_MIN_AVG_PNL_PER_TRADE_USD", 0.0005) or 0.0005
+        )
+        self.max_loss_share = float(getattr(config, "PROFILE_AUTOSTOP_MAX_LOSS_SHARE", 0.58) or 0.58)
+        self.max_drawdown_from_peak_usd = float(
+            getattr(config, "PROFILE_AUTOSTOP_MAX_DRAWDOWN_FROM_PEAK_USD", 0.18) or 0.18
+        )
+        self.min_fail_signals = int(getattr(config, "PROFILE_AUTOSTOP_MIN_FAIL_SIGNALS", 2) or 2)
+        self.started_ts = time.time()
+        self.next_eval_ts = self.started_ts + max(30, int(self.interval_seconds))
+        self.peak_realized_pnl_usd = 0.0
+        self.triggered = False
+
+    def maybe_stop(self, *, auto_stats: dict[str, float | int]) -> tuple[bool, dict[str, object] | None]:
+        if not self.enabled or self.triggered:
+            return False, None
+        now_ts = time.time()
+        if now_ts < float(self.next_eval_ts):
+            return False, None
+        self.next_eval_ts = now_ts + max(30, int(self.interval_seconds))
+
+        runtime_seconds = max(0, int(now_ts - float(self.started_ts)))
+        closed = int(auto_stats.get("closed", 0) or 0)
+        wins = int(auto_stats.get("wins", 0) or 0)
+        losses = int(auto_stats.get("losses", 0) or 0)
+        realized = float(auto_stats.get("realized_pnl_usd", 0.0) or 0.0)
+        self.peak_realized_pnl_usd = max(float(self.peak_realized_pnl_usd), float(realized))
+
+        if runtime_seconds < int(self.min_runtime_seconds):
+            return False, None
+        if closed < int(self.min_closed_trades):
+            return False, None
+
+        avg_pnl_per_trade = (realized / float(closed)) if closed > 0 else 0.0
+        loss_share = (float(losses) / float(closed)) if closed > 0 else 0.0
+        drawdown_from_peak = float(realized - float(self.peak_realized_pnl_usd))
+
+        fail_reasons: list[str] = []
+        if realized < float(self.min_realized_pnl_usd):
+            fail_reasons.append(
+                f"realized_pnl_usd {realized:.4f} < {float(self.min_realized_pnl_usd):.4f}"
+            )
+        if avg_pnl_per_trade < float(self.min_avg_pnl_per_trade_usd):
+            fail_reasons.append(
+                f"avg_pnl_trade {avg_pnl_per_trade:.5f} < {float(self.min_avg_pnl_per_trade_usd):.5f}"
+            )
+        if loss_share > float(self.max_loss_share):
+            fail_reasons.append(f"loss_share {loss_share:.3f} > {float(self.max_loss_share):.3f}")
+        if drawdown_from_peak <= -abs(float(self.max_drawdown_from_peak_usd)):
+            fail_reasons.append(
+                f"drawdown_from_peak {drawdown_from_peak:.4f} <= -{abs(float(self.max_drawdown_from_peak_usd)):.4f}"
+            )
+
+        if len(fail_reasons) < int(self.min_fail_signals):
+            return False, None
+
+        self.triggered = True
+        summary = (
+            f"profile={RUN_TAG} runtime={runtime_seconds}s closed={closed} wins={wins} losses={losses} "
+            f"realized={realized:.4f} avg={avg_pnl_per_trade:.5f} loss_share={loss_share:.3f} "
+            f"drawdown_from_peak={drawdown_from_peak:.4f} fail_signals={len(fail_reasons)}"
+        )
+        reason_text = "; ".join(fail_reasons)
+        try:
+            stop_file = _graceful_stop_file_path()
+            os.makedirs(os.path.dirname(stop_file) or ".", exist_ok=True)
+            with open(stop_file, "w", encoding="utf-8") as f:
+                f.write(
+                    json.dumps(
+                        {
+                            "ts": now_ts,
+                            "run_tag": RUN_TAG,
+                            "event": "PROFILE_AUTOSTOP",
+                            "reason": reason_text,
+                            "summary": summary,
+                        },
+                        ensure_ascii=False,
+                        sort_keys=False,
+                    )
+                )
+        except Exception:
+            logger.exception("PROFILE_AUTOSTOP failed to write graceful stop file")
+
+        event = {
+            "event_type": "PROFILE_AUTOSTOP",
+            "symbol": "PROFILE_AUTOSTOP",
+            "score": 0,
+            "recommendation": "STOP",
+            "risk_level": "WARNING",
+            "name": f"{RUN_TAG} stopped",
+            "breakdown": {
+                "run_tag": RUN_TAG,
+                "reason": reason_text,
+                "summary": summary,
+                "fail_reasons": fail_reasons,
+            },
+            "address": "",
+            "liquidity": 0.0,
+            "volume_5m": 0.0,
+            "price_change_5m": 0.0,
+            "warning_flags": len(fail_reasons),
+        }
+        return True, event
 
 
 class MiniAnalyzer:
@@ -1620,6 +2078,21 @@ async def run_local_loop() -> None:
     adaptive_filters.prev_realized_usd = float(adaptive_init_stats.get("realized_pnl_usd", 0.0) or 0.0)
     autonomy_controller = AutonomousControlController()
     autonomy_controller.prime(auto_stats=adaptive_init_stats)
+    strategy_orchestrator = StrategyOrchestrator()
+    strategy_orchestrator.prime(auto_stats=adaptive_init_stats)
+    profile_autostop = ProfileAutoStopController()
+    v2_universe = UniverseFlowController()
+    v2_safety_budget = SafetyBudgetController()
+    v2_calibrator = UnifiedCalibrator()
+    v2_policy_router = PolicyEntryRouter()
+    v2_dual_entry = DualEntryController()
+    v2_rolling_edge = RollingEdgeGovernor()
+    v2_kpi_loop = RuntimeKpiLoop()
+    v2_champion_guard = MatrixChampionGuard(
+        run_tag=RUN_TAG,
+        paper_state_file=str(getattr(config, "PAPER_STATE_FILE", "")),
+        graceful_stop_file=_graceful_stop_file_path(),
+    )
     mini_analyzer = MiniAnalyzer()
     mini_analyzer.prime(
         closed=int(adaptive_init_stats.get("closed", 0) or 0),
@@ -1628,8 +2101,11 @@ async def run_local_loop() -> None:
     recent_candidate_counts: deque[int] = deque(
         maxlen=max(3, int(getattr(config, "MARKET_REGIME_WINDOW_CYCLES", 12) or 12))
     )
-    market_regime_current = "BALANCED"
+    market_regime_current = "YELLOW"
     market_regime_reason = "init"
+    market_mode_risk_streak = 0
+    market_mode_recover_streak = 0
+    market_regime_prev = market_regime_current
     cycle_index = 0
 
     logger.info("Local mode started (Telegram disabled).")
@@ -1689,6 +2165,16 @@ async def run_local_loop() -> None:
                                 logger.info("WATCHLIST merged count=%s", len(wl))
                     except Exception as exc:
                         logger.warning("WATCHLIST fetch failed: %s", exc)
+                if tokens:
+                    before_universe = len(tokens)
+                    tokens = v2_universe.filter_tokens(tokens or [])
+                    if len(tokens) != before_universe:
+                        logger.info(
+                            "V2_UNIVERSE cycle=%s before=%s after=%s",
+                            cycle_index,
+                            before_universe,
+                            len(tokens),
+                        )
 
                 high_quality = 0
                 alerts_sent = 0
@@ -1698,6 +2184,7 @@ async def run_local_loop() -> None:
                 heavy_dedup_skipped = 0
                 heavy_dedup_override = 0
                 dedup_repeat_intervals_cycle: list[float] = []
+                v2_safety_budget.reset_cycle()
                 excluded_addresses = _excluded_trade_addresses()
                 now_mono = time.monotonic()
                 if heavy_seen_until:
@@ -1708,17 +2195,36 @@ async def run_local_loop() -> None:
                         heavy_last_volume_5m.pop(a, None)
                 if tokens:
                     cycle_filter_fails: dict[str, int] = {}
-                    regime_score_delta, regime_volume_mult, regime_edge_mult = _regime_entry_overrides(market_regime_current)
+                    mode_profile = _market_mode_entry_profile(market_regime_current)
+                    regime_score_delta = int(mode_profile.get("score_delta", 0) or 0)
+                    regime_volume_mult = float(mode_profile.get("volume_mult", 1.0) or 1.0)
+                    regime_edge_mult = float(mode_profile.get("edge_mult", 1.0) or 1.0)
+                    regime_size_mult = float(mode_profile.get("size_mult", 1.0) or 1.0)
+                    regime_hold_mult = float(mode_profile.get("hold_mult", 1.0) or 1.0)
+                    regime_partial_tp_trigger_mult = float(mode_profile.get("partial_tp_trigger_mult", 1.0) or 1.0)
+                    regime_partial_tp_sell_mult = float(mode_profile.get("partial_tp_sell_mult", 1.0) or 1.0)
+                    allow_soft = bool(mode_profile.get("allow_soft", True))
+                    soft_cap = int(mode_profile.get("soft_cap", 0) or 0)
+                    base_score_floor = int(getattr(config, "MIN_TOKEN_SCORE", 70) or 70)
+                    strict_score_min = max(
+                        base_score_floor,
+                        int(getattr(config, "MARKET_MODE_STRICT_SCORE", 78) or 78) + int(regime_score_delta),
+                    )
+                    soft_score_base = int(getattr(config, "MARKET_MODE_SOFT_SCORE", 70) or 70)
+                    soft_score_min = max(base_score_floor, min(strict_score_min, soft_score_base + int(regime_score_delta)))
+                    soft_selected_cycle = 0
 
                     def _filter_fail(reason: str, token: dict, extra: str = "") -> None:
                         key = str(reason or "unknown").strip().lower() or "unknown"
                         quality = _candidate_quality_features(token, (token.get("score_data") or {}))
+                        candidate_id = str(token.get("_candidate_id", "") or "")
                         filter_fail_reasons_session[key] = int(filter_fail_reasons_session.get(key, 0)) + 1
                         cycle_filter_fails[key] = int(cycle_filter_fails.get(key, 0)) + 1
                         candidate_writer.write(
                             {
                                 "ts": time.time(),
                                 "cycle_index": cycle_index,
+                                "candidate_id": candidate_id,
                                 "source_mode": source_mode,
                                 "decision_stage": "filter_fail",
                                 "decision": "skip",
@@ -1750,8 +2256,10 @@ async def run_local_loop() -> None:
                                 reason,
                             )
 
-                    for token in tokens:
+                    for token_idx, token in enumerate(tokens):
                         token_address = normalize_address(token.get("address", ""))
+                        candidate_id = f"{RUN_TAG}:{cycle_index}:{token_idx}:{token_address or 'noaddr'}"
+                        token["_candidate_id"] = candidate_id
                         if token_address:
                             seen_now = time.monotonic()
                             prev_seen = float(heavy_last_seen_ts.get(token_address, 0.0) or 0.0)
@@ -1770,13 +2278,33 @@ async def run_local_loop() -> None:
                         token["score_data"] = score_data
                         if int(score_data.get("score", 0)) >= 70:
                             high_quality += 1
-                        score_min_base = int(config.MIN_TOKEN_SCORE)
-                        score_min_regime = max(0, score_min_base + int(regime_score_delta))
-                        if config.AUTO_FILTER_ENABLED and int(score_data.get("score", 0)) < int(score_min_regime):
+                        score_now = int(score_data.get("score", 0) or 0)
+                        if score_now >= strict_score_min:
+                            entry_tier = "A"
+                        elif score_now >= soft_score_min:
+                            entry_tier = "B"
+                        else:
+                            entry_tier = ""
+
+                        if config.AUTO_FILTER_ENABLED and not entry_tier:
                             _filter_fail(
                                 "score_min",
                                 token,
-                                f"score={score_data.get('score', 0)} min={int(score_min_regime)} regime={market_regime_current}",
+                                f"score={score_now} strict_min={strict_score_min} soft_min={soft_score_min} mode={market_regime_current}",
+                            )
+                            continue
+                        if entry_tier == "B" and not allow_soft:
+                            _filter_fail(
+                                "tier_b_blocked_mode",
+                                token,
+                                f"score={score_now} mode={market_regime_current}",
+                            )
+                            continue
+                        if entry_tier == "B" and soft_cap > 0 and soft_selected_cycle >= soft_cap:
+                            _filter_fail(
+                                "tier_b_cycle_cap",
+                                token,
+                                f"score={score_now} cap={soft_cap} mode={market_regime_current}",
                             )
                             continue
 
@@ -1831,6 +2359,9 @@ async def run_local_loop() -> None:
                                     continue
 
                         # Expensive safety API check only after cheap filters.
+                        if not v2_safety_budget.allow(token):
+                            _filter_fail("safety_budget", token)
+                            continue
                         safety = await checker.check_token_safety(
                             token.get("address", ""),
                             token.get("liquidity", 0),
@@ -1862,12 +2393,21 @@ async def run_local_loop() -> None:
                                 continue
 
                         token["_regime_edge_mult"] = float(regime_edge_mult)
+                        token["_regime_size_mult"] = float(regime_size_mult)
+                        token["_regime_hold_mult"] = float(regime_hold_mult)
+                        token["_regime_partial_tp_trigger_mult"] = float(regime_partial_tp_trigger_mult)
+                        token["_regime_partial_tp_sell_mult"] = float(regime_partial_tp_sell_mult)
                         token["_regime_name"] = str(market_regime_current)
+                        token["_entry_tier"] = str(entry_tier)
+                        if entry_tier == "B":
+                            soft_selected_cycle += 1
 
                         logger.info(
-                            "FILTER_PASS token=%s score=%s risk=%s liq=%.0f vol5m=%.0f",
+                            "FILTER_PASS token=%s tier=%s score=%s mode=%s risk=%s liq=%.0f vol5m=%.0f",
                             token.get("symbol", "N/A"),
+                            entry_tier,
                             score_data.get("score", 0),
+                            market_regime_current,
                             token.get("risk_level", "N/A"),
                             float(token.get("liquidity") or 0),
                             float(token.get("volume_5m") or 0),
@@ -1876,11 +2416,13 @@ async def run_local_loop() -> None:
                             {
                                 "ts": time.time(),
                                 "cycle_index": cycle_index,
+                                "candidate_id": candidate_id,
                                 "source_mode": source_mode,
                                 "decision_stage": "post_filters",
                                 "decision": "candidate_pass",
                                 "reason": "passed_all_filters",
                                 "market_regime": market_regime_current,
+                                "entry_tier": entry_tier,
                                 "address": token_address,
                                 "symbol": str(token.get("symbol", "N/A")),
                                 "score": int(score_data.get("score", 0)),
@@ -1896,6 +2438,7 @@ async def run_local_loop() -> None:
                             }
                         )
                         trade_candidates.append((token, score_data))
+                        v2_universe.record_candidate_pass(token_address, str(token.get("symbol", "") or ""))
                         # Optional: avoid alert spam from watchlist flow.
                         if str(token.get("source", "")).lower() == "watchlist" and not bool(
                             getattr(config, "WATCHLIST_ALERTS_ENABLED", False)
@@ -1930,23 +2473,102 @@ async def run_local_loop() -> None:
                     if recent_candidate_counts
                     else float(len(trade_candidates))
                 )
-                market_regime_current, market_regime_reason = _detect_market_regime(
+                raw_market_mode, raw_market_reason = _detect_market_regime(
                     policy_state=policy_state,
                     source_stats=source_stats,
                     safety_stats=safety_stats,
                     avg_candidates_recent=avg_candidates_recent,
                 )
-                policy_mode_current = policy_state
-                auto_trader.set_data_policy(policy_state, policy_reason)
-                if policy_state == "FAIL_CLOSED":
-                    logger.warning(
-                        "SAFETY_MODE fail_closed active; BUY disabled until safety API recovers. reason=%s",
-                        policy_reason,
+                market_regime_current, market_regime_reason, market_mode_risk_streak, market_mode_recover_streak = (
+                    _apply_market_mode_hysteresis(
+                        raw_mode=raw_market_mode,
+                        raw_reason=raw_market_reason,
+                        current_mode=market_regime_current,
+                        risk_streak=market_mode_risk_streak,
+                        recover_streak=market_mode_recover_streak,
                     )
-                elif policy_state == "DEGRADED":
+                )
+                policy_mode_current = policy_state
+                candidates_pre_route = list(trade_candidates)
+                candidates_symbols_cycle = [
+                    str((token_data or {}).get("symbol", "") or "").strip().upper()
+                    for token_data, _ in candidates_pre_route
+                    if str((token_data or {}).get("symbol", "") or "").strip()
+                ]
+                dual_route_meta: dict[str, object] = {
+                    "enabled": bool(getattr(config, "V2_ENTRY_DUAL_CHANNEL_ENABLED", False)),
+                    "in_total": len(candidates_pre_route),
+                    "out_total": len(candidates_pre_route),
+                    "core_out": len(candidates_pre_route),
+                    "explore_out": 0,
+                    "regime": market_regime_current,
+                }
+                candidates_dual = list(candidates_pre_route)
+                if candidates_pre_route:
+                    candidates_dual, dual_route_meta = v2_dual_entry.allocate(
+                        candidates=candidates_pre_route,
+                        market_mode=market_regime_current,
+                    )
+                    if int(dual_route_meta.get("in_total", 0) or 0) != int(dual_route_meta.get("out_total", 0) or 0) or bool(
+                        dual_route_meta.get("enabled", False)
+                    ):
+                        logger.info(
+                            (
+                                "V2_ENTRY_ROUTE enabled=%s regime=%s in=%s out=%s core_out=%s explore_out=%s "
+                                "quota=%s allow_explore=%s"
+                            ),
+                            bool(dual_route_meta.get("enabled", False)),
+                            str(dual_route_meta.get("regime", market_regime_current)),
+                            int(dual_route_meta.get("in_total", 0) or 0),
+                            int(dual_route_meta.get("out_total", 0) or 0),
+                            int(dual_route_meta.get("core_out", 0) or 0),
+                            int(dual_route_meta.get("explore_out", 0) or 0),
+                            int(dual_route_meta.get("explore_quota", 0) or 0),
+                            bool(dual_route_meta.get("allow_explore", False)),
+                        )
+
+                candidates_routed = list(candidates_dual)
+                policy_route_meta: dict[str, object] = {
+                    "enabled": bool(getattr(config, "V2_POLICY_ROUTER_ENABLED", False)),
+                    "policy_state": policy_state,
+                    "effective_mode": ("OK" if str(policy_state).upper() == "OK" else "BLOCKED"),
+                    "action": ("allow_all" if str(policy_state).upper() == "OK" else "legacy_block"),
+                    "in_total": len(candidates_dual),
+                    "out_total": len(candidates_dual) if str(policy_state).upper() == "OK" else 0,
+                    "reason": policy_reason,
+                }
+                if candidates_dual:
+                    candidates_routed, policy_route_meta = v2_policy_router.route(
+                        candidates=candidates_dual,
+                        policy_state=policy_state,
+                        policy_reason=policy_reason,
+                        market_mode=market_regime_current,
+                    )
+
+                policy_effective_mode = str(policy_route_meta.get("effective_mode", policy_state) or policy_state).strip().upper()
+                policy_effective_reason = (
+                    f"{policy_reason} | route={str(policy_route_meta.get('action', 'n/a'))}"
+                )
+                auto_trader.set_data_policy(policy_effective_mode, policy_effective_reason)
+                if policy_effective_mode == "BLOCKED":
                     logger.warning(
-                        "DATA_MODE degraded; BUY disabled by policy. reason=%s",
-                        policy_reason,
+                        "AUTO_POLICY mode=%s action=block reason=%s candidates_in=%s",
+                        policy_state,
+                        policy_effective_reason,
+                        len(candidates_dual),
+                    )
+                elif policy_effective_mode == "LIMITED":
+                    logger.warning(
+                        (
+                            "AUTO_POLICY mode=%s action=limited reason=%s candidates_in=%s allowed=%s "
+                            "strict_out=%s soft_out=%s"
+                        ),
+                        policy_state,
+                        policy_effective_reason,
+                        int(policy_route_meta.get("in_total", 0) or 0),
+                        int(policy_route_meta.get("out_total", 0) or 0),
+                        int(policy_route_meta.get("strict_out", 0) or 0),
+                        int(policy_route_meta.get("soft_out", 0) or 0),
                     )
                 logger.info(
                     "MARKET_REGIME mode=%s reason=%s avg_cand_recent=%.2f",
@@ -1954,21 +2576,51 @@ async def run_local_loop() -> None:
                     market_regime_reason,
                     avg_candidates_recent,
                 )
+                if market_regime_current != market_regime_prev:
+                    try:
+                        await local_alerter.send_event(
+                            {
+                                "event_type": "MARKET_MODE_CHANGE",
+                                "symbol": "MARKET_MODE",
+                                "recommendation": market_regime_current,
+                                "risk_level": "INFO",
+                                "name": f"{RUN_TAG} market mode {market_regime_prev}->{market_regime_current}",
+                                "breakdown": {
+                                    "previous_mode": market_regime_prev,
+                                    "new_mode": market_regime_current,
+                                    "reason": market_regime_reason,
+                                    "avg_candidates_recent": round(avg_candidates_recent, 4),
+                                },
+                            }
+                        )
+                    except Exception:
+                        logger.exception("MARKET_MODE_CHANGE event write failed")
+                market_regime_prev = market_regime_current
 
                 opened_trades = 0
-                if trade_candidates and policy_state == "OK":
-                    opened_trades = await auto_trader.plan_batch(trade_candidates)
-                elif trade_candidates:
-                    for token_data, score_data in trade_candidates:
+                if candidates_routed:
+                    opened_trades = await auto_trader.plan_batch(candidates_routed)
+
+                routed_candidate_ids = {
+                    str((token_data or {}).get("_candidate_id", "") or "")
+                    for token_data, _ in candidates_routed
+                }
+                if candidates_dual and len(routed_candidate_ids) < len(candidates_dual):
+                    policy_skip_reason = f"policy_{str(policy_effective_mode).lower()}"
+                    for token_data, score_data in candidates_dual:
+                        candidate_id = str(token_data.get("_candidate_id", "") or "")
+                        if candidate_id in routed_candidate_ids:
+                            continue
                         candidate_writer.write(
                             {
                                 "ts": time.time(),
                                 "cycle_index": cycle_index,
+                                "candidate_id": candidate_id,
                                 "source_mode": source_mode,
                                 "decision_stage": "policy_gate",
                                 "decision": "skip",
-                                "reason": f"policy_{str(policy_state).lower()}",
-                                "policy_reason": str(policy_reason),
+                                "reason": policy_skip_reason,
+                                "policy_reason": str(policy_effective_reason),
                                 "market_regime": market_regime_current,
                                 "market_regime_reason": market_regime_reason,
                                 "address": normalize_address(token_data.get("address", "")),
@@ -1978,17 +2630,12 @@ async def run_local_loop() -> None:
                                 "quality": _candidate_quality_features(token_data, score_data),
                             }
                         )
-                    logger.warning(
-                        "AUTO_POLICY mode=%s action=no_buy reason=%s candidates=%s",
-                        policy_state,
-                        policy_reason,
-                        len(trade_candidates),
-                    )
                 await auto_trader.process_open_positions(bot=None)
                 auto_stats = auto_trader.get_stats()
                 skip_reasons_cycle = auto_trader.pop_skip_reason_counts_window()
+                candidate_count_cycle = len(candidates_pre_route)
                 adaptive_filters.record_cycle(
-                    candidates=len(trade_candidates),
+                    candidates=candidate_count_cycle,
                     opened=opened_trades,
                     filter_fails_cycle=cycle_filter_fails,
                     skip_reasons_cycle=skip_reasons_cycle,
@@ -1996,20 +2643,37 @@ async def run_local_loop() -> None:
                     dedup_repeat_intervals_cycle=dedup_repeat_intervals_cycle,
                 )
                 autonomy_controller.record_cycle(
-                    candidates=len(trade_candidates),
+                    candidates=candidate_count_cycle,
                     opened=opened_trades,
                     policy_state=policy_state,
                     market_regime=market_regime_current,
                     skip_reasons_cycle=skip_reasons_cycle,
                 )
+                strategy_orchestrator.record_cycle(
+                    candidates=candidate_count_cycle,
+                    opened=opened_trades,
+                    market_regime=market_regime_current,
+                )
                 mini_analyzer.record(
                     scanned=len(tokens or []),
-                    candidates=len(trade_candidates),
+                    candidates=candidate_count_cycle,
                     opened=opened_trades,
                     filter_fails_cycle=cycle_filter_fails,
                     skip_reasons_cycle=skip_reasons_cycle,
                     policy_state=policy_state,
                     market_regime=market_regime_current,
+                )
+                v2_rolling_edge.record_cycle(
+                    candidates=candidate_count_cycle,
+                    opened=opened_trades,
+                    skip_reasons_cycle=skip_reasons_cycle,
+                )
+                v2_kpi_loop.record_cycle(
+                    candidates=candidate_count_cycle,
+                    opened=opened_trades,
+                    policy_state=policy_effective_mode,
+                    symbols=candidates_symbols_cycle,
+                    skip_reasons_cycle=skip_reasons_cycle,
                 )
                 adaptive_filters.maybe_adapt(
                     policy_state=policy_state,
@@ -2021,6 +2685,88 @@ async def run_local_loop() -> None:
                     market_regime=market_regime_current,
                     auto_stats=auto_stats,
                 )
+                strategy_orchestrator.maybe_adapt(
+                    policy_state=policy_state,
+                    market_regime=market_regime_current,
+                    auto_stats=auto_stats,
+                )
+                calibration_event = v2_calibrator.maybe_apply()
+                if isinstance(calibration_event, dict):
+                    try:
+                        await local_alerter.send_event(
+                            {
+                                "event_type": "V2_CALIBRATION_APPLIED",
+                                "symbol": "V2_CALIBRATION",
+                                "recommendation": "INFO",
+                                "risk_level": "INFO",
+                                "name": f"{RUN_TAG} calibration updated",
+                                "breakdown": calibration_event,
+                            }
+                        )
+                    except Exception:
+                        logger.exception("V2_CALIBRATION event write failed")
+                rolling_edge_event = v2_rolling_edge.maybe_apply(auto_trader=auto_trader, auto_stats=auto_stats)
+                if isinstance(rolling_edge_event, dict):
+                    try:
+                        await local_alerter.send_event(
+                            {
+                                "event_type": "V2_ROLLING_EDGE_APPLIED",
+                                "symbol": "V2_ROLLING_EDGE",
+                                "recommendation": str(rolling_edge_event.get("action", "INFO")).upper(),
+                                "risk_level": "INFO",
+                                "name": f"{RUN_TAG} rolling edge updated",
+                                "breakdown": rolling_edge_event,
+                            }
+                        )
+                    except Exception:
+                        logger.exception("V2_ROLLING_EDGE event write failed")
+                kpi_event = v2_kpi_loop.maybe_apply()
+                if isinstance(kpi_event, dict):
+                    try:
+                        await local_alerter.send_event(
+                            {
+                                "event_type": "V2_KPI_LOOP_APPLIED",
+                                "symbol": "V2_KPI_LOOP",
+                                "recommendation": str(kpi_event.get("action", "INFO")).upper(),
+                                "risk_level": "INFO",
+                                "name": f"{RUN_TAG} KPI loop adjusted",
+                                "breakdown": kpi_event,
+                            }
+                        )
+                    except Exception:
+                        logger.exception("V2_KPI_LOOP event write failed")
+                stop_now, stop_event = profile_autostop.maybe_stop(auto_stats=auto_stats)
+                if stop_now:
+                    reason = ""
+                    if isinstance(stop_event, dict):
+                        reason = str((stop_event.get("breakdown") or {}).get("reason", ""))
+                    logger.error(
+                        "PROFILE_AUTOSTOP_TRIGGERED run_tag=%s reason=%s",
+                        RUN_TAG,
+                        reason,
+                    )
+                    if bool(profile_autostop.notify_enabled) and isinstance(stop_event, dict):
+                        try:
+                            await local_alerter.send_event(stop_event)
+                        except Exception:
+                            logger.exception("PROFILE_AUTOSTOP notification write failed")
+                    break
+                champ_stop, champ_event = v2_champion_guard.maybe_stop(auto_stats=auto_stats)
+                if champ_stop:
+                    reason = ""
+                    if isinstance(champ_event, dict):
+                        reason = str((champ_event.get("breakdown") or {}).get("reason", ""))
+                    logger.error(
+                        "V2_CHAMPION_GUARD_TRIGGERED run_tag=%s reason=%s",
+                        RUN_TAG,
+                        reason,
+                    )
+                    if isinstance(champ_event, dict):
+                        try:
+                            await local_alerter.send_event(champ_event)
+                        except Exception:
+                            logger.exception("V2_CHAMPION_GUARD event write failed")
+                    break
                 mini_analyzer.maybe_emit(auto_stats=auto_stats)
 
                 active_tasks = len(asyncio.all_tasks())
@@ -2042,9 +2788,15 @@ async def run_local_loop() -> None:
                         float(config.NO_MOMENTUM_EXIT_MAX_PNL_PERCENT),
                         float(config.WEAKNESS_EXIT_PNL_PERCENT),
                     )
+                v2_budget_snapshot = v2_safety_budget.snapshot()
 
                 logger.info(
-                    "Scanned %s tokens | High quality: %s | Alerts sent: %s | Trade candidates: %s | Opened: %s | Mode: local | Source: %s | Policy: %s(%s) | Regime: %s(%s) | Safety: checked=%s fail_closed=%s reasons=%s | FiltersTop(session): %s | Dedup: heavy_skip=%s override=%s | Ingest: %s | Sources: %s | Tasks: %s | RSS: %.1fMB | CycleAvg: %.2fs",
+                    (
+                        "Scanned %s tokens | High quality: %s | Alerts sent: %s | Trade candidates: %s | Opened: %s | "
+                        "Mode: local | Source: %s | Policy: raw=%s/effective=%s(%s) | Regime: %s(%s) | "
+                        "Safety: checked=%s fail_closed=%s reasons=%s | FiltersTop(session): %s | Dedup: heavy_skip=%s override=%s | "
+                        "V2Budget: %s/%s | Ingest: %s | Sources: %s | Tasks: %s | RSS: %.1fMB | CycleAvg: %.2fs"
+                    ),
                     len(tokens or []),
                     high_quality,
                     alerts_sent,
@@ -2052,7 +2804,8 @@ async def run_local_loop() -> None:
                     opened_trades,
                     source_mode,
                     policy_state,
-                    policy_reason,
+                    policy_effective_mode,
+                    policy_effective_reason,
                     market_regime_current,
                     market_regime_reason,
                     safety_checked,
@@ -2061,6 +2814,8 @@ async def run_local_loop() -> None:
                     _format_top_filter_reasons(filter_fail_reasons_session),
                     heavy_dedup_skipped,
                     heavy_dedup_override,
+                    int(v2_budget_snapshot.get("used_total", 0) or 0),
+                    int(v2_budget_snapshot.get("max_total", 0) or 0),
                     _format_ingest_stats_brief(gecko_ingest_stats),
                     _format_source_stats_brief(source_stats),
                     active_tasks,

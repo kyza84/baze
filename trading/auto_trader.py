@@ -62,6 +62,12 @@ class PaperPosition:
     original_position_size_usd: float = 0.0
     partial_tp_done: bool = False
     partial_realized_pnl_usd: float = 0.0
+    market_mode: str = ""
+    entry_tier: str = ""
+    entry_channel: str = ""
+    partial_tp_trigger_mult: float = 1.0
+    partial_tp_sell_mult: float = 1.0
+    candidate_id: str = ""
 
 
 class AutoTrader:
@@ -84,6 +90,8 @@ class AutoTrader:
         self.total_losses = 0
         self.current_loss_streak = 0
         self.token_cooldowns: dict[str, float] = {}
+        self.token_cooldown_strikes: dict[str, int] = {}
+        self.symbol_cooldowns: dict[str, float] = {}
         self.trade_open_timestamps: list[float] = []
         self.tx_event_timestamps: list[float] = []
         self.price_guard_pending: dict[str, dict[str, float | int]] = {}
@@ -104,6 +112,18 @@ class AutoTrader:
         self._recovery_attempts: dict[str, int] = {}
         self._recovery_last_attempt_ts: dict[str, float] = {}
         self._skip_reason_counts_window: dict[str, int] = {}
+        self._last_reinvest_mult = 1.0
+        self.trade_decisions_log_enabled = bool(getattr(config, "TRADE_DECISIONS_LOG_ENABLED", True))
+        raw_decisions_log = str(
+            getattr(config, "TRADE_DECISIONS_LOG_FILE", os.path.join("logs", "trade_decisions.jsonl")) or ""
+        ).strip()
+        if not raw_decisions_log:
+            raw_decisions_log = os.path.join("logs", "trade_decisions.jsonl")
+        root = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+        self.trade_decisions_log_file = (
+            raw_decisions_log if os.path.isabs(raw_decisions_log) else os.path.join(root, raw_decisions_log)
+        )
+        self._active_trade_decision_context: dict[str, Any] | None = None
         self.data_policy_mode = "OK"
         self.data_policy_reason = ""
         self._http = ResilientHttpClient(
@@ -322,6 +342,141 @@ class AutoTrader:
                     pause_seconds=dd_pause,
                 )
 
+    @staticmethod
+    def _close_reason_matches(reason: str, patterns: list[str]) -> bool:
+        key = str(reason or "").strip().upper()
+        if not key:
+            return False
+        for raw in patterns:
+            p = str(raw or "").strip().upper()
+            if not p:
+                continue
+            if key == p or key.startswith(f"{p}:"):
+                return True
+        return False
+
+    def _apply_token_cooldown_after_close(self, *, token_address: str, close_reason: str, pnl_usd: float) -> None:
+        normalized = normalize_address(token_address)
+        if not normalized:
+            return
+        now_ts = datetime.now(timezone.utc).timestamp()
+        base = max(0, int(getattr(config, "MAX_TOKEN_COOLDOWN_SECONDS", 0) or 0))
+        dynamic_enabled = bool(getattr(config, "AUTO_TRADE_TOKEN_COOLDOWN_DYNAMIC_ENABLED", True))
+        step_seconds = max(0, int(getattr(config, "AUTO_TRADE_TOKEN_COOLDOWN_STEP_SECONDS", 0) or 0))
+        max_strikes = max(1, int(getattr(config, "AUTO_TRADE_TOKEN_COOLDOWN_MAX_STRIKES", 1) or 1))
+        recovery_step = max(1, int(getattr(config, "AUTO_TRADE_TOKEN_COOLDOWN_RECOVERY_STEP", 1) or 1))
+        cap_seconds = max(base, int(getattr(config, "AUTO_TRADE_TOKEN_COOLDOWN_MAX_SECONDS", base) or base))
+        patterns = list(getattr(config, "AUTO_TRADE_TOKEN_COOLDOWN_ESCALATE_REASONS", []) or [])
+
+        strikes_prev = int(self.token_cooldown_strikes.get(normalized, 0) or 0)
+        strikes_next = strikes_prev
+        should_escalate = bool(pnl_usd < 0.0) and self._close_reason_matches(close_reason, patterns)
+        if dynamic_enabled and should_escalate:
+            strikes_next = min(max_strikes, strikes_prev + 1)
+        elif dynamic_enabled:
+            strikes_next = max(0, strikes_prev - recovery_step)
+        if strikes_next > 0:
+            self.token_cooldown_strikes[normalized] = strikes_next
+        else:
+            self.token_cooldown_strikes.pop(normalized, None)
+
+        cooldown_seconds = base
+        if dynamic_enabled and base > 0 and step_seconds > 0:
+            cooldown_seconds = min(cap_seconds, base + (strikes_next * step_seconds))
+        if cooldown_seconds > 0:
+            self.token_cooldowns[normalized] = now_ts + cooldown_seconds
+            logger.info(
+                "TOKEN_COOLDOWN token=%s reason=%s pnl=$%.4f cooldown=%ss strikes=%s->%s dynamic=%s",
+                normalized,
+                close_reason,
+                float(pnl_usd),
+                int(cooldown_seconds),
+                strikes_prev,
+                strikes_next,
+                dynamic_enabled,
+            )
+
+    @staticmethod
+    def _symbol_key(symbol: str) -> str:
+        return str(symbol or "").strip().upper()
+
+    def _symbol_cooldown_left_seconds(self, symbol: str) -> int:
+        key = self._symbol_key(symbol)
+        if not key:
+            return 0
+        until = float(self.symbol_cooldowns.get(key, 0.0) or 0.0)
+        now_ts = datetime.now(timezone.utc).timestamp()
+        if until <= now_ts:
+            self.symbol_cooldowns.pop(key, None)
+            return 0
+        return int(max(1, until - now_ts))
+
+    def _set_symbol_cooldown(self, symbol: str, seconds: int, reason: str) -> None:
+        key = self._symbol_key(symbol)
+        sec = max(0, int(seconds))
+        if not key or sec <= 0:
+            return
+        now_ts = datetime.now(timezone.utc).timestamp()
+        until = now_ts + sec
+        prev_until = float(self.symbol_cooldowns.get(key, 0.0) or 0.0)
+        self.symbol_cooldowns[key] = max(prev_until, until)
+        logger.info(
+            "SYMBOL_COOLDOWN symbol=%s seconds=%s reason=%s",
+            key,
+            sec,
+            reason,
+        )
+
+    def _symbol_window_metrics(self, symbol: str) -> dict[str, float | int]:
+        key = self._symbol_key(symbol)
+        if not key:
+            return {
+                "trades": 0,
+                "wins": 0,
+                "losses": 0,
+                "loss_share": 0.0,
+                "sum_pnl": 0.0,
+                "avg_pnl": 0.0,
+                "loss_streak": 0,
+            }
+        window_minutes = max(1, int(getattr(config, "SYMBOL_EV_WINDOW_MINUTES", 120) or 120))
+        cutoff = datetime.now(timezone.utc).timestamp() - (window_minutes * 60)
+        rows = [
+            p
+            for p in self.closed_positions
+            if self._symbol_key(p.symbol) == key and p.closed_at is not None and p.closed_at.timestamp() >= cutoff
+        ]
+        trades = len(rows)
+        if trades <= 0:
+            return {
+                "trades": 0,
+                "wins": 0,
+                "losses": 0,
+                "loss_share": 0.0,
+                "sum_pnl": 0.0,
+                "avg_pnl": 0.0,
+                "loss_streak": 0,
+            }
+        sum_pnl = sum(float(r.pnl_usd) for r in rows)
+        wins = sum(1 for r in rows if self._pnl_outcome(float(r.pnl_usd)) == "win")
+        losses = sum(1 for r in rows if self._pnl_outcome(float(r.pnl_usd)) == "loss")
+        sorted_rows = sorted(rows, key=lambda r: r.closed_at or datetime.now(timezone.utc), reverse=True)
+        loss_streak = 0
+        for r in sorted_rows:
+            if self._pnl_outcome(float(r.pnl_usd)) == "loss":
+                loss_streak += 1
+            else:
+                break
+        return {
+            "trades": trades,
+            "wins": wins,
+            "losses": losses,
+            "loss_share": float(losses) / float(max(1, trades)),
+            "sum_pnl": float(sum_pnl),
+            "avg_pnl": float(sum_pnl) / float(max(1, trades)),
+            "loss_streak": int(loss_streak),
+        }
+
     def _risk_governor_block_reason(self) -> str | None:
         if not bool(getattr(config, "RISK_GOVERNOR_ENABLED", True)):
             return None
@@ -343,8 +498,20 @@ class AutoTrader:
                 return f"governor_drawdown {drawdown_pct:.2f}% <= {-abs(dd_limit):.2f}%"
         return None
 
+    def _policy_block_detail(self) -> str | None:
+        mode = str(self.data_policy_mode or "OK").strip().upper() or "OK"
+        reason = str(self.data_policy_reason or "").strip()
+        if mode == "BLOCKED":
+            return f"data_policy:{mode}:{reason}"
+        if bool(getattr(config, "DATA_POLICY_HARD_BLOCK_ENABLED", False)) and mode != "OK":
+            return f"data_policy_hard_block:{mode}:{reason}"
+        if (not bool(getattr(config, "V2_POLICY_ROUTER_ENABLED", False))) and mode in {"DEGRADED", "FAIL_CLOSED"}:
+            return f"data_policy_legacy_block:{mode}:{reason}"
+        return None
+
     def can_open_trade(self) -> bool:
-        if self.data_policy_mode != "OK":
+        policy_block = self._policy_block_detail()
+        if policy_block is not None:
             return False
         self._refresh_daily_window()
         block_reason = self._risk_governor_block_reason()
@@ -394,8 +561,9 @@ class AutoTrader:
     def _cannot_open_trade_detail(self) -> str:
         # Keep this in sync with can_open_trade() so "disabled_or_limits" logs
         # tell the operator exactly which guard/limit is active.
-        if self.data_policy_mode != "OK":
-            return f"data_policy:{self.data_policy_mode}:{self.data_policy_reason}"
+        policy_block = self._policy_block_detail()
+        if policy_block is not None:
+            return policy_block
         self._refresh_daily_window()
         block_reason = self._risk_governor_block_reason()
         if block_reason is not None:
@@ -435,7 +603,7 @@ class AutoTrader:
 
     def set_data_policy(self, mode: str, reason: str = "") -> None:
         normalized = str(mode or "OK").strip().upper()
-        if normalized not in {"OK", "DEGRADED", "FAIL_CLOSED"}:
+        if normalized not in {"OK", "DEGRADED", "FAIL_CLOSED", "LIMITED", "BLOCKED"}:
             normalized = "DEGRADED"
         if normalized == self.data_policy_mode and str(reason or "") == self.data_policy_reason:
             return
@@ -480,14 +648,70 @@ class AutoTrader:
             return
         self.recovery_queue = [a for a in self.recovery_queue if normalize_address(a) != key]
 
+    @staticmethod
+    def _position_key(token_address: str) -> str:
+        return normalize_address(token_address)
+
+    def _set_open_position(self, position: PaperPosition) -> None:
+        key = self._position_key(position.token_address)
+        if not key:
+            return
+        # Keep canonical (normalized) key format across runtime and persisted state.
+        self.open_positions[key] = position
+
+    def _pop_open_position(self, token_address: str) -> None:
+        key = self._position_key(token_address)
+        if key:
+            self.open_positions.pop(key, None)
+            self.price_guard_pending.pop(key, None)
+        # Backward-compatible cleanup for any stale pre-fix raw keys.
+        raw = str(token_address or "").strip()
+        if raw and raw != key:
+            self.open_positions.pop(raw, None)
+            self.price_guard_pending.pop(raw, None)
+
     def _bump_skip_reason(self, reason: str) -> None:
         key = str(reason or "unknown").strip().lower() or "unknown"
         self._skip_reason_counts_window[key] = int(self._skip_reason_counts_window.get(key, 0)) + 1
+        ctx = dict(self._active_trade_decision_context or {})
+        if ctx:
+            payload = {
+                "ts": time.time(),
+                "decision_stage": "plan_trade",
+                "decision": "skip",
+                "reason": key,
+                **ctx,
+            }
+            self._write_trade_decision(payload)
+            self._active_trade_decision_context = None
 
     def pop_skip_reason_counts_window(self) -> dict[str, int]:
         out = dict(self._skip_reason_counts_window)
         self._skip_reason_counts_window = {}
         return out
+
+    @staticmethod
+    def _decision_run_tag() -> str:
+        run_tag = str(os.getenv("RUN_TAG", "") or "").strip()
+        if run_tag:
+            return run_tag
+        inst = str(os.getenv("BOT_INSTANCE_ID", "") or "").strip()
+        if inst:
+            return inst
+        return "single_or_other"
+
+    def _write_trade_decision(self, event: dict[str, Any]) -> None:
+        if not self.trade_decisions_log_enabled:
+            return
+        try:
+            payload = dict(event or {})
+            payload.setdefault("ts", time.time())
+            payload.setdefault("run_tag", self._decision_run_tag())
+            os.makedirs(os.path.dirname(self.trade_decisions_log_file) or ".", exist_ok=True)
+            with open(self.trade_decisions_log_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False, sort_keys=False) + "\n")
+        except Exception:
+            logger.exception("TRADE_DECISION log write failed")
 
     @staticmethod
     def _is_live_mode() -> bool:
@@ -586,6 +810,7 @@ class AutoTrader:
     def _refresh_daily_window(self) -> None:
         now_ts = datetime.now(timezone.utc).timestamp()
         self.token_cooldowns = {k: v for k, v in self.token_cooldowns.items() if v > now_ts}
+        self.symbol_cooldowns = {k: v for k, v in self.symbol_cooldowns.items() if v > now_ts}
         self._prune_daily_tx_window()
         current_day = self._current_day_id()
         if self.day_id == current_day:
@@ -913,8 +1138,9 @@ class AutoTrader:
         if not addr or not bool(ADDRESS_RE.match(addr)):
             return False, "invalid_normalized_address"
 
-        if self.data_policy_mode != "OK":
-            return False, f"data_policy_{self.data_policy_mode}"
+        policy_block = self._policy_block_detail()
+        if policy_block is not None:
+            return False, policy_block
 
         try:
             slippage_bps = int(config.LIVE_SLIPPAGE_BPS)
@@ -954,6 +1180,21 @@ class AutoTrader:
 
     async def plan_trade(self, token_data: dict[str, Any], score_data: dict[str, Any]) -> PaperPosition | None:
         symbol = str(token_data.get("symbol", "N/A"))
+        candidate_id = str(token_data.get("_candidate_id", "") or "").strip()
+        ctx_token_address = normalize_address(str(token_data.get("address", "") or ""))
+        ctx_entry_tier = str(token_data.get("_entry_tier", "") or "").strip().upper()
+        ctx_market_mode = str(token_data.get("_regime_name", "") or "").strip().upper()
+        ctx_entry_channel = str(token_data.get("_entry_channel", "") or "").strip().lower()
+        self._active_trade_decision_context = {
+            "candidate_id": candidate_id,
+            "token_address": ctx_token_address,
+            "symbol": symbol,
+            "score": int(score_data.get("score", 0) or 0),
+            "entry_tier": ctx_entry_tier,
+            "entry_channel": ctx_entry_channel,
+            "market_mode": ctx_market_mode,
+            "source": str(token_data.get("source", "") or ""),
+        }
         symbol_upper = symbol.strip().upper()
         excluded_symbols = set(getattr(config, "AUTO_TRADE_EXCLUDED_SYMBOLS", []) or [])
         if symbol_upper and symbol_upper in excluded_symbols:
@@ -965,6 +1206,16 @@ class AutoTrader:
             logger.info("AutoTrade skip token=%s reason=disabled_or_limits detail=%s", symbol, self._cannot_open_trade_detail())
             return None
         if self._kill_switch_active():
+            self._write_trade_decision(
+                {
+                    "ts": time.time(),
+                    "decision_stage": "plan_trade",
+                    "decision": "skip",
+                    "reason": "kill_switch_active",
+                    **dict(self._active_trade_decision_context or {}),
+                }
+            )
+            self._active_trade_decision_context = None
             logger.warning("KILL_SWITCH active path=%s", config.KILL_SWITCH_FILE)
             return None
 
@@ -982,6 +1233,13 @@ class AutoTrader:
 
         raw_token_address = str(token_data.get("address", "") or "")
         token_address = normalize_address(raw_token_address)
+        entry_tier = str(token_data.get("_entry_tier", "") or "").strip().upper()
+        if self._active_trade_decision_context is not None:
+            self._active_trade_decision_context["token_address"] = token_address
+            self._active_trade_decision_context["entry_tier"] = entry_tier
+            self._active_trade_decision_context["entry_channel"] = str(
+                token_data.get("_entry_channel", "") or ""
+            ).strip().lower()
         blocked, blk_reason = self._blacklist_is_blocked(token_address)
         if blocked:
             self._bump_skip_reason("blacklist")
@@ -1003,6 +1261,77 @@ class AutoTrader:
             self._bump_skip_reason("cooldown")
             logger.info("AutoTrade skip token=%s reason=cooldown_left_%ss", symbol, int(cooldown_until - now_ts))
             return None
+        symbol_cd_left = self._symbol_cooldown_left_seconds(symbol_upper)
+        if symbol_cd_left > 0:
+            self._bump_skip_reason("symbol_cooldown")
+            logger.info("AutoTrade skip token=%s reason=symbol_cooldown_left_%ss", symbol, symbol_cd_left)
+            return None
+
+        if bool(getattr(config, "SYMBOL_EV_GUARD_ENABLED", True)):
+            metrics = self._symbol_window_metrics(symbol_upper)
+            trades_w = int(metrics.get("trades", 0) or 0)
+            avg_pnl_w = float(metrics.get("avg_pnl", 0.0) or 0.0)
+            loss_share_w = float(metrics.get("loss_share", 0.0) or 0.0)
+            loss_streak_w = int(metrics.get("loss_streak", 0) or 0)
+
+            fatigue_cap = int(getattr(config, "SYMBOL_FATIGUE_MAX_TRADES_PER_WINDOW", 0) or 0)
+            if fatigue_cap > 0 and trades_w >= fatigue_cap:
+                self._bump_skip_reason("symbol_fatigue_cap")
+                cooldown = int(getattr(config, "SYMBOL_FATIGUE_COOLDOWN_SECONDS", 0) or 0)
+                self._set_symbol_cooldown(symbol_upper, cooldown, "fatigue_cap")
+                logger.info(
+                    "AutoTrade skip token=%s reason=symbol_fatigue_cap trades=%s cap=%s",
+                    symbol,
+                    trades_w,
+                    fatigue_cap,
+                )
+                return None
+
+            max_loss_streak = int(getattr(config, "SYMBOL_FATIGUE_MAX_LOSS_STREAK", 0) or 0)
+            if max_loss_streak > 0 and loss_streak_w >= max_loss_streak:
+                self._bump_skip_reason("symbol_loss_streak")
+                cooldown = int(getattr(config, "SYMBOL_FATIGUE_COOLDOWN_SECONDS", 0) or 0)
+                self._set_symbol_cooldown(symbol_upper, cooldown, "loss_streak")
+                logger.info(
+                    "AutoTrade skip token=%s reason=symbol_loss_streak streak=%s max=%s",
+                    symbol,
+                    loss_streak_w,
+                    max_loss_streak,
+                )
+                return None
+
+            min_trades = int(getattr(config, "SYMBOL_EV_MIN_TRADES", 3) or 3)
+            if trades_w >= min_trades:
+                bad_ev = (
+                    avg_pnl_w < float(getattr(config, "SYMBOL_EV_MIN_AVG_PNL_USD", 0.0005) or 0.0005)
+                    or loss_share_w > float(getattr(config, "SYMBOL_EV_MAX_LOSS_SHARE", 0.60) or 0.60)
+                )
+                if bad_ev:
+                    if bool(getattr(config, "SYMBOL_EV_BAD_TO_STRICT_ONLY", True)) and entry_tier != "A":
+                        self._bump_skip_reason("symbol_ev_strict_only")
+                        logger.info(
+                            "AutoTrade skip token=%s reason=symbol_ev_strict_only tier=%s trades=%s avg=%.5f loss_share=%.2f",
+                            symbol,
+                            entry_tier or "-",
+                            trades_w,
+                            avg_pnl_w,
+                            loss_share_w,
+                        )
+                        return None
+                    self._bump_skip_reason("symbol_ev_bad")
+                    self._set_symbol_cooldown(
+                        symbol_upper,
+                        int(getattr(config, "SYMBOL_EV_BAD_COOLDOWN_SECONDS", 0) or 0),
+                        "bad_ev",
+                    )
+                    logger.info(
+                        "AutoTrade skip token=%s reason=symbol_ev_bad trades=%s avg=%.5f loss_share=%.2f",
+                        symbol,
+                        trades_w,
+                        avg_pnl_w,
+                        loss_share_w,
+                    )
+                    return None
 
         entry_price_usd = float(token_data.get("price_usd") or 0)
         if entry_price_usd <= 0:
@@ -1055,6 +1384,29 @@ class AutoTrader:
         expected_edge_percent = self._estimate_edge_percent(score, tp, sl, cost_profile["total_percent"], risk_level)
         regime_edge_mult = _safe_float(token_data.get("_regime_edge_mult"), 1.0)
         regime_edge_mult = max(0.75, min(1.35, regime_edge_mult))
+        regime_size_mult = _safe_float(token_data.get("_regime_size_mult"), 1.0)
+        regime_size_mult = max(0.25, min(1.50, regime_size_mult))
+        regime_hold_mult = _safe_float(token_data.get("_regime_hold_mult"), 1.0)
+        regime_hold_mult = max(0.35, min(1.40, regime_hold_mult))
+        regime_partial_tp_trigger_mult = _safe_float(token_data.get("_regime_partial_tp_trigger_mult"), 1.0)
+        regime_partial_tp_trigger_mult = max(0.20, min(2.00, regime_partial_tp_trigger_mult))
+        regime_partial_tp_sell_mult = _safe_float(token_data.get("_regime_partial_tp_sell_mult"), 1.0)
+        regime_partial_tp_sell_mult = max(0.20, min(2.00, regime_partial_tp_sell_mult))
+        entry_tier = str(token_data.get("_entry_tier", "") or "").strip().upper()
+        market_mode = str(token_data.get("_regime_name", "") or "").strip().upper()
+        entry_channel = str(token_data.get("_entry_channel", "core") or "core").strip().lower()
+        if entry_channel not in {"core", "explore"}:
+            entry_channel = "core"
+        channel_size_mult = _safe_float(token_data.get("_entry_channel_size_mult"), 1.0)
+        channel_size_mult = max(0.10, min(1.40, channel_size_mult))
+        channel_hold_mult = _safe_float(token_data.get("_entry_channel_hold_mult"), 1.0)
+        channel_hold_mult = max(0.20, min(1.40, channel_hold_mult))
+        channel_edge_usd_mult = _safe_float(token_data.get("_entry_channel_edge_usd_mult"), 1.0)
+        channel_edge_usd_mult = max(0.05, min(1.50, channel_edge_usd_mult))
+        channel_edge_pct_mult = _safe_float(token_data.get("_entry_channel_edge_pct_mult"), 1.0)
+        channel_edge_pct_mult = max(0.05, min(1.50, channel_edge_pct_mult))
+        regime_size_mult = max(0.10, min(1.50, float(regime_size_mult) * float(channel_size_mult)))
+        regime_hold_mult = max(0.20, min(1.40, float(regime_hold_mult) * float(channel_hold_mult)))
 
         position_size_usd = self._choose_position_size(expected_edge_percent)
         if bool(getattr(config, "POSITION_SIZE_QUALITY_ENABLED", True)):
@@ -1067,6 +1419,9 @@ class AutoTrader:
             position_size_usd *= float(mult)
         else:
             mult, mult_detail = 1.0, "off"
+        position_size_usd *= float(regime_size_mult)
+        reinvest_mult, reinvest_detail = self._reinvest_multiplier(expected_edge_percent=float(expected_edge_percent))
+        position_size_usd *= float(reinvest_mult)
 
         position_size_usd = min(position_size_usd, self._available_balance_usd())
         position_size_usd = self._apply_max_loss_per_trade_cap(
@@ -1135,8 +1490,8 @@ class AutoTrader:
         )
         if config.EDGE_FILTER_ENABLED:
             mode = str(getattr(config, "EDGE_FILTER_MODE", "usd") or "usd").strip().lower()
-            min_edge_pct = float(getattr(config, "MIN_EXPECTED_EDGE_PERCENT", 0.0) or 0.0)
-            min_edge_usd = float(getattr(config, "MIN_EXPECTED_EDGE_USD", 0.0) or 0.0)
+            min_edge_pct = float(getattr(config, "MIN_EXPECTED_EDGE_PERCENT", 0.0) or 0.0) * float(channel_edge_pct_mult)
+            min_edge_usd = float(getattr(config, "MIN_EXPECTED_EDGE_USD", 0.0) or 0.0) * float(channel_edge_usd_mult)
             pct_ok = edge_percent_for_decision >= float(min_edge_pct)
             usd_ok = expected_edge_usd >= float(min_edge_usd)
             if mode == "percent" and not pct_ok:
@@ -1191,8 +1546,15 @@ class AutoTrader:
 
         breakdown = score_data.get("breakdown") if isinstance(score_data.get("breakdown"), dict) else {}
         logger.info(
-            "AUTO_DECISION token=%s score=%s src=%s liq=%.0f vol5m=%.0f chg5m=%.2f%% edge=%.2f%% raw=%.2f%% regime_mult=%.2f edge_usd=$%.3f size=$%.2f mult=%.2f(%s) costs=%.2f%% gas=$%.3f breakdown=%s",
+            (
+                "AUTO_DECISION token=%s mode=%s tier=%s channel=%s score=%s src=%s liq=%.0f vol5m=%.0f chg5m=%.2f%% "
+                "edge=%.2f%% raw=%.2f%% regime_mult=%.2f edge_usd=$%.3f size=$%.2f mult=%.2f(%s) reinvest=%.2f(%s) "
+                "size_mode=%.2f hold_mode=%.2f edge_gate_mult(usd=%.2f,pct=%.2f) costs=%.2f%% gas=$%.3f breakdown=%s"
+            ),
             symbol,
+            market_mode or "-",
+            entry_tier or "-",
+            entry_channel,
             score,
             str(token_data.get("source", "-")),
             liquidity_usd,
@@ -1205,6 +1567,12 @@ class AutoTrader:
             position_size_usd,
             float(mult),
             str(mult_detail),
+            float(reinvest_mult),
+            str(reinvest_detail),
+            float(regime_size_mult),
+            float(regime_hold_mult),
+            float(channel_edge_usd_mult),
+            float(channel_edge_pct_mult),
             float(cost_profile["total_percent"]),
             float(cost_profile["gas_usd"]),
             breakdown,
@@ -1216,6 +1584,7 @@ class AutoTrader:
             volume_5m=volume_5m,
             price_change_5m=price_change_5m,
         )
+        max_hold_seconds = int(max(30, round(float(max_hold_seconds) * float(regime_hold_mult))))
 
         if self._is_live_mode():
             if self.live_executor is None:
@@ -1377,8 +1746,9 @@ class AutoTrader:
                 except Exception:
                     raw_balance = 0
                 if raw_balance > 0:
-                    prev = int(self.recovery_untracked.get(token_address, 0) or 0)
-                    self.recovery_untracked[token_address] = raw_balance
+                    key = self._position_key(token_address)
+                    prev = int(self.recovery_untracked.get(key, 0) or 0)
+                    self.recovery_untracked[key] = raw_balance
                     if prev <= 0:
                         logger.warning(
                             "RECOVERY live_buy_untracked token=%s address=%s raw_balance=%s tx=%s",
@@ -1398,6 +1768,7 @@ class AutoTrader:
                 return None
             pos = PaperPosition(
                 token_address=token_address,
+                candidate_id=candidate_id,
                 symbol=symbol,
                 entry_price_usd=entry_price_usd,
                 current_price_usd=entry_price_usd,
@@ -1418,16 +1789,24 @@ class AutoTrader:
                 buy_tx_status="confirmed",
                 spent_eth=float(buy_result.spent_eth),
                 original_position_size_usd=position_size_usd,
+                market_mode=market_mode,
+                entry_tier=entry_tier,
+                entry_channel=entry_channel,
+                partial_tp_trigger_mult=regime_partial_tp_trigger_mult,
+                partial_tp_sell_mult=regime_partial_tp_sell_mult,
             )
-            self.open_positions[token_address] = pos
+            self._set_open_position(pos)
             self.total_plans += 1
             self.total_executed += 1
             self.trade_open_timestamps.append(datetime.now(timezone.utc).timestamp())
             self._record_tx_event()
             logger.info(
-                "AUTO_BUY Live BUY token=%s address=%s spend=%.8f ETH score=%s edge=%.2f%% edge_usd=$%.3f size=$%.2f mult=%.2f(%s) hold=%ss tx=%s",
+                "AUTO_BUY Live BUY token=%s address=%s mode=%s tier=%s channel=%s spend=%.8f ETH score=%s edge=%.2f%% edge_usd=$%.3f size=$%.2f mult=%.2f(%s) hold=%ss tx=%s",
                 pos.symbol,
                 pos.token_address,
+                pos.market_mode or "-",
+                pos.entry_tier or "-",
+                pos.entry_channel or "-",
                 pos.spent_eth,
                 pos.score,
                 pos.expected_edge_percent,
@@ -1438,11 +1817,32 @@ class AutoTrader:
                 pos.max_hold_seconds,
                 pos.buy_tx_hash,
             )
+            self._write_trade_decision(
+                {
+                    "ts": time.time(),
+                    "decision_stage": "trade_open",
+                    "decision": "open",
+                    "reason": "buy_live",
+                    "candidate_id": pos.candidate_id,
+                    "token_address": pos.token_address,
+                    "symbol": pos.symbol,
+                    "score": int(pos.score),
+                    "entry_tier": pos.entry_tier,
+                    "entry_channel": pos.entry_channel,
+                    "market_mode": pos.market_mode,
+                    "position_size_usd": float(pos.position_size_usd),
+                    "expected_edge_percent": float(pos.expected_edge_percent),
+                    "max_hold_seconds": int(pos.max_hold_seconds),
+                    "tx_hash": pos.buy_tx_hash,
+                }
+            )
+            self._active_trade_decision_context = None
             self._save_state()
             return pos
 
         pos = PaperPosition(
             token_address=token_address,
+            candidate_id=candidate_id,
             symbol=symbol,
             entry_price_usd=entry_price_usd,
             current_price_usd=entry_price_usd,
@@ -1459,9 +1859,14 @@ class AutoTrader:
             sell_cost_percent=cost_profile["sell_percent"],
             gas_cost_usd=cost_profile["gas_usd"],
             original_position_size_usd=position_size_usd,
+            market_mode=market_mode,
+            entry_tier=entry_tier,
+            entry_channel=entry_channel,
+            partial_tp_trigger_mult=regime_partial_tp_trigger_mult,
+            partial_tp_sell_mult=regime_partial_tp_sell_mult,
         )
 
-        self.open_positions[token_address] = pos
+        self._set_open_position(pos)
         self.total_plans += 1
         self.total_executed += 1
         self.trade_open_timestamps.append(datetime.now(timezone.utc).timestamp())
@@ -1469,9 +1874,12 @@ class AutoTrader:
         self.paper_balance_usd -= position_size_usd
 
         logger.info(
-            "AUTO_BUY Paper BUY token=%s address=%s entry=$%.8f size=$%.2f score=%s edge=%.2f%% edge_usd=$%.3f mult=%.2f(%s) hold=%ss costs=%.2f%% gas=$%.2f",
+            "AUTO_BUY Paper BUY token=%s address=%s mode=%s tier=%s channel=%s entry=$%.8f size=$%.2f score=%s edge=%.2f%% edge_usd=$%.3f mult=%.2f(%s) hold=%ss costs=%.2f%% gas=$%.2f",
             pos.symbol,
             pos.token_address,
+            pos.market_mode or "-",
+            pos.entry_tier or "-",
+            pos.entry_channel or "-",
             pos.entry_price_usd,
             pos.position_size_usd,
             pos.score,
@@ -1483,6 +1891,25 @@ class AutoTrader:
             pos.buy_cost_percent + pos.sell_cost_percent,
             pos.gas_cost_usd,
         )
+        self._write_trade_decision(
+            {
+                "ts": time.time(),
+                "decision_stage": "trade_open",
+                "decision": "open",
+                "reason": "buy_paper",
+                "candidate_id": pos.candidate_id,
+                "token_address": pos.token_address,
+                "symbol": pos.symbol,
+                "score": int(pos.score),
+                "entry_tier": pos.entry_tier,
+                "entry_channel": pos.entry_channel,
+                "market_mode": pos.market_mode,
+                "position_size_usd": float(pos.position_size_usd),
+                "expected_edge_percent": float(pos.expected_edge_percent),
+                "max_hold_seconds": int(pos.max_hold_seconds),
+            }
+        )
+        self._active_trade_decision_context = None
         self._save_state()
         return pos
 
@@ -1831,8 +2258,7 @@ class AutoTrader:
             position.sell_tx_hash = ""
             position.sell_tx_status = "failed"
 
-            self.open_positions.pop(position.token_address, None)
-            self.price_guard_pending.pop(position.token_address, None)
+            self._pop_open_position(position.token_address)
             self._recovery_forget_address(position.token_address)
             self.closed_positions.append(position)
             self._prune_closed_positions()
@@ -1924,8 +2350,7 @@ class AutoTrader:
         position.sell_tx_status = "confirmed"
         self._record_tx_event()
 
-        self.open_positions.pop(position.token_address, None)
-        self.price_guard_pending.pop(position.token_address, None)
+        self._pop_open_position(position.token_address)
         self._recovery_forget_address(position.token_address)
         self.closed_positions.append(position)
         self._prune_closed_positions()
@@ -1943,10 +2368,11 @@ class AutoTrader:
         else:
             self.current_loss_streak = 0
         self._risk_governor_after_close(close_reason=reason, pnl_usd=float(position.pnl_usd))
-
-        token_cooldown = int(config.MAX_TOKEN_COOLDOWN_SECONDS)
-        if token_cooldown > 0:
-            self.token_cooldowns[normalize_address(position.token_address)] = datetime.now(timezone.utc).timestamp() + token_cooldown
+        self._apply_token_cooldown_after_close(
+            token_address=position.token_address,
+            close_reason=reason,
+            pnl_usd=float(position.pnl_usd),
+        )
 
         logger.info(
             "AUTO_SELL Live SELL token=%s reason=%s recv=%.8f ETH pnl=%.2f%% ($%.2f) tx=%s",
@@ -1956,6 +2382,25 @@ class AutoTrader:
             position.pnl_percent,
             position.pnl_usd,
             position.sell_tx_hash,
+        )
+        self._write_trade_decision(
+            {
+                "ts": time.time(),
+                "decision_stage": "trade_close",
+                "decision": "close",
+                "reason": str(reason),
+                "candidate_id": str(position.candidate_id or ""),
+                "token_address": position.token_address,
+                "symbol": position.symbol,
+                "score": int(position.score),
+                "entry_tier": str(position.entry_tier or ""),
+                "entry_channel": str(position.entry_channel or ""),
+                "market_mode": str(position.market_mode or ""),
+                "pnl_percent": float(position.pnl_percent),
+                "pnl_usd": float(position.pnl_usd),
+                "max_hold_seconds": int(position.max_hold_seconds),
+                "closed_mode": "live",
+            }
         )
         self._save_state()
 
@@ -1999,8 +2444,7 @@ class AutoTrader:
         position.sell_tx_status = "simulated"
         self._record_tx_event()
 
-        self.open_positions.pop(position.token_address, None)
-        self.price_guard_pending.pop(position.token_address, None)
+        self._pop_open_position(position.token_address)
         self._recovery_forget_address(position.token_address)
         self.closed_positions.append(position)
         self._prune_closed_positions()
@@ -2021,10 +2465,11 @@ class AutoTrader:
         else:
             self.current_loss_streak = 0
         self._risk_governor_after_close(close_reason=reason, pnl_usd=float(total_pnl_usd))
-
-        token_cooldown = int(config.MAX_TOKEN_COOLDOWN_SECONDS)
-        if token_cooldown > 0:
-            self.token_cooldowns[normalize_address(position.token_address)] = datetime.now(timezone.utc).timestamp() + token_cooldown
+        self._apply_token_cooldown_after_close(
+            token_address=position.token_address,
+            close_reason=reason,
+            pnl_usd=float(total_pnl_usd),
+        )
 
         logger.info(
             "AUTO_SELL Paper SELL token=%s reason=%s exit=$%.8f pnl=%.2f%% ($%.2f) remaining=$%.2f partial=$%.2f raw=%.2f%% cost=%.2f%% gas=$%.2f balance=$%.2f",
@@ -2040,6 +2485,25 @@ class AutoTrader:
             position.gas_cost_usd,
             self.paper_balance_usd,
         )
+        self._write_trade_decision(
+            {
+                "ts": time.time(),
+                "decision_stage": "trade_close",
+                "decision": "close",
+                "reason": str(reason),
+                "candidate_id": str(position.candidate_id or ""),
+                "token_address": position.token_address,
+                "symbol": position.symbol,
+                "score": int(position.score),
+                "entry_tier": str(position.entry_tier or ""),
+                "entry_channel": str(position.entry_channel or ""),
+                "market_mode": str(position.market_mode or ""),
+                "pnl_percent": float(position.pnl_percent),
+                "pnl_usd": float(position.pnl_usd),
+                "max_hold_seconds": int(position.max_hold_seconds),
+                "closed_mode": "paper",
+            }
+        )
         self._save_state()
 
     def _maybe_partial_take_profit(self, position: PaperPosition, raw_price_pnl_percent: float) -> None:
@@ -2048,10 +2512,12 @@ class AutoTrader:
         if bool(position.partial_tp_done):
             return
         trigger = float(getattr(config, "PAPER_PARTIAL_TP_TRIGGER_PERCENT", 2.5) or 2.5)
+        trigger *= max(0.2, float(getattr(position, "partial_tp_trigger_mult", 1.0) or 1.0))
         if float(raw_price_pnl_percent) < trigger:
             return
 
         frac = float(getattr(config, "PAPER_PARTIAL_TP_SELL_FRACTION", 0.5) or 0.5)
+        frac *= max(0.2, float(getattr(position, "partial_tp_sell_mult", 1.0) or 1.0))
         frac = max(0.1, min(0.9, frac))
         if float(position.position_size_usd) <= 0.0:
             return
@@ -2105,6 +2571,23 @@ class AutoTrader:
             realized_slice_pnl,
             position.position_size_usd,
             float(position.stop_loss_percent),
+        )
+        self._write_trade_decision(
+            {
+                "ts": time.time(),
+                "decision_stage": "trade_partial",
+                "decision": "partial_take_profit",
+                "reason": "TP1_PARTIAL",
+                "candidate_id": str(position.candidate_id or ""),
+                "token_address": position.token_address,
+                "symbol": position.symbol,
+                "score": int(position.score),
+                "entry_tier": str(position.entry_tier or ""),
+                "entry_channel": str(position.entry_channel or ""),
+                "market_mode": str(position.market_mode or ""),
+                "partial_realized_pnl_usd": float(realized_slice_pnl),
+                "remaining_position_size_usd": float(position.position_size_usd),
+            }
         )
         self._save_state()
 
@@ -2349,6 +2832,7 @@ class AutoTrader:
             "stair_step_enabled": bool(config.STAIR_STEP_ENABLED),
             "stair_floor_usd": round(self.stair_floor_usd, 2),
             "stair_peak_balance_usd": round(self.stair_peak_balance_usd, 2),
+            "reinvest_mult": round(float(self._last_reinvest_mult), 4),
             "available_balance_usd": round(self._available_balance_usd(), 2),
             "emergency_halt_reason": self.emergency_halt_reason,
             "emergency_halt_ts": round(self.emergency_halt_ts, 2),
@@ -2369,6 +2853,8 @@ class AutoTrader:
         self.current_loss_streak = 0
         self.trading_pause_until_ts = 0.0
         self.token_cooldowns.clear()
+        self.token_cooldown_strikes.clear()
+        self.symbol_cooldowns.clear()
         self.trade_open_timestamps.clear()
         self.tx_event_timestamps.clear()
         self.price_guard_pending.clear()
@@ -2377,6 +2863,7 @@ class AutoTrader:
         self._live_sell_failures = 0
         self.stair_floor_usd = 0.0
         self.stair_peak_balance_usd = self.paper_balance_usd
+        self._last_reinvest_mult = 1.0
         self.open_positions.clear()
         if not keep_closed:
             self.closed_positions.clear()
@@ -2641,6 +3128,45 @@ class AutoTrader:
             "expected_percent": float(expected),
         }
 
+    def _reinvest_multiplier(self, expected_edge_percent: float) -> tuple[float, str]:
+        if not bool(getattr(config, "V2_REINVEST_ENABLED", False)):
+            self._last_reinvest_mult = 1.0
+            return 1.0, "off"
+
+        min_mult = max(0.2, float(getattr(config, "V2_REINVEST_MIN_MULT", 0.80) or 0.80))
+        max_mult = max(min_mult, float(getattr(config, "V2_REINVEST_MAX_MULT", 1.50) or 1.50))
+        growth_step_usd = max(0.05, float(getattr(config, "V2_REINVEST_GROWTH_STEP_USD", 0.60) or 0.60))
+        growth_step_mult = max(0.0, float(getattr(config, "V2_REINVEST_STEP_MULT", 0.05) or 0.05))
+        drawdown_cut_pct = max(0.0, float(getattr(config, "V2_REINVEST_DRAWDOWN_CUT_PERCENT", 2.5) or 2.5))
+        drawdown_mult = max(0.2, float(getattr(config, "V2_REINVEST_DRAWDOWN_MULT", 0.80) or 0.80))
+        loss_streak_step = max(0.0, float(getattr(config, "V2_REINVEST_LOSS_STREAK_STEP", 0.08) or 0.08))
+        high_edge_threshold = float(getattr(config, "V2_REINVEST_HIGH_EDGE_THRESHOLD_PERCENT", 1.40) or 1.40)
+        high_edge_bonus = max(0.0, float(getattr(config, "V2_REINVEST_HIGH_EDGE_BONUS", 0.06) or 0.06))
+
+        equity = float(self._equity_usd())
+        initial = max(0.01, float(self.initial_balance_usd or 0.01))
+        growth_usd = max(0.0, equity - initial)
+        growth_steps = int(growth_usd / growth_step_usd)
+        mult = 1.0 + (float(growth_steps) * growth_step_mult)
+
+        drawdown = float(self._risk_drawdown_percent())
+        if drawdown <= -abs(drawdown_cut_pct):
+            mult *= float(drawdown_mult)
+
+        if int(self.current_loss_streak) > 0 and loss_streak_step > 0:
+            mult *= max(0.35, 1.0 - (float(self.current_loss_streak) * loss_streak_step))
+
+        if float(expected_edge_percent) >= high_edge_threshold and high_edge_bonus > 0:
+            mult *= 1.0 + float(high_edge_bonus)
+
+        mult = max(min_mult, min(max_mult, mult))
+        self._last_reinvest_mult = float(mult)
+        detail = (
+            f"growth_steps={growth_steps} drawdown={drawdown:.2f}% "
+            f"loss_streak={self.current_loss_streak} edge={float(expected_edge_percent):.2f}%"
+        )
+        return float(mult), detail
+
     def _choose_position_size(self, expected_edge_percent: float) -> float:
         min_size = max(0.1, float(config.PAPER_TRADE_SIZE_MIN_USD))
         max_size = max(min_size, float(config.PAPER_TRADE_SIZE_MAX_USD))
@@ -2755,6 +3281,8 @@ class AutoTrader:
                 "day_start_equity_usd": self.day_start_equity_usd,
                 "day_realized_pnl_usd": self.day_realized_pnl_usd,
                 "token_cooldowns": self.token_cooldowns,
+                "token_cooldown_strikes": self.token_cooldown_strikes,
+                "symbol_cooldowns": self.symbol_cooldowns,
                 "trade_open_timestamps": self.trade_open_timestamps[-500:],
                 "tx_event_timestamps": self.tx_event_timestamps[-1000:],
                 "price_guard_pending": self.price_guard_pending,
@@ -2768,6 +3296,7 @@ class AutoTrader:
                 "emergency_halt_ts": self.emergency_halt_ts,
                 "stair_floor_usd": self.stair_floor_usd,
                 "stair_peak_balance_usd": self.stair_peak_balance_usd,
+                "last_reinvest_mult": self._last_reinvest_mult,
                 "live_start_ts": self.live_start_ts,
                 "live_start_balance_eth": self.live_start_balance_eth,
                 "live_start_balance_usd": self.live_start_balance_usd,
@@ -2815,6 +3344,18 @@ class AutoTrader:
             self.day_realized_pnl_usd = float(payload.get("day_realized_pnl_usd", 0.0))
             raw_cooldowns = payload.get("token_cooldowns", {}) or {}
             self.token_cooldowns = {normalize_address(str(k)): float(v) for k, v in raw_cooldowns.items() if normalize_address(str(k))}
+            raw_cooldown_strikes = payload.get("token_cooldown_strikes", {}) or {}
+            self.token_cooldown_strikes = {
+                normalize_address(str(k)): max(0, int(v))
+                for k, v in raw_cooldown_strikes.items()
+                if normalize_address(str(k))
+            }
+            raw_symbol_cooldowns = payload.get("symbol_cooldowns", {}) or {}
+            self.symbol_cooldowns = {
+                self._symbol_key(str(k)): float(v)
+                for k, v in raw_symbol_cooldowns.items()
+                if self._symbol_key(str(k))
+            }
             raw_trade_ts = payload.get("trade_open_timestamps", []) or []
             self.trade_open_timestamps = []
             for value in raw_trade_ts:
@@ -2886,13 +3427,14 @@ class AutoTrader:
                     except Exception:
                         continue
             self.data_policy_mode = str(payload.get("data_policy_mode", self.data_policy_mode) or "OK").upper()
-            if self.data_policy_mode not in {"OK", "DEGRADED", "FAIL_CLOSED"}:
+            if self.data_policy_mode not in {"OK", "DEGRADED", "FAIL_CLOSED", "LIMITED", "BLOCKED"}:
                 self.data_policy_mode = "OK"
             self.data_policy_reason = str(payload.get("data_policy_reason", self.data_policy_reason) or "")
             self.emergency_halt_reason = str(payload.get("emergency_halt_reason", "") or "")
             self.emergency_halt_ts = float(payload.get("emergency_halt_ts", 0.0) or 0.0)
             self.stair_floor_usd = float(payload.get("stair_floor_usd", self.stair_floor_usd))
             self.stair_peak_balance_usd = float(payload.get("stair_peak_balance_usd", self.paper_balance_usd))
+            self._last_reinvest_mult = float(payload.get("last_reinvest_mult", self._last_reinvest_mult) or 1.0)
             self.live_start_ts = float(payload.get("live_start_ts", self.live_start_ts) or 0.0)
             self.live_start_balance_eth = float(payload.get("live_start_balance_eth", self.live_start_balance_eth) or 0.0)
             self.live_start_balance_usd = float(payload.get("live_start_balance_usd", self.live_start_balance_usd) or 0.0)
@@ -2925,6 +3467,7 @@ class AutoTrader:
     def _serialize_pos(pos: PaperPosition) -> dict[str, Any]:
         return {
             "token_address": normalize_address(pos.token_address),
+            "candidate_id": pos.candidate_id,
             "symbol": pos.symbol,
             "entry_price_usd": pos.entry_price_usd,
             "current_price_usd": pos.current_price_usd,
@@ -2955,6 +3498,11 @@ class AutoTrader:
             "original_position_size_usd": pos.original_position_size_usd,
             "partial_tp_done": pos.partial_tp_done,
             "partial_realized_pnl_usd": pos.partial_realized_pnl_usd,
+            "market_mode": pos.market_mode,
+            "entry_tier": pos.entry_tier,
+            "entry_channel": pos.entry_channel,
+            "partial_tp_trigger_mult": pos.partial_tp_trigger_mult,
+            "partial_tp_sell_mult": pos.partial_tp_sell_mult,
         }
 
     @staticmethod
@@ -2971,6 +3519,7 @@ class AutoTrader:
                     closed_at = closed_at.replace(tzinfo=timezone.utc)
             return PaperPosition(
                 token_address=normalize_address(str(row.get("token_address", ""))),
+                candidate_id=str(row.get("candidate_id", "")),
                 symbol=str(row.get("symbol", "N/A")),
                 entry_price_usd=float(row.get("entry_price_usd", 0)),
                 current_price_usd=float(row.get("current_price_usd", 0)),
@@ -3001,6 +3550,11 @@ class AutoTrader:
                 original_position_size_usd=float(row.get("original_position_size_usd", row.get("position_size_usd", 0.0))),
                 partial_tp_done=bool(row.get("partial_tp_done", False)),
                 partial_realized_pnl_usd=float(row.get("partial_realized_pnl_usd", 0.0)),
+                market_mode=str(row.get("market_mode", "")),
+                entry_tier=str(row.get("entry_tier", "")),
+                entry_channel=str(row.get("entry_channel", "")),
+                partial_tp_trigger_mult=float(row.get("partial_tp_trigger_mult", 1.0) or 1.0),
+                partial_tp_sell_mult=float(row.get("partial_tp_sell_mult", 1.0) or 1.0),
             )
         except Exception:
             return None

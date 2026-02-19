@@ -29,9 +29,10 @@ Production-style desktop control + local engine for Base meme/alt token monitori
 
 - `main_local.py`
   - основной цикл сканирования/фильтрации/трейдинга,
-  - data-policy (OK / DEGRADED / FAIL_CLOSED),
+  - data-policy (OK / DEGRADED / FAIL_CLOSED / LIMITED / BLOCKED),
   - graceful stop,
-  - adaptive filters.
+  - adaptive filters,
+  - v2 runtime controllers (policy router / dual entry / rolling edge / KPI loop).
 
 - `monitor/*`
   - источники данных (Dex/Gecko/on-chain/watchlist),
@@ -73,8 +74,10 @@ Production-style desktop control + local engine for Base meme/alt token monitori
 
 Data policy режимы цикла:
 - `OK` — торгуем.
-- `DEGRADED` — наблюдаем/блок BUY (по условиям).
-- `FAIL_CLOSED` — BUY pause до восстановления источников.
+- `DEGRADED` — через `V2_POLICY_ROUTER_*` можно не стопать полностью, а резать поток (LIMITED).
+- `FAIL_CLOSED` — через `V2_POLICY_ROUTER_*` можно оставить только strict/core поток (LIMITED) или hard-block.
+- `BLOCKED` — явная блокировка входов.
+- `LIMITED` — ограниченный вход (квота/strict-only).
 
 SELL в paper/live не должен блокироваться тем же образом, чтобы не застревать в позиции.
 
@@ -162,6 +165,16 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\matrix_paper_stop.ps1 
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\matrix_paper_summary.ps1
 ```
 
+Pre-check перед LIVE (без запуска торговли):
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\live_precheck.ps1
+```
+
+Promote победителя matrix -> live (strict parity, без перетюна параметров):
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\matrix_promote_live.ps1 -ProfileId mx11_baseline_adapted
+```
+
 ## 6.2 Через GUI
 
 - `Matrix Start`
@@ -218,6 +231,24 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\matrix_paper_summary.p
 
 ---
 
+## 8.1 V2 runtime patch (актуально)
+
+Добавлены runtime-контроллеры:
+- `PolicyEntryRouter`:
+  - развязывает деградацию источников и полный стоп торговли,
+  - режимы `allow_all / limited / block` по policy-state.
+- `DualEntryController`:
+  - каналы входа `core` и `explore`,
+  - лимит доли `explore`, множители size/hold/edge для explore.
+- `RollingEdgeGovernor`:
+  - периодически двигает `MIN_EXPECTED_EDGE_USD/%` по свежим закрытиям и edge-low давлению.
+- `RuntimeKpiLoop`:
+  - подстраивает `MAX_BUYS_PER_HOUR`, `AUTO_TRADE_TOP_N`, explore-share и novelty-share по KPI окна.
+- `UniverseFlowController` (расширен):
+  - anti-repeat по символам (soft/hard cap + penalty/override), чтобы не застревать на одних токенах.
+
+---
+
 ## 9) Ключевые env блоки
 
 ## 9.1 Risk / throughput
@@ -257,6 +288,13 @@ TOKEN_SAFETY_FAIL_CLOSED=true
 DATA_POLICY_ENTER_STREAK=...
 DATA_POLICY_EXIT_STREAK=...
 DATA_POLICY_FAIL_CLOSED_*...
+DATA_POLICY_HARD_BLOCK_ENABLED=false
+V2_POLICY_ROUTER_ENABLED=true|false
+V2_POLICY_FAIL_CLOSED_ACTION=limited|block
+V2_POLICY_DEGRADED_ACTION=limited|block
+V2_POLICY_LIMITED_ENTRY_RATIO=...
+V2_POLICY_LIMITED_MIN_PER_CYCLE=...
+V2_POLICY_LIMITED_ONLY_STRICT=true|false
 ```
 
 ## 9.4 HTTP stability
@@ -280,6 +318,38 @@ ADAPTIVE_DEDUP_DYNAMIC_MAX=...
 ADAPTIVE_DEDUP_DYNAMIC_TARGET_PERCENTILE=...
 ADAPTIVE_DEDUP_DYNAMIC_FACTOR=...
 ADAPTIVE_DEDUP_DYNAMIC_MIN_SAMPLES=...
+```
+
+## 9.6 V2 entry / kpi / edge
+
+```env
+V2_ENTRY_DUAL_CHANNEL_ENABLED=true|false
+V2_ENTRY_EXPLORE_MAX_SHARE=...
+V2_ENTRY_EXPLORE_MAX_PER_CYCLE=...
+V2_ENTRY_CORE_MIN_PER_CYCLE=...
+V2_EXPLORE_EDGE_USD_MULT=...
+V2_EXPLORE_EDGE_PERCENT_MULT=...
+
+V2_ROLLING_EDGE_ENABLED=true|false
+V2_ROLLING_EDGE_INTERVAL_SECONDS=...
+V2_ROLLING_EDGE_MIN_CLOSED=...
+V2_ROLLING_EDGE_WINDOW_CLOSED=...
+
+V2_KPI_LOOP_ENABLED=true|false
+V2_KPI_LOOP_INTERVAL_SECONDS=...
+V2_KPI_LOOP_WINDOW_CYCLES=...
+V2_KPI_MAX_BUYS_CAP=...
+V2_KPI_TOPN_CAP=...
+```
+
+## 9.7 V2 universe anti-repeat
+
+```env
+V2_UNIVERSE_SYMBOL_REPEAT_WINDOW_SECONDS=...
+V2_UNIVERSE_SYMBOL_REPEAT_SOFT_CAP=...
+V2_UNIVERSE_SYMBOL_REPEAT_HARD_CAP=...
+V2_UNIVERSE_SYMBOL_REPEAT_PENALTY_MULT=...
+V2_UNIVERSE_SYMBOL_REPEAT_OVERRIDE_VOL_MULT=...
 ```
 
 ---
@@ -341,6 +411,8 @@ ADAPTIVE_DEDUP_DYNAMIC_MIN_SAMPLES=...
 - `tools/matrix_paper_launcher.ps1`
 - `tools/matrix_paper_stop.ps1`
 - `tools/matrix_paper_summary.ps1`
+- `trading/v2_runtime.py`
+- `tools/v2_dataset_calibrate.py`
 
 ---
 

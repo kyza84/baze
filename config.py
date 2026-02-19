@@ -249,6 +249,33 @@ MARKET_REGIME_MOMENTUM_CANDIDATES = float(os.getenv("MARKET_REGIME_MOMENTUM_CAND
 MARKET_REGIME_THIN_CANDIDATES = float(os.getenv("MARKET_REGIME_THIN_CANDIDATES", "0.8"))
 MARKET_REGIME_FAIL_CLOSED_RATIO = float(os.getenv("MARKET_REGIME_FAIL_CLOSED_RATIO", "20.0"))
 MARKET_REGIME_SOURCE_ERROR_PERCENT = float(os.getenv("MARKET_REGIME_SOURCE_ERROR_PERCENT", "20.0"))
+MARKET_MODE_ENTER_STREAK = max(1, int(os.getenv("MARKET_MODE_ENTER_STREAK", "2")))
+MARKET_MODE_EXIT_STREAK = max(1, int(os.getenv("MARKET_MODE_EXIT_STREAK", "3")))
+MARKET_MODE_OWNS_STRICTNESS = os.getenv("MARKET_MODE_OWNS_STRICTNESS", "true").lower() == "true"
+MARKET_MODE_STRICT_SCORE = max(0, int(os.getenv("MARKET_MODE_STRICT_SCORE", "78")))
+MARKET_MODE_SOFT_SCORE = max(0, int(os.getenv("MARKET_MODE_SOFT_SCORE", "70")))
+MARKET_MODE_YELLOW_SOFT_CAP_PER_CYCLE = max(0, int(os.getenv("MARKET_MODE_YELLOW_SOFT_CAP_PER_CYCLE", "2")))
+MARKET_MODE_GREEN_SCORE_DELTA = int(os.getenv("MARKET_MODE_GREEN_SCORE_DELTA", "0"))
+MARKET_MODE_YELLOW_SCORE_DELTA = int(os.getenv("MARKET_MODE_YELLOW_SCORE_DELTA", "1"))
+MARKET_MODE_RED_SCORE_DELTA = int(os.getenv("MARKET_MODE_RED_SCORE_DELTA", "3"))
+MARKET_MODE_GREEN_VOLUME_MULT = max(0.1, float(os.getenv("MARKET_MODE_GREEN_VOLUME_MULT", "1.00")))
+MARKET_MODE_YELLOW_VOLUME_MULT = max(0.1, float(os.getenv("MARKET_MODE_YELLOW_VOLUME_MULT", "1.10")))
+MARKET_MODE_RED_VOLUME_MULT = max(0.1, float(os.getenv("MARKET_MODE_RED_VOLUME_MULT", "1.30")))
+MARKET_MODE_GREEN_EDGE_MULT = max(0.5, float(os.getenv("MARKET_MODE_GREEN_EDGE_MULT", "1.00")))
+MARKET_MODE_YELLOW_EDGE_MULT = max(0.5, float(os.getenv("MARKET_MODE_YELLOW_EDGE_MULT", "1.08")))
+MARKET_MODE_RED_EDGE_MULT = max(0.5, float(os.getenv("MARKET_MODE_RED_EDGE_MULT", "1.20")))
+MARKET_MODE_GREEN_SIZE_MULT = max(0.1, float(os.getenv("MARKET_MODE_GREEN_SIZE_MULT", "1.00")))
+MARKET_MODE_YELLOW_SIZE_MULT = max(0.1, float(os.getenv("MARKET_MODE_YELLOW_SIZE_MULT", "0.80")))
+MARKET_MODE_RED_SIZE_MULT = max(0.1, float(os.getenv("MARKET_MODE_RED_SIZE_MULT", "0.55")))
+MARKET_MODE_GREEN_HOLD_MULT = max(0.1, float(os.getenv("MARKET_MODE_GREEN_HOLD_MULT", "1.00")))
+MARKET_MODE_YELLOW_HOLD_MULT = max(0.1, float(os.getenv("MARKET_MODE_YELLOW_HOLD_MULT", "0.80")))
+MARKET_MODE_RED_HOLD_MULT = max(0.1, float(os.getenv("MARKET_MODE_RED_HOLD_MULT", "0.60")))
+MARKET_MODE_GREEN_PARTIAL_TP_TRIGGER_MULT = max(0.2, float(os.getenv("MARKET_MODE_GREEN_PARTIAL_TP_TRIGGER_MULT", "1.00")))
+MARKET_MODE_YELLOW_PARTIAL_TP_TRIGGER_MULT = max(0.2, float(os.getenv("MARKET_MODE_YELLOW_PARTIAL_TP_TRIGGER_MULT", "0.90")))
+MARKET_MODE_RED_PARTIAL_TP_TRIGGER_MULT = max(0.2, float(os.getenv("MARKET_MODE_RED_PARTIAL_TP_TRIGGER_MULT", "0.75")))
+MARKET_MODE_GREEN_PARTIAL_TP_SELL_MULT = max(0.2, float(os.getenv("MARKET_MODE_GREEN_PARTIAL_TP_SELL_MULT", "1.00")))
+MARKET_MODE_YELLOW_PARTIAL_TP_SELL_MULT = max(0.2, float(os.getenv("MARKET_MODE_YELLOW_PARTIAL_TP_SELL_MULT", "1.20")))
+MARKET_MODE_RED_PARTIAL_TP_SELL_MULT = max(0.2, float(os.getenv("MARKET_MODE_RED_PARTIAL_TP_SELL_MULT", "1.40")))
 # Adaptive filters (paper calibration)
 ADAPTIVE_FILTERS_ENABLED = os.getenv("ADAPTIVE_FILTERS_ENABLED", "false").lower() == "true"
 ADAPTIVE_FILTERS_MODE = os.getenv("ADAPTIVE_FILTERS_MODE", "dry_run").strip().lower()  # off | dry_run | apply
@@ -380,6 +407,583 @@ AUTONOMOUS_CONTROL_DECISIONS_LOG_ENABLED = os.getenv("AUTONOMOUS_CONTROL_DECISIO
 AUTONOMOUS_CONTROL_DECISIONS_LOG_FILE = os.getenv(
     "AUTONOMOUS_CONTROL_DECISIONS_LOG_FILE",
     os.path.join("logs", "autonomy_decisions.jsonl"),
+)
+TRADE_DECISIONS_LOG_ENABLED = os.getenv("TRADE_DECISIONS_LOG_ENABLED", "true").lower() == "true"
+TRADE_DECISIONS_LOG_FILE = os.getenv(
+    "TRADE_DECISIONS_LOG_FILE",
+    os.path.join("logs", "trade_decisions.jsonl"),
+)
+
+# Strategy orchestrator (HARVEST/DEFENSE profile switching over existing adaptives).
+STRATEGY_ORCHESTRATOR_ENABLED = os.getenv("STRATEGY_ORCHESTRATOR_ENABLED", "false").lower() == "true"
+STRATEGY_ORCHESTRATOR_MODE = os.getenv("STRATEGY_ORCHESTRATOR_MODE", "dry_run").strip().lower()  # off | dry_run | apply
+STRATEGY_ORCHESTRATOR_LOCK_AUTONOMY_CONTROLS = (
+    os.getenv("STRATEGY_ORCHESTRATOR_LOCK_AUTONOMY_CONTROLS", "true").lower() == "true"
+)
+STRATEGY_ORCHESTRATOR_LOCK_ADAPTIVE_FILTERS = (
+    os.getenv("STRATEGY_ORCHESTRATOR_LOCK_ADAPTIVE_FILTERS", "true").lower() == "true"
+)
+STRATEGY_ORCHESTRATOR_INTERVAL_SECONDS = max(
+    60,
+    int(os.getenv("STRATEGY_ORCHESTRATOR_INTERVAL_SECONDS", "300")),
+)
+STRATEGY_ORCHESTRATOR_MIN_WINDOW_CYCLES = max(
+    1,
+    int(os.getenv("STRATEGY_ORCHESTRATOR_MIN_WINDOW_CYCLES", "2")),
+)
+STRATEGY_ORCHESTRATOR_COOLDOWN_WINDOWS = max(
+    0,
+    int(os.getenv("STRATEGY_ORCHESTRATOR_COOLDOWN_WINDOWS", "1")),
+)
+STRATEGY_ORCHESTRATOR_MIN_CLOSED_DELTA = max(
+    1,
+    int(os.getenv("STRATEGY_ORCHESTRATOR_MIN_CLOSED_DELTA", "6")),
+)
+STRATEGY_ORCHESTRATOR_DEFENSE_ENTER_STREAK = max(
+    1,
+    int(os.getenv("STRATEGY_ORCHESTRATOR_DEFENSE_ENTER_STREAK", "2")),
+)
+STRATEGY_ORCHESTRATOR_HARVEST_ENTER_STREAK = max(
+    1,
+    int(os.getenv("STRATEGY_ORCHESTRATOR_HARVEST_ENTER_STREAK", "2")),
+)
+STRATEGY_ORCHESTRATOR_DEFENSE_TRIGGER_AVG_PNL_PER_TRADE_USD = float(
+    os.getenv("STRATEGY_ORCHESTRATOR_DEFENSE_TRIGGER_AVG_PNL_PER_TRADE_USD", "-0.0020")
+)
+STRATEGY_ORCHESTRATOR_DEFENSE_TRIGGER_LOSS_SHARE = max(
+    0.0,
+    min(1.0, float(os.getenv("STRATEGY_ORCHESTRATOR_DEFENSE_TRIGGER_LOSS_SHARE", "0.62"))),
+)
+STRATEGY_ORCHESTRATOR_HARVEST_TRIGGER_AVG_PNL_PER_TRADE_USD = float(
+    os.getenv("STRATEGY_ORCHESTRATOR_HARVEST_TRIGGER_AVG_PNL_PER_TRADE_USD", "0.0010")
+)
+STRATEGY_ORCHESTRATOR_HARVEST_TRIGGER_LOSS_SHARE = max(
+    0.0,
+    min(1.0, float(os.getenv("STRATEGY_ORCHESTRATOR_HARVEST_TRIGGER_LOSS_SHARE", "0.45"))),
+)
+STRATEGY_ORCHESTRATOR_RED_FORCE_DEFENSE_ENABLED = (
+    os.getenv("STRATEGY_ORCHESTRATOR_RED_FORCE_DEFENSE_ENABLED", "true").lower() == "true"
+)
+STRATEGY_ORCHESTRATOR_RED_FORCE_DEFENSE_REALIZED_DELTA_USD = float(
+    os.getenv("STRATEGY_ORCHESTRATOR_RED_FORCE_DEFENSE_REALIZED_DELTA_USD", "-0.02")
+)
+STRATEGY_ORCHESTRATOR_INITIAL_PROFILE = os.getenv("STRATEGY_ORCHESTRATOR_INITIAL_PROFILE", "harvest").strip().lower()
+
+# Per-profile auto-stop (mainly for matrix): stop weak profiles early with explicit reason.
+PROFILE_AUTOSTOP_ENABLED = os.getenv("PROFILE_AUTOSTOP_ENABLED", "false").lower() == "true"
+PROFILE_AUTOSTOP_NOTIFY_ENABLED = os.getenv("PROFILE_AUTOSTOP_NOTIFY_ENABLED", "true").lower() == "true"
+PROFILE_AUTOSTOP_EVAL_INTERVAL_SECONDS = max(
+    30,
+    int(os.getenv("PROFILE_AUTOSTOP_EVAL_INTERVAL_SECONDS", "120")),
+)
+PROFILE_AUTOSTOP_MIN_RUNTIME_SECONDS = max(
+    60,
+    int(os.getenv("PROFILE_AUTOSTOP_MIN_RUNTIME_SECONDS", "3600")),
+)
+PROFILE_AUTOSTOP_MIN_CLOSED_TRADES = max(
+    1,
+    int(os.getenv("PROFILE_AUTOSTOP_MIN_CLOSED_TRADES", "24")),
+)
+PROFILE_AUTOSTOP_MIN_REALIZED_PNL_USD = float(
+    os.getenv("PROFILE_AUTOSTOP_MIN_REALIZED_PNL_USD", "0.00")
+)
+PROFILE_AUTOSTOP_MIN_AVG_PNL_PER_TRADE_USD = float(
+    os.getenv("PROFILE_AUTOSTOP_MIN_AVG_PNL_PER_TRADE_USD", "0.0005")
+)
+PROFILE_AUTOSTOP_MAX_LOSS_SHARE = max(
+    0.0,
+    min(1.0, float(os.getenv("PROFILE_AUTOSTOP_MAX_LOSS_SHARE", "0.58"))),
+)
+PROFILE_AUTOSTOP_MAX_DRAWDOWN_FROM_PEAK_USD = max(
+    0.0,
+    float(os.getenv("PROFILE_AUTOSTOP_MAX_DRAWDOWN_FROM_PEAK_USD", "0.18")),
+)
+PROFILE_AUTOSTOP_MIN_FAIL_SIGNALS = max(
+    1,
+    int(os.getenv("PROFILE_AUTOSTOP_MIN_FAIL_SIGNALS", "2")),
+)
+
+# V2 runtime controls
+V2_UNIVERSE_ENABLED = os.getenv("V2_UNIVERSE_ENABLED", "false").lower() == "true"
+V2_UNIVERSE_MAX_TOTAL_PER_CYCLE = max(
+    0,
+    int(os.getenv("V2_UNIVERSE_MAX_TOTAL_PER_CYCLE", "0")),
+)
+V2_UNIVERSE_NOVELTY_WINDOW_SECONDS = max(
+    60,
+    int(os.getenv("V2_UNIVERSE_NOVELTY_WINDOW_SECONDS", "1800")),
+)
+V2_UNIVERSE_NOVELTY_MIN_SHARE = max(
+    0.0,
+    min(1.0, float(os.getenv("V2_UNIVERSE_NOVELTY_MIN_SHARE", "0.30"))),
+)
+V2_UNIVERSE_NOVELTY_MIN_ABS = max(
+    0,
+    int(os.getenv("V2_UNIVERSE_NOVELTY_MIN_ABS", "2")),
+)
+V2_UNIVERSE_PASS_REPEAT_COOLDOWN_SECONDS = max(
+    0,
+    int(os.getenv("V2_UNIVERSE_PASS_REPEAT_COOLDOWN_SECONDS", "180")),
+)
+V2_UNIVERSE_PASS_REPEAT_OVERRIDE_VOL_MULT = max(
+    1.0,
+    float(os.getenv("V2_UNIVERSE_PASS_REPEAT_OVERRIDE_VOL_MULT", "2.2")),
+)
+V2_UNIVERSE_SOURCE_CAPS = os.getenv(
+    "V2_UNIVERSE_SOURCE_CAPS",
+    "onchain:120,onchain+market:120,dexscreener:100,geckoterminal:100,watchlist:35,dex_boosts:35",
+).strip()
+V2_UNIVERSE_SOURCE_WEIGHTS = os.getenv(
+    "V2_UNIVERSE_SOURCE_WEIGHTS",
+    "onchain:1.15,onchain+market:1.10,dexscreener:1.00,geckoterminal:1.05,watchlist:0.90,dex_boosts:1.10",
+).strip()
+V2_UNIVERSE_SYMBOL_REPEAT_WINDOW_SECONDS = max(
+    60,
+    int(os.getenv("V2_UNIVERSE_SYMBOL_REPEAT_WINDOW_SECONDS", "1800")),
+)
+V2_UNIVERSE_SYMBOL_REPEAT_SOFT_CAP = max(
+    0,
+    int(os.getenv("V2_UNIVERSE_SYMBOL_REPEAT_SOFT_CAP", "4")),
+)
+V2_UNIVERSE_SYMBOL_REPEAT_HARD_CAP = max(
+    V2_UNIVERSE_SYMBOL_REPEAT_SOFT_CAP,
+    int(os.getenv("V2_UNIVERSE_SYMBOL_REPEAT_HARD_CAP", "8")),
+)
+V2_UNIVERSE_SYMBOL_REPEAT_PENALTY_MULT = max(
+    0.10,
+    min(1.0, float(os.getenv("V2_UNIVERSE_SYMBOL_REPEAT_PENALTY_MULT", "0.72"))),
+)
+V2_UNIVERSE_SYMBOL_REPEAT_OVERRIDE_VOL_MULT = max(
+    1.0,
+    float(os.getenv("V2_UNIVERSE_SYMBOL_REPEAT_OVERRIDE_VOL_MULT", "2.5")),
+)
+
+V2_SAFETY_BUDGET_ENABLED = os.getenv("V2_SAFETY_BUDGET_ENABLED", "false").lower() == "true"
+V2_SAFETY_BUDGET_MAX_PER_CYCLE = max(
+    1,
+    int(os.getenv("V2_SAFETY_BUDGET_MAX_PER_CYCLE", "80")),
+)
+V2_SAFETY_BUDGET_PER_SOURCE = os.getenv(
+    "V2_SAFETY_BUDGET_PER_SOURCE",
+    "onchain:48,onchain+market:48,dexscreener:42,geckoterminal:42,watchlist:18,dex_boosts:18",
+).strip()
+
+V2_CALIBRATION_ENABLED = os.getenv("V2_CALIBRATION_ENABLED", "false").lower() == "true"
+V2_CALIBRATION_INTERVAL_SECONDS = max(
+    120,
+    int(os.getenv("V2_CALIBRATION_INTERVAL_SECONDS", "900")),
+)
+V2_CALIBRATION_MIN_CLOSED = max(
+    20,
+    int(os.getenv("V2_CALIBRATION_MIN_CLOSED", "120")),
+)
+V2_CALIBRATION_LOOKBACK_ROWS = max(
+    50,
+    int(os.getenv("V2_CALIBRATION_LOOKBACK_ROWS", "2000")),
+)
+V2_CALIBRATION_SMOOTH_ALPHA = max(
+    0.05,
+    min(1.0, float(os.getenv("V2_CALIBRATION_SMOOTH_ALPHA", "0.35"))),
+)
+V2_CALIBRATION_EDGE_USD_MIN = max(
+    0.0,
+    float(os.getenv("V2_CALIBRATION_EDGE_USD_MIN", "0.010")),
+)
+V2_CALIBRATION_EDGE_USD_MAX = max(
+    V2_CALIBRATION_EDGE_USD_MIN,
+    float(os.getenv("V2_CALIBRATION_EDGE_USD_MAX", "0.120")),
+)
+V2_CALIBRATION_VOLUME_MIN = max(
+    0.0,
+    float(os.getenv("V2_CALIBRATION_VOLUME_MIN", "20")),
+)
+V2_CALIBRATION_VOLUME_MAX = max(
+    V2_CALIBRATION_VOLUME_MIN,
+    float(os.getenv("V2_CALIBRATION_VOLUME_MAX", "450")),
+)
+V2_CALIBRATION_DB_PATH = os.getenv(
+    "V2_CALIBRATION_DB_PATH",
+    os.path.join("data", "unified_dataset", "unified.db"),
+)
+V2_CALIBRATION_OUTPUT_JSON = os.getenv(
+    "V2_CALIBRATION_OUTPUT_JSON",
+    os.path.join("data", "analysis", "v2_calibration_latest.json"),
+)
+
+V2_REINVEST_ENABLED = os.getenv("V2_REINVEST_ENABLED", "false").lower() == "true"
+V2_REINVEST_MIN_MULT = max(
+    0.2,
+    float(os.getenv("V2_REINVEST_MIN_MULT", "0.80")),
+)
+V2_REINVEST_MAX_MULT = max(
+    V2_REINVEST_MIN_MULT,
+    float(os.getenv("V2_REINVEST_MAX_MULT", "1.50")),
+)
+V2_REINVEST_GROWTH_STEP_USD = max(
+    0.05,
+    float(os.getenv("V2_REINVEST_GROWTH_STEP_USD", "0.60")),
+)
+V2_REINVEST_STEP_MULT = max(
+    0.0,
+    float(os.getenv("V2_REINVEST_STEP_MULT", "0.05")),
+)
+V2_REINVEST_DRAWDOWN_CUT_PERCENT = max(
+    0.0,
+    float(os.getenv("V2_REINVEST_DRAWDOWN_CUT_PERCENT", "2.5")),
+)
+V2_REINVEST_DRAWDOWN_MULT = max(
+    0.2,
+    float(os.getenv("V2_REINVEST_DRAWDOWN_MULT", "0.80")),
+)
+V2_REINVEST_LOSS_STREAK_STEP = max(
+    0.0,
+    float(os.getenv("V2_REINVEST_LOSS_STREAK_STEP", "0.08")),
+)
+V2_REINVEST_HIGH_EDGE_THRESHOLD_PERCENT = float(
+    os.getenv("V2_REINVEST_HIGH_EDGE_THRESHOLD_PERCENT", "1.40")
+)
+V2_REINVEST_HIGH_EDGE_BONUS = max(
+    0.0,
+    float(os.getenv("V2_REINVEST_HIGH_EDGE_BONUS", "0.06")),
+)
+
+V2_CHAMPION_GUARD_ENABLED = os.getenv("V2_CHAMPION_GUARD_ENABLED", "false").lower() == "true"
+V2_CHAMPION_GUARD_INTERVAL_SECONDS = max(
+    30,
+    int(os.getenv("V2_CHAMPION_GUARD_INTERVAL_SECONDS", "120")),
+)
+V2_CHAMPION_GUARD_MIN_RUNTIME_SECONDS = max(
+    180,
+    int(os.getenv("V2_CHAMPION_GUARD_MIN_RUNTIME_SECONDS", "3600")),
+)
+V2_CHAMPION_GUARD_MIN_CLOSED_TRADES = max(
+    1,
+    int(os.getenv("V2_CHAMPION_GUARD_MIN_CLOSED_TRADES", "20")),
+)
+V2_CHAMPION_GUARD_MAX_LAG_USD = max(
+    0.0,
+    float(os.getenv("V2_CHAMPION_GUARD_MAX_LAG_USD", "0.22")),
+)
+V2_CHAMPION_GUARD_FAIL_WINDOWS = max(
+    1,
+    int(os.getenv("V2_CHAMPION_GUARD_FAIL_WINDOWS", "3")),
+)
+V2_CHAMPION_GUARD_ACTIVE_MATRIX_PATH = os.getenv(
+    "V2_CHAMPION_GUARD_ACTIVE_MATRIX_PATH",
+    os.path.join("data", "matrix", "runs", "active_matrix.json"),
+)
+
+# V2 policy router: decouple data-quality policy from hard entry shutdown.
+V2_POLICY_ROUTER_ENABLED = os.getenv("V2_POLICY_ROUTER_ENABLED", "false").lower() == "true"
+V2_POLICY_FAIL_CLOSED_ACTION = os.getenv("V2_POLICY_FAIL_CLOSED_ACTION", "limited").strip().lower()  # limited|block
+V2_POLICY_DEGRADED_ACTION = os.getenv("V2_POLICY_DEGRADED_ACTION", "limited").strip().lower()  # limited|block
+V2_POLICY_LIMITED_ENTRY_RATIO = max(
+    0.05,
+    min(1.0, float(os.getenv("V2_POLICY_LIMITED_ENTRY_RATIO", "0.45"))),
+)
+V2_POLICY_LIMITED_MIN_PER_CYCLE = max(
+    1,
+    int(os.getenv("V2_POLICY_LIMITED_MIN_PER_CYCLE", "2")),
+)
+V2_POLICY_LIMITED_ONLY_STRICT = os.getenv("V2_POLICY_LIMITED_ONLY_STRICT", "true").lower() == "true"
+V2_POLICY_LIMITED_ALLOW_EXPLORE_IN_RED = os.getenv("V2_POLICY_LIMITED_ALLOW_EXPLORE_IN_RED", "false").lower() == "true"
+
+# Safety cache fallback for temporary safety API outages (does not bypass hard deny on truly unsafe tokens).
+V2_SAFETY_CACHE_FALLBACK_ENABLED = os.getenv("V2_SAFETY_CACHE_FALLBACK_ENABLED", "true").lower() == "true"
+V2_SAFETY_CACHE_TTL_SECONDS = max(
+    120,
+    int(os.getenv("V2_SAFETY_CACHE_TTL_SECONDS", "3600")),
+)
+V2_SAFETY_CACHE_ALLOWED_POLICY_MODES = [
+    x.strip().upper()
+    for x in os.getenv("V2_SAFETY_CACHE_ALLOWED_POLICY_MODES", "DEGRADED,FAIL_CLOSED").split(",")
+    if x.strip()
+]
+V2_SAFETY_CACHE_ALLOWED_RISKS = [
+    x.strip().upper()
+    for x in os.getenv("V2_SAFETY_CACHE_ALLOWED_RISKS", "LOW,MEDIUM").split(",")
+    if x.strip()
+]
+V2_SAFETY_CACHE_ALLOWED_SOURCES = [
+    x.strip().lower()
+    for x in os.getenv("V2_SAFETY_CACHE_ALLOWED_SOURCES", "watchlist,onchain+market").split(",")
+    if x.strip()
+]
+
+# Dual entry channels (core/explore): core keeps quality, explore keeps adaptation flow with reduced risk.
+V2_ENTRY_DUAL_CHANNEL_ENABLED = os.getenv("V2_ENTRY_DUAL_CHANNEL_ENABLED", "false").lower() == "true"
+V2_ENTRY_EXPLORE_MAX_SHARE = max(
+    0.0,
+    min(1.0, float(os.getenv("V2_ENTRY_EXPLORE_MAX_SHARE", "0.35"))),
+)
+V2_ENTRY_EXPLORE_MAX_PER_CYCLE = max(
+    0,
+    int(os.getenv("V2_ENTRY_EXPLORE_MAX_PER_CYCLE", "3")),
+)
+V2_ENTRY_EXPLORE_ALLOW_IN_RED = os.getenv("V2_ENTRY_EXPLORE_ALLOW_IN_RED", "false").lower() == "true"
+V2_ENTRY_CORE_MIN_PER_CYCLE = max(
+    0,
+    int(os.getenv("V2_ENTRY_CORE_MIN_PER_CYCLE", "1")),
+)
+V2_ENTRY_EXPLORE_SIZE_MULT = max(
+    0.10,
+    min(1.0, float(os.getenv("V2_ENTRY_EXPLORE_SIZE_MULT", "0.45"))),
+)
+V2_ENTRY_EXPLORE_HOLD_MULT = max(
+    0.20,
+    min(1.2, float(os.getenv("V2_ENTRY_EXPLORE_HOLD_MULT", "0.75"))),
+)
+
+# Rolling edge governor (continuous adaptation in runtime, not only from offline db calibration).
+V2_ROLLING_EDGE_ENABLED = os.getenv("V2_ROLLING_EDGE_ENABLED", "false").lower() == "true"
+V2_ROLLING_EDGE_INTERVAL_SECONDS = max(
+    60,
+    int(os.getenv("V2_ROLLING_EDGE_INTERVAL_SECONDS", "240")),
+)
+V2_ROLLING_EDGE_MIN_CLOSED = max(
+    10,
+    int(os.getenv("V2_ROLLING_EDGE_MIN_CLOSED", "24")),
+)
+V2_ROLLING_EDGE_WINDOW_CLOSED = max(
+    20,
+    int(os.getenv("V2_ROLLING_EDGE_WINDOW_CLOSED", "120")),
+)
+V2_ROLLING_EDGE_RELAX_STEP_USD = max(
+    0.0,
+    float(os.getenv("V2_ROLLING_EDGE_RELAX_STEP_USD", "0.0020")),
+)
+V2_ROLLING_EDGE_TIGHTEN_STEP_USD = max(
+    0.0,
+    float(os.getenv("V2_ROLLING_EDGE_TIGHTEN_STEP_USD", "0.0025")),
+)
+V2_ROLLING_EDGE_RELAX_STEP_PERCENT = max(
+    0.0,
+    float(os.getenv("V2_ROLLING_EDGE_RELAX_STEP_PERCENT", "0.08")),
+)
+V2_ROLLING_EDGE_TIGHTEN_STEP_PERCENT = max(
+    0.0,
+    float(os.getenv("V2_ROLLING_EDGE_TIGHTEN_STEP_PERCENT", "0.10")),
+)
+V2_ROLLING_EDGE_MIN_USD = max(
+    0.0,
+    float(os.getenv("V2_ROLLING_EDGE_MIN_USD", "0.008")),
+)
+V2_ROLLING_EDGE_MAX_USD = max(
+    V2_ROLLING_EDGE_MIN_USD,
+    float(os.getenv("V2_ROLLING_EDGE_MAX_USD", "0.120")),
+)
+V2_ROLLING_EDGE_MIN_PERCENT = max(
+    0.0,
+    float(os.getenv("V2_ROLLING_EDGE_MIN_PERCENT", "0.35")),
+)
+V2_ROLLING_EDGE_MAX_PERCENT = max(
+    V2_ROLLING_EDGE_MIN_PERCENT,
+    float(os.getenv("V2_ROLLING_EDGE_MAX_PERCENT", "3.20")),
+)
+V2_ROLLING_EDGE_EDGE_LOW_SHARE_RELAX = max(
+    0.0,
+    min(1.0, float(os.getenv("V2_ROLLING_EDGE_EDGE_LOW_SHARE_RELAX", "0.65"))),
+)
+V2_ROLLING_EDGE_LOSS_SHARE_TIGHTEN = max(
+    0.0,
+    min(1.0, float(os.getenv("V2_ROLLING_EDGE_LOSS_SHARE_TIGHTEN", "0.58"))),
+)
+V2_EXPLORE_EDGE_USD_MULT = max(
+    0.05,
+    float(os.getenv("V2_EXPLORE_EDGE_USD_MULT", "0.75")),
+)
+V2_EXPLORE_EDGE_PERCENT_MULT = max(
+    0.05,
+    float(os.getenv("V2_EXPLORE_EDGE_PERCENT_MULT", "0.80")),
+)
+
+# Runtime KPI loop (controls throughput/diversity and prevents dead zones).
+V2_KPI_LOOP_ENABLED = os.getenv("V2_KPI_LOOP_ENABLED", "false").lower() == "true"
+V2_KPI_LOOP_INTERVAL_SECONDS = max(
+    60,
+    int(os.getenv("V2_KPI_LOOP_INTERVAL_SECONDS", "300")),
+)
+V2_KPI_LOOP_WINDOW_CYCLES = max(
+    3,
+    int(os.getenv("V2_KPI_LOOP_WINDOW_CYCLES", "20")),
+)
+V2_KPI_EDGE_LOW_RELAX_TRIGGER = max(
+    0.0,
+    min(1.0, float(os.getenv("V2_KPI_EDGE_LOW_RELAX_TRIGGER", "0.70"))),
+)
+V2_KPI_OPEN_RATE_LOW_TRIGGER = max(
+    0.0,
+    float(os.getenv("V2_KPI_OPEN_RATE_LOW_TRIGGER", "0.03")),
+)
+V2_KPI_POLICY_BLOCK_TRIGGER = max(
+    0.0,
+    min(1.0, float(os.getenv("V2_KPI_POLICY_BLOCK_TRIGGER", "0.35"))),
+)
+V2_KPI_UNIQUE_SYMBOLS_MIN = max(
+    1,
+    int(os.getenv("V2_KPI_UNIQUE_SYMBOLS_MIN", "6")),
+)
+V2_KPI_MAX_BUYS_BOOST_STEP = max(
+    0,
+    int(os.getenv("V2_KPI_MAX_BUYS_BOOST_STEP", "4")),
+)
+V2_KPI_MAX_BUYS_CAP = max(
+    1,
+    int(os.getenv("V2_KPI_MAX_BUYS_CAP", "96")),
+)
+V2_KPI_TOPN_BOOST_STEP = max(
+    0,
+    int(os.getenv("V2_KPI_TOPN_BOOST_STEP", "1")),
+)
+V2_KPI_TOPN_CAP = max(
+    1,
+    int(os.getenv("V2_KPI_TOPN_CAP", "24")),
+)
+V2_KPI_EXPLORE_SHARE_STEP = max(
+    0.0,
+    min(0.30, float(os.getenv("V2_KPI_EXPLORE_SHARE_STEP", "0.03"))),
+)
+V2_KPI_EXPLORE_SHARE_MAX = max(
+    0.05,
+    min(1.0, float(os.getenv("V2_KPI_EXPLORE_SHARE_MAX", "0.55"))),
+)
+V2_KPI_NOVELTY_SHARE_STEP = max(
+    0.0,
+    min(0.30, float(os.getenv("V2_KPI_NOVELTY_SHARE_STEP", "0.03"))),
+)
+V2_KPI_NOVELTY_SHARE_MAX = max(
+    0.05,
+    min(1.0, float(os.getenv("V2_KPI_NOVELTY_SHARE_MAX", "0.60"))),
+)
+
+# Keep old behavior available for emergency rollback.
+DATA_POLICY_HARD_BLOCK_ENABLED = os.getenv("DATA_POLICY_HARD_BLOCK_ENABLED", "false").lower() == "true"
+
+_ORCH_BASE_MAX_OPEN = max(1, int(os.getenv("MAX_OPEN_TRADES", "3") or "3"))
+_ORCH_BASE_TOP_N = max(1, int(os.getenv("AUTO_TRADE_TOP_N", "10") or "10"))
+_ORCH_BASE_BUYS = max(1, int(os.getenv("MAX_BUYS_PER_HOUR", "24") or "24"))
+_ORCH_BASE_SIZE_MAX = max(0.05, float(os.getenv("PAPER_TRADE_SIZE_MAX_USD", "1.0") or "1.0"))
+_ORCH_BASE_HOLD_MAX = max(30, int(os.getenv("HOLD_MAX_SECONDS", os.getenv("PAPER_MAX_HOLD_SECONDS", "180")) or "180"))
+_ORCH_BASE_NM_AGE = max(1.0, float(os.getenv("NO_MOMENTUM_EXIT_MIN_AGE_PERCENT", "12") or "12"))
+_ORCH_BASE_NM_MAX_PNL = float(os.getenv("NO_MOMENTUM_EXIT_MAX_PNL_PERCENT", "0.3") or "0.3")
+_ORCH_BASE_WEAK_AGE = max(1.0, float(os.getenv("WEAKNESS_EXIT_MIN_AGE_PERCENT", "14") or "14"))
+_ORCH_BASE_WEAK_PNL = float(os.getenv("WEAKNESS_EXIT_PNL_PERCENT", "-2.6") or "-2.6")
+_ORCH_BASE_PARTIAL_TRIGGER = max(0.1, float(os.getenv("PAPER_PARTIAL_TP_TRIGGER_PERCENT", "1.2") or "1.2"))
+_ORCH_BASE_PARTIAL_FRAC = max(0.05, min(0.95, float(os.getenv("PAPER_PARTIAL_TP_SELL_FRACTION", "0.4") or "0.4")))
+
+STRATEGY_ORCHESTRATOR_HARVEST_MAX_OPEN_TRADES = max(
+    1,
+    int(os.getenv("STRATEGY_ORCHESTRATOR_HARVEST_MAX_OPEN_TRADES", str(_ORCH_BASE_MAX_OPEN))),
+)
+STRATEGY_ORCHESTRATOR_HARVEST_TOP_N = max(
+    1,
+    int(os.getenv("STRATEGY_ORCHESTRATOR_HARVEST_TOP_N", str(_ORCH_BASE_TOP_N))),
+)
+STRATEGY_ORCHESTRATOR_HARVEST_MAX_BUYS_PER_HOUR = max(
+    1,
+    int(os.getenv("STRATEGY_ORCHESTRATOR_HARVEST_MAX_BUYS_PER_HOUR", str(_ORCH_BASE_BUYS))),
+)
+STRATEGY_ORCHESTRATOR_HARVEST_TRADE_SIZE_MAX_USD = max(
+    0.05,
+    float(os.getenv("STRATEGY_ORCHESTRATOR_HARVEST_TRADE_SIZE_MAX_USD", f"{_ORCH_BASE_SIZE_MAX:.4f}")),
+)
+STRATEGY_ORCHESTRATOR_HARVEST_HOLD_MAX_SECONDS = max(
+    30,
+    int(os.getenv("STRATEGY_ORCHESTRATOR_HARVEST_HOLD_MAX_SECONDS", str(_ORCH_BASE_HOLD_MAX))),
+)
+STRATEGY_ORCHESTRATOR_HARVEST_NO_MOMENTUM_MIN_AGE_PERCENT = max(
+    1.0,
+    float(os.getenv("STRATEGY_ORCHESTRATOR_HARVEST_NO_MOMENTUM_MIN_AGE_PERCENT", f"{_ORCH_BASE_NM_AGE:.2f}")),
+)
+STRATEGY_ORCHESTRATOR_HARVEST_NO_MOMENTUM_MAX_PNL_PERCENT = float(
+    os.getenv("STRATEGY_ORCHESTRATOR_HARVEST_NO_MOMENTUM_MAX_PNL_PERCENT", f"{_ORCH_BASE_NM_MAX_PNL:.2f}")
+)
+STRATEGY_ORCHESTRATOR_HARVEST_WEAKNESS_MIN_AGE_PERCENT = max(
+    1.0,
+    float(os.getenv("STRATEGY_ORCHESTRATOR_HARVEST_WEAKNESS_MIN_AGE_PERCENT", f"{_ORCH_BASE_WEAK_AGE:.2f}")),
+)
+STRATEGY_ORCHESTRATOR_HARVEST_WEAKNESS_PNL_PERCENT = float(
+    os.getenv("STRATEGY_ORCHESTRATOR_HARVEST_WEAKNESS_PNL_PERCENT", f"{_ORCH_BASE_WEAK_PNL:.2f}")
+)
+STRATEGY_ORCHESTRATOR_HARVEST_PARTIAL_TP_TRIGGER_PERCENT = max(
+    0.1,
+    float(os.getenv("STRATEGY_ORCHESTRATOR_HARVEST_PARTIAL_TP_TRIGGER_PERCENT", f"{_ORCH_BASE_PARTIAL_TRIGGER:.2f}")),
+)
+STRATEGY_ORCHESTRATOR_HARVEST_PARTIAL_TP_SELL_FRACTION = max(
+    0.05,
+    min(
+        0.95,
+        float(os.getenv("STRATEGY_ORCHESTRATOR_HARVEST_PARTIAL_TP_SELL_FRACTION", f"{_ORCH_BASE_PARTIAL_FRAC:.3f}")),
+    ),
+)
+
+STRATEGY_ORCHESTRATOR_DEFENSE_MAX_OPEN_TRADES = max(
+    1,
+    int(os.getenv("STRATEGY_ORCHESTRATOR_DEFENSE_MAX_OPEN_TRADES", str(max(1, _ORCH_BASE_MAX_OPEN - 1)))),
+)
+STRATEGY_ORCHESTRATOR_DEFENSE_TOP_N = max(
+    1,
+    int(os.getenv("STRATEGY_ORCHESTRATOR_DEFENSE_TOP_N", str(max(1, _ORCH_BASE_TOP_N - 2)))),
+)
+STRATEGY_ORCHESTRATOR_DEFENSE_MAX_BUYS_PER_HOUR = max(
+    1,
+    int(os.getenv("STRATEGY_ORCHESTRATOR_DEFENSE_MAX_BUYS_PER_HOUR", str(max(1, int(_ORCH_BASE_BUYS * 0.7))))),
+)
+STRATEGY_ORCHESTRATOR_DEFENSE_TRADE_SIZE_MAX_USD = max(
+    0.05,
+    float(os.getenv("STRATEGY_ORCHESTRATOR_DEFENSE_TRADE_SIZE_MAX_USD", f"{max(0.05, _ORCH_BASE_SIZE_MAX * 0.85):.4f}")),
+)
+STRATEGY_ORCHESTRATOR_DEFENSE_HOLD_MAX_SECONDS = max(
+    30,
+    int(os.getenv("STRATEGY_ORCHESTRATOR_DEFENSE_HOLD_MAX_SECONDS", str(max(30, int(_ORCH_BASE_HOLD_MAX * 0.85))))),
+)
+STRATEGY_ORCHESTRATOR_DEFENSE_NO_MOMENTUM_MIN_AGE_PERCENT = max(
+    1.0,
+    float(
+        os.getenv(
+            "STRATEGY_ORCHESTRATOR_DEFENSE_NO_MOMENTUM_MIN_AGE_PERCENT",
+            f"{max(1.0, _ORCH_BASE_NM_AGE * 0.85):.2f}",
+        )
+    ),
+)
+STRATEGY_ORCHESTRATOR_DEFENSE_NO_MOMENTUM_MAX_PNL_PERCENT = float(
+    os.getenv(
+        "STRATEGY_ORCHESTRATOR_DEFENSE_NO_MOMENTUM_MAX_PNL_PERCENT",
+        f"{min(_ORCH_BASE_NM_MAX_PNL, 0.20):.2f}",
+    )
+)
+STRATEGY_ORCHESTRATOR_DEFENSE_WEAKNESS_MIN_AGE_PERCENT = max(
+    1.0,
+    float(
+        os.getenv(
+            "STRATEGY_ORCHESTRATOR_DEFENSE_WEAKNESS_MIN_AGE_PERCENT",
+            f"{max(1.0, _ORCH_BASE_WEAK_AGE * 0.9):.2f}",
+        )
+    ),
+)
+STRATEGY_ORCHESTRATOR_DEFENSE_WEAKNESS_PNL_PERCENT = float(
+    os.getenv("STRATEGY_ORCHESTRATOR_DEFENSE_WEAKNESS_PNL_PERCENT", f"{max(-8.0, _ORCH_BASE_WEAK_PNL + 0.8):.2f}")
+)
+STRATEGY_ORCHESTRATOR_DEFENSE_PARTIAL_TP_TRIGGER_PERCENT = max(
+    0.1,
+    float(
+        os.getenv(
+            "STRATEGY_ORCHESTRATOR_DEFENSE_PARTIAL_TP_TRIGGER_PERCENT",
+            f"{max(0.1, _ORCH_BASE_PARTIAL_TRIGGER * 0.9):.2f}",
+        )
+    ),
+)
+STRATEGY_ORCHESTRATOR_DEFENSE_PARTIAL_TP_SELL_FRACTION = max(
+    0.05,
+    min(
+        0.95,
+        float(
+            os.getenv(
+                "STRATEGY_ORCHESTRATOR_DEFENSE_PARTIAL_TP_SELL_FRACTION",
+                f"{min(0.95, _ORCH_BASE_PARTIAL_FRAC + 0.06):.3f}",
+            )
+        ),
+    ),
 )
 
 # Optional extra token flow sources
@@ -586,6 +1190,43 @@ LOW_BALANCE_GUARD_ENABLED = os.getenv("LOW_BALANCE_GUARD_ENABLED", "true").lower
 # Trade risk controls
 MAX_TOKEN_PRICE_CHANGE_5M_ABS_PERCENT = float(os.getenv("MAX_TOKEN_PRICE_CHANGE_5M_ABS_PERCENT", "35"))
 MAX_TOKEN_COOLDOWN_SECONDS = max(0, int(os.getenv("MAX_TOKEN_COOLDOWN_SECONDS", "600")))
+AUTO_TRADE_TOKEN_COOLDOWN_DYNAMIC_ENABLED = (
+    os.getenv("AUTO_TRADE_TOKEN_COOLDOWN_DYNAMIC_ENABLED", "true").lower() == "true"
+)
+AUTO_TRADE_TOKEN_COOLDOWN_STEP_SECONDS = max(
+    0,
+    int(os.getenv("AUTO_TRADE_TOKEN_COOLDOWN_STEP_SECONDS", "300")),
+)
+AUTO_TRADE_TOKEN_COOLDOWN_MAX_STRIKES = max(
+    1,
+    int(os.getenv("AUTO_TRADE_TOKEN_COOLDOWN_MAX_STRIKES", "4")),
+)
+AUTO_TRADE_TOKEN_COOLDOWN_RECOVERY_STEP = max(
+    1,
+    int(os.getenv("AUTO_TRADE_TOKEN_COOLDOWN_RECOVERY_STEP", "1")),
+)
+AUTO_TRADE_TOKEN_COOLDOWN_MAX_SECONDS = max(
+    MAX_TOKEN_COOLDOWN_SECONDS,
+    int(os.getenv("AUTO_TRADE_TOKEN_COOLDOWN_MAX_SECONDS", "3600")),
+)
+AUTO_TRADE_TOKEN_COOLDOWN_ESCALATE_REASONS = [
+    x.strip().upper()
+    for x in os.getenv(
+        "AUTO_TRADE_TOKEN_COOLDOWN_ESCALATE_REASONS",
+        "SL,NO_MOMENTUM,TIMEOUT,WEAKNESS,ABANDON",
+    ).split(",")
+    if x.strip()
+]
+SYMBOL_EV_GUARD_ENABLED = os.getenv("SYMBOL_EV_GUARD_ENABLED", "true").lower() == "true"
+SYMBOL_EV_WINDOW_MINUTES = max(10, int(os.getenv("SYMBOL_EV_WINDOW_MINUTES", "120")))
+SYMBOL_EV_MIN_TRADES = max(1, int(os.getenv("SYMBOL_EV_MIN_TRADES", "3")))
+SYMBOL_EV_MIN_AVG_PNL_USD = float(os.getenv("SYMBOL_EV_MIN_AVG_PNL_USD", "0.0005"))
+SYMBOL_EV_MAX_LOSS_SHARE = max(0.0, min(1.0, float(os.getenv("SYMBOL_EV_MAX_LOSS_SHARE", "0.60"))))
+SYMBOL_EV_BAD_TO_STRICT_ONLY = os.getenv("SYMBOL_EV_BAD_TO_STRICT_ONLY", "true").lower() == "true"
+SYMBOL_EV_BAD_COOLDOWN_SECONDS = max(0, int(os.getenv("SYMBOL_EV_BAD_COOLDOWN_SECONDS", "1200")))
+SYMBOL_FATIGUE_MAX_TRADES_PER_WINDOW = max(0, int(os.getenv("SYMBOL_FATIGUE_MAX_TRADES_PER_WINDOW", "4")))
+SYMBOL_FATIGUE_MAX_LOSS_STREAK = max(0, int(os.getenv("SYMBOL_FATIGUE_MAX_LOSS_STREAK", "3")))
+SYMBOL_FATIGUE_COOLDOWN_SECONDS = max(0, int(os.getenv("SYMBOL_FATIGUE_COOLDOWN_SECONDS", "1800")))
 # Cooldown after a stop-loss close to avoid immediate re-entries on the same token.
 AUTO_TRADE_SL_REENTRY_COOLDOWN_SECONDS = max(
     0,
