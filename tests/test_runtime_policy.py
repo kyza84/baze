@@ -83,6 +83,25 @@ class RuntimePolicyTests(ConfigPatchMixin, unittest.TestCase):
         self.assertEqual(risk2, 2)
         self.assertEqual(rec2, 0)
 
+    def test_market_mode_profile_reanchors_when_edge_drift_is_high(self) -> None:
+        self.patch_cfg(
+            V2_REGIME_REANCHOR_ENABLED=True,
+            V2_REGIME_REANCHOR_EDGE_REFERENCE_PERCENT=0.60,
+            V2_REGIME_REANCHOR_EDGE_REFERENCE_USD=0.010,
+            V2_REGIME_REANCHOR_SENSITIVITY=1.0,
+            V2_REGIME_REANCHOR_MAX_RELAX=0.50,
+            MIN_EXPECTED_EDGE_PERCENT=1.20,
+            MIN_EXPECTED_EDGE_USD=0.020,
+            MARKET_MODE_RED_SCORE_DELTA=4,
+            MARKET_MODE_RED_VOLUME_MULT=1.40,
+            MARKET_MODE_RED_EDGE_MULT=1.30,
+        )
+        profile = runtime_policy.market_mode_entry_profile("RED")
+        self.assertLessEqual(int(profile.get("score_delta", 0) or 0), 2)
+        self.assertLess(float(profile.get("volume_mult", 1.0) or 1.0), 1.40)
+        self.assertLess(float(profile.get("edge_mult", 1.0) or 1.0), 1.30)
+        self.assertGreater(float(profile.get("reanchor_relax", 0.0) or 0.0), 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

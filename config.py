@@ -577,6 +577,139 @@ V2_UNIVERSE_SYMBOL_REPEAT_OVERRIDE_VOL_MULT = max(
     1.0,
     float(os.getenv("V2_UNIVERSE_SYMBOL_REPEAT_OVERRIDE_VOL_MULT", "2.5")),
 )
+V2_UNIVERSE_SURGE_ENABLED = os.getenv("V2_UNIVERSE_SURGE_ENABLED", "false").lower() == "true"
+V2_UNIVERSE_SURGE_MIN_ABS_CHANGE_5M = max(
+    0.0,
+    float(os.getenv("V2_UNIVERSE_SURGE_MIN_ABS_CHANGE_5M", "4.0")),
+)
+V2_UNIVERSE_SURGE_MIN_VOLUME_5M_USD = max(
+    0.0,
+    float(os.getenv("V2_UNIVERSE_SURGE_MIN_VOLUME_5M_USD", "2500")),
+)
+V2_UNIVERSE_SURGE_MIN_VOL_TO_LIQ = max(
+    0.0,
+    float(os.getenv("V2_UNIVERSE_SURGE_MIN_VOL_TO_LIQ", "0.06")),
+)
+V2_UNIVERSE_SURGE_RESERVE_SHARE = max(
+    0.0,
+    min(0.50, float(os.getenv("V2_UNIVERSE_SURGE_RESERVE_SHARE", "0.22"))),
+)
+V2_UNIVERSE_SURGE_RESERVE_MIN_ABS = max(
+    0,
+    int(os.getenv("V2_UNIVERSE_SURGE_RESERVE_MIN_ABS", "2")),
+)
+V2_UNIVERSE_SURGE_SIZE_MULT = max(
+    0.10,
+    min(1.60, float(os.getenv("V2_UNIVERSE_SURGE_SIZE_MULT", "0.88"))),
+)
+V2_UNIVERSE_SURGE_HOLD_MULT = max(
+    0.20,
+    min(1.40, float(os.getenv("V2_UNIVERSE_SURGE_HOLD_MULT", "0.90"))),
+)
+V2_UNIVERSE_SURGE_EDGE_USD_MULT = max(
+    0.05,
+    min(1.80, float(os.getenv("V2_UNIVERSE_SURGE_EDGE_USD_MULT", "1.08"))),
+)
+V2_UNIVERSE_SURGE_EDGE_PERCENT_MULT = max(
+    0.05,
+    min(1.80, float(os.getenv("V2_UNIVERSE_SURGE_EDGE_PERCENT_MULT", "1.06"))),
+)
+
+# V2 quality gate: EV-first pool shaping (core/explore/cooldown) before entry routing.
+V2_QUALITY_GATE_ENABLED = os.getenv("V2_QUALITY_GATE_ENABLED", "false").lower() == "true"
+V2_QUALITY_REFRESH_SECONDS = max(
+    120,
+    int(os.getenv("V2_QUALITY_REFRESH_SECONDS", "1800")),
+)
+V2_QUALITY_WINDOW_SECONDS = max(
+    600,
+    int(os.getenv("V2_QUALITY_WINDOW_SECONDS", "14400")),
+)
+V2_QUALITY_MIN_SYMBOL_TRADES = max(
+    2,
+    int(os.getenv("V2_QUALITY_MIN_SYMBOL_TRADES", "12")),
+)
+V2_QUALITY_MIN_CLUSTER_TRADES = max(
+    2,
+    int(os.getenv("V2_QUALITY_MIN_CLUSTER_TRADES", "16")),
+)
+V2_QUALITY_MIN_AVG_PNL_USD = float(os.getenv("V2_QUALITY_MIN_AVG_PNL_USD", "0.0000"))
+V2_QUALITY_MAX_LOSS_SHARE = max(
+    0.0,
+    min(1.0, float(os.getenv("V2_QUALITY_MAX_LOSS_SHARE", "0.60"))),
+)
+V2_QUALITY_BAD_AVG_PNL_USD = float(os.getenv("V2_QUALITY_BAD_AVG_PNL_USD", "-0.0008"))
+V2_QUALITY_BAD_LOSS_SHARE = max(
+    0.0,
+    min(1.0, float(os.getenv("V2_QUALITY_BAD_LOSS_SHARE", "0.67"))),
+)
+V2_QUALITY_EXPLORE_MAX_SHARE = max(
+    0.0,
+    min(0.60, float(os.getenv("V2_QUALITY_EXPLORE_MAX_SHARE", "0.18"))),
+)
+V2_QUALITY_EXPLORE_MIN_ABS = max(
+    0,
+    int(os.getenv("V2_QUALITY_EXPLORE_MIN_ABS", "1")),
+)
+V2_QUALITY_COOLDOWN_PROBE_PROBABILITY = max(
+    0.0,
+    min(1.0, float(os.getenv("V2_QUALITY_COOLDOWN_PROBE_PROBABILITY", "0.15"))),
+)
+V2_QUALITY_COOLDOWN_SIZE_MULT = max(
+    0.05,
+    min(1.0, float(os.getenv("V2_QUALITY_COOLDOWN_SIZE_MULT", "0.55"))),
+)
+V2_QUALITY_COOLDOWN_HOLD_MULT = max(
+    0.10,
+    min(1.2, float(os.getenv("V2_QUALITY_COOLDOWN_HOLD_MULT", "0.75"))),
+)
+V2_QUALITY_COOLDOWN_EDGE_USD_MULT = max(
+    0.05,
+    float(os.getenv("V2_QUALITY_COOLDOWN_EDGE_USD_MULT", "1.35")),
+)
+V2_QUALITY_COOLDOWN_EDGE_PERCENT_MULT = max(
+    0.05,
+    float(os.getenv("V2_QUALITY_COOLDOWN_EDGE_PERCENT_MULT", "1.30")),
+)
+V2_QUALITY_SYMBOL_CONCENTRATION_WINDOW_SECONDS = max(
+    300,
+    int(os.getenv("V2_QUALITY_SYMBOL_CONCENTRATION_WINDOW_SECONDS", "3600")),
+)
+V2_QUALITY_SYMBOL_MAX_SHARE = max(
+    0.02,
+    min(0.50, float(os.getenv("V2_QUALITY_SYMBOL_MAX_SHARE", "0.10"))),
+)
+V2_QUALITY_SYMBOL_MIN_ABS_CAP = max(
+    1,
+    int(os.getenv("V2_QUALITY_SYMBOL_MIN_ABS_CAP", "2")),
+)
+V2_QUALITY_SOURCE_BUDGET_ENABLED = os.getenv("V2_QUALITY_SOURCE_BUDGET_ENABLED", "true").lower() == "true"
+V2_QUALITY_SOURCE_MIN_TRADES = max(
+    2,
+    int(os.getenv("V2_QUALITY_SOURCE_MIN_TRADES", "10")),
+)
+V2_QUALITY_SOURCE_WINDOW_SECONDS = max(
+    600,
+    int(os.getenv("V2_QUALITY_SOURCE_WINDOW_SECONDS", "14400")),
+)
+V2_QUALITY_SOURCE_GOOD_AVG_PNL_USD = float(os.getenv("V2_QUALITY_SOURCE_GOOD_AVG_PNL_USD", "0.0020"))
+V2_QUALITY_SOURCE_BAD_AVG_PNL_USD = float(os.getenv("V2_QUALITY_SOURCE_BAD_AVG_PNL_USD", "-0.0015"))
+V2_QUALITY_SOURCE_BOOST_MULT = max(
+    0.50,
+    float(os.getenv("V2_QUALITY_SOURCE_BOOST_MULT", "1.28")),
+)
+V2_QUALITY_SOURCE_CUT_MULT = max(
+    0.10,
+    min(1.0, float(os.getenv("V2_QUALITY_SOURCE_CUT_MULT", "0.62"))),
+)
+V2_QUALITY_SOURCE_MIN_SHARE = max(
+    0.0,
+    min(0.40, float(os.getenv("V2_QUALITY_SOURCE_MIN_SHARE", "0.08"))),
+)
+V2_QUALITY_LOG_TOP_SYMBOLS = max(
+    1,
+    int(os.getenv("V2_QUALITY_LOG_TOP_SYMBOLS", "8")),
+)
 
 V2_SAFETY_BUDGET_ENABLED = os.getenv("V2_SAFETY_BUDGET_ENABLED", "false").lower() == "true"
 V2_SAFETY_BUDGET_MAX_PER_CYCLE = max(
@@ -1347,11 +1480,76 @@ SYMBOL_EV_WINDOW_MINUTES = max(10, int(os.getenv("SYMBOL_EV_WINDOW_MINUTES", "12
 SYMBOL_EV_MIN_TRADES = max(1, int(os.getenv("SYMBOL_EV_MIN_TRADES", "3")))
 SYMBOL_EV_MIN_AVG_PNL_USD = float(os.getenv("SYMBOL_EV_MIN_AVG_PNL_USD", "0.0005"))
 SYMBOL_EV_MAX_LOSS_SHARE = max(0.0, min(1.0, float(os.getenv("SYMBOL_EV_MAX_LOSS_SHARE", "0.60"))))
+# `skip` hard-blocks bad symbol EV; `degrade` keeps symbol tradable with EV-memory penalties.
+SYMBOL_EV_BAD_ACTION = str(os.getenv("SYMBOL_EV_BAD_ACTION", "degrade") or "degrade").strip().lower()
 SYMBOL_EV_BAD_TO_STRICT_ONLY = os.getenv("SYMBOL_EV_BAD_TO_STRICT_ONLY", "true").lower() == "true"
 SYMBOL_EV_BAD_COOLDOWN_SECONDS = max(0, int(os.getenv("SYMBOL_EV_BAD_COOLDOWN_SECONDS", "1200")))
 SYMBOL_FATIGUE_MAX_TRADES_PER_WINDOW = max(0, int(os.getenv("SYMBOL_FATIGUE_MAX_TRADES_PER_WINDOW", "4")))
 SYMBOL_FATIGUE_MAX_LOSS_STREAK = max(0, int(os.getenv("SYMBOL_FATIGUE_MAX_LOSS_STREAK", "3")))
 SYMBOL_FATIGUE_COOLDOWN_SECONDS = max(0, int(os.getenv("SYMBOL_FATIGUE_COOLDOWN_SECONDS", "1800")))
+
+# EV-core (entry/sizing/exit) controls.
+EV_FIRST_ENTRY_ENABLED = os.getenv("EV_FIRST_ENTRY_ENABLED", "true").lower() == "true"
+EV_FIRST_ENTRY_MIN_SAMPLES = max(5, int(os.getenv("EV_FIRST_ENTRY_MIN_SAMPLES", "24")))
+EV_FIRST_ENTRY_MIN_NET_USD = float(os.getenv("EV_FIRST_ENTRY_MIN_NET_USD", "0.0010"))
+EV_FIRST_ENTRY_MIN_NET_USD_GREEN_MULT = max(0.2, float(os.getenv("EV_FIRST_ENTRY_MIN_NET_USD_GREEN_MULT", "1.00")))
+EV_FIRST_ENTRY_MIN_NET_USD_YELLOW_MULT = max(0.2, float(os.getenv("EV_FIRST_ENTRY_MIN_NET_USD_YELLOW_MULT", "1.08")))
+EV_FIRST_ENTRY_MIN_NET_USD_RED_MULT = max(0.2, float(os.getenv("EV_FIRST_ENTRY_MIN_NET_USD_RED_MULT", "1.20")))
+EV_FIRST_ENTRY_MIN_NET_USD_EXPLORE_MULT = max(0.2, float(os.getenv("EV_FIRST_ENTRY_MIN_NET_USD_EXPLORE_MULT", "1.20")))
+EV_FIRST_ENTRY_FALLBACK_WEIGHT_MAX = max(0.0, min(1.0, float(os.getenv("EV_FIRST_ENTRY_FALLBACK_WEIGHT_MAX", "0.70"))))
+EV_FIRST_ENTRY_COST_HAIRCUT_USD = max(0.0, float(os.getenv("EV_FIRST_ENTRY_COST_HAIRCUT_USD", "0.0005")))
+EV_FIRST_ENTRY_LOCAL_WINDOW_MINUTES = max(30, int(os.getenv("EV_FIRST_ENTRY_LOCAL_WINDOW_MINUTES", "360")))
+EV_FIRST_ENTRY_DB_LOOKBACK_ROWS = max(100, int(os.getenv("EV_FIRST_ENTRY_DB_LOOKBACK_ROWS", "2500")))
+EV_FIRST_ENTRY_DB_BUCKET_SCORE_WIDTH = max(5, int(os.getenv("EV_FIRST_ENTRY_DB_BUCKET_SCORE_WIDTH", "10")))
+EV_FIRST_ENTRY_DB_CACHE_TTL_SECONDS = max(10, int(os.getenv("EV_FIRST_ENTRY_DB_CACHE_TTL_SECONDS", "90")))
+EV_FIRST_ENTRY_DB_PATH = str(
+    os.getenv(
+        "EV_FIRST_ENTRY_DB_PATH",
+        os.getenv("V2_CALIBRATION_DB_PATH", os.path.join("data", "unified_dataset", "unified.db")),
+    )
+    or os.path.join("data", "unified_dataset", "unified.db")
+)
+
+KELLY_LITE_ENABLED = os.getenv("KELLY_LITE_ENABLED", "true").lower() == "true"
+KELLY_LITE_MIN_MULT = max(0.10, float(os.getenv("KELLY_LITE_MIN_MULT", "0.55")))
+KELLY_LITE_MAX_MULT = max(KELLY_LITE_MIN_MULT, float(os.getenv("KELLY_LITE_MAX_MULT", "1.55")))
+KELLY_LITE_MAX_FRACTION = max(0.05, min(1.0, float(os.getenv("KELLY_LITE_MAX_FRACTION", "0.45"))))
+KELLY_LITE_MIN_CONFIDENCE_SAMPLES = max(5, int(os.getenv("KELLY_LITE_MIN_CONFIDENCE_SAMPLES", "18")))
+
+TOKEN_EV_MEMORY_ENABLED = os.getenv("TOKEN_EV_MEMORY_ENABLED", "true").lower() == "true"
+TOKEN_EV_MEMORY_MIN_TRADES = max(2, int(os.getenv("TOKEN_EV_MEMORY_MIN_TRADES", "4")))
+TOKEN_EV_MEMORY_BAD_AVG_PNL_USD = float(os.getenv("TOKEN_EV_MEMORY_BAD_AVG_PNL_USD", "0.0002"))
+TOKEN_EV_MEMORY_BAD_LOSS_SHARE = max(0.0, min(1.0, float(os.getenv("TOKEN_EV_MEMORY_BAD_LOSS_SHARE", "0.62"))))
+TOKEN_EV_MEMORY_SEVERE_AVG_PNL_USD = float(os.getenv("TOKEN_EV_MEMORY_SEVERE_AVG_PNL_USD", "-0.0018"))
+TOKEN_EV_MEMORY_SEVERE_LOSS_SHARE = max(0.0, min(1.0, float(os.getenv("TOKEN_EV_MEMORY_SEVERE_LOSS_SHARE", "0.72"))))
+TOKEN_EV_MEMORY_BAD_SIZE_MULT = max(0.05, float(os.getenv("TOKEN_EV_MEMORY_BAD_SIZE_MULT", "0.78")))
+TOKEN_EV_MEMORY_SEVERE_SIZE_MULT = max(0.05, float(os.getenv("TOKEN_EV_MEMORY_SEVERE_SIZE_MULT", "0.58")))
+TOKEN_EV_MEMORY_BAD_EDGE_MULT = max(0.20, float(os.getenv("TOKEN_EV_MEMORY_BAD_EDGE_MULT", "1.12")))
+TOKEN_EV_MEMORY_SEVERE_EDGE_MULT = max(0.20, float(os.getenv("TOKEN_EV_MEMORY_SEVERE_EDGE_MULT", "1.28")))
+TOKEN_EV_MEMORY_BAD_ENTRY_PROBABILITY = max(0.0, min(1.0, float(os.getenv("TOKEN_EV_MEMORY_BAD_ENTRY_PROBABILITY", "0.72"))))
+TOKEN_EV_MEMORY_SEVERE_ENTRY_PROBABILITY = max(0.0, min(1.0, float(os.getenv("TOKEN_EV_MEMORY_SEVERE_ENTRY_PROBABILITY", "0.42"))))
+
+ASYMMETRIC_EXITS_ENABLED = os.getenv("ASYMMETRIC_EXITS_ENABLED", "true").lower() == "true"
+ASYM_PRE_PARTIAL_RISK_ENABLED = os.getenv("ASYM_PRE_PARTIAL_RISK_ENABLED", "true").lower() == "true"
+ASYM_PRE_PARTIAL_MIN_AGE_SECONDS = max(0, int(os.getenv("ASYM_PRE_PARTIAL_MIN_AGE_SECONDS", "24")))
+ASYM_PRE_PARTIAL_MAX_PEAK_PERCENT = float(os.getenv("ASYM_PRE_PARTIAL_MAX_PEAK_PERCENT", "0.90"))
+ASYM_PRE_PARTIAL_MAX_LOSS_PERCENT = float(os.getenv("ASYM_PRE_PARTIAL_MAX_LOSS_PERCENT", "-1.35"))
+ASYM_POST_PARTIAL_PROTECT_ENABLED = os.getenv("ASYM_POST_PARTIAL_PROTECT_ENABLED", "true").lower() == "true"
+ASYM_POST_PARTIAL_MIN_PEAK_PERCENT = float(os.getenv("ASYM_POST_PARTIAL_MIN_PEAK_PERCENT", "0.80"))
+ASYM_POST_PARTIAL_PROTECT_MIN_FLOOR_PERCENT = float(os.getenv("ASYM_POST_PARTIAL_PROTECT_MIN_FLOOR_PERCENT", "0.12"))
+ASYM_POST_PARTIAL_PROTECT_GIVEBACK_PERCENT = max(0.0, float(os.getenv("ASYM_POST_PARTIAL_PROTECT_GIVEBACK_PERCENT", "0.55")))
+
+V2_REGIME_REANCHOR_ENABLED = os.getenv("V2_REGIME_REANCHOR_ENABLED", "true").lower() == "true"
+V2_REGIME_REANCHOR_EDGE_REFERENCE_PERCENT = max(
+    0.05,
+    float(os.getenv("V2_REGIME_REANCHOR_EDGE_REFERENCE_PERCENT", f"{MIN_EXPECTED_EDGE_PERCENT:.4f}")),
+)
+V2_REGIME_REANCHOR_EDGE_REFERENCE_USD = max(
+    0.0005,
+    float(os.getenv("V2_REGIME_REANCHOR_EDGE_REFERENCE_USD", f"{MIN_EXPECTED_EDGE_USD:.6f}")),
+)
+V2_REGIME_REANCHOR_SENSITIVITY = max(0.0, float(os.getenv("V2_REGIME_REANCHOR_SENSITIVITY", "0.85")))
+V2_REGIME_REANCHOR_MAX_RELAX = max(0.0, min(0.8, float(os.getenv("V2_REGIME_REANCHOR_MAX_RELAX", "0.45"))))
 # Cooldown after a stop-loss close to avoid immediate re-entries on the same token.
 AUTO_TRADE_SL_REENTRY_COOLDOWN_SECONDS = max(
     0,
@@ -1382,6 +1580,19 @@ RISK_GOVERNOR_DRAWDOWN_PAUSE_SECONDS = max(
 # Default is false to avoid deadlocks where trading never resumes without manual intervention.
 RISK_GOVERNOR_HARD_BLOCK_ON_STREAK = os.getenv("RISK_GOVERNOR_HARD_BLOCK_ON_STREAK", "false").lower() == "true"
 RISK_GOVERNOR_LOG_INTERVAL_SECONDS = max(5, int(os.getenv("RISK_GOVERNOR_LOG_INTERVAL_SECONDS", "30")))
+SESSION_PROFIT_LOCK_ENABLED = os.getenv("SESSION_PROFIT_LOCK_ENABLED", "false").lower() == "true"
+SESSION_PROFIT_LOCK_ACTIVATE_USD = float(os.getenv("SESSION_PROFIT_LOCK_ACTIVATE_USD", "0.35"))
+SESSION_PROFIT_LOCK_KEEP_RATIO = max(
+    0.0,
+    min(1.0, float(os.getenv("SESSION_PROFIT_LOCK_KEEP_RATIO", "0.55"))),
+)
+SESSION_PROFIT_LOCK_MIN_FLOOR_USD = float(os.getenv("SESSION_PROFIT_LOCK_MIN_FLOOR_USD", "0.10"))
+SESSION_PROFIT_LOCK_PAUSE_SECONDS = max(0, int(os.getenv("SESSION_PROFIT_LOCK_PAUSE_SECONDS", "900")))
+ANTI_CHOKE_ENABLED = os.getenv("ANTI_CHOKE_ENABLED", "true").lower() == "true"
+ANTI_CHOKE_IDLE_SECONDS = max(30, int(os.getenv("ANTI_CHOKE_IDLE_SECONDS", "1800")))
+ANTI_CHOKE_ALLOW_SYMBOL_COOLDOWN_BYPASS = os.getenv("ANTI_CHOKE_ALLOW_SYMBOL_COOLDOWN_BYPASS", "true").lower() == "true"
+ANTI_CHOKE_ALLOW_SYMBOL_FATIGUE_BYPASS = os.getenv("ANTI_CHOKE_ALLOW_SYMBOL_FATIGUE_BYPASS", "true").lower() == "true"
+ANTI_CHOKE_ALLOW_SYMBOL_STRICT_BYPASS = os.getenv("ANTI_CHOKE_ALLOW_SYMBOL_STRICT_BYPASS", "true").lower() == "true"
 
 GOPLUS_EVM_API = os.getenv(
     "GOPLUS_EVM_API",

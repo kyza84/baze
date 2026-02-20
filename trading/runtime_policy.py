@@ -7,6 +7,42 @@ from typing import Any
 import config
 
 
+def _apply_regime_reanchor(profile: dict[str, float | int | bool]) -> dict[str, float | int | bool]:
+    out = dict(profile or {})
+    if not bool(getattr(config, "V2_REGIME_REANCHOR_ENABLED", True)):
+        return out
+
+    ref_pct = max(
+        0.0001,
+        float(getattr(config, "V2_REGIME_REANCHOR_EDGE_REFERENCE_PERCENT", getattr(config, "MIN_EXPECTED_EDGE_PERCENT", 0.1)) or 0.1),
+    )
+    ref_usd = max(
+        0.000001,
+        float(getattr(config, "V2_REGIME_REANCHOR_EDGE_REFERENCE_USD", getattr(config, "MIN_EXPECTED_EDGE_USD", 0.001)) or 0.001),
+    )
+    current_pct = max(0.0, float(getattr(config, "MIN_EXPECTED_EDGE_PERCENT", ref_pct) or ref_pct))
+    current_usd = max(0.0, float(getattr(config, "MIN_EXPECTED_EDGE_USD", ref_usd) or ref_usd))
+    drift_pct = max(0.0, (current_pct / ref_pct) - 1.0)
+    drift_usd = max(0.0, (current_usd / ref_usd) - 1.0)
+    drift = max(drift_pct, drift_usd)
+    sensitivity = max(0.0, float(getattr(config, "V2_REGIME_REANCHOR_SENSITIVITY", 0.85) or 0.85))
+    max_relax = max(0.0, min(0.8, float(getattr(config, "V2_REGIME_REANCHOR_MAX_RELAX", 0.45) or 0.45)))
+    relax = max(0.0, min(max_relax, drift * sensitivity))
+    if relax <= 0.0:
+        return out
+
+    def _towards_one(value: float) -> float:
+        return 1.0 + ((float(value) - 1.0) * (1.0 - relax))
+
+    score_delta = int(out.get("score_delta", 0) or 0)
+    if score_delta > 0:
+        out["score_delta"] = max(0, int(round(float(score_delta) * (1.0 - relax))))
+    out["volume_mult"] = max(0.10, _towards_one(float(out.get("volume_mult", 1.0) or 1.0)))
+    out["edge_mult"] = max(0.10, _towards_one(float(out.get("edge_mult", 1.0) or 1.0)))
+    out["reanchor_relax"] = float(relax)
+    return out
+
+
 def policy_state(
     *,
     source_stats: dict[str, dict[str, int | float]],
@@ -101,7 +137,8 @@ def detect_market_regime(
 def market_mode_entry_profile(market_mode: str) -> dict[str, float | int | bool]:
     mode = str(market_mode or "YELLOW").strip().upper()
     if mode == "GREEN":
-        return {
+        return _apply_regime_reanchor(
+            {
             "score_delta": int(getattr(config, "MARKET_MODE_GREEN_SCORE_DELTA", 0)),
             "volume_mult": float(getattr(config, "MARKET_MODE_GREEN_VOLUME_MULT", 1.0)),
             "edge_mult": float(getattr(config, "MARKET_MODE_GREEN_EDGE_MULT", 1.0)),
@@ -111,9 +148,11 @@ def market_mode_entry_profile(market_mode: str) -> dict[str, float | int | bool]
             "partial_tp_sell_mult": float(getattr(config, "MARKET_MODE_GREEN_PARTIAL_TP_SELL_MULT", 1.0)),
             "allow_soft": True,
             "soft_cap": 0,
-        }
+            }
+        )
     if mode == "RED":
-        return {
+        return _apply_regime_reanchor(
+            {
             "score_delta": int(getattr(config, "MARKET_MODE_RED_SCORE_DELTA", 3)),
             "volume_mult": float(getattr(config, "MARKET_MODE_RED_VOLUME_MULT", 1.3)),
             "edge_mult": float(getattr(config, "MARKET_MODE_RED_EDGE_MULT", 1.2)),
@@ -123,8 +162,10 @@ def market_mode_entry_profile(market_mode: str) -> dict[str, float | int | bool]
             "partial_tp_sell_mult": float(getattr(config, "MARKET_MODE_RED_PARTIAL_TP_SELL_MULT", 1.4)),
             "allow_soft": False,
             "soft_cap": 0,
-        }
-    return {
+            }
+        )
+    return _apply_regime_reanchor(
+        {
         "score_delta": int(getattr(config, "MARKET_MODE_YELLOW_SCORE_DELTA", 1)),
         "volume_mult": float(getattr(config, "MARKET_MODE_YELLOW_VOLUME_MULT", 1.1)),
         "edge_mult": float(getattr(config, "MARKET_MODE_YELLOW_EDGE_MULT", 1.08)),
@@ -134,7 +175,8 @@ def market_mode_entry_profile(market_mode: str) -> dict[str, float | int | bool]
         "partial_tp_sell_mult": float(getattr(config, "MARKET_MODE_YELLOW_PARTIAL_TP_SELL_MULT", 1.2)),
         "allow_soft": True,
         "soft_cap": int(getattr(config, "MARKET_MODE_YELLOW_SOFT_CAP_PER_CYCLE", 2)),
-    }
+        }
+    )
 
 
 def apply_market_mode_hysteresis(

@@ -8,6 +8,7 @@ import math
 import os
 import sqlite3
 import time
+import hashlib
 from collections import defaultdict, deque
 from typing import Any
 
@@ -68,10 +69,29 @@ def _percentile(values: list[float], p: float) -> float:
     return float(xs[lo] + ((xs[hi] - xs[lo]) * frac))
 
 
+def _deterministic_probability(seed: str) -> float:
+    digest = hashlib.sha1(str(seed or "").encode("utf-8")).hexdigest()
+    top = int(digest[:8], 16)
+    return float(top % 10000) / 10000.0
+
+
+def _datetime_to_ts(value: Any) -> float:
+    try:
+        if value is None:
+            return 0.0
+        return float(value.timestamp())
+    except Exception:
+        return 0.0
+
+
 class UniverseFlowController:
     """Flow-shaping before heavy checks: diversity + anti-repeat."""
 
     def __init__(self) -> None:
+        def _cfg(name: str, default: Any) -> Any:
+            value = getattr(config, name, default)
+            return default if value is None else value
+
         self.enabled = bool(getattr(config, "V2_UNIVERSE_ENABLED", False))
         self.max_total_per_cycle = max(0, int(getattr(config, "V2_UNIVERSE_MAX_TOTAL_PER_CYCLE", 0) or 0))
         self.novelty_window_seconds = max(60, int(getattr(config, "V2_UNIVERSE_NOVELTY_WINDOW_SECONDS", 1800) or 1800))
@@ -135,7 +155,31 @@ class UniverseFlowController:
             1.0,
             float(getattr(config, "V2_UNIVERSE_SYMBOL_REPEAT_OVERRIDE_VOL_MULT", 2.5) or 2.5),
         )
+        self.surge_enabled = bool(_cfg("V2_UNIVERSE_SURGE_ENABLED", False))
+        self.surge_min_abs_change_5m = max(0.0, float(_cfg("V2_UNIVERSE_SURGE_MIN_ABS_CHANGE_5M", 4.0)))
+        self.surge_min_volume_5m = max(0.0, float(_cfg("V2_UNIVERSE_SURGE_MIN_VOLUME_5M_USD", 2500.0)))
+        self.surge_min_vol_to_liq = max(0.0, float(_cfg("V2_UNIVERSE_SURGE_MIN_VOL_TO_LIQ", 0.06)))
+        self.surge_reserve_share = _clamp(float(_cfg("V2_UNIVERSE_SURGE_RESERVE_SHARE", 0.22)), 0.0, 0.50)
+        self.surge_reserve_min_abs = max(0, int(_cfg("V2_UNIVERSE_SURGE_RESERVE_MIN_ABS", 2)))
+        self.surge_size_mult = _clamp(float(_cfg("V2_UNIVERSE_SURGE_SIZE_MULT", 0.88)), 0.10, 1.60)
+        self.surge_hold_mult = _clamp(float(_cfg("V2_UNIVERSE_SURGE_HOLD_MULT", 0.90)), 0.20, 1.40)
+        self.surge_edge_usd_mult = _clamp(float(_cfg("V2_UNIVERSE_SURGE_EDGE_USD_MULT", 1.08)), 0.05, 1.80)
+        self.surge_edge_percent_mult = _clamp(float(_cfg("V2_UNIVERSE_SURGE_EDGE_PERCENT_MULT", 1.06)), 0.05, 1.80)
         self._symbol_pass_history: dict[str, deque[float]] = {}
+
+    def _is_surge_row(self, row: dict[str, Any]) -> bool:
+        if not self.surge_enabled:
+            return False
+        token = dict(row.get("token") or {})
+        vol5m = max(0.0, _safe_float(row.get("vol5m"), _safe_float(token.get("volume_5m"), 0.0)))
+        liq = max(0.0, _safe_float(token.get("liquidity"), 0.0))
+        change5m = abs(_safe_float(token.get("price_change_5m"), 0.0))
+        vol_to_liq = vol5m / max(liq, 1.0)
+        return (
+            change5m >= float(self.surge_min_abs_change_5m)
+            and vol5m >= float(self.surge_min_volume_5m)
+            and vol_to_liq >= float(self.surge_min_vol_to_liq)
+        )
 
     def _prune(self, now_ts: float) -> None:
         ttl = max(float(self.novelty_window_seconds) * 1.8, 3600.0)
@@ -311,6 +355,7 @@ class UniverseFlowController:
         source_counts: dict[str, int] = defaultdict(int)
         selected: list[dict[str, Any]] = []
         selected_addrs: set[str] = set()
+        surge_in = 0
 
         def _source_cap(src: str) -> int:
             if src in self.source_caps:
@@ -329,6 +374,38 @@ class UniverseFlowController:
             source_counts[src] = int(source_counts[src]) + 1
             selected.append(row)
             return True
+
+        if self.surge_enabled:
+            for row in rows:
+                is_surge = self._is_surge_row(row)
+                row["is_surge"] = bool(is_surge)
+                if is_surge:
+                    surge_in += 1
+        else:
+            for row in rows:
+                row["is_surge"] = False
+
+        surge_target = 0
+        if self.surge_enabled and target > 0 and surge_in > 0:
+            surge_target = int(math.ceil(float(target) * float(self.surge_reserve_share)))
+            surge_target = max(surge_target, int(self.surge_reserve_min_abs))
+            surge_target = min(surge_target, int(surge_in), int(target))
+
+        surge_rows = [row for row in rows if bool(row.get("is_surge", False))]
+        surge_novel_rows = [row for row in surge_rows if bool(row.get("is_novel"))]
+        surge_selected = 0
+        if surge_target > 0:
+            for row in surge_novel_rows:
+                if surge_selected >= surge_target:
+                    break
+                if _try_take(row):
+                    surge_selected += 1
+            if surge_selected < surge_target:
+                for row in surge_rows:
+                    if surge_selected >= surge_target:
+                        break
+                    if _try_take(row):
+                        surge_selected += 1
 
         novel = [row for row in rows if bool(row.get("is_novel"))]
         known = [row for row in rows if not bool(row.get("is_novel"))]
@@ -352,6 +429,26 @@ class UniverseFlowController:
                 selected.append(row)
 
         out = [dict(row.get("token") or {}) for row in selected]
+        surge_out = 0
+        for idx, row in enumerate(selected):
+            if not bool(row.get("is_surge", False)):
+                continue
+            token2 = dict(out[idx] or {})
+            token2["_universe_lane"] = "surge"
+            token2["_entry_channel_size_mult"] = float(token2.get("_entry_channel_size_mult", 1.0) or 1.0) * float(
+                self.surge_size_mult
+            )
+            token2["_entry_channel_hold_mult"] = float(token2.get("_entry_channel_hold_mult", 1.0) or 1.0) * float(
+                self.surge_hold_mult
+            )
+            token2["_entry_channel_edge_usd_mult"] = float(token2.get("_entry_channel_edge_usd_mult", 1.0) or 1.0) * float(
+                self.surge_edge_usd_mult
+            )
+            token2["_entry_channel_edge_pct_mult"] = float(token2.get("_entry_channel_edge_pct_mult", 1.0) or 1.0) * float(
+                self.surge_edge_percent_mult
+            )
+            out[idx] = token2
+            surge_out += 1
         for row in selected:
             addr = str(row.get("addr", ""))
             if addr:
@@ -360,7 +457,7 @@ class UniverseFlowController:
         logger.info(
             (
                 "V2_UNIVERSE in=%s dedup=%s out=%s target=%s novel_target=%s novel_out=%s "
-                "repeat_dropped=%s symbol_dropped=%s"
+                "repeat_dropped=%s symbol_dropped=%s surge_in=%s surge_target=%s surge_out=%s"
             ),
             len(tokens),
             len(dedup),
@@ -370,6 +467,9 @@ class UniverseFlowController:
             sum(1 for row in selected if bool(row.get("is_novel"))),
             dropped_repeat,
             symbol_dropped,
+            surge_in,
+            surge_target,
+            surge_out,
         )
         return out
 
@@ -380,6 +480,593 @@ class UniverseFlowController:
         vol5m = max(0.0, _safe_float(token.get("volume_5m"), 0.0))
         score = float((0.65 * math.log1p(vol5m)) + (0.35 * math.log1p(liq)))
         return float(score * src_w)
+
+
+class UniverseQualityGateController:
+    """EV-first pool shaping: core/explore/cooldown + source budgets + anti-concentration."""
+
+    def __init__(self) -> None:
+        def _cfg(name: str, default: Any) -> Any:
+            value = getattr(config, name, default)
+            return default if value is None else value
+
+        self.enabled = bool(_cfg("V2_QUALITY_GATE_ENABLED", False))
+        self.refresh_seconds = max(60, int(_cfg("V2_QUALITY_REFRESH_SECONDS", 1800)))
+        self.window_seconds = max(300, int(_cfg("V2_QUALITY_WINDOW_SECONDS", 14400)))
+        self.min_symbol_trades = max(1, int(_cfg("V2_QUALITY_MIN_SYMBOL_TRADES", 12)))
+        self.min_cluster_trades = max(1, int(_cfg("V2_QUALITY_MIN_CLUSTER_TRADES", 16)))
+        self.min_avg_pnl_usd = float(_cfg("V2_QUALITY_MIN_AVG_PNL_USD", 0.0))
+        self.max_loss_share = _clamp(float(_cfg("V2_QUALITY_MAX_LOSS_SHARE", 0.60)), 0.0, 1.0)
+        self.bad_avg_pnl_usd = float(_cfg("V2_QUALITY_BAD_AVG_PNL_USD", -0.0008))
+        self.bad_loss_share = _clamp(float(_cfg("V2_QUALITY_BAD_LOSS_SHARE", 0.67)), 0.0, 1.0)
+        self.explore_max_share = _clamp(float(_cfg("V2_QUALITY_EXPLORE_MAX_SHARE", 0.18)), 0.0, 0.60)
+        self.explore_min_abs = max(0, int(_cfg("V2_QUALITY_EXPLORE_MIN_ABS", 1)))
+        self.cooldown_probe_probability = _clamp(
+            float(_cfg("V2_QUALITY_COOLDOWN_PROBE_PROBABILITY", 0.15)),
+            0.0,
+            1.0,
+        )
+        self.cooldown_size_mult = _clamp(float(_cfg("V2_QUALITY_COOLDOWN_SIZE_MULT", 0.55)), 0.05, 1.0)
+        self.cooldown_hold_mult = _clamp(float(_cfg("V2_QUALITY_COOLDOWN_HOLD_MULT", 0.75)), 0.10, 1.2)
+        self.cooldown_edge_usd_mult = max(0.05, float(_cfg("V2_QUALITY_COOLDOWN_EDGE_USD_MULT", 1.35)))
+        self.cooldown_edge_percent_mult = max(
+            0.05,
+            float(_cfg("V2_QUALITY_COOLDOWN_EDGE_PERCENT_MULT", 1.30)),
+        )
+        self.symbol_concentration_window_seconds = max(
+            120,
+            int(_cfg("V2_QUALITY_SYMBOL_CONCENTRATION_WINDOW_SECONDS", 3600)),
+        )
+        self.symbol_max_share = _clamp(float(_cfg("V2_QUALITY_SYMBOL_MAX_SHARE", 0.10)), 0.02, 0.50)
+        self.symbol_min_abs_cap = max(1, int(_cfg("V2_QUALITY_SYMBOL_MIN_ABS_CAP", 2)))
+        self.source_budget_enabled = bool(_cfg("V2_QUALITY_SOURCE_BUDGET_ENABLED", True))
+        self.source_min_trades = max(1, int(_cfg("V2_QUALITY_SOURCE_MIN_TRADES", 10)))
+        self.source_window_seconds = max(300, int(_cfg("V2_QUALITY_SOURCE_WINDOW_SECONDS", 14400)))
+        self.source_good_avg = float(_cfg("V2_QUALITY_SOURCE_GOOD_AVG_PNL_USD", 0.0020))
+        self.source_bad_avg = float(_cfg("V2_QUALITY_SOURCE_BAD_AVG_PNL_USD", -0.0015))
+        self.source_boost_mult = max(0.50, float(_cfg("V2_QUALITY_SOURCE_BOOST_MULT", 1.28)))
+        self.source_cut_mult = _clamp(float(_cfg("V2_QUALITY_SOURCE_CUT_MULT", 0.62)), 0.10, 1.0)
+        self.source_min_share = _clamp(float(_cfg("V2_QUALITY_SOURCE_MIN_SHARE", 0.08)), 0.0, 0.40)
+        self.log_top_symbols = max(1, int(_cfg("V2_QUALITY_LOG_TOP_SYMBOLS", 8)))
+        self._next_refresh_ts = 0.0
+        self._symbol_stats: dict[str, dict[str, float]] = {}
+        self._cluster_stats: dict[str, dict[str, float]] = {}
+        self._source_stats: dict[str, dict[str, float]] = {}
+        self._candidate_source: dict[str, tuple[str, float]] = {}
+        self._symbol_history: deque[tuple[float, str]] = deque()
+        self._last_rotation_signature = ""
+
+    @staticmethod
+    def _symbol_key(token: dict[str, Any]) -> str:
+        sym = str(token.get("symbol", "") or "").strip().upper()
+        if sym:
+            return sym
+        name = str(token.get("name", "") or "").strip().upper()
+        return name or "-"
+
+    @staticmethod
+    def _cluster_key(token: dict[str, Any], score_data: dict[str, Any]) -> str:
+        score = int(_safe_float((score_data or {}).get("score"), 0.0))
+        if score >= 90:
+            score_band = "s3"
+        elif score >= 80:
+            score_band = "s2"
+        elif score >= 70:
+            score_band = "s1"
+        else:
+            score_band = "s0"
+
+        liq = _safe_float(token.get("liquidity"), 0.0)
+        if liq >= 500_000:
+            liq_band = "l3"
+        elif liq >= 120_000:
+            liq_band = "l2"
+        elif liq >= 35_000:
+            liq_band = "l1"
+        else:
+            liq_band = "l0"
+
+        vol = _safe_float(token.get("volume_5m"), 0.0)
+        if vol >= 12_000:
+            vol_band = "v3"
+        elif vol >= 3_500:
+            vol_band = "v2"
+        elif vol >= 800:
+            vol_band = "v1"
+        else:
+            vol_band = "v0"
+
+        mom_abs = abs(_safe_float(token.get("price_change_5m"), 0.0))
+        if mom_abs >= 8.0:
+            mom_band = "m3"
+        elif mom_abs >= 3.0:
+            mom_band = "m2"
+        elif mom_abs >= 1.0:
+            mom_band = "m1"
+        else:
+            mom_band = "m0"
+
+        risk = str(token.get("risk_level", "MEDIUM") or "MEDIUM").strip().upper()
+        risk_band = {"LOW": "r0", "MEDIUM": "r1", "HIGH": "r2"}.get(risk, "r1")
+        return f"{score_band}|{liq_band}|{vol_band}|{mom_band}|{risk_band}"
+
+    @staticmethod
+    def _roll_stats(pnls: list[float]) -> dict[str, float]:
+        vals = [float(x or 0.0) for x in (pnls or [])]
+        if not vals:
+            return {"trades": 0.0, "avg_pnl": 0.0, "loss_share": 0.0, "win_rate": 0.0, "sum_pnl": 0.0}
+        wins = sum(1 for x in vals if x > 0.0)
+        losses = sum(1 for x in vals if x <= 0.0)
+        return {
+            "trades": float(len(vals)),
+            "avg_pnl": float(sum(vals) / float(max(1, len(vals)))),
+            "loss_share": float(losses) / float(max(1, len(vals))),
+            "win_rate": float(wins) / float(max(1, len(vals))),
+            "sum_pnl": float(sum(vals)),
+        }
+
+    def _is_good(self, stats: dict[str, float], *, min_trades: int) -> bool:
+        trades = int(_safe_float(stats.get("trades"), 0.0))
+        if trades < int(min_trades):
+            return False
+        avg = _safe_float(stats.get("avg_pnl"), 0.0)
+        loss_share = _safe_float(stats.get("loss_share"), 0.0)
+        return (
+            float(avg) > float(self.min_avg_pnl_usd)
+            and float(loss_share) <= float(self.max_loss_share)
+        )
+
+    def _is_bad(self, stats: dict[str, float], *, min_trades: int) -> bool:
+        trades = int(_safe_float(stats.get("trades"), 0.0))
+        if trades < int(min_trades):
+            return False
+        avg = _safe_float(stats.get("avg_pnl"), 0.0)
+        loss_share = _safe_float(stats.get("loss_share"), 0.0)
+        return (
+            float(avg) <= float(self.bad_avg_pnl_usd)
+            or float(loss_share) >= float(self.bad_loss_share)
+        )
+
+    def _source_mult(self, source: str) -> float:
+        if not self.source_budget_enabled:
+            return 1.0
+        src = str(source or "unknown").strip().lower() or "unknown"
+        stats = dict(self._source_stats.get(src, {}))
+        trades = int(stats.get("trades", 0.0) or 0.0)
+        if trades < int(self.source_min_trades):
+            return 1.0
+        avg = float(stats.get("avg_pnl", 0.0) or 0.0)
+        good = float(self.source_good_avg)
+        bad = float(self.source_bad_avg)
+        if avg >= good:
+            return float(self.source_boost_mult)
+        if avg <= bad:
+            return float(self.source_cut_mult)
+        if avg >= 0.0:
+            span = max(0.000001, good)
+            k = _clamp(avg / span, 0.0, 1.0)
+            return float(1.0 + ((float(self.source_boost_mult) - 1.0) * k))
+        span = max(0.000001, abs(bad))
+        k = _clamp(abs(avg) / span, 0.0, 1.0)
+        return float(1.0 - ((1.0 - float(self.source_cut_mult)) * k))
+
+    def _prune_candidate_source(self, now_ts: float) -> None:
+        ttl = max(float(self.source_window_seconds) * 2.0, float(self.window_seconds) * 2.0, 7200.0)
+        self._candidate_source = {
+            cid: row
+            for cid, row in self._candidate_source.items()
+            if float((row or ("", 0.0))[1] or 0.0) >= (now_ts - ttl)
+        }
+
+    def _refresh_stats(self, *, auto_trader: Any, now_ts: float) -> dict[str, Any]:
+        closed_positions = list(getattr(auto_trader, "closed_positions", []) or [])
+        cutoff = float(now_ts) - float(self.window_seconds)
+        cutoff_source = float(now_ts) - float(self.source_window_seconds)
+        symbol_rows: dict[str, list[float]] = defaultdict(list)
+        cluster_rows: dict[str, list[float]] = defaultdict(list)
+        source_rows: dict[str, list[float]] = defaultdict(list)
+
+        self._prune_candidate_source(now_ts)
+        for pos in closed_positions:
+            closed_ts = _datetime_to_ts(getattr(pos, "closed_at", None))
+            if closed_ts <= 0.0 or closed_ts < cutoff:
+                continue
+            pnl = float(getattr(pos, "pnl_usd", 0.0) or 0.0)
+            symbol = str(getattr(pos, "symbol", "") or "").strip().upper() or "-"
+            cluster = str(getattr(pos, "token_cluster_key", "") or "").strip().lower()
+            if symbol:
+                symbol_rows[symbol].append(pnl)
+            if cluster:
+                cluster_rows[cluster].append(pnl)
+
+            if closed_ts >= cutoff_source:
+                cid = str(getattr(pos, "candidate_id", "") or "").strip()
+                src = "unknown"
+                if cid and cid in self._candidate_source:
+                    src = str((self._candidate_source.get(cid) or ("unknown", 0.0))[0] or "unknown").strip().lower() or "unknown"
+                source_rows[src].append(pnl)
+
+        self._symbol_stats = {k: self._roll_stats(v) for k, v in symbol_rows.items()}
+        self._cluster_stats = {k: self._roll_stats(v) for k, v in cluster_rows.items()}
+        self._source_stats = {k: self._roll_stats(v) for k, v in source_rows.items()}
+        self._next_refresh_ts = float(now_ts) + float(self.refresh_seconds)
+
+        core_symbols = [
+            (k, v)
+            for k, v in self._symbol_stats.items()
+            if self._is_good(v, min_trades=int(self.min_symbol_trades))
+        ]
+        cooldown_symbols = [
+            (k, v)
+            for k, v in self._symbol_stats.items()
+            if self._is_bad(v, min_trades=int(self.min_symbol_trades))
+        ]
+        core_symbols.sort(key=lambda row: float((row[1] or {}).get("avg_pnl", 0.0) or 0.0), reverse=True)
+        cooldown_symbols.sort(key=lambda row: float((row[1] or {}).get("avg_pnl", 0.0) or 0.0))
+        top_n = int(self.log_top_symbols)
+        top_core = [
+            f"{sym}:{float(stats.get('avg_pnl', 0.0) or 0.0):.4f}/{int(stats.get('trades', 0.0) or 0)}"
+            for sym, stats in core_symbols[:top_n]
+        ]
+        top_cooldown = [
+            f"{sym}:{float(stats.get('avg_pnl', 0.0) or 0.0):.4f}/{int(stats.get('trades', 0.0) or 0)}"
+            for sym, stats in cooldown_symbols[:top_n]
+        ]
+        signature = json.dumps(
+            {
+                "core": top_core,
+                "cooldown": top_cooldown,
+                "source_count": len(self._source_stats),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        changed = signature != self._last_rotation_signature
+        if changed:
+            self._last_rotation_signature = signature
+            logger.info(
+                "V2_QUALITY_ROTATE symbols_core=%s symbols_cooldown=%s sources=%s top_core=%s top_cooldown=%s",
+                len(core_symbols),
+                len(cooldown_symbols),
+                len(self._source_stats),
+                ",".join(top_core) if top_core else "-",
+                ",".join(top_cooldown) if top_cooldown else "-",
+            )
+        return {
+            "refreshed": True,
+            "rotation_changed": bool(changed),
+            "symbols_core": int(len(core_symbols)),
+            "symbols_cooldown": int(len(cooldown_symbols)),
+            "sources_tracked": int(len(self._source_stats)),
+        }
+
+    def _source_caps(self, rows: list[dict[str, Any]], *, target: int) -> dict[str, int]:
+        by_source: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for row in rows:
+            src = str(row.get("source", "unknown") or "unknown").strip().lower() or "unknown"
+            by_source[src].append(row)
+        if not by_source:
+            return {}
+        if not self.source_budget_enabled:
+            return {src: len(items) for src, items in by_source.items()}
+
+        weighted: dict[str, float] = {}
+        for src, items in by_source.items():
+            mult = max(0.10, float(self._source_mult(src)))
+            weighted[src] = float(len(items)) * mult
+        total_w = float(sum(weighted.values()))
+        if total_w <= 0.0:
+            return {src: len(items) for src, items in by_source.items()}
+
+        shares: dict[str, float] = {}
+        for src, items in by_source.items():
+            raw_share = float(weighted.get(src, 0.0)) / total_w
+            st = dict(self._source_stats.get(src, {}))
+            min_share = float(self.source_min_share) if int(st.get("trades", 0.0) or 0.0) >= int(self.source_min_trades) else 0.0
+            shares[src] = max(0.0, max(raw_share, min_share))
+
+        share_sum = float(sum(shares.values())) or 1.0
+        caps: dict[str, int] = {}
+        rem = int(max(1, target))
+        srcs = sorted(shares.keys(), key=lambda s: float(shares[s]), reverse=True)
+        for idx, src in enumerate(srcs):
+            available = len(by_source.get(src, []))
+            if idx == len(srcs) - 1:
+                cap = min(available, max(0, rem))
+            else:
+                cap = int(math.ceil((float(shares[src]) / share_sum) * float(max(1, target))))
+                cap = min(available, max(0, cap))
+                rem = max(0, rem - cap)
+            if cap <= 0 and available > 0:
+                cap = 1
+                rem = max(0, rem - 1)
+            caps[src] = int(cap)
+        return caps
+
+    def _prune_symbol_history(self, now_ts: float) -> None:
+        cutoff = float(now_ts) - float(self.symbol_concentration_window_seconds)
+        while self._symbol_history and float(self._symbol_history[0][0]) < cutoff:
+            self._symbol_history.popleft()
+
+    def _register_candidate_sources(self, candidates: list[tuple[dict[str, Any], dict[str, Any]]], now_ts: float) -> None:
+        for token, _ in candidates:
+            cid = str((token or {}).get("_candidate_id", "") or "").strip()
+            if not cid:
+                continue
+            src = str((token or {}).get("source", "unknown") or "unknown").strip().lower() or "unknown"
+            self._candidate_source[cid] = (src, float(now_ts))
+
+    def filter_candidates(
+        self,
+        *,
+        candidates: list[tuple[dict[str, Any], dict[str, Any]]],
+        auto_trader: Any,
+        market_mode: str,
+    ) -> tuple[list[tuple[dict[str, Any], dict[str, Any]]], dict[str, Any]]:
+        regime = str(market_mode or "YELLOW").strip().upper() or "YELLOW"
+        if not candidates:
+            return [], {
+                "enabled": bool(self.enabled),
+                "in_total": 0,
+                "out_total": 0,
+                "core_out": 0,
+                "explore_out": 0,
+                "probe_out": 0,
+                "dropped": [],
+                "drop_counts": {},
+                "regime": regime,
+            }
+        if not self.enabled:
+            return list(candidates), {
+                "enabled": False,
+                "in_total": len(candidates),
+                "out_total": len(candidates),
+                "core_out": sum(
+                    1
+                    for token, _ in candidates
+                    if str((token or {}).get("_entry_tier", "")).strip().upper() == "A"
+                ),
+                "explore_out": sum(
+                    1
+                    for token, _ in candidates
+                    if str((token or {}).get("_entry_tier", "")).strip().upper() != "A"
+                ),
+                "probe_out": 0,
+                "dropped": [],
+                "drop_counts": {},
+                "regime": regime,
+            }
+
+        now_ts = time.time()
+        self._register_candidate_sources(candidates, now_ts)
+        refresh_meta: dict[str, Any] = {}
+        if now_ts >= float(self._next_refresh_ts):
+            refresh_meta = self._refresh_stats(auto_trader=auto_trader, now_ts=now_ts)
+
+        rows: list[dict[str, Any]] = []
+        for token, score_data in candidates:
+            token_d = dict(token or {})
+            score_d = dict(score_data or {})
+            symbol = self._symbol_key(token_d)
+            cluster_key = self._cluster_key(token_d, score_d)
+            src = str(token_d.get("source", "unknown") or "unknown").strip().lower() or "unknown"
+            sym_stats = dict(self._symbol_stats.get(symbol, {}))
+            clu_stats = dict(self._cluster_stats.get(cluster_key.lower(), {}))
+            sym_good = self._is_good(sym_stats, min_trades=int(self.min_symbol_trades))
+            clu_good = self._is_good(clu_stats, min_trades=int(self.min_cluster_trades))
+            sym_bad = self._is_bad(sym_stats, min_trades=int(self.min_symbol_trades))
+            clu_bad = self._is_bad(clu_stats, min_trades=int(self.min_cluster_trades))
+            if sym_good or clu_good:
+                bucket = "core"
+            elif sym_bad or clu_bad:
+                bucket = "cooldown"
+            else:
+                bucket = "explore"
+
+            score = _safe_float(score_d.get("score"), 0.0)
+            liq = max(0.0, _safe_float(token_d.get("liquidity"), 0.0))
+            vol = max(0.0, _safe_float(token_d.get("volume_5m"), 0.0))
+            base_priority = float(score + (1.3 * math.log1p(liq / 10000.0)) + (1.8 * math.log1p(vol / 1200.0)))
+            ev_signal = max(float(sym_stats.get("avg_pnl", 0.0) or 0.0), float(clu_stats.get("avg_pnl", 0.0) or 0.0))
+            ev_bonus = _clamp(ev_signal * 360.0, -6.0, 8.0)
+            src_mult = self._source_mult(src)
+            bucket_bias = 6.0 if bucket == "core" else (-6.0 if bucket == "cooldown" else 0.0)
+            priority = (base_priority + ev_bonus + bucket_bias) * float(src_mult)
+            rows.append(
+                {
+                    "token": token_d,
+                    "score_data": score_d,
+                    "symbol": symbol,
+                    "cluster_key": cluster_key.lower(),
+                    "source": src,
+                    "bucket": bucket,
+                    "priority": float(priority),
+                    "ev_signal": float(ev_signal),
+                    "src_mult": float(src_mult),
+                    "is_probe": False,
+                }
+            )
+
+        rows.sort(key=lambda row: float(row.get("priority", 0.0) or 0.0), reverse=True)
+        core_rows = [row for row in rows if str(row.get("bucket")) == "core"]
+        explore_rows = [row for row in rows if str(row.get("bucket")) == "explore"]
+        cooldown_rows = [row for row in rows if str(row.get("bucket")) == "cooldown"]
+
+        dropped: list[dict[str, Any]] = []
+        drop_counts: dict[str, int] = defaultdict(int)
+        probe_rows: list[dict[str, Any]] = []
+        probe_p = float(self.cooldown_probe_probability)
+        if regime == "RED":
+            probe_p *= 0.75
+        for row in cooldown_rows:
+            token = dict(row.get("token") or {})
+            cid = str(token.get("_candidate_id", "") or "")
+            seed = f"{cid}|{int(now_ts // 300)}|{regime}"
+            if _deterministic_probability(seed) <= probe_p:
+                row2 = dict(row)
+                row2["is_probe"] = True
+                row2["bucket"] = "explore_probe"
+                row2["priority"] = float(row2.get("priority", 0.0) or 0.0) * 0.92
+                probe_rows.append(row2)
+            else:
+                drop_counts["cooldown_bucket"] += 1
+                dropped.append(
+                    {
+                        "candidate_id": str(token.get("_candidate_id", "") or ""),
+                        "symbol": str(token.get("symbol", "") or ""),
+                        "reason": "cooldown_bucket",
+                        "bucket": "cooldown",
+                    }
+                )
+
+        explore_pool = sorted(explore_rows + probe_rows, key=lambda row: float(row.get("priority", 0.0) or 0.0), reverse=True)
+        target_total = len(rows)
+        explore_quota = int(math.floor(float(target_total) * float(self.explore_max_share)))
+        if int(self.explore_min_abs) > 0 and (not core_rows):
+            explore_quota = max(explore_quota, int(self.explore_min_abs))
+        if regime == "RED":
+            explore_quota = min(explore_quota, 1)
+        explore_quota = max(0, min(len(explore_pool), explore_quota))
+
+        source_caps = self._source_caps(core_rows + explore_pool, target=target_total)
+        source_used: dict[str, int] = defaultdict(int)
+        self._prune_symbol_history(now_ts)
+        hist_by_symbol: dict[str, int] = defaultdict(int)
+        for _, sym in self._symbol_history:
+            if sym:
+                hist_by_symbol[str(sym)] = int(hist_by_symbol.get(str(sym), 0)) + 1
+        selected_symbol_counts: dict[str, int] = defaultdict(int)
+
+        selected: list[dict[str, Any]] = []
+
+        def _try_take(row: dict[str, Any]) -> bool:
+            token = dict(row.get("token") or {})
+            source = str(row.get("source", "unknown") or "unknown")
+            symbol = str(row.get("symbol", "-") or "-")
+            cap = int(source_caps.get(source, 10**9))
+            if int(source_used.get(source, 0)) >= cap:
+                drop_counts["source_budget"] += 1
+                dropped.append(
+                    {
+                        "candidate_id": str(token.get("_candidate_id", "") or ""),
+                        "symbol": str(token.get("symbol", "") or ""),
+                        "reason": "source_budget",
+                        "bucket": str(row.get("bucket", "")),
+                    }
+                )
+                return False
+
+            projected_total = int(len(self._symbol_history)) + int(len(selected)) + 1
+            allowed = max(int(self.symbol_min_abs_cap), int(math.floor(float(projected_total) * float(self.symbol_max_share))))
+            used_symbol = int(hist_by_symbol.get(symbol, 0)) + int(selected_symbol_counts.get(symbol, 0))
+            if used_symbol >= allowed:
+                drop_counts["symbol_concentration"] += 1
+                dropped.append(
+                    {
+                        "candidate_id": str(token.get("_candidate_id", "") or ""),
+                        "symbol": str(token.get("symbol", "") or ""),
+                        "reason": "symbol_concentration",
+                        "bucket": str(row.get("bucket", "")),
+                    }
+                )
+                return False
+
+            selected.append(row)
+            source_used[source] = int(source_used.get(source, 0)) + 1
+            selected_symbol_counts[symbol] = int(selected_symbol_counts.get(symbol, 0)) + 1
+            return True
+
+        for row in core_rows:
+            _try_take(row)
+
+        explore_taken = 0
+        for row in explore_pool:
+            if explore_taken >= int(explore_quota):
+                break
+            if _try_take(row):
+                explore_taken += 1
+
+        if not selected and explore_pool:
+            # Absolute scarcity fallback: allow at least one explore/probe candidate.
+            row = explore_pool[0]
+            selected = [row]
+            source = str(row.get("source", "unknown") or "unknown")
+            symbol = str(row.get("symbol", "-") or "-")
+            source_used[source] = int(source_used.get(source, 0)) + 1
+            selected_symbol_counts[symbol] = int(selected_symbol_counts.get(symbol, 0)) + 1
+
+        for row in selected:
+            sym = str(row.get("symbol", "") or "")
+            if sym:
+                self._symbol_history.append((float(now_ts), sym))
+
+        tagged: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        core_out = 0
+        explore_out = 0
+        probe_out = 0
+        for row in selected:
+            token = dict(row.get("token") or {})
+            score_data = dict(row.get("score_data") or {})
+            bucket = str(row.get("bucket", "explore") or "explore")
+            token["_quality_bucket"] = bucket
+            token["_quality_priority"] = float(row.get("priority", 0.0) or 0.0)
+            token["_quality_ev_signal"] = float(row.get("ev_signal", 0.0) or 0.0)
+            token["_quality_source_mult"] = float(row.get("src_mult", 1.0) or 1.0)
+            token["_quality_source"] = str(row.get("source", "unknown") or "unknown")
+            token["_quality_cluster_key"] = str(row.get("cluster_key", "") or "")
+            if bucket == "core":
+                token["_entry_tier"] = "A"
+                core_out += 1
+            else:
+                token["_entry_tier"] = "B"
+                explore_out += 1
+                if bool(row.get("is_probe", False)):
+                    probe_out += 1
+                    token["_entry_channel_size_mult"] = float(token.get("_entry_channel_size_mult", 1.0) or 1.0) * float(
+                        self.cooldown_size_mult
+                    )
+                    token["_entry_channel_hold_mult"] = float(token.get("_entry_channel_hold_mult", 1.0) or 1.0) * float(
+                        self.cooldown_hold_mult
+                    )
+                    token["_entry_channel_edge_usd_mult"] = float(token.get("_entry_channel_edge_usd_mult", 1.0) or 1.0) * float(
+                        self.cooldown_edge_usd_mult
+                    )
+                    token["_entry_channel_edge_pct_mult"] = float(token.get("_entry_channel_edge_pct_mult", 1.0) or 1.0) * float(
+                        self.cooldown_edge_percent_mult
+                    )
+            tagged.append((token, score_data))
+
+        total_out = len(tagged)
+        symbol_counts_out: dict[str, int] = defaultdict(int)
+        for token, _ in tagged:
+            sk = self._symbol_key(token)
+            symbol_counts_out[sk] = int(symbol_counts_out.get(sk, 0)) + 1
+        max_symbol_share = 0.0
+        if total_out > 0 and symbol_counts_out:
+            max_symbol_share = max(float(v) / float(total_out) for v in symbol_counts_out.values())
+
+        meta = {
+            "enabled": True,
+            "regime": regime,
+            "in_total": len(candidates),
+            "out_total": int(total_out),
+            "core_in": len(core_rows),
+            "explore_in": len(explore_rows),
+            "cooldown_in": len(cooldown_rows),
+            "core_out": int(core_out),
+            "explore_out": int(explore_out),
+            "probe_out": int(probe_out),
+            "explore_quota": int(explore_quota),
+            "source_caps": dict(source_caps),
+            "source_used": dict(source_used),
+            "drop_counts": dict(drop_counts),
+            "dropped": dropped,
+            "core_share_out": round((float(core_out) / float(max(1, total_out))), 6),
+            "explore_share_out": round((float(explore_out) / float(max(1, total_out))), 6),
+            "max_symbol_share_out": round(float(max_symbol_share), 6),
+            **dict(refresh_meta or {}),
+        }
+        return tagged, meta
 
 
 class SafetyBudgetController:
@@ -918,11 +1605,15 @@ class DualEntryController:
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         token, score_data = row
         token2 = dict(token or {})
+        prev_size_mult = _safe_float(token2.get("_entry_channel_size_mult"), 1.0)
+        prev_hold_mult = _safe_float(token2.get("_entry_channel_hold_mult"), 1.0)
+        prev_edge_usd_mult = _safe_float(token2.get("_entry_channel_edge_usd_mult"), 1.0)
+        prev_edge_pct_mult = _safe_float(token2.get("_entry_channel_edge_pct_mult"), 1.0)
         token2["_entry_channel"] = str(channel).strip().lower()
-        token2["_entry_channel_size_mult"] = float(size_mult)
-        token2["_entry_channel_hold_mult"] = float(hold_mult)
-        token2["_entry_channel_edge_usd_mult"] = float(edge_usd_mult)
-        token2["_entry_channel_edge_pct_mult"] = float(edge_pct_mult)
+        token2["_entry_channel_size_mult"] = float(size_mult) * float(prev_size_mult)
+        token2["_entry_channel_hold_mult"] = float(hold_mult) * float(prev_hold_mult)
+        token2["_entry_channel_edge_usd_mult"] = float(edge_usd_mult) * float(prev_edge_usd_mult)
+        token2["_entry_channel_edge_pct_mult"] = float(edge_pct_mult) * float(prev_edge_pct_mult)
         return token2, score_data
 
     def allocate(

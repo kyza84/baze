@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
 import os
 import re
+import sqlite3
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -73,6 +75,10 @@ class PaperPosition:
     partial_tp_trigger_mult: float = 1.0
     partial_tp_sell_mult: float = 1.0
     candidate_id: str = ""
+    token_cluster_key: str = ""
+    ev_expected_net_usd: float = 0.0
+    ev_confidence: float = 0.0
+    kelly_mult: float = 1.0
 
 
 class AutoTrader:
@@ -101,6 +107,8 @@ class AutoTrader:
         self.tx_event_timestamps: list[float] = []
         self.price_guard_pending: dict[str, dict[str, float | int]] = {}
         self.trading_pause_until_ts = 0.0
+        self._session_peak_realized_pnl_usd = 0.0
+        self._session_profit_lock_last_trigger_ts = 0.0
         self.day_id = self._current_day_id()
         self.day_start_equity_usd = float(config.WALLET_BALANCE_USD)
         self.day_realized_pnl_usd = 0.0
@@ -118,13 +126,17 @@ class AutoTrader:
         self._recovery_last_attempt_ts: dict[str, float] = {}
         self._skip_reason_counts_window: dict[str, int] = {}
         self._last_reinvest_mult = 1.0
+        self._ev_db_cache: dict[str, tuple[float, dict[str, float]]] = {}
+        root = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+        ev_db_default = os.path.join(root, "data", "unified_dataset", "unified.db")
+        raw_ev_db = str(getattr(config, "EV_FIRST_ENTRY_DB_PATH", ev_db_default) or ev_db_default).strip()
+        self._ev_db_path = raw_ev_db if os.path.isabs(raw_ev_db) else os.path.join(root, raw_ev_db)
         self.trade_decisions_log_enabled = bool(getattr(config, "TRADE_DECISIONS_LOG_ENABLED", True))
         raw_decisions_log = str(
             getattr(config, "TRADE_DECISIONS_LOG_FILE", os.path.join("logs", "trade_decisions.jsonl")) or ""
         ).strip()
         if not raw_decisions_log:
             raw_decisions_log = os.path.join("logs", "trade_decisions.jsonl")
-        root = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
         self.trade_decisions_log_file = (
             raw_decisions_log if os.path.isabs(raw_decisions_log) else os.path.join(root, raw_decisions_log)
         )
@@ -481,6 +493,262 @@ class AutoTrader:
             "avg_pnl": float(sum_pnl) / float(max(1, trades)),
             "loss_streak": int(loss_streak),
         }
+
+    @staticmethod
+    def _token_cluster_key(
+        *,
+        score: int,
+        liquidity_usd: float,
+        volume_5m: float,
+        price_change_5m: float,
+        risk_level: str,
+    ) -> str:
+        s = int(score)
+        if s >= 90:
+            score_band = "s3"
+        elif s >= 80:
+            score_band = "s2"
+        elif s >= 70:
+            score_band = "s1"
+        else:
+            score_band = "s0"
+
+        liq = float(liquidity_usd)
+        if liq >= 500_000:
+            liq_band = "l3"
+        elif liq >= 120_000:
+            liq_band = "l2"
+        elif liq >= 35_000:
+            liq_band = "l1"
+        else:
+            liq_band = "l0"
+
+        vol = float(volume_5m)
+        if vol >= 12_000:
+            vol_band = "v3"
+        elif vol >= 3_500:
+            vol_band = "v2"
+        elif vol >= 800:
+            vol_band = "v1"
+        else:
+            vol_band = "v0"
+
+        mom_abs = abs(float(price_change_5m))
+        if mom_abs >= 8.0:
+            mom_band = "m3"
+        elif mom_abs >= 3.0:
+            mom_band = "m2"
+        elif mom_abs >= 1.0:
+            mom_band = "m1"
+        else:
+            mom_band = "m0"
+
+        risk = str(risk_level or "MEDIUM").strip().upper()
+        risk_band = {
+            "LOW": "r0",
+            "MEDIUM": "r1",
+            "HIGH": "r2",
+        }.get(risk, "r1")
+        return f"{score_band}|{liq_band}|{vol_band}|{mom_band}|{risk_band}"
+
+    @staticmethod
+    def _ev_stats_from_pnls(pnls: list[float]) -> dict[str, float]:
+        rows = [float(x or 0.0) for x in (pnls or [])]
+        if not rows:
+            return {
+                "samples": 0.0,
+                "win_rate": 0.0,
+                "avg_win_usd": 0.0,
+                "avg_loss_usd": 0.0,
+                "avg_net_usd": 0.0,
+            }
+        wins = [x for x in rows if x > 0.0]
+        losses = [abs(x) for x in rows if x <= 0.0]
+        avg_win = float(sum(wins) / max(1, len(wins)))
+        avg_loss = float(sum(losses) / max(1, len(losses)))
+        win_rate = float(len(wins)) / float(max(1, len(rows)))
+        avg_net = float(sum(rows) / float(max(1, len(rows))))
+        return {
+            "samples": float(len(rows)),
+            "win_rate": float(win_rate),
+            "avg_win_usd": float(avg_win),
+            "avg_loss_usd": float(avg_loss),
+            "avg_net_usd": float(avg_net),
+        }
+
+    def _closed_rows_window(self, *, window_minutes: int) -> list[PaperPosition]:
+        mins = max(5, int(window_minutes))
+        cutoff_ts = datetime.now(timezone.utc).timestamp() - (mins * 60)
+        return [
+            p
+            for p in self.closed_positions
+            if p.closed_at is not None and p.closed_at.timestamp() >= cutoff_ts
+        ]
+
+    def _cluster_window_metrics(self, cluster_key: str) -> dict[str, float]:
+        key = str(cluster_key or "").strip().lower()
+        if not key:
+            return self._ev_stats_from_pnls([])
+        rows = [
+            p
+            for p in self._closed_rows_window(window_minutes=int(getattr(config, "EV_FIRST_ENTRY_LOCAL_WINDOW_MINUTES", 360) or 360))
+            if str(getattr(p, "token_cluster_key", "") or "").strip().lower() == key
+        ]
+        return self._ev_stats_from_pnls([float(getattr(p, "pnl_usd", 0.0) or 0.0) for p in rows])
+
+    def _symbol_ev_stats(self, symbol: str) -> dict[str, float]:
+        key = self._symbol_key(symbol)
+        if not key:
+            return self._ev_stats_from_pnls([])
+        rows = [
+            p
+            for p in self._closed_rows_window(window_minutes=int(getattr(config, "SYMBOL_EV_WINDOW_MINUTES", 120) or 120))
+            if self._symbol_key(p.symbol) == key
+        ]
+        return self._ev_stats_from_pnls([float(getattr(p, "pnl_usd", 0.0) or 0.0) for p in rows])
+
+    @staticmethod
+    def _blend_ev_stats(stats_rows: list[dict[str, float]]) -> dict[str, float]:
+        total_w = 0.0
+        out = {
+            "samples": 0.0,
+            "win_rate": 0.0,
+            "avg_win_usd": 0.0,
+            "avg_loss_usd": 0.0,
+            "avg_net_usd": 0.0,
+        }
+        for row in stats_rows:
+            samples = max(0.0, float((row or {}).get("samples", 0.0) or 0.0))
+            if samples <= 0.0:
+                continue
+            weight_cap = max(1.0, float(getattr(config, "EV_FIRST_ENTRY_DB_LOOKBACK_ROWS", 2500) or 2500) / 20.0)
+            w = min(weight_cap, samples)
+            total_w += w
+            out["samples"] += samples
+            out["win_rate"] += w * float((row or {}).get("win_rate", 0.0) or 0.0)
+            out["avg_win_usd"] += w * float((row or {}).get("avg_win_usd", 0.0) or 0.0)
+            out["avg_loss_usd"] += w * float((row or {}).get("avg_loss_usd", 0.0) or 0.0)
+            out["avg_net_usd"] += w * float((row or {}).get("avg_net_usd", 0.0) or 0.0)
+        if total_w <= 0.0:
+            return out
+        out["win_rate"] /= total_w
+        out["avg_win_usd"] /= total_w
+        out["avg_loss_usd"] /= total_w
+        out["avg_net_usd"] /= total_w
+        return out
+
+    def _ev_db_stats(self, *, market_mode: str, entry_tier: str, score: int) -> dict[str, float]:
+        path = str(self._ev_db_path or "").strip()
+        if (not path) or (not os.path.exists(path)):
+            return self._ev_stats_from_pnls([])
+        width = max(5, int(getattr(config, "EV_FIRST_ENTRY_DB_BUCKET_SCORE_WIDTH", 10) or 10))
+        score_mid = int(score)
+        lo = max(0, score_mid - width)
+        hi = min(100, score_mid + width)
+        key = f"{str(market_mode).upper()}|{str(entry_tier).upper()}|{lo}|{hi}"
+        now_ts = time.time()
+        cached = self._ev_db_cache.get(key)
+        if cached and float(cached[0]) > now_ts:
+            return dict(cached[1])
+
+        rows_limit = max(100, int(getattr(config, "EV_FIRST_ENTRY_DB_LOOKBACK_ROWS", 2500) or 2500))
+        p = str(market_mode or "").strip().upper()
+        t = str(entry_tier or "").strip().upper()
+        rows: list[tuple[float]] = []
+        conn: sqlite3.Connection | None = None
+        try:
+            conn = sqlite3.connect(path, timeout=2.0)
+            cur = conn.cursor()
+            rows = cur.execute(
+                """
+                SELECT pnl_usd
+                FROM closed_trades
+                WHERE market_mode = ?
+                  AND entry_tier = ?
+                  AND score BETWEEN ? AND ?
+                ORDER BY rowid DESC
+                LIMIT ?
+                """,
+                (p, t, int(lo), int(hi), int(rows_limit)),
+            ).fetchall()
+            if len(rows) < max(8, int(getattr(config, "EV_FIRST_ENTRY_MIN_SAMPLES", 24) or 24) // 2):
+                rows = cur.execute(
+                    """
+                    SELECT pnl_usd
+                    FROM closed_trades
+                    WHERE market_mode = ?
+                      AND entry_tier = ?
+                    ORDER BY rowid DESC
+                    LIMIT ?
+                    """,
+                    (p, t, int(rows_limit)),
+                ).fetchall()
+        except Exception:
+            rows = []
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        stats = self._ev_stats_from_pnls([_safe_float(r[0], 0.0) for r in rows])
+        ttl = max(10, int(getattr(config, "EV_FIRST_ENTRY_DB_CACHE_TTL_SECONDS", 90) or 90))
+        self._ev_db_cache[key] = (now_ts + float(ttl), dict(stats))
+        return stats
+
+    @staticmethod
+    def _deterministic_probability(seed: str) -> float:
+        digest = hashlib.sha1(str(seed or "").encode("utf-8")).hexdigest()
+        top = int(digest[:8], 16)
+        return float(top % 10_000) / 10_000.0
+
+    def _passes_probability_gate(self, *, seed: str, probability: float) -> bool:
+        p = max(0.0, min(1.0, float(probability)))
+        if p >= 1.0:
+            return True
+        if p <= 0.0:
+            return False
+        return self._deterministic_probability(seed) <= p
+
+    def _entry_idle_seconds(self) -> float:
+        if not self.trade_open_timestamps:
+            return 10**9
+        now_ts = datetime.now(timezone.utc).timestamp()
+        last_ts = max(float(ts) for ts in self.trade_open_timestamps)
+        return max(0.0, now_ts - last_ts)
+
+    def _anti_choke_active(self) -> bool:
+        if not bool(getattr(config, "ANTI_CHOKE_ENABLED", True)):
+            return False
+        idle_threshold = max(30, int(getattr(config, "ANTI_CHOKE_IDLE_SECONDS", 1800) or 1800))
+        return self._entry_idle_seconds() >= float(idle_threshold)
+
+    def _session_profit_lock_after_close(self, *, close_reason: str, pnl_usd: float) -> None:
+        if not bool(getattr(config, "SESSION_PROFIT_LOCK_ENABLED", False)):
+            return
+        realized_now = float(self.realized_pnl_usd or 0.0)
+        prev_peak = float(self._session_peak_realized_pnl_usd or 0.0)
+        peak = max(prev_peak, realized_now)
+        self._session_peak_realized_pnl_usd = peak
+
+        activate = max(0.0, float(getattr(config, "SESSION_PROFIT_LOCK_ACTIVATE_USD", 0.35) or 0.35))
+        if peak < activate:
+            return
+        keep_ratio = max(0.0, min(1.0, float(getattr(config, "SESSION_PROFIT_LOCK_KEEP_RATIO", 0.55) or 0.55)))
+        min_floor = max(0.0, float(getattr(config, "SESSION_PROFIT_LOCK_MIN_FLOOR_USD", 0.10) or 0.10))
+        floor = max(min_floor, peak * keep_ratio)
+        if realized_now >= floor:
+            return
+        pause_seconds = max(0, int(getattr(config, "SESSION_PROFIT_LOCK_PAUSE_SECONDS", 900) or 900))
+        self._risk_trigger_pause(
+            reason="session_profit_lock",
+            detail=(
+                f"reason={close_reason} pnl_usd={pnl_usd:.4f} "
+                f"realized={realized_now:.4f} peak={peak:.4f} floor={floor:.4f}"
+            ),
+            pause_seconds=pause_seconds,
+        )
+        self._session_profit_lock_last_trigger_ts = datetime.now(timezone.utc).timestamp()
 
     def _risk_governor_block_reason(self) -> str | None:
         if not bool(getattr(config, "RISK_GOVERNOR_ENABLED", True)):
@@ -1264,31 +1532,56 @@ class AutoTrader:
             self._bump_skip_reason("cooldown")
             logger.info("AutoTrade skip token=%s reason=cooldown_left_%ss", symbol, int(cooldown_until - now_ts))
             return None
+        anti_choke = self._anti_choke_active()
         symbol_cd_left = self._symbol_cooldown_left_seconds(symbol_upper)
         if symbol_cd_left > 0:
-            self._bump_skip_reason("symbol_cooldown")
-            logger.info("AutoTrade skip token=%s reason=symbol_cooldown_left_%ss", symbol, symbol_cd_left)
-            return None
+            if anti_choke and bool(getattr(config, "ANTI_CHOKE_ALLOW_SYMBOL_COOLDOWN_BYPASS", True)):
+                logger.info(
+                    "AutoTrade bypass token=%s reason=symbol_cooldown anti_choke=true left=%ss",
+                    symbol,
+                    symbol_cd_left,
+                )
+            else:
+                self._bump_skip_reason("symbol_cooldown")
+                logger.info("AutoTrade skip token=%s reason=symbol_cooldown_left_%ss", symbol, symbol_cd_left)
+                return None
 
+        symbol_metrics = self._symbol_window_metrics(symbol_upper)
+        token_ev_memory = {
+            "size_mult": 1.0,
+            "edge_mult": 1.0,
+            "entry_probability": 1.0,
+            "detail": "neutral",
+            "bad_ev": False,
+            "severe_ev": False,
+            "seed": "",
+        }
         if bool(getattr(config, "SYMBOL_EV_GUARD_ENABLED", True)):
-            metrics = self._symbol_window_metrics(symbol_upper)
-            trades_w = int(metrics.get("trades", 0) or 0)
-            avg_pnl_w = float(metrics.get("avg_pnl", 0.0) or 0.0)
-            loss_share_w = float(metrics.get("loss_share", 0.0) or 0.0)
-            loss_streak_w = int(metrics.get("loss_streak", 0) or 0)
+            trades_w = int(symbol_metrics.get("trades", 0) or 0)
+            avg_pnl_w = float(symbol_metrics.get("avg_pnl", 0.0) or 0.0)
+            loss_share_w = float(symbol_metrics.get("loss_share", 0.0) or 0.0)
+            loss_streak_w = int(symbol_metrics.get("loss_streak", 0) or 0)
 
             fatigue_cap = int(getattr(config, "SYMBOL_FATIGUE_MAX_TRADES_PER_WINDOW", 0) or 0)
             if fatigue_cap > 0 and trades_w >= fatigue_cap:
-                self._bump_skip_reason("symbol_fatigue_cap")
-                cooldown = int(getattr(config, "SYMBOL_FATIGUE_COOLDOWN_SECONDS", 0) or 0)
-                self._set_symbol_cooldown(symbol_upper, cooldown, "fatigue_cap")
-                logger.info(
-                    "AutoTrade skip token=%s reason=symbol_fatigue_cap trades=%s cap=%s",
-                    symbol,
-                    trades_w,
-                    fatigue_cap,
-                )
-                return None
+                if anti_choke and bool(getattr(config, "ANTI_CHOKE_ALLOW_SYMBOL_FATIGUE_BYPASS", True)):
+                    logger.info(
+                        "AutoTrade bypass token=%s reason=symbol_fatigue_cap anti_choke=true trades=%s cap=%s",
+                        symbol,
+                        trades_w,
+                        fatigue_cap,
+                    )
+                else:
+                    self._bump_skip_reason("symbol_fatigue_cap")
+                    cooldown = int(getattr(config, "SYMBOL_FATIGUE_COOLDOWN_SECONDS", 0) or 0)
+                    self._set_symbol_cooldown(symbol_upper, cooldown, "fatigue_cap")
+                    logger.info(
+                        "AutoTrade skip token=%s reason=symbol_fatigue_cap trades=%s cap=%s",
+                        symbol,
+                        trades_w,
+                        fatigue_cap,
+                    )
+                    return None
 
             max_loss_streak = int(getattr(config, "SYMBOL_FATIGUE_MAX_LOSS_STREAK", 0) or 0)
             if max_loss_streak > 0 and loss_streak_w >= max_loss_streak:
@@ -1310,31 +1603,71 @@ class AutoTrader:
                     or loss_share_w > float(getattr(config, "SYMBOL_EV_MAX_LOSS_SHARE", 0.60) or 0.60)
                 )
                 if bad_ev:
+                    bad_action = str(getattr(config, "SYMBOL_EV_BAD_ACTION", "skip") or "skip").strip().lower()
                     if bool(getattr(config, "SYMBOL_EV_BAD_TO_STRICT_ONLY", True)) and entry_tier != "A":
-                        self._bump_skip_reason("symbol_ev_strict_only")
+                        if anti_choke and bool(getattr(config, "ANTI_CHOKE_ALLOW_SYMBOL_STRICT_BYPASS", True)):
+                            logger.info(
+                                "AutoTrade bypass token=%s reason=symbol_ev_strict_only anti_choke=true tier=%s trades=%s avg=%.5f loss_share=%.2f",
+                                symbol,
+                                entry_tier or "-",
+                                trades_w,
+                                avg_pnl_w,
+                                loss_share_w,
+                            )
+                        else:
+                            self._bump_skip_reason("symbol_ev_strict_only")
+                            logger.info(
+                                "AutoTrade skip token=%s reason=symbol_ev_strict_only tier=%s trades=%s avg=%.5f loss_share=%.2f",
+                                symbol,
+                                entry_tier or "-",
+                                trades_w,
+                                avg_pnl_w,
+                                loss_share_w,
+                            )
+                            return None
+                    if bad_action == "skip":
+                        self._bump_skip_reason("symbol_ev_bad")
+                        self._set_symbol_cooldown(
+                            symbol_upper,
+                            int(getattr(config, "SYMBOL_EV_BAD_COOLDOWN_SECONDS", 0) or 0),
+                            "bad_ev",
+                        )
                         logger.info(
-                            "AutoTrade skip token=%s reason=symbol_ev_strict_only tier=%s trades=%s avg=%.5f loss_share=%.2f",
+                            "AutoTrade skip token=%s reason=symbol_ev_bad trades=%s avg=%.5f loss_share=%.2f",
                             symbol,
-                            entry_tier or "-",
                             trades_w,
                             avg_pnl_w,
                             loss_share_w,
                         )
                         return None
-                    self._bump_skip_reason("symbol_ev_bad")
-                    self._set_symbol_cooldown(
-                        symbol_upper,
-                        int(getattr(config, "SYMBOL_EV_BAD_COOLDOWN_SECONDS", 0) or 0),
-                        "bad_ev",
-                    )
-                    logger.info(
-                        "AutoTrade skip token=%s reason=symbol_ev_bad trades=%s avg=%.5f loss_share=%.2f",
-                        symbol,
-                        trades_w,
-                        avg_pnl_w,
-                        loss_share_w,
-                    )
-                    return None
+
+        if bool(getattr(config, "TOKEN_EV_MEMORY_ENABLED", True)):
+            token_ev_memory = self._token_ev_memory_adjustments(
+                symbol=symbol_upper,
+                market_mode=str(token_data.get("_regime_name", "") or ""),
+                entry_tier=str(entry_tier or ""),
+                candidate_id=candidate_id,
+            )
+            if self._active_trade_decision_context is not None:
+                self._active_trade_decision_context.update(
+                    {
+                        "token_ev_memory_detail": str(token_ev_memory.get("detail", "")),
+                        "token_ev_memory_size_mult": float(token_ev_memory.get("size_mult", 1.0) or 1.0),
+                        "token_ev_memory_edge_mult": float(token_ev_memory.get("edge_mult", 1.0) or 1.0),
+                        "token_ev_memory_probability": float(token_ev_memory.get("entry_probability", 1.0) or 1.0),
+                    }
+                )
+            prob = float(token_ev_memory.get("entry_probability", 1.0) or 1.0)
+            seed = str(token_ev_memory.get("seed", "") or "")
+            if prob < 1.0 and (not self._passes_probability_gate(seed=seed, probability=prob)):
+                self._bump_skip_reason("token_ev_memory_prob")
+                logger.info(
+                    "AutoTrade skip token=%s reason=token_ev_memory_prob p=%.2f detail=%s",
+                    symbol,
+                    prob,
+                    str(token_ev_memory.get("detail", "")),
+                )
+                return None
 
         entry_price_usd = float(token_data.get("price_usd") or 0)
         if entry_price_usd <= 0:
@@ -1352,6 +1685,26 @@ class AutoTrader:
         volume_5m = float(token_data.get("volume_5m") or 0)
         price_change_5m = float(token_data.get("price_change_5m") or 0)
         risk_level = str(token_data.get("risk_level", "MEDIUM")).upper()
+        cluster_key = self._token_cluster_key(
+            score=int(score),
+            liquidity_usd=float(liquidity_usd),
+            volume_5m=float(volume_5m),
+            price_change_5m=float(price_change_5m),
+            risk_level=str(risk_level),
+        )
+        if self._active_trade_decision_context is not None:
+            self._active_trade_decision_context.update(
+                {
+                    "token_cluster_key": cluster_key,
+                    "symbol_window_trades": int(symbol_metrics.get("trades", 0) or 0),
+                    "symbol_window_avg_pnl_usd": float(symbol_metrics.get("avg_pnl", 0.0) or 0.0),
+                    "symbol_window_loss_share": float(symbol_metrics.get("loss_share", 0.0) or 0.0),
+                    "token_ev_memory_detail": str(token_ev_memory.get("detail", "")),
+                    "token_ev_memory_size_mult": float(token_ev_memory.get("size_mult", 1.0) or 1.0),
+                    "token_ev_memory_edge_mult": float(token_ev_memory.get("edge_mult", 1.0) or 1.0),
+                    "token_ev_memory_probability": float(token_ev_memory.get("entry_probability", 1.0) or 1.0),
+                }
+            )
         if bool(getattr(config, "ENTRY_REQUIRE_POSITIVE_CHANGE_5M", False)):
             min_change_5m = float(getattr(config, "ENTRY_MIN_PRICE_CHANGE_5M_PERCENT", 0.0) or 0.0)
             if price_change_5m <= min_change_5m:
@@ -1408,6 +1761,8 @@ class AutoTrader:
         channel_edge_usd_mult = max(0.05, min(1.50, channel_edge_usd_mult))
         channel_edge_pct_mult = _safe_float(token_data.get("_entry_channel_edge_pct_mult"), 1.0)
         channel_edge_pct_mult = max(0.05, min(1.50, channel_edge_pct_mult))
+        token_ev_edge_mult = max(0.20, float(token_ev_memory.get("edge_mult", 1.0) or 1.0))
+        token_ev_size_mult = max(0.05, float(token_ev_memory.get("size_mult", 1.0) or 1.0))
         regime_size_mult = max(0.10, min(1.50, float(regime_size_mult) * float(channel_size_mult)))
         regime_hold_mult = max(0.20, min(1.40, float(regime_hold_mult) * float(channel_hold_mult)))
 
@@ -1423,6 +1778,7 @@ class AutoTrader:
         else:
             mult, mult_detail = 1.0, "off"
         position_size_usd *= float(regime_size_mult)
+        position_size_usd *= float(token_ev_size_mult)
         reinvest_mult, reinvest_detail = self._reinvest_multiplier(expected_edge_percent=float(expected_edge_percent))
         position_size_usd *= float(reinvest_mult)
 
@@ -1467,6 +1823,43 @@ class AutoTrader:
 
         expected_edge_percent = self._estimate_edge_percent(score, tp, sl, cost_profile["total_percent"], risk_level)
         edge_percent_for_decision = float(expected_edge_percent) * float(regime_edge_mult)
+        expected_edge_usd = float(position_size_usd) * float(edge_percent_for_decision) / 100.0
+        ev_snapshot = self._ev_expected_snapshot(
+            market_mode=market_mode,
+            entry_tier=entry_tier,
+            symbol=symbol_upper,
+            cluster_key=cluster_key,
+            score=int(score),
+            fallback_edge_usd=float(expected_edge_usd),
+        )
+        kelly_mult, kelly_fraction = self._kelly_lite_multiplier(
+            p_win=float(ev_snapshot.get("win_rate", 0.0) or 0.0),
+            avg_win_usd=float(ev_snapshot.get("avg_win_usd", 0.0) or 0.0),
+            avg_loss_usd=float(ev_snapshot.get("avg_loss_usd", 0.0) or 0.0),
+            confidence=float(ev_snapshot.get("confidence", 0.0) or 0.0),
+            expected_net_usd=float(ev_snapshot.get("expected_net_usd", 0.0) or 0.0),
+        )
+        position_size_usd *= float(kelly_mult)
+        position_size_usd = min(position_size_usd, self._available_balance_usd())
+        if max_buy_weth > 0:
+            position_size_usd = min(position_size_usd, cap_usd)
+        cost_profile = self._estimate_cost_profile(
+            liquidity_usd,
+            risk_level,
+            score,
+            position_size_usd=position_size_usd,
+        )
+        position_size_usd = self._apply_max_loss_per_trade_cap(
+            position_size_usd=position_size_usd,
+            stop_loss_percent=sl,
+            total_cost_percent=cost_profile["total_percent"],
+            gas_usd=cost_profile["gas_usd"],
+        )
+        position_size_usd = min(position_size_usd, self._available_balance_usd())
+        if max_buy_weth > 0:
+            position_size_usd = min(position_size_usd, cap_usd)
+        expected_edge_percent = self._estimate_edge_percent(score, tp, sl, cost_profile["total_percent"], risk_level)
+        edge_percent_for_decision = float(expected_edge_percent) * float(regime_edge_mult)
 
         min_trade_usd = max(0.01, float(getattr(config, "MIN_TRADE_USD", 0.25) or 0.25))
         if position_size_usd < min_trade_usd:
@@ -1484,6 +1877,54 @@ class AutoTrader:
             return None
 
         expected_edge_usd = float(position_size_usd) * float(edge_percent_for_decision) / 100.0
+        if bool(getattr(config, "EV_FIRST_ENTRY_ENABLED", True)):
+            ev_samples = float(ev_snapshot.get("samples", 0.0) or 0.0)
+            ev_expected_net = float(ev_snapshot.get("expected_net_usd", 0.0) or 0.0)
+            ev_min = float(getattr(config, "EV_FIRST_ENTRY_MIN_NET_USD", 0.0010) or 0.0010)
+            mm = str(market_mode or "").strip().upper()
+            if mm == "RED":
+                ev_min *= float(getattr(config, "EV_FIRST_ENTRY_MIN_NET_USD_RED_MULT", 1.20) or 1.20)
+            elif mm == "YELLOW":
+                ev_min *= float(getattr(config, "EV_FIRST_ENTRY_MIN_NET_USD_YELLOW_MULT", 1.08) or 1.08)
+            else:
+                ev_min *= float(getattr(config, "EV_FIRST_ENTRY_MIN_NET_USD_GREEN_MULT", 1.00) or 1.00)
+            if str(entry_channel) == "explore":
+                ev_min *= float(getattr(config, "EV_FIRST_ENTRY_MIN_NET_USD_EXPLORE_MULT", 1.20) or 1.20)
+            ev_min *= float(token_ev_edge_mult)
+            min_samples = max(5.0, float(getattr(config, "EV_FIRST_ENTRY_MIN_SAMPLES", 24) or 24))
+            if ev_samples >= min_samples and ev_expected_net < ev_min:
+                self._bump_skip_reason("ev_net_low")
+                logger.info(
+                    (
+                        "AutoTrade skip token=%s reason=ev_net_low expected_net=$%.5f min=$%.5f "
+                        "samples=%.0f conf=%.2f pwin=%.2f avg_win=$%.4f avg_loss=$%.4f kelly=%.3f mem=%s"
+                    ),
+                    symbol,
+                    ev_expected_net,
+                    ev_min,
+                    ev_samples,
+                    float(ev_snapshot.get("confidence", 0.0) or 0.0),
+                    float(ev_snapshot.get("win_rate", 0.0) or 0.0),
+                    float(ev_snapshot.get("avg_win_usd", 0.0) or 0.0),
+                    float(ev_snapshot.get("avg_loss_usd", 0.0) or 0.0),
+                    float(kelly_fraction),
+                    str(token_ev_memory.get("detail", "")),
+                )
+                return None
+        if self._active_trade_decision_context is not None:
+            self._active_trade_decision_context.update(
+                {
+                    "ev_samples": float(ev_snapshot.get("samples", 0.0) or 0.0),
+                    "ev_confidence": float(ev_snapshot.get("confidence", 0.0) or 0.0),
+                    "ev_win_rate": float(ev_snapshot.get("win_rate", 0.0) or 0.0),
+                    "ev_avg_win_usd": float(ev_snapshot.get("avg_win_usd", 0.0) or 0.0),
+                    "ev_avg_loss_usd": float(ev_snapshot.get("avg_loss_usd", 0.0) or 0.0),
+                    "ev_avg_net_usd": float(ev_snapshot.get("avg_net_usd", 0.0) or 0.0),
+                    "ev_expected_net_usd": float(ev_snapshot.get("expected_net_usd", 0.0) or 0.0),
+                    "kelly_mult": float(kelly_mult),
+                    "kelly_fraction": float(kelly_fraction),
+                }
+            )
         edge_dbg = self._edge_debug_components(
             score=score,
             tp_percent=tp,
@@ -1493,8 +1934,8 @@ class AutoTrader:
         )
         if config.EDGE_FILTER_ENABLED:
             mode = str(getattr(config, "EDGE_FILTER_MODE", "usd") or "usd").strip().lower()
-            min_edge_pct = float(getattr(config, "MIN_EXPECTED_EDGE_PERCENT", 0.0) or 0.0) * float(channel_edge_pct_mult)
-            min_edge_usd = float(getattr(config, "MIN_EXPECTED_EDGE_USD", 0.0) or 0.0) * float(channel_edge_usd_mult)
+            min_edge_pct = float(getattr(config, "MIN_EXPECTED_EDGE_PERCENT", 0.0) or 0.0) * float(channel_edge_pct_mult) * float(token_ev_edge_mult)
+            min_edge_usd = float(getattr(config, "MIN_EXPECTED_EDGE_USD", 0.0) or 0.0) * float(channel_edge_usd_mult) * float(token_ev_edge_mult)
             pct_ok = edge_percent_for_decision >= float(min_edge_pct)
             usd_ok = expected_edge_usd >= float(min_edge_usd)
             if mode == "percent" and not pct_ok:
@@ -1552,7 +1993,9 @@ class AutoTrader:
             (
                 "AUTO_DECISION token=%s mode=%s tier=%s channel=%s score=%s src=%s liq=%.0f vol5m=%.0f chg5m=%.2f%% "
                 "edge=%.2f%% raw=%.2f%% regime_mult=%.2f edge_usd=$%.3f size=$%.2f mult=%.2f(%s) reinvest=%.2f(%s) "
-                "size_mode=%.2f hold_mode=%.2f edge_gate_mult(usd=%.2f,pct=%.2f) costs=%.2f%% gas=$%.3f breakdown=%s"
+                "size_mode=%.2f hold_mode=%.2f edge_gate_mult(usd=%.2f,pct=%.2f) costs=%.2f%% gas=$%.3f "
+                "ev_net=$%.5f ev_samples=%.0f conf=%.2f pwin=%.2f avg_win=$%.4f avg_loss=$%.4f kelly=%.2f(k=%.3f) "
+                "token_ev=%s cluster=%s breakdown=%s"
             ),
             symbol,
             market_mode or "-",
@@ -1578,6 +2021,16 @@ class AutoTrader:
             float(channel_edge_pct_mult),
             float(cost_profile["total_percent"]),
             float(cost_profile["gas_usd"]),
+            float(ev_snapshot.get("expected_net_usd", 0.0) or 0.0),
+            float(ev_snapshot.get("samples", 0.0) or 0.0),
+            float(ev_snapshot.get("confidence", 0.0) or 0.0),
+            float(ev_snapshot.get("win_rate", 0.0) or 0.0),
+            float(ev_snapshot.get("avg_win_usd", 0.0) or 0.0),
+            float(ev_snapshot.get("avg_loss_usd", 0.0) or 0.0),
+            float(kelly_mult),
+            float(kelly_fraction),
+            str(token_ev_memory.get("detail", "")),
+            str(cluster_key),
             breakdown,
         )
         max_hold_seconds = self._choose_hold_seconds(
@@ -1797,6 +2250,10 @@ class AutoTrader:
                 entry_channel=entry_channel,
                 partial_tp_trigger_mult=regime_partial_tp_trigger_mult,
                 partial_tp_sell_mult=regime_partial_tp_sell_mult,
+                token_cluster_key=cluster_key,
+                ev_expected_net_usd=float(ev_snapshot.get("expected_net_usd", 0.0) or 0.0),
+                ev_confidence=float(ev_snapshot.get("confidence", 0.0) or 0.0),
+                kelly_mult=float(kelly_mult),
             )
             self._set_open_position(pos)
             self.total_plans += 1
@@ -1835,6 +2292,10 @@ class AutoTrader:
                     "market_mode": pos.market_mode,
                     "position_size_usd": float(pos.position_size_usd),
                     "expected_edge_percent": float(pos.expected_edge_percent),
+                    "token_cluster_key": str(pos.token_cluster_key or ""),
+                    "ev_expected_net_usd": float(pos.ev_expected_net_usd),
+                    "ev_confidence": float(pos.ev_confidence),
+                    "kelly_mult": float(pos.kelly_mult),
                     "max_hold_seconds": int(pos.max_hold_seconds),
                     "tx_hash": pos.buy_tx_hash,
                 }
@@ -1867,6 +2328,10 @@ class AutoTrader:
             entry_channel=entry_channel,
             partial_tp_trigger_mult=regime_partial_tp_trigger_mult,
             partial_tp_sell_mult=regime_partial_tp_sell_mult,
+            token_cluster_key=cluster_key,
+            ev_expected_net_usd=float(ev_snapshot.get("expected_net_usd", 0.0) or 0.0),
+            ev_confidence=float(ev_snapshot.get("confidence", 0.0) or 0.0),
+            kelly_mult=float(kelly_mult),
         )
 
         self._set_open_position(pos)
@@ -1909,6 +2374,10 @@ class AutoTrader:
                 "market_mode": pos.market_mode,
                 "position_size_usd": float(pos.position_size_usd),
                 "expected_edge_percent": float(pos.expected_edge_percent),
+                "token_cluster_key": str(pos.token_cluster_key or ""),
+                "ev_expected_net_usd": float(pos.ev_expected_net_usd),
+                "ev_confidence": float(pos.ev_confidence),
+                "kelly_mult": float(pos.kelly_mult),
                 "max_hold_seconds": int(pos.max_hold_seconds),
             }
         )
@@ -2061,6 +2530,39 @@ class AutoTrader:
             return False
         return (pnl / peak) <= retain_ratio
 
+    def _asym_pre_partial_should_exit(self, position: PaperPosition, age_seconds: int) -> bool:
+        if not bool(getattr(config, "ASYMMETRIC_EXITS_ENABLED", True)):
+            return False
+        if not bool(getattr(config, "ASYM_PRE_PARTIAL_RISK_ENABLED", True)):
+            return False
+        if self._partial_tp_stage(position) > 0:
+            return False
+
+        min_age = max(0, int(getattr(config, "ASYM_PRE_PARTIAL_MIN_AGE_SECONDS", 24) or 24))
+        if int(age_seconds) < min_age:
+            return False
+        peak_cap = float(getattr(config, "ASYM_PRE_PARTIAL_MAX_PEAK_PERCENT", 0.90) or 0.90)
+        max_loss = float(getattr(config, "ASYM_PRE_PARTIAL_MAX_LOSS_PERCENT", -1.35) or -1.35)
+        if float(position.peak_pnl_percent) > peak_cap:
+            return False
+        return float(position.pnl_percent) <= max_loss
+
+    def _asym_post_partial_floor_percent(self, position: PaperPosition) -> float | None:
+        if not bool(getattr(config, "ASYMMETRIC_EXITS_ENABLED", True)):
+            return None
+        if not bool(getattr(config, "ASYM_POST_PARTIAL_PROTECT_ENABLED", True)):
+            return None
+        if self._partial_tp_stage(position) <= 0:
+            return None
+
+        peak = float(position.peak_pnl_percent)
+        min_peak = float(getattr(config, "ASYM_POST_PARTIAL_MIN_PEAK_PERCENT", 0.80) or 0.80)
+        if peak < min_peak:
+            return None
+        min_floor = float(getattr(config, "ASYM_POST_PARTIAL_PROTECT_MIN_FLOOR_PERCENT", 0.12) or 0.12)
+        giveback = max(0.0, float(getattr(config, "ASYM_POST_PARTIAL_PROTECT_GIVEBACK_PERCENT", 0.55) or 0.55))
+        return float(max(min_floor, peak - giveback))
+
     async def process_open_positions(self, bot=None) -> None:
         await self._process_recovery_queue()
         await self._check_critical_conditions()
@@ -2108,15 +2610,20 @@ class AutoTrader:
             close_reason = ""
             trailing_floor = self._trailing_floor_percent(position) if has_price_update else None
             partial_stage = self._partial_tp_stage(position)
+            age_seconds = int((datetime.now(timezone.utc) - position.opened_at).total_seconds())
             be_protect_floor = (
                 self._partial_tp_be_protect_floor_percent(position)
                 if (has_price_update and partial_stage > 0 and bool(getattr(config, "PAPER_PARTIAL_TP_BE_PROTECT_ENABLED", True)))
                 else None
             )
+            asym_post_partial_floor = self._asym_post_partial_floor_percent(position) if has_price_update else None
 
             if has_price_update and position.pnl_percent >= position.take_profit_percent:
                 should_close = True
                 close_reason = "TP"
+            elif has_price_update and self._asym_pre_partial_should_exit(position, age_seconds):
+                should_close = True
+                close_reason = "EARLY_RISK"
             elif has_price_update and position.pnl_percent <= -abs(position.stop_loss_percent):
                 should_close = True
                 close_reason = "SL"
@@ -2129,6 +2636,13 @@ class AutoTrader:
             ):
                 should_close = True
                 close_reason = "PROFIT_LOCK"
+            elif (
+                has_price_update
+                and asym_post_partial_floor is not None
+                and float(position.pnl_percent) <= float(asym_post_partial_floor)
+            ):
+                should_close = True
+                close_reason = "POST_PARTIAL_PROTECT"
             elif (
                 has_price_update
                 and be_protect_floor is not None
@@ -2144,7 +2658,6 @@ class AutoTrader:
                 should_close = True
                 close_reason = "TRAIL_FLOOR"
             else:
-                age_seconds = int((datetime.now(timezone.utc) - position.opened_at).total_seconds())
                 effective_hold_seconds = self._effective_timeout_seconds(position)
                 no_momentum_age_gate = max(
                     int(position.max_hold_seconds * max(0.0, min(100.0, float(config.NO_MOMENTUM_EXIT_MIN_AGE_PERCENT))) / 100.0),
@@ -2405,6 +2918,10 @@ class AutoTrader:
             if self.emergency_halt_reason:
                 self._clear_emergency_halt(f"abandoned_position:{self._short_error_text(abandon_reason)}")
             self._risk_governor_after_close(close_reason=f"ABANDON:{abandon_reason}", pnl_usd=float(position.pnl_usd))
+            self._session_profit_lock_after_close(
+                close_reason=f"ABANDON:{abandon_reason}",
+                pnl_usd=float(position.pnl_usd),
+            )
 
             logger.error(
                 "AUTO_SELL Live ABANDON token=%s reason=%s detail=%s",
@@ -2496,6 +3013,7 @@ class AutoTrader:
         else:
             self.current_loss_streak = 0
         self._risk_governor_after_close(close_reason=reason, pnl_usd=float(position.pnl_usd))
+        self._session_profit_lock_after_close(close_reason=reason, pnl_usd=float(position.pnl_usd))
         self._apply_token_cooldown_after_close(
             token_address=position.token_address,
             close_reason=reason,
@@ -2593,6 +3111,7 @@ class AutoTrader:
         else:
             self.current_loss_streak = 0
         self._risk_governor_after_close(close_reason=reason, pnl_usd=float(total_pnl_usd))
+        self._session_profit_lock_after_close(close_reason=reason, pnl_usd=float(total_pnl_usd))
         self._apply_token_cooldown_after_close(
             token_address=position.token_address,
             close_reason=reason,
@@ -3005,6 +3524,8 @@ class AutoTrader:
             "win_rate_percent": round(win_rate, 2),
             "paper_balance_usd": round(self.paper_balance_usd, 2),
             "realized_pnl_usd": round(self.realized_pnl_usd, 2),
+            "session_peak_realized_pnl_usd": round(self._session_peak_realized_pnl_usd, 2),
+            "session_profit_lock_last_trigger_ts": round(self._session_profit_lock_last_trigger_ts, 2),
             "day_realized_pnl_usd": round(self.day_realized_pnl_usd, 2),
             "unrealized_pnl_usd": round(unrealized_pnl, 2),
             "equity_usd": round(equity, 2),
@@ -3027,12 +3548,16 @@ class AutoTrader:
             "recovery_queue": len(self.recovery_queue),
             "recovery_untracked": len(self.recovery_untracked),
             "skip_reasons_window": dict(self._skip_reason_counts_window),
+            "anti_choke_active": self._anti_choke_active(),
+            "entry_idle_seconds": round(self._entry_idle_seconds(), 1),
         }
 
     def reset_paper_state(self, keep_closed: bool = True) -> None:
         self.initial_balance_usd = float(config.WALLET_BALANCE_USD)
         self.paper_balance_usd = float(config.WALLET_BALANCE_USD)
         self.realized_pnl_usd = 0.0
+        self._session_peak_realized_pnl_usd = 0.0
+        self._session_profit_lock_last_trigger_ts = 0.0
         self.day_id = self._current_day_id()
         self.day_start_equity_usd = float(config.WALLET_BALANCE_USD)
         self.day_realized_pnl_usd = 0.0
@@ -3269,6 +3794,156 @@ class AutoTrader:
         if len(self.recovery_untracked) != before:
             self._save_state()
 
+    def _ev_expected_snapshot(
+        self,
+        *,
+        market_mode: str,
+        entry_tier: str,
+        symbol: str,
+        cluster_key: str,
+        score: int,
+        fallback_edge_usd: float,
+    ) -> dict[str, float]:
+        local_rows = self._closed_rows_window(
+            window_minutes=int(getattr(config, "EV_FIRST_ENTRY_LOCAL_WINDOW_MINUTES", 360) or 360)
+        )
+        mm = str(market_mode or "").strip().upper()
+        et = str(entry_tier or "").strip().upper()
+        regime_local = self._ev_stats_from_pnls(
+            [
+                float(getattr(p, "pnl_usd", 0.0) or 0.0)
+                for p in local_rows
+                if str(getattr(p, "market_mode", "") or "").strip().upper() == mm
+                and str(getattr(p, "entry_tier", "") or "").strip().upper() == et
+            ]
+        )
+        cluster_local = self._cluster_window_metrics(cluster_key)
+        symbol_local = self._symbol_ev_stats(symbol)
+        regime_db = self._ev_db_stats(market_mode=mm, entry_tier=et, score=int(score))
+
+        blended = self._blend_ev_stats([regime_db, regime_local, cluster_local, symbol_local])
+        samples = float(blended.get("samples", 0.0) or 0.0)
+        min_samples = max(5.0, float(getattr(config, "EV_FIRST_ENTRY_MIN_SAMPLES", 24) or 24))
+        conf = max(0.0, min(1.0, samples / min_samples))
+        # Keep some dependency on in-engine edge model for stability on sparse buckets.
+        fallback_w_max = max(0.0, min(1.0, float(getattr(config, "EV_FIRST_ENTRY_FALLBACK_WEIGHT_MAX", 0.70) or 0.70)))
+        fallback_w = (1.0 - conf) * fallback_w_max
+        expected_net_usd = (
+            (1.0 - fallback_w) * float(blended.get("avg_net_usd", 0.0) or 0.0)
+            + fallback_w * float(fallback_edge_usd)
+        )
+        expected_net_usd -= max(0.0, float(getattr(config, "EV_FIRST_ENTRY_COST_HAIRCUT_USD", 0.0005) or 0.0005))
+        return {
+            "samples": float(samples),
+            "confidence": float(conf),
+            "win_rate": float(blended.get("win_rate", 0.0) or 0.0),
+            "avg_win_usd": float(blended.get("avg_win_usd", 0.0) or 0.0),
+            "avg_loss_usd": float(blended.get("avg_loss_usd", 0.0) or 0.0),
+            "avg_net_usd": float(blended.get("avg_net_usd", 0.0) or 0.0),
+            "expected_net_usd": float(expected_net_usd),
+            "fallback_edge_usd": float(fallback_edge_usd),
+        }
+
+    def _token_ev_memory_adjustments(
+        self,
+        *,
+        symbol: str,
+        market_mode: str,
+        entry_tier: str,
+        candidate_id: str,
+    ) -> dict[str, float | str | bool]:
+        out: dict[str, float | str | bool] = {
+            "enabled": bool(getattr(config, "TOKEN_EV_MEMORY_ENABLED", True)),
+            "bad_ev": False,
+            "severe_ev": False,
+            "size_mult": 1.0,
+            "edge_mult": 1.0,
+            "entry_probability": 1.0,
+            "avg_pnl_usd": 0.0,
+            "loss_share": 0.0,
+            "trades": 0.0,
+            "seed": "",
+            "detail": "neutral",
+        }
+        if not bool(out["enabled"]):
+            return out
+
+        stats = self._symbol_window_metrics(symbol)
+        trades = float(stats.get("trades", 0) or 0.0)
+        avg_pnl = float(stats.get("avg_pnl", 0.0) or 0.0)
+        loss_share = float(stats.get("loss_share", 0.0) or 0.0)
+        out["trades"] = trades
+        out["avg_pnl_usd"] = avg_pnl
+        out["loss_share"] = loss_share
+
+        min_trades = max(2.0, float(getattr(config, "TOKEN_EV_MEMORY_MIN_TRADES", 4) or 4))
+        if trades < min_trades:
+            out["detail"] = f"sparse trades={int(trades)}<{int(min_trades)}"
+            return out
+
+        bad_avg = float(getattr(config, "TOKEN_EV_MEMORY_BAD_AVG_PNL_USD", 0.0002) or 0.0002)
+        bad_loss_share = float(getattr(config, "TOKEN_EV_MEMORY_BAD_LOSS_SHARE", 0.62) or 0.62)
+        severe_avg = float(getattr(config, "TOKEN_EV_MEMORY_SEVERE_AVG_PNL_USD", -0.0018) or -0.0018)
+        severe_loss_share = float(getattr(config, "TOKEN_EV_MEMORY_SEVERE_LOSS_SHARE", 0.72) or 0.72)
+
+        bad = (avg_pnl < bad_avg) or (loss_share > bad_loss_share)
+        severe = (avg_pnl < severe_avg) or (loss_share > severe_loss_share)
+        out["bad_ev"] = bool(bad)
+        out["severe_ev"] = bool(severe)
+        if not bad:
+            out["detail"] = f"ok trades={int(trades)} avg={avg_pnl:.5f} loss_share={loss_share:.2f}"
+            return out
+
+        if severe:
+            out["size_mult"] = float(getattr(config, "TOKEN_EV_MEMORY_SEVERE_SIZE_MULT", 0.58) or 0.58)
+            out["edge_mult"] = float(getattr(config, "TOKEN_EV_MEMORY_SEVERE_EDGE_MULT", 1.28) or 1.28)
+            out["entry_probability"] = float(getattr(config, "TOKEN_EV_MEMORY_SEVERE_ENTRY_PROBABILITY", 0.42) or 0.42)
+        else:
+            out["size_mult"] = float(getattr(config, "TOKEN_EV_MEMORY_BAD_SIZE_MULT", 0.78) or 0.78)
+            out["edge_mult"] = float(getattr(config, "TOKEN_EV_MEMORY_BAD_EDGE_MULT", 1.12) or 1.12)
+            out["entry_probability"] = float(getattr(config, "TOKEN_EV_MEMORY_BAD_ENTRY_PROBABILITY", 0.72) or 0.72)
+
+        minute_slot = int(time.time() // 60)
+        seed = f"{str(symbol).upper()}|{str(market_mode).upper()}|{str(entry_tier).upper()}|{str(candidate_id)}|{minute_slot}"
+        out["seed"] = seed
+        out["detail"] = (
+            f"bad={bad} severe={severe} trades={int(trades)} avg={avg_pnl:.5f} "
+            f"loss_share={loss_share:.2f} size_mult={float(out['size_mult']):.2f} "
+            f"edge_mult={float(out['edge_mult']):.2f} p={float(out['entry_probability']):.2f}"
+        )
+        return out
+
+    @staticmethod
+    def _kelly_lite_multiplier(
+        *,
+        p_win: float,
+        avg_win_usd: float,
+        avg_loss_usd: float,
+        confidence: float,
+        expected_net_usd: float,
+    ) -> tuple[float, float]:
+        if not bool(getattr(config, "KELLY_LITE_ENABLED", True)):
+            return 1.0, 0.0
+        p = max(0.0, min(1.0, float(p_win)))
+        w = max(0.0, float(avg_win_usd))
+        l = max(0.000001, float(avg_loss_usd))
+        if w <= 0.0 or float(expected_net_usd) <= 0.0:
+            k = 0.0
+        else:
+            b = w / l
+            q = 1.0 - p
+            k = ((b * p) - q) / max(0.000001, b)
+        k = max(0.0, min(float(getattr(config, "KELLY_LITE_MAX_FRACTION", 0.45) or 0.45), k))
+        confidence_clamped = max(0.0, min(1.0, float(confidence)))
+        min_samples = max(5.0, float(getattr(config, "KELLY_LITE_MIN_CONFIDENCE_SAMPLES", 18) or 18))
+        conf_adj = min(1.0, confidence_clamped * (float(confidence_clamped) * (min_samples / max(5.0, min_samples))))
+        min_mult = max(0.1, float(getattr(config, "KELLY_LITE_MIN_MULT", 0.55) or 0.55))
+        max_mult = max(min_mult, float(getattr(config, "KELLY_LITE_MAX_MULT", 1.55) or 1.55))
+        raw_mult = min_mult + ((max_mult - min_mult) * (k / max(0.000001, float(getattr(config, "KELLY_LITE_MAX_FRACTION", 0.45) or 0.45))))
+        # Pull toward neutral when confidence is low.
+        mult = 1.0 + ((raw_mult - 1.0) * conf_adj)
+        return float(max(min_mult, min(max_mult, mult))), float(k)
+
     @staticmethod
     def _estimate_edge_percent(
         score: int,
@@ -3497,6 +4172,10 @@ class AutoTrader:
             "entry_channel": pos.entry_channel,
             "partial_tp_trigger_mult": pos.partial_tp_trigger_mult,
             "partial_tp_sell_mult": pos.partial_tp_sell_mult,
+            "token_cluster_key": pos.token_cluster_key,
+            "ev_expected_net_usd": pos.ev_expected_net_usd,
+            "ev_confidence": pos.ev_confidence,
+            "kelly_mult": pos.kelly_mult,
         }
 
     @staticmethod
@@ -3563,6 +4242,10 @@ class AutoTrader:
                 entry_channel=str(row.get("entry_channel", "")),
                 partial_tp_trigger_mult=float(row.get("partial_tp_trigger_mult", 1.0) or 1.0),
                 partial_tp_sell_mult=float(row.get("partial_tp_sell_mult", 1.0) or 1.0),
+                token_cluster_key=str(row.get("token_cluster_key", "")),
+                ev_expected_net_usd=float(row.get("ev_expected_net_usd", 0.0) or 0.0),
+                ev_confidence=float(row.get("ev_confidence", 0.0) or 0.0),
+                kelly_mult=float(row.get("kelly_mult", 1.0) or 1.0),
             )
         except Exception:
             return None

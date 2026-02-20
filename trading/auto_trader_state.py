@@ -23,6 +23,8 @@ def save_state(trader: Any) -> None:
             "initial_balance_usd": trader.initial_balance_usd,
             "paper_balance_usd": trader.paper_balance_usd,
             "realized_pnl_usd": trader.realized_pnl_usd,
+            "session_peak_realized_pnl_usd": trader._session_peak_realized_pnl_usd,
+            "session_profit_lock_last_trigger_ts": trader._session_profit_lock_last_trigger_ts,
             "total_plans": trader.total_plans,
             "total_executed": trader.total_executed,
             "total_closed": trader.total_closed,
@@ -86,6 +88,12 @@ def load_state(trader: Any) -> None:
         trader.initial_balance_usd = float(payload.get("initial_balance_usd", trader.initial_balance_usd))
         trader.paper_balance_usd = float(payload.get("paper_balance_usd", trader.paper_balance_usd))
         trader.realized_pnl_usd = float(payload.get("realized_pnl_usd", 0.0))
+        trader._session_peak_realized_pnl_usd = float(
+            payload.get("session_peak_realized_pnl_usd", trader.realized_pnl_usd) or 0.0
+        )
+        trader._session_profit_lock_last_trigger_ts = float(
+            payload.get("session_profit_lock_last_trigger_ts", 0.0) or 0.0
+        )
         trader.total_plans = int(payload.get("total_plans", 0))
         trader.total_executed = int(payload.get("total_executed", 0))
         trader.total_closed = int(payload.get("total_closed", 0))
@@ -216,4 +224,3 @@ def load_state(trader: Any) -> None:
         )
     except Exception as exc:
         logger.warning("AutoTrade state load failed: %s", exc)
-

@@ -13,6 +13,7 @@ import time
 from collections import deque
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
+from typing import Any
 
 try:
     import msvcrt  # Windows-only, used for a robust single-instance file lock.
@@ -38,6 +39,7 @@ from trading.v2_runtime import (
     SafetyBudgetController,
     UnifiedCalibrator,
     UniverseFlowController,
+    UniverseQualityGateController,
 )
 from utils.log_contracts import candidate_decision_event
 from utils.addressing import normalize_address
@@ -1980,6 +1982,7 @@ async def run_local_loop() -> None:
     strategy_orchestrator.prime(auto_stats=adaptive_init_stats)
     profile_autostop = ProfileAutoStopController()
     v2_universe = UniverseFlowController()
+    v2_quality_gate = UniverseQualityGateController()
     v2_safety_budget = SafetyBudgetController()
     v2_calibrator = UnifiedCalibrator()
     v2_policy_router = PolicyEntryRouter()
@@ -2388,23 +2391,85 @@ async def run_local_loop() -> None:
                 )
                 policy_mode_current = policy_state
                 candidates_pre_route = list(trade_candidates)
+                candidate_lookup: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+                for token_data, score_data in candidates_pre_route:
+                    cid = str((token_data or {}).get("_candidate_id", "") or "")
+                    if cid:
+                        candidate_lookup[cid] = (token_data, score_data)
+                quality_gate_meta: dict[str, object] = {
+                    "enabled": bool(getattr(config, "V2_QUALITY_GATE_ENABLED", False)),
+                    "in_total": len(candidates_pre_route),
+                    "out_total": len(candidates_pre_route),
+                    "core_out": 0,
+                    "explore_out": 0,
+                    "probe_out": 0,
+                    "drop_counts": {},
+                }
+                candidates_quality = list(candidates_pre_route)
+                if candidates_pre_route:
+                    candidates_quality, quality_gate_meta = v2_quality_gate.filter_candidates(
+                        candidates=candidates_pre_route,
+                        auto_trader=auto_trader,
+                        market_mode=market_regime_current,
+                    )
+                    logger.info(
+                        (
+                            "V2_QUALITY_GATE enabled=%s regime=%s in=%s out=%s core_out=%s explore_out=%s probe_out=%s "
+                            "quota=%s max_symbol_share=%.3f drop=%s sources_used=%s"
+                        ),
+                        bool(quality_gate_meta.get("enabled", False)),
+                        str(quality_gate_meta.get("regime", market_regime_current)),
+                        int(quality_gate_meta.get("in_total", 0) or 0),
+                        int(quality_gate_meta.get("out_total", 0) or 0),
+                        int(quality_gate_meta.get("core_out", 0) or 0),
+                        int(quality_gate_meta.get("explore_out", 0) or 0),
+                        int(quality_gate_meta.get("probe_out", 0) or 0),
+                        int(quality_gate_meta.get("explore_quota", 0) or 0),
+                        float(quality_gate_meta.get("max_symbol_share_out", 0.0) or 0.0),
+                        dict(quality_gate_meta.get("drop_counts", {}) or {}),
+                        dict(quality_gate_meta.get("source_used", {}) or {}),
+                    )
+                quality_dropped = list(quality_gate_meta.get("dropped", []) or [])
+                if quality_dropped:
+                    for drop_row in quality_dropped:
+                        cid = str((drop_row or {}).get("candidate_id", "") or "")
+                        token_data, score_data = candidate_lookup.get(cid, ({}, {}))
+                        candidate_writer.write(
+                            {
+                                "ts": time.time(),
+                                "cycle_index": cycle_index,
+                                "candidate_id": cid,
+                                "source_mode": source_mode,
+                                "decision_stage": "quality_gate",
+                                "decision": "skip",
+                                "reason": str((drop_row or {}).get("reason", "quality_gate")),
+                                "quality_bucket": str((drop_row or {}).get("bucket", "")),
+                                "market_regime": market_regime_current,
+                                "market_regime_reason": market_regime_reason,
+                                "address": normalize_address((token_data or {}).get("address", "")),
+                                "symbol": str((token_data or {}).get("symbol", (drop_row or {}).get("symbol", "N/A"))),
+                                "score": int((score_data or {}).get("score", 0)),
+                                "recommendation": str((score_data or {}).get("recommendation", "")),
+                                "quality": _candidate_quality_features(token_data or {}, score_data or {}),
+                            }
+                        )
                 candidates_symbols_cycle = [
                     str((token_data or {}).get("symbol", "") or "").strip().upper()
-                    for token_data, _ in candidates_pre_route
+                    for token_data, _ in candidates_quality
                     if str((token_data or {}).get("symbol", "") or "").strip()
                 ]
                 dual_route_meta: dict[str, object] = {
                     "enabled": bool(getattr(config, "V2_ENTRY_DUAL_CHANNEL_ENABLED", False)),
-                    "in_total": len(candidates_pre_route),
-                    "out_total": len(candidates_pre_route),
-                    "core_out": len(candidates_pre_route),
+                    "in_total": len(candidates_quality),
+                    "out_total": len(candidates_quality),
+                    "core_out": len(candidates_quality),
                     "explore_out": 0,
                     "regime": market_regime_current,
                 }
-                candidates_dual = list(candidates_pre_route)
-                if candidates_pre_route:
+                candidates_dual = list(candidates_quality)
+                if candidates_quality:
                     candidates_dual, dual_route_meta = v2_dual_entry.allocate(
-                        candidates=candidates_pre_route,
+                        candidates=candidates_quality,
                         market_mode=market_regime_current,
                     )
                     if int(dual_route_meta.get("in_total", 0) or 0) != int(dual_route_meta.get("out_total", 0) or 0) or bool(
@@ -2531,7 +2596,7 @@ async def run_local_loop() -> None:
                 await auto_trader.process_open_positions(bot=None)
                 auto_stats = auto_trader.get_stats()
                 skip_reasons_cycle = auto_trader.pop_skip_reason_counts_window()
-                candidate_count_cycle = len(candidates_pre_route)
+                candidate_count_cycle = len(candidates_quality)
                 adaptive_filters.record_cycle(
                     candidates=candidate_count_cycle,
                     opened=opened_trades,
@@ -2690,7 +2755,8 @@ async def run_local_loop() -> None:
 
                 logger.info(
                     (
-                        "Scanned %s tokens | High quality: %s | Alerts sent: %s | Trade candidates: %s | Opened: %s | "
+                        "Scanned %s tokens | High quality: %s | Alerts sent: %s | Trade candidates: %s | "
+                        "Quality out/core/explore/probe: %s/%s/%s/%s | Opened: %s | "
                         "Mode: local | Source: %s | Policy: raw=%s/effective=%s(%s) | Regime: %s(%s) | "
                         "Safety: checked=%s fail_closed=%s reasons=%s | FiltersTop(session): %s | Dedup: heavy_skip=%s override=%s | "
                         "V2Budget: %s/%s | Ingest: %s | Sources: %s | Tasks: %s | RSS: %.1fMB | CycleAvg: %.2fs"
@@ -2699,6 +2765,10 @@ async def run_local_loop() -> None:
                     high_quality,
                     alerts_sent,
                     len(trade_candidates),
+                    int(quality_gate_meta.get("out_total", 0) or 0),
+                    int(quality_gate_meta.get("core_out", 0) or 0),
+                    int(quality_gate_meta.get("explore_out", 0) or 0),
+                    int(quality_gate_meta.get("probe_out", 0) or 0),
                     opened_trades,
                     source_mode,
                     policy_state,

@@ -1,74 +1,115 @@
-﻿# NEXT_CHAT_CONTEXT
+# NEXT_CHAT_CONTEXT
 
-## Project
+## Project Snapshot (2026-02-20)
 - Repo: `d:\earnforme\solana-alert-bot`
-- Goal: stabilize `LIVE` mode so behavior/visibility is close to `PAPER` (without unsafe relax of scam filters).
-- GUI is the main control surface (`launcher_gui.py`).
+- Mode in focus: `MATRIX` only (paper test runs for preset selection).
+- Objective: raise net profitability consistency, not just trade flow stability.
+- Current active test profiles:
+  - `mx20_quality_balanced`
+  - `mx21_quality_aggressive`
 
-## What happened before
-- In `LIVE`, user often saw:
-  - opened positions not visible in GUI,
-  - `UNTRACKED` rows hanging after sell,
-  - mismatch between wallet and `open_positions`,
-  - lower entry flow than in `PAPER` due stricter live gates.
-- User explicitly requires manual confirmation before any live switch/start.
+## What Was Implemented (latest patch)
+### 1) Universe Quality Gate (pre-entry)
+- File: `trading/v2_runtime.py`
+- Controller: `UniverseQualityGateController`
+- Adds EV-first routing before dual-entry/policy router:
+  - `core` pool: symbols/clusters with rolling EV+ and acceptable loss share.
+  - `explore` pool: unknown/neutral candidates, quota-limited.
+  - `cooldown` bucket: weak symbols/clusters; not permanent ban.
+- Cooldown logic:
+  - rare probe entries (probabilistic re-check),
+  - reduced size/hold and stricter edge multipliers for probe entries.
 
-## Important constraints from user
-- Do not start/stop live trading without direct explicit user command.
-- Preserve quality of entries (anti-scam guardrails must stay strong).
-- GUI must show real runtime state clearly (open/closed/live reasons/health).
+### 2) Dynamic Source Budget
+- File: `trading/v2_runtime.py`
+- Per-source allocation based on recent rolling source EV (windowed).
+- Strong sources receive larger effective slot share.
+- Weak sources are cut but not hard-removed.
 
-## Latest code changes (current session)
-### 1) Address-key consistency fix in trader state
-- File: `trading/auto_trader.py`
-- Added helpers:
-  - `_position_key(token_address)`
-  - `_set_open_position(position)`
-  - `_pop_open_position(token_address)`
-- Purpose:
-  - enforce normalized address keys in `open_positions`,
-  - remove stale legacy raw keys on close,
-  - reduce `UNTRACKED`/stuck-open mismatches caused by mixed key formats.
-- Updated open/close paths to use helpers instead of direct dict access.
-- Updated `live_buy_zero_amount` recovery map write to normalized key.
+### 3) Symbol Concentration Protection
+- File: `trading/v2_runtime.py`
+- Per-window limit on same-symbol entry share.
+- Prevents one false-good or false-bad symbol from dominating run results.
 
-### 2) In-progress GUI consistency pass
-- Target file: `launcher_gui.py`
-- Next intended adjustment: KPI/summary should count visible untracked wallet positions (not show misleading `Open: 0` when `UNTRACKED` rows exist).
-- This part was planned and should be completed/validated in the next chat if not yet applied.
+### 4) Online Pool Rotation
+- File: `trading/v2_runtime.py`
+- Rotation refresh every configured interval.
+- Logs `V2_QUALITY_ROTATE` with top core/cooldown symbols.
 
-## Runtime/data state notes
-- Repo contains many runtime artifacts (`trading/paper_state*.json`, `logs/*`, `data/matrix/backups/*`, `collected_info/*`).
-- There are deep nested backup paths from old `full_project_*` recursion artifacts.
-- Keep code commits clean: avoid committing runtime junk unless explicitly requested.
+### 5) Main Pipeline Integration + Visibility
+- File: `main_local.py`
+- Quality gate inserted before dual-entry/router.
+- Added quality-stage drop logging (`decision_stage="quality_gate"`).
+- Cycle summary now includes quality metrics:
+  - `Quality out/core/explore/probe`.
 
-## What to verify first in next chat
-1. Run static sanity:
-   - `python -m py_compile launcher_gui.py main_local.py trading/auto_trader.py trading/live_executor.py`
-2. Verify key consistency behavior:
-   - open live position -> ensure appears in GUI open table,
-   - close/sell -> ensure row leaves open table and appears in closed,
-   - ensure no stale `UNTRACKED` remains when wallet balance is zero.
-3. Check GUI source selector:
-   - in `Trades` tab, verify correct source (`single` vs matrix profile) before judging “no trades”.
-4. Validate `LIVE` guard reasons in GUI:
-   - limits line, idle reasons, block-after-pass, health line.
+### 6) DualEntry Compatibility Fix
+- File: `trading/v2_runtime.py`
+- DualEntry now multiplies existing `_entry_channel_*` multipliers instead of overwriting.
+- Required so quality-gate penalties survive downstream tagging.
 
-## Operational checklist before next live start
-- Confirm `.env` mode coherence:
-  - `AUTO_TRADE_ENABLED=true`
-  - `AUTO_TRADE_PAPER=false` for live
-  - correct wallet/rpc/router fields
-- Ensure bot process state is clean (no stale old PID lock confusion).
-- Clear only GUI-visible history if needed (without deleting forensic logs).
-- Start only after user says explicit command.
+### 7) Config Surface Added
+- File: `config.py`
+- Added `V2_QUALITY_*` controls:
+  - gate on/off, windows, min trades,
+  - EV/loss thresholds,
+  - explore quota,
+  - cooldown probe and risk multipliers,
+  - source budget tuning,
+  - symbol concentration limits,
+  - top-symbol logging count.
 
-## Suggested next-step implementation
-- Finish GUI KPI fix for untracked/open count consistency.
-- Add a small invariant check in refresh loop:
-  - if wallet shows token raw>0 and neither `open_positions` nor `recovery_untracked` has it, emit warning event and attempt one-shot resync.
-- Add an integration smoke script for state lifecycle (buy/open -> close -> persisted state).
+### 8) Matrix Profiles Added
+- File: `tools/matrix_paper_launcher.ps1`
+- Added:
+  - `mx20_quality_balanced` (base `mx18_v2_balanced`)
+  - `mx21_quality_aggressive` (base `mx19_v2_aggressive`)
 
-## Quick starter prompt for new chat
-Use this:
-"Continue from NEXT_CHAT_CONTEXT.md. First verify current code state and compile checks, then finish GUI open/untracked consistency, then run a safe dry validation plan for live visibility without starting live until I confirm."
+## Critical Bug Fixed
+- File: `trading/v2_runtime.py`
+- In quality-gate config reads, `0` values were previously overridden by defaults due to `or default` pattern.
+- Fixed via explicit `None` handling so values like `0.0` apply correctly.
+
+## Validation Status
+- Compile/tests state after patch:
+  - `python -m unittest discover -s tests -p "test_*.py" -v`
+  - Result: `26 tests, OK`.
+- Quality-gate tests present in:
+  - `tests/test_v2_runtime_controls.py`
+
+## Non-negotiable Log-Cut Protocol (must use every time)
+During each session cut, evaluate ALL layers, not only PnL:
+1. Flow: candidates in/out, open rate, idle gaps.
+2. Pool: core/explore/cooldown shares, rotation behavior, max symbol share.
+3. Source: dynamic source caps, who gets boosted/cut.
+4. Entries: tier A/B distribution, edge, size, probe frequency.
+5. Exits: TP/timeout/SL split, avg win/loss, hold-time profile.
+6. Regime: GREEN/YELLOW/RED transitions and reasons.
+7. Policy: OK/DEGRADED/FAIL_CLOSED impact on routing.
+8. Outcome: realized PnL, EV/trade, EV/hour, equity smoothness.
+
+## Interpretation Rule
+- First 20-40 minutes: adaptation warming (signals valid but estimates still stabilizing).
+- Stronger effect expected after enough rolling window fill (roughly 40-90 minutes).
+
+## Current Working Principle
+- MATRIX is the only place for testing/ranking presets.
+- LIVE is only for selected winner preset after evidence.
+- Do not claim success from one short burst; evaluate by full checklist and windowed EV.
+
+## Commands (quick ops)
+- Stop matrix:
+  - `powershell -NoProfile -ExecutionPolicy Bypass -File tools/matrix_paper_stop.ps1 -HardKill`
+- Launch two quality profiles:
+  - `powershell -NoProfile -ExecutionPolicy Bypass -File tools/matrix_paper_launcher.ps1 -Run -Count 2 -ProfileIds mx20_quality_balanced,mx21_quality_aggressive`
+- Matrix summary:
+  - `powershell -NoProfile -ExecutionPolicy Bypass -File tools/matrix_paper_summary.ps1`
+
+## What To Do First In New Chat
+1. Confirm only expected matrix processes are active.
+2. Take a time-bounded log cut (at least 60 minutes preferred).
+3. Produce checklist-based diagnosis (8 sections above).
+4. Decide next patch by root cause layer (pool/source/entry/exit), not by raw PnL alone.
+
+## Ready-to-use Prompt For Next Chat
+"Continue from NEXT_CHAT_CONTEXT.md. Start with a full matrix log-cut diagnosis using the 8-layer checklist (flow/pool/source/entries/exits/regime/policy/outcome), then propose exact parameter/code changes for the weakest layer and run only two matrix profiles."
