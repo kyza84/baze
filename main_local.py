@@ -1909,12 +1909,17 @@ def configure_logging() -> None:
     os.makedirs(LOG_DIR, exist_ok=True)
     session_logs_dir = os.path.join(LOG_DIR, "sessions")
     os.makedirs(session_logs_dir, exist_ok=True)
-    class _RunTagFilter(logging.Filter):
-        def filter(self, record: logging.LogRecord) -> bool:
-            setattr(record, "run_tag", RUN_TAG)
-            return True
 
     formatter = logging.Formatter("%(asctime)s [%(levelname)s] [%(run_tag)s] %(name)s: %(message)s")
+    prev_factory = logging.getLogRecordFactory()
+
+    def _record_factory(*args: Any, **kwargs: Any) -> logging.LogRecord:
+        record = prev_factory(*args, **kwargs)
+        if not hasattr(record, "run_tag"):
+            setattr(record, "run_tag", RUN_TAG)
+        return record
+
+    logging.setLogRecordFactory(_record_factory)
 
     file_handler = RotatingFileHandler(APP_LOG_FILE, maxBytes=1_000_000, backupCount=5, encoding="utf-8")
     file_handler.setFormatter(formatter)
@@ -1935,7 +1940,6 @@ def configure_logging() -> None:
     root.addHandler(out_handler)
     root.addHandler(session_handler)
     root.addHandler(console_handler)
-    root.addFilter(_RunTagFilter())
 
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger(__name__).info("SESSION_LOG file=%s", session_log_file)
@@ -2653,6 +2657,21 @@ async def run_local_loop() -> None:
                     market_regime=market_regime_current,
                     auto_stats=auto_stats,
                 )
+                kpi_event = v2_kpi_loop.maybe_apply()
+                if isinstance(kpi_event, dict):
+                    try:
+                        await local_alerter.send_event(
+                            {
+                                "event_type": "V2_KPI_LOOP_APPLIED",
+                                "symbol": "V2_KPI_LOOP",
+                                "recommendation": str(kpi_event.get("action", "INFO")).upper(),
+                                "risk_level": "INFO",
+                                "name": f"{RUN_TAG} KPI loop adjusted",
+                                "breakdown": kpi_event,
+                            }
+                        )
+                    except Exception:
+                        logger.exception("V2_KPI_LOOP event write failed")
                 calibration_event = v2_calibrator.maybe_apply()
                 if isinstance(calibration_event, dict):
                     try:
@@ -2683,21 +2702,6 @@ async def run_local_loop() -> None:
                         )
                     except Exception:
                         logger.exception("V2_ROLLING_EDGE event write failed")
-                kpi_event = v2_kpi_loop.maybe_apply()
-                if isinstance(kpi_event, dict):
-                    try:
-                        await local_alerter.send_event(
-                            {
-                                "event_type": "V2_KPI_LOOP_APPLIED",
-                                "symbol": "V2_KPI_LOOP",
-                                "recommendation": str(kpi_event.get("action", "INFO")).upper(),
-                                "risk_level": "INFO",
-                                "name": f"{RUN_TAG} KPI loop adjusted",
-                                "breakdown": kpi_event,
-                            }
-                        )
-                    except Exception:
-                        logger.exception("V2_KPI_LOOP event write failed")
                 stop_now, stop_event = profile_autostop.maybe_stop(auto_stats=auto_stats)
                 if stop_now:
                     reason = ""

@@ -98,7 +98,7 @@ def build_report(root: str) -> dict[str, Any]:
     for path in files:
         source_files += 1
         try:
-            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            with open(path, "r", encoding="utf-8-sig", errors="ignore") as f:
                 payload = json.load(f)
         except Exception:
             parse_errors += 1

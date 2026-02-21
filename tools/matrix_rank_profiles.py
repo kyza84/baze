@@ -60,9 +60,11 @@ class ProfileStats:
     losses: int
     breakeven: int
     realized_pnl_usd: float
+    realized_pnl_clipped_usd: float
     winrate_pct: float
     profit_factor: float
     worst_trade_usd: float
+    top_symbol_share: float
     current_loss_streak: int
     entries_last_window: int
     exits_last_window: int
@@ -79,9 +81,11 @@ class ProfileStats:
             "losses": self.losses,
             "breakeven": self.breakeven,
             "realized_pnl_usd": round(self.realized_pnl_usd, 6),
+            "realized_pnl_clipped_usd": round(self.realized_pnl_clipped_usd, 6),
             "winrate_pct": round(self.winrate_pct, 2),
             "profit_factor": round(self.profit_factor, 4) if self.profit_factor != float("inf") else "inf",
             "worst_trade_usd": round(self.worst_trade_usd, 6),
+            "top_symbol_share": round(self.top_symbol_share, 4),
             "current_loss_streak": self.current_loss_streak,
             "entries_last_window": self.entries_last_window,
             "exits_last_window": self.exits_last_window,
@@ -157,20 +161,23 @@ def _build_stats(
         closed_rows = []
     open_rows = [x for x in open_rows if isinstance(x, dict)]
     closed_rows = [x for x in closed_rows if isinstance(x, dict)]
+    clipped_rows = [x for x in closed_rows if abs(_safe_float(x.get("pnl_percent"), 0.0)) < 100.0]
+    base_rows = clipped_rows if clipped_rows else closed_rows
 
-    wins = sum(1 for row in closed_rows if _safe_float(row.get("pnl_usd"), 0.0) > 0.0)
-    losses = sum(1 for row in closed_rows if _safe_float(row.get("pnl_usd"), 0.0) < 0.0)
-    breakeven = max(0, len(closed_rows) - wins - losses)
+    wins = sum(1 for row in base_rows if _safe_float(row.get("pnl_usd"), 0.0) > 0.0)
+    losses = sum(1 for row in base_rows if _safe_float(row.get("pnl_usd"), 0.0) < 0.0)
+    breakeven = max(0, len(base_rows) - wins - losses)
     realized = _safe_float(state.get("realized_pnl_usd"), 0.0)
     if realized == 0.0 and closed_rows:
         realized = float(sum(_safe_float(row.get("pnl_usd"), 0.0) for row in closed_rows))
+    realized_clipped = float(sum(_safe_float(row.get("pnl_usd"), 0.0) for row in base_rows))
 
     closed_non_be = max(1, wins + losses)
     winrate_pct = (wins / closed_non_be) * 100.0 if (wins + losses) > 0 else 0.0
 
-    gain_sum = float(sum(_safe_float(row.get("pnl_usd"), 0.0) for row in closed_rows if _safe_float(row.get("pnl_usd"), 0.0) > 0))
+    gain_sum = float(sum(_safe_float(row.get("pnl_usd"), 0.0) for row in base_rows if _safe_float(row.get("pnl_usd"), 0.0) > 0))
     loss_sum_abs = float(
-        abs(sum(_safe_float(row.get("pnl_usd"), 0.0) for row in closed_rows if _safe_float(row.get("pnl_usd"), 0.0) < 0))
+        abs(sum(_safe_float(row.get("pnl_usd"), 0.0) for row in base_rows if _safe_float(row.get("pnl_usd"), 0.0) < 0))
     )
     if loss_sum_abs > 0:
         profit_factor = gain_sum / loss_sum_abs
@@ -180,8 +187,15 @@ def _build_stats(
         profit_factor = 0.0
 
     worst_trade_usd = 0.0
-    if closed_rows:
-        worst_trade_usd = float(min(_safe_float(row.get("pnl_usd"), 0.0) for row in closed_rows))
+    if base_rows:
+        worst_trade_usd = float(min(_safe_float(row.get("pnl_usd"), 0.0) for row in base_rows))
+    symbol_counts: dict[str, int] = {}
+    for row in base_rows:
+        symbol = str(row.get("symbol", "") or "").strip().upper() or "UNKNOWN"
+        symbol_counts[symbol] = int(symbol_counts.get(symbol, 0)) + 1
+    top_symbol_share = 0.0
+    if base_rows and symbol_counts:
+        top_symbol_share = max(symbol_counts.values()) / float(len(base_rows))
     current_loss_streak = _current_loss_streak(closed_rows)
 
     now_utc = datetime.now(timezone.utc)
@@ -204,7 +218,7 @@ def _build_stats(
 
     # Composite score: prioritize realized pnl + activity, keep risk penalty explicit.
     activity_score = min(40.0, float(entries_last + exits_last) * 2.5)
-    pnl_score = float(realized) * 45.0
+    pnl_score = float(realized_clipped) * 45.0
     quality_score = ((winrate_pct - 50.0) * 0.35)
     if profit_factor == float("inf"):
         quality_score += 15.0
@@ -215,6 +229,7 @@ def _build_stats(
     risk_penalty = 0.0
     risk_penalty += max(0.0, (abs(worst_trade_usd) - 0.70) * 20.0)
     risk_penalty += max(0.0, (float(current_loss_streak) - 2.0) * 4.0)
+    risk_penalty += max(0.0, (float(top_symbol_share) - 0.35) * 40.0)
     if len(closed_rows) < int(min_closed):
         risk_penalty += float(int(min_closed) - len(closed_rows)) * 2.0
 
@@ -236,9 +251,11 @@ def _build_stats(
         losses=losses,
         breakeven=breakeven,
         realized_pnl_usd=float(realized),
+        realized_pnl_clipped_usd=float(realized_clipped),
         winrate_pct=float(winrate_pct),
         profit_factor=float(profit_factor),
         worst_trade_usd=float(worst_trade_usd),
+        top_symbol_share=float(top_symbol_share),
         current_loss_streak=current_loss_streak,
         entries_last_window=entries_last,
         exits_last_window=exits_last,
@@ -308,7 +325,8 @@ def main() -> int:
         pf = "inf" if s.profit_factor == float("inf") else f"{s.profit_factor:.2f}"
         print(
             f"{idx}. {s.profile_id:<20} score={s.score_total:>7.2f} "
-            f"realized=${s.realized_pnl_usd:+.4f} closed={s.closed_total:>3} "
+            f"realized=${s.realized_pnl_usd:+.4f} clipped=${s.realized_pnl_clipped_usd:+.4f} "
+            f"closed={s.closed_total:>3} top_sym={s.top_symbol_share:>4.2f} "
             f"W/L/BE={s.wins}/{s.losses}/{s.breakeven} wr={s.winrate_pct:>5.1f}% "
             f"pf={pf} act={s.entries_last_window + s.exits_last_window}"
         )

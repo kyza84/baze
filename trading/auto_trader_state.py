@@ -25,6 +25,11 @@ def save_state(trader: Any) -> None:
             "realized_pnl_usd": trader.realized_pnl_usd,
             "session_peak_realized_pnl_usd": trader._session_peak_realized_pnl_usd,
             "session_profit_lock_last_trigger_ts": trader._session_profit_lock_last_trigger_ts,
+            "session_profit_lock_armed": bool(getattr(trader, "_session_profit_lock_armed", True)),
+            "session_profit_lock_rearm_ready_ts": float(getattr(trader, "_session_profit_lock_rearm_ready_ts", 0.0)),
+            "session_profit_lock_rearm_floor_usd": float(getattr(trader, "_session_profit_lock_rearm_floor_usd", 0.0)),
+            "session_profit_lock_last_floor_usd": float(getattr(trader, "_session_profit_lock_last_floor_usd", 0.0)),
+            "session_profit_lock_last_metric_usd": float(getattr(trader, "_session_profit_lock_last_metric_usd", 0.0)),
             "total_plans": trader.total_plans,
             "total_executed": trader.total_executed,
             "total_closed": trader.total_closed,
@@ -32,6 +37,9 @@ def save_state(trader: Any) -> None:
             "total_losses": trader.total_losses,
             "current_loss_streak": trader.current_loss_streak,
             "trading_pause_until_ts": trader.trading_pause_until_ts,
+            "last_pause_reason": str(getattr(trader, "_last_pause_reason", "") or ""),
+            "last_pause_detail": str(getattr(trader, "_last_pause_detail", "") or ""),
+            "last_pause_trigger_ts": float(getattr(trader, "_last_pause_trigger_ts", 0.0) or 0.0),
             "day_id": trader.day_id,
             "day_start_equity_usd": trader.day_start_equity_usd,
             "day_realized_pnl_usd": trader.day_realized_pnl_usd,
@@ -94,13 +102,32 @@ def load_state(trader: Any) -> None:
         trader._session_profit_lock_last_trigger_ts = float(
             payload.get("session_profit_lock_last_trigger_ts", 0.0) or 0.0
         )
+        trader._session_profit_lock_armed = bool(payload.get("session_profit_lock_armed", True))
+        trader._session_profit_lock_rearm_ready_ts = float(
+            payload.get("session_profit_lock_rearm_ready_ts", 0.0) or 0.0
+        )
+        trader._session_profit_lock_rearm_floor_usd = float(
+            payload.get("session_profit_lock_rearm_floor_usd", 0.0) or 0.0
+        )
+        trader._session_profit_lock_last_floor_usd = float(
+            payload.get("session_profit_lock_last_floor_usd", 0.0) or 0.0
+        )
+        trader._session_profit_lock_last_metric_usd = float(
+            payload.get("session_profit_lock_last_metric_usd", 0.0) or 0.0
+        )
         trader.total_plans = int(payload.get("total_plans", 0))
         trader.total_executed = int(payload.get("total_executed", 0))
         trader.total_closed = int(payload.get("total_closed", 0))
         trader.total_wins = int(payload.get("total_wins", 0))
         trader.total_losses = int(payload.get("total_losses", 0))
         trader.current_loss_streak = int(payload.get("current_loss_streak", 0))
-        trader.trading_pause_until_ts = 0.0
+        if bool(getattr(config, "PERSIST_TRADING_PAUSE_ON_RESTART", True)):
+            trader.trading_pause_until_ts = float(payload.get("trading_pause_until_ts", 0.0) or 0.0)
+        else:
+            trader.trading_pause_until_ts = 0.0
+        trader._last_pause_reason = str(payload.get("last_pause_reason", "") or "")
+        trader._last_pause_detail = str(payload.get("last_pause_detail", "") or "")
+        trader._last_pause_trigger_ts = float(payload.get("last_pause_trigger_ts", 0.0) or 0.0)
         trader.day_id = str(payload.get("day_id", trader._current_day_id()))
         trader.day_start_equity_usd = float(payload.get("day_start_equity_usd", trader.paper_balance_usd))
         trader.day_realized_pnl_usd = float(payload.get("day_realized_pnl_usd", 0.0))

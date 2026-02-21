@@ -96,10 +96,12 @@ class ProfileWindowStats:
     loss_share_window: float
     breakeven_window: int
     pnl_window_usd: float
+    pnl_window_clipped_usd: float
     winrate_window_pct: float
     profit_factor_window: float
     worst_trade_window_usd: float
     best_trade_window_usd: float
+    top_symbol_share_window: float
     score_total: float
     score_breakdown: dict[str, float]
 
@@ -117,10 +119,12 @@ class ProfileWindowStats:
             "loss_share_window": round(self.loss_share_window, 4),
             "breakeven_window": self.breakeven_window,
             "pnl_window_usd": round(self.pnl_window_usd, 6),
+            "pnl_window_clipped_usd": round(self.pnl_window_clipped_usd, 6),
             "winrate_window_pct": round(self.winrate_window_pct, 2),
             "profit_factor_window": round(pf, 4) if pf != float("inf") else "inf",
             "worst_trade_window_usd": round(self.worst_trade_window_usd, 6),
             "best_trade_window_usd": round(self.best_trade_window_usd, 6),
+            "top_symbol_share_window": round(self.top_symbol_share_window, 4),
             "score_total": round(self.score_total, 4),
             "score_breakdown": {k: round(v, 4) for k, v in self.score_breakdown.items()},
         }
@@ -140,6 +144,8 @@ def _build_stats(profile_id: str, state_file: str, *, cutoff: datetime, min_clos
 
     open_window = [x for x in open_rows if (_parse_ts(x.get("opened_at")) or datetime.min.replace(tzinfo=timezone.utc)) >= cutoff]
     closed_window = [x for x in closed_rows if (_parse_ts(x.get("closed_at")) or datetime.min.replace(tzinfo=timezone.utc)) >= cutoff]
+    clipped_window = [x for x in closed_window if abs(_safe_float(x.get("pnl_percent"), 0.0)) < 100.0]
+    base_window = clipped_window if clipped_window else closed_window
 
     entries_window = len(open_window)
     for row in closed_rows:
@@ -148,15 +154,16 @@ def _build_stats(profile_id: str, state_file: str, *, cutoff: datetime, min_clos
             entries_window += 1
 
     exits_window = len(closed_window)
-    wins = sum(1 for row in closed_window if _safe_float(row.get("pnl_usd"), 0.0) > 0.0)
-    losses = sum(1 for row in closed_window if _safe_float(row.get("pnl_usd"), 0.0) < 0.0)
-    breakeven = max(0, len(closed_window) - wins - losses)
+    wins = sum(1 for row in base_window if _safe_float(row.get("pnl_usd"), 0.0) > 0.0)
+    losses = sum(1 for row in base_window if _safe_float(row.get("pnl_usd"), 0.0) < 0.0)
+    breakeven = max(0, len(base_window) - wins - losses)
     pnl_window = float(sum(_safe_float(row.get("pnl_usd"), 0.0) for row in closed_window))
+    pnl_window_clipped = float(sum(_safe_float(row.get("pnl_usd"), 0.0) for row in base_window))
     loss_share = (float(losses) / float(max(1, wins + losses))) if (wins + losses) > 0 else 0.0
 
     winrate = (wins / (wins + losses) * 100.0) if (wins + losses) > 0 else 0.0
-    gains = float(sum(_safe_float(row.get("pnl_usd"), 0.0) for row in closed_window if _safe_float(row.get("pnl_usd"), 0.0) > 0.0))
-    losses_abs = abs(float(sum(_safe_float(row.get("pnl_usd"), 0.0) for row in closed_window if _safe_float(row.get("pnl_usd"), 0.0) < 0.0)))
+    gains = float(sum(_safe_float(row.get("pnl_usd"), 0.0) for row in base_window if _safe_float(row.get("pnl_usd"), 0.0) > 0.0))
+    losses_abs = abs(float(sum(_safe_float(row.get("pnl_usd"), 0.0) for row in base_window if _safe_float(row.get("pnl_usd"), 0.0) < 0.0)))
     if losses_abs > 0:
         pf = gains / losses_abs
     elif gains > 0:
@@ -164,12 +171,19 @@ def _build_stats(profile_id: str, state_file: str, *, cutoff: datetime, min_clos
     else:
         pf = 0.0
 
-    worst = min((_safe_float(row.get("pnl_usd"), 0.0) for row in closed_window), default=0.0)
-    best = max((_safe_float(row.get("pnl_usd"), 0.0) for row in closed_window), default=0.0)
+    worst = min((_safe_float(row.get("pnl_usd"), 0.0) for row in base_window), default=0.0)
+    best = max((_safe_float(row.get("pnl_usd"), 0.0) for row in base_window), default=0.0)
+    symbol_counts: dict[str, int] = {}
+    for row in base_window:
+        symbol = str(row.get("symbol", "") or "").strip().upper() or "UNKNOWN"
+        symbol_counts[symbol] = int(symbol_counts.get(symbol, 0)) + 1
+    top_symbol_share = 0.0
+    if base_window and symbol_counts:
+        top_symbol_share = max(symbol_counts.values()) / float(len(base_window))
 
     # Keep activity as a small tie-breaker, not a primary driver.
     activity_score = min(14.0, float(entries_window + exits_window) * 0.35)
-    pnl_score = pnl_window * 160.0
+    pnl_score = pnl_window_clipped * 160.0
     quality_score = (winrate - 50.0) * 0.8
     if pf == float("inf"):
         quality_score += 12.0
@@ -180,6 +194,7 @@ def _build_stats(profile_id: str, state_file: str, *, cutoff: datetime, min_clos
     risk_penalty = 0.0
     risk_penalty += max(0.0, (abs(worst) - 0.08) * 110.0)
     risk_penalty += max(0.0, (loss_share - 0.56) * 40.0)
+    risk_penalty += max(0.0, (float(top_symbol_share) - 0.38) * 42.0)
     if len(closed_window) < int(min_closed):
         risk_penalty += float(int(min_closed) - len(closed_window)) * 2.5
 
@@ -204,10 +219,12 @@ def _build_stats(profile_id: str, state_file: str, *, cutoff: datetime, min_clos
         loss_share_window=loss_share,
         breakeven_window=breakeven,
         pnl_window_usd=pnl_window,
+        pnl_window_clipped_usd=pnl_window_clipped,
         winrate_window_pct=winrate,
         profit_factor_window=pf,
         worst_trade_window_usd=worst,
         best_trade_window_usd=best,
+        top_symbol_share_window=top_symbol_share,
         score_total=total,
         score_breakdown=breakdown,
     )
@@ -271,8 +288,10 @@ def main() -> int:
     for idx, row in enumerate(stats, start=1):
         pf = "inf" if row.profit_factor_window == float("inf") else f"{row.profit_factor_window:.2f}"
         print(
-            f"{idx}. {row.profile_id:<20} score={row.score_total:>7.2f} pnl_4h=${row.pnl_window_usd:+.4f} "
-            f"closed_4h={row.closed_window:>3} wr_4h={row.winrate_window_pct:>5.1f}% pf_4h={pf} "
+            f"{idx}. {row.profile_id:<20} score={row.score_total:>7.2f} "
+            f"pnl_4h=${row.pnl_window_usd:+.4f} clipped=${row.pnl_window_clipped_usd:+.4f} "
+            f"closed_4h={row.closed_window:>3} top_sym={row.top_symbol_share_window:>4.2f} "
+            f"wr_4h={row.winrate_window_pct:>5.1f}% pf_4h={pf} "
             f"entries_4h={row.entries_window:>3}"
         )
     print(f"WINNER {winner.profile_id}")

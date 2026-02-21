@@ -88,14 +88,29 @@ def _summarize_profile(root: str, profile_id: str, env_file: str, tail: int) -> 
         log_file = os.path.join("logs", "matrix", profile_id, "autonomy_decisions.jsonl")
     if not os.path.isabs(log_file):
         log_file = os.path.join(root, log_file)
-    rows = _read_jsonl(log_file)
+    orchestrator_file = os.path.join(
+        root,
+        "logs",
+        "matrix",
+        profile_id,
+        f"{profile_id}_orchestrator_decisions.jsonl",
+    )
+    candidate_files = [log_file, orchestrator_file]
+    sources: list[dict[str, Any]] = []
+    for path in candidate_files:
+        rows = _read_jsonl(path)
+        sources.append({"path": path, "rows": rows, "count": len(rows)})
+    sources.sort(key=lambda row: int(row.get("count", 0)), reverse=True)
+    chosen = sources[0] if sources else {"path": log_file, "rows": [], "count": 0}
+    rows = list(chosen.get("rows") or [])
     last_rows = rows[-max(1, int(tail)) :]
     latest = last_rows[-1] if last_rows else {}
 
     return {
         "profile_id": profile_id,
         "env_file": env_file,
-        "decisions_log_file": log_file,
+        "decisions_log_file": str(chosen.get("path") or log_file),
+        "decisions_sources": [{"path": s["path"], "count": int(s["count"])} for s in sources],
         "decisions_total": len(rows),
         "latest_action": str(latest.get("action", "") or ""),
         "latest_changed": bool(latest.get("changed", False)),
@@ -153,4 +168,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

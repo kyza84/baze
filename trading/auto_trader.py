@@ -79,6 +79,11 @@ class PaperPosition:
     ev_expected_net_usd: float = 0.0
     ev_confidence: float = 0.0
     kelly_mult: float = 1.0
+    execution_lane: str = ""
+    execution_phase: str = ""
+    cluster_ev_avg_net_usd: float = 0.0
+    cluster_ev_loss_share: float = 0.0
+    cluster_ev_samples: float = 0.0
 
 
 class AutoTrader:
@@ -107,8 +112,16 @@ class AutoTrader:
         self.tx_event_timestamps: list[float] = []
         self.price_guard_pending: dict[str, dict[str, float | int]] = {}
         self.trading_pause_until_ts = 0.0
+        self._last_pause_reason = ""
+        self._last_pause_detail = ""
+        self._last_pause_trigger_ts = 0.0
         self._session_peak_realized_pnl_usd = 0.0
         self._session_profit_lock_last_trigger_ts = 0.0
+        self._session_profit_lock_armed = True
+        self._session_profit_lock_rearm_ready_ts = 0.0
+        self._session_profit_lock_rearm_floor_usd = 0.0
+        self._session_profit_lock_last_floor_usd = 0.0
+        self._session_profit_lock_last_metric_usd = 0.0
         self.day_id = self._current_day_id()
         self.day_start_equity_usd = float(config.WALLET_BALANCE_USD)
         self.day_realized_pnl_usd = 0.0
@@ -125,6 +138,8 @@ class AutoTrader:
         self._recovery_attempts: dict[str, int] = {}
         self._recovery_last_attempt_ts: dict[str, float] = {}
         self._skip_reason_counts_window: dict[str, int] = {}
+        self._recent_open_symbols: list[tuple[float, str]] = []
+        self._last_market_mode_seen = "YELLOW"
         self._last_reinvest_mult = 1.0
         self._ev_db_cache: dict[str, tuple[float, dict[str, float]]] = {}
         root = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
@@ -319,8 +334,35 @@ class AutoTrader:
         equity = float(self._equity_usd())
         return ((equity - start) / start) * 100.0
 
+    def _adaptive_pause_seconds(self, *, reason: str, base_seconds: int) -> int:
+        sec = max(0, int(base_seconds))
+        if sec <= 0:
+            return 0
+        if not bool(getattr(config, "RISK_GOVERNOR_ADAPTIVE_PAUSE_ENABLED", True)):
+            return sec
+
+        mode = str(self._last_market_mode_seen or "YELLOW").strip().upper() or "YELLOW"
+        if mode == "GREEN":
+            sec = int(round(sec * float(getattr(config, "RISK_GOVERNOR_PAUSE_GREEN_MULT", 0.65) or 0.65)))
+        elif mode == "YELLOW":
+            sec = int(round(sec * float(getattr(config, "RISK_GOVERNOR_PAUSE_YELLOW_MULT", 0.82) or 0.82)))
+        else:
+            sec = int(round(sec * float(getattr(config, "RISK_GOVERNOR_PAUSE_RED_MULT", 1.0) or 1.0)))
+
+        min_sec = max(0, int(getattr(config, "RISK_GOVERNOR_PAUSE_MIN_SECONDS", 60) or 60))
+        max_sec = max(min_sec, int(getattr(config, "RISK_GOVERNOR_PAUSE_MAX_SECONDS", 1800) or 1800))
+        sec = max(min_sec, min(max_sec, sec))
+
+        if str(reason or "").strip().lower() in {"session_profit_lock", "loss_streak"} and self._anti_choke_active():
+            anti_choke_cap = max(min_sec, int(getattr(config, "RISK_GOVERNOR_ANTI_CHOKE_MAX_PAUSE_SECONDS", 300) or 300))
+            sec = min(sec, anti_choke_cap)
+        if str(reason or "").strip().lower() == "daily_drawdown":
+            dd_min = max(min_sec, int(getattr(config, "RISK_GOVERNOR_DRAWDOWN_MIN_PAUSE_SECONDS", 240) or 240))
+            sec = max(sec, dd_min)
+        return max(0, int(sec))
+
     def _risk_trigger_pause(self, *, reason: str, detail: str, pause_seconds: int) -> None:
-        pause_seconds = max(0, int(pause_seconds))
+        pause_seconds = self._adaptive_pause_seconds(reason=str(reason or ""), base_seconds=int(pause_seconds))
         if pause_seconds <= 0:
             return
         now_ts = datetime.now(timezone.utc).timestamp()
@@ -328,6 +370,9 @@ class AutoTrader:
         if until_ts <= float(self.trading_pause_until_ts or 0.0):
             return
         self.trading_pause_until_ts = until_ts
+        self._last_pause_reason = str(reason or "")
+        self._last_pause_detail = str(detail or "")
+        self._last_pause_trigger_ts = now_ts
         logger.warning(
             "RISK_GOVERNOR pause reason=%s detail=%s pause=%ss until_ts=%s",
             reason,
@@ -335,6 +380,56 @@ class AutoTrader:
             pause_seconds,
             int(until_ts),
         )
+
+    def _prune_symbol_open_window(self, window_seconds: int) -> None:
+        win = max(60, int(window_seconds))
+        now_ts = datetime.now(timezone.utc).timestamp()
+        self._recent_open_symbols = [
+            row
+            for row in self._recent_open_symbols
+            if (now_ts - float(row[0])) <= float(win)
+        ]
+
+    def _record_open_symbol(self, symbol: str) -> None:
+        key = self._symbol_key(symbol)
+        if not key:
+            return
+        now_ts = datetime.now(timezone.utc).timestamp()
+        self._recent_open_symbols.append((now_ts, key))
+        window_seconds = max(300, int(getattr(config, "SYMBOL_CONCENTRATION_WINDOW_SECONDS", 3600) or 3600))
+        self._prune_symbol_open_window(window_seconds)
+
+    def _symbol_concentration_blocked(self, *, symbol: str, entry_tier: str) -> tuple[bool, str]:
+        if not bool(getattr(config, "SYMBOL_CONCENTRATION_GUARD_ENABLED", True)):
+            return False, ""
+        key = self._symbol_key(symbol)
+        if not key:
+            return False, ""
+        if self._anti_choke_active():
+            return False, ""
+
+        window_seconds = max(300, int(getattr(config, "SYMBOL_CONCENTRATION_WINDOW_SECONDS", 3600) or 3600))
+        min_opens = max(1, int(getattr(config, "SYMBOL_CONCENTRATION_MIN_OPENS", 12) or 12))
+        max_share = max(0.01, min(1.0, float(getattr(config, "SYMBOL_CONCENTRATION_MAX_SHARE", 0.10) or 0.10)))
+        tier_a_mult = max(1.0, float(getattr(config, "SYMBOL_CONCENTRATION_TIER_A_SHARE_MULT", 1.15) or 1.15))
+
+        self._prune_symbol_open_window(window_seconds)
+        total = len(self._recent_open_symbols)
+        if total < min_opens:
+            return False, ""
+        same = sum(1 for _, s in self._recent_open_symbols if s == key)
+        projected_share = float(same + 1) / float(total + 1)
+
+        cap = max_share
+        if str(entry_tier or "").strip().upper() == "A":
+            cap = min(1.0, cap * tier_a_mult)
+        if projected_share <= cap:
+            return False, ""
+        detail = (
+            f"symbol_concentration symbol={key} projected_share={projected_share:.3f} "
+            f"cap={cap:.3f} opens={same}/{total} window={window_seconds}s"
+        )
+        return True, detail
 
     def _risk_governor_after_close(self, *, close_reason: str, pnl_usd: float) -> None:
         if not bool(getattr(config, "RISK_GOVERNOR_ENABLED", True)):
@@ -561,6 +656,7 @@ class AutoTrader:
                 "avg_win_usd": 0.0,
                 "avg_loss_usd": 0.0,
                 "avg_net_usd": 0.0,
+                "loss_share": 0.0,
             }
         wins = [x for x in rows if x > 0.0]
         losses = [abs(x) for x in rows if x <= 0.0]
@@ -568,12 +664,14 @@ class AutoTrader:
         avg_loss = float(sum(losses) / max(1, len(losses)))
         win_rate = float(len(wins)) / float(max(1, len(rows)))
         avg_net = float(sum(rows) / float(max(1, len(rows))))
+        loss_share = float(len(losses)) / float(max(1, len(rows)))
         return {
             "samples": float(len(rows)),
             "win_rate": float(win_rate),
             "avg_win_usd": float(avg_win),
             "avg_loss_usd": float(avg_loss),
             "avg_net_usd": float(avg_net),
+            "loss_share": float(loss_share),
         }
 
     def _closed_rows_window(self, *, window_minutes: int) -> list[PaperPosition]:
@@ -616,6 +714,7 @@ class AutoTrader:
             "avg_win_usd": 0.0,
             "avg_loss_usd": 0.0,
             "avg_net_usd": 0.0,
+            "loss_share": 0.0,
         }
         for row in stats_rows:
             samples = max(0.0, float((row or {}).get("samples", 0.0) or 0.0))
@@ -629,12 +728,14 @@ class AutoTrader:
             out["avg_win_usd"] += w * float((row or {}).get("avg_win_usd", 0.0) or 0.0)
             out["avg_loss_usd"] += w * float((row or {}).get("avg_loss_usd", 0.0) or 0.0)
             out["avg_net_usd"] += w * float((row or {}).get("avg_net_usd", 0.0) or 0.0)
+            out["loss_share"] += w * float((row or {}).get("loss_share", 0.0) or 0.0)
         if total_w <= 0.0:
             return out
         out["win_rate"] /= total_w
         out["avg_win_usd"] /= total_w
         out["avg_loss_usd"] /= total_w
         out["avg_net_usd"] /= total_w
+        out["loss_share"] /= total_w
         return out
 
     def _ev_db_stats(self, *, market_mode: str, entry_tier: str, score: int) -> dict[str, float]:
@@ -726,29 +827,67 @@ class AutoTrader:
     def _session_profit_lock_after_close(self, *, close_reason: str, pnl_usd: float) -> None:
         if not bool(getattr(config, "SESSION_PROFIT_LOCK_ENABLED", False)):
             return
+        now_ts = datetime.now(timezone.utc).timestamp()
         realized_now = float(self.realized_pnl_usd or 0.0)
+        equity_now = float(self._equity_usd())
+        equity_pnl_now = float(equity_now - float(self.initial_balance_usd or 0.0))
+        use_equity_guard = bool(getattr(config, "SESSION_PROFIT_LOCK_USE_EQUITY_GUARD", True))
+        metric_now = max(realized_now, equity_pnl_now) if use_equity_guard else realized_now
+        self._session_profit_lock_last_metric_usd = metric_now
+
         prev_peak = float(self._session_peak_realized_pnl_usd or 0.0)
-        peak = max(prev_peak, realized_now)
+        use_equity_peak = bool(getattr(config, "SESSION_PROFIT_LOCK_USE_EQUITY_FOR_PEAK", False))
+        peak_source = metric_now if use_equity_peak else realized_now
+        peak = max(prev_peak, peak_source)
         self._session_peak_realized_pnl_usd = peak
 
         activate = max(0.0, float(getattr(config, "SESSION_PROFIT_LOCK_ACTIVATE_USD", 0.35) or 0.35))
         if peak < activate:
+            self._session_profit_lock_armed = True
+            self._session_profit_lock_rearm_ready_ts = 0.0
+            self._session_profit_lock_rearm_floor_usd = 0.0
+            self._session_profit_lock_last_floor_usd = 0.0
             return
         keep_ratio = max(0.0, min(1.0, float(getattr(config, "SESSION_PROFIT_LOCK_KEEP_RATIO", 0.55) or 0.55)))
         min_floor = max(0.0, float(getattr(config, "SESSION_PROFIT_LOCK_MIN_FLOOR_USD", 0.10) or 0.10))
         floor = max(min_floor, peak * keep_ratio)
-        if realized_now >= floor:
+        self._session_profit_lock_last_floor_usd = floor
+        rearm_buffer = max(0.0, float(getattr(config, "SESSION_PROFIT_LOCK_REARM_BUFFER_USD", 0.03) or 0.03))
+        rearm_floor = max(floor + rearm_buffer, float(self._session_profit_lock_rearm_floor_usd or 0.0))
+        rearm_cooldown = max(0, int(getattr(config, "SESSION_PROFIT_LOCK_REARM_COOLDOWN_SECONDS", 300) or 300))
+
+        if not bool(self._session_profit_lock_armed):
+            ready_by_time = now_ts >= float(self._session_profit_lock_rearm_ready_ts or 0.0)
+            if ready_by_time and metric_now >= rearm_floor:
+                self._session_profit_lock_armed = True
+                self._session_profit_lock_rearm_ready_ts = 0.0
+                self._session_profit_lock_rearm_floor_usd = 0.0
+            else:
+                return
+
+        if metric_now >= floor:
             return
+        min_retrigger_seconds = max(
+            0,
+            int(getattr(config, "SESSION_PROFIT_LOCK_MIN_RETRIGGER_SECONDS", 300) or 300),
+        )
+        if (now_ts - float(self._session_profit_lock_last_trigger_ts or 0.0)) < float(min_retrigger_seconds):
+            return
+
         pause_seconds = max(0, int(getattr(config, "SESSION_PROFIT_LOCK_PAUSE_SECONDS", 900) or 900))
         self._risk_trigger_pause(
             reason="session_profit_lock",
             detail=(
                 f"reason={close_reason} pnl_usd={pnl_usd:.4f} "
-                f"realized={realized_now:.4f} peak={peak:.4f} floor={floor:.4f}"
+                f"realized={realized_now:.4f} equity_pnl={equity_pnl_now:.4f} metric={metric_now:.4f} "
+                f"peak={peak:.4f} floor={floor:.4f} rearm_floor={rearm_floor:.4f}"
             ),
             pause_seconds=pause_seconds,
         )
-        self._session_profit_lock_last_trigger_ts = datetime.now(timezone.utc).timestamp()
+        self._session_profit_lock_last_trigger_ts = now_ts
+        self._session_profit_lock_armed = False
+        self._session_profit_lock_rearm_ready_ts = now_ts + float(rearm_cooldown)
+        self._session_profit_lock_rearm_floor_usd = rearm_floor
 
     def _risk_governor_block_reason(self) -> str | None:
         if not bool(getattr(config, "RISK_GOVERNOR_ENABLED", True)):
@@ -757,6 +896,9 @@ class AutoTrader:
         pause_until = float(self.trading_pause_until_ts or 0.0)
         if pause_until > now_ts:
             rem = int(max(1, pause_until - now_ts))
+            pause_reason = str(self._last_pause_reason or "").strip()
+            if pause_reason:
+                return f"governor_pause {rem}s reason={pause_reason}"
             return f"governor_pause {rem}s"
 
         max_streak = int(getattr(config, "RISK_GOVERNOR_MAX_LOSS_STREAK", config.MAX_CONSECUTIVE_LOSSES) or 0)
@@ -1082,6 +1224,7 @@ class AutoTrader:
         now_ts = datetime.now(timezone.utc).timestamp()
         self.token_cooldowns = {k: v for k, v in self.token_cooldowns.items() if v > now_ts}
         self.symbol_cooldowns = {k: v for k, v in self.symbol_cooldowns.items() if v > now_ts}
+        self._prune_symbol_open_window(max(300, int(getattr(config, "SYMBOL_CONCENTRATION_WINDOW_SECONDS", 3600) or 3600)))
         self._prune_daily_tx_window()
         current_day = self._current_day_id()
         if self.day_id == current_day:
@@ -1090,6 +1233,13 @@ class AutoTrader:
         self.day_realized_pnl_usd = 0.0
         self.day_start_equity_usd = self._equity_usd()
         self.current_loss_streak = 0
+        if bool(getattr(config, "SESSION_PROFIT_LOCK_RESET_ON_NEW_DAY", True)):
+            self._session_peak_realized_pnl_usd = max(0.0, float(self.day_realized_pnl_usd or 0.0))
+            self._session_profit_lock_armed = True
+            self._session_profit_lock_rearm_ready_ts = 0.0
+            self._session_profit_lock_rearm_floor_usd = 0.0
+            self._session_profit_lock_last_floor_usd = 0.0
+            self._session_profit_lock_last_metric_usd = 0.0
 
     @staticmethod
     def _kill_switch_active() -> bool:
@@ -1456,6 +1606,8 @@ class AutoTrader:
         ctx_entry_tier = str(token_data.get("_entry_tier", "") or "").strip().upper()
         ctx_market_mode = str(token_data.get("_regime_name", "") or "").strip().upper()
         ctx_entry_channel = str(token_data.get("_entry_channel", "") or "").strip().lower()
+        if ctx_market_mode in {"GREEN", "YELLOW", "RED"}:
+            self._last_market_mode_seen = ctx_market_mode
         self._active_trade_decision_context = {
             "candidate_id": candidate_id,
             "token_address": ctx_token_address,
@@ -1511,6 +1663,20 @@ class AutoTrader:
             self._active_trade_decision_context["entry_channel"] = str(
                 token_data.get("_entry_channel", "") or ""
             ).strip().lower()
+        market_mode = str(token_data.get("_regime_name", "") or "").strip().upper()
+        if market_mode in {"GREEN", "YELLOW", "RED"}:
+            self._last_market_mode_seen = market_mode
+        entry_channel = str(token_data.get("_entry_channel", "core") or "core").strip().lower()
+        if entry_channel not in {"core", "explore"}:
+            entry_channel = "core"
+        concentration_blocked, concentration_detail = self._symbol_concentration_blocked(
+            symbol=symbol,
+            entry_tier=entry_tier,
+        )
+        if concentration_blocked:
+            self._bump_skip_reason("symbol_concentration")
+            logger.info("AutoTrade skip token=%s reason=symbol_concentration detail=%s", symbol, concentration_detail)
+            return None
         blocked, blk_reason = self._blacklist_is_blocked(token_address)
         if blocked:
             self._bump_skip_reason("blacklist")
@@ -1765,6 +1931,21 @@ class AutoTrader:
         token_ev_size_mult = max(0.05, float(token_ev_memory.get("size_mult", 1.0) or 1.0))
         regime_size_mult = max(0.10, min(1.50, float(regime_size_mult) * float(channel_size_mult)))
         regime_hold_mult = max(0.20, min(1.40, float(regime_hold_mult) * float(channel_hold_mult)))
+        execution_lane = "scalp"
+        execution_lane_detail = "off"
+        execution_size_mult = 1.0
+        execution_hold_mult = 1.0
+        execution_edge_mult = 1.0
+        cluster_route = {
+            "detail": "off",
+            "samples": 0.0,
+            "avg_net_usd": 0.0,
+            "loss_share": 0.0,
+            "size_mult": 1.0,
+            "hold_mult": 1.0,
+            "edge_mult": 1.0,
+            "entry_probability": 1.0,
+        }
 
         position_size_usd = self._choose_position_size(expected_edge_percent)
         if bool(getattr(config, "POSITION_SIZE_QUALITY_ENABLED", True)):
@@ -1840,6 +2021,46 @@ class AutoTrader:
             expected_net_usd=float(ev_snapshot.get("expected_net_usd", 0.0) or 0.0),
         )
         position_size_usd *= float(kelly_mult)
+        if bool(getattr(config, "EXECUTION_ARCH_ENABLED", True)):
+            lane_profile = self._execution_lane_profile(
+                symbol=symbol_upper,
+                market_mode=market_mode,
+                entry_tier=entry_tier,
+                entry_channel=entry_channel,
+                score=int(score),
+                expected_edge_percent=float(edge_percent_for_decision),
+                ev_snapshot=ev_snapshot,
+            )
+            execution_lane = str(lane_profile.get("lane", "scalp") or "scalp").strip().lower()
+            execution_lane_detail = str(lane_profile.get("detail", "n/a") or "n/a")
+            execution_size_mult *= max(0.05, float(lane_profile.get("size_mult", 1.0) or 1.0))
+            execution_hold_mult *= max(0.10, float(lane_profile.get("hold_mult", 1.0) or 1.0))
+            execution_edge_mult *= max(0.20, float(lane_profile.get("edge_mult", 1.0) or 1.0))
+
+            cluster_route = self._cluster_ev_routing_adjustments(
+                cluster_key=cluster_key,
+                market_mode=market_mode,
+                entry_tier=entry_tier,
+                entry_channel=entry_channel,
+                candidate_id=candidate_id,
+            )
+            cluster_prob = float(cluster_route.get("entry_probability", 1.0) or 1.0)
+            cluster_seed = str(cluster_route.get("seed", "") or "")
+            if cluster_prob < 1.0 and (not self._passes_probability_gate(seed=cluster_seed, probability=cluster_prob)):
+                self._bump_skip_reason("cluster_ev_prob")
+                logger.info(
+                    "AutoTrade skip token=%s reason=cluster_ev_prob p=%.2f detail=%s",
+                    symbol,
+                    cluster_prob,
+                    str(cluster_route.get("detail", "")),
+                )
+                return None
+            execution_size_mult *= max(0.05, float(cluster_route.get("size_mult", 1.0) or 1.0))
+            execution_hold_mult *= max(0.10, float(cluster_route.get("hold_mult", 1.0) or 1.0))
+            execution_edge_mult *= max(0.20, float(cluster_route.get("edge_mult", 1.0) or 1.0))
+            regime_hold_mult = max(0.20, min(2.20, float(regime_hold_mult) * float(execution_hold_mult)))
+            position_size_usd *= float(execution_size_mult)
+
         position_size_usd = min(position_size_usd, self._available_balance_usd())
         if max_buy_weth > 0:
             position_size_usd = min(position_size_usd, cap_usd)
@@ -1888,9 +2109,17 @@ class AutoTrader:
                 ev_min *= float(getattr(config, "EV_FIRST_ENTRY_MIN_NET_USD_YELLOW_MULT", 1.08) or 1.08)
             else:
                 ev_min *= float(getattr(config, "EV_FIRST_ENTRY_MIN_NET_USD_GREEN_MULT", 1.00) or 1.00)
+            if (
+                bool(getattr(config, "ENTRY_EDGE_SOFTEN_GREEN_A_CORE_ENABLED", True))
+                and mm == "GREEN"
+                and str(entry_tier or "").strip().upper() == "A"
+                and str(entry_channel or "").strip().lower() == "core"
+            ):
+                ev_min *= float(getattr(config, "EV_FIRST_ENTRY_MIN_NET_USD_GREEN_A_CORE_MULT", 0.95) or 0.95)
             if str(entry_channel) == "explore":
                 ev_min *= float(getattr(config, "EV_FIRST_ENTRY_MIN_NET_USD_EXPLORE_MULT", 1.20) or 1.20)
             ev_min *= float(token_ev_edge_mult)
+            ev_min *= float(execution_edge_mult)
             min_samples = max(5.0, float(getattr(config, "EV_FIRST_ENTRY_MIN_SAMPLES", 24) or 24))
             if ev_samples >= min_samples and ev_expected_net < ev_min:
                 self._bump_skip_reason("ev_net_low")
@@ -1923,6 +2152,16 @@ class AutoTrader:
                     "ev_expected_net_usd": float(ev_snapshot.get("expected_net_usd", 0.0) or 0.0),
                     "kelly_mult": float(kelly_mult),
                     "kelly_fraction": float(kelly_fraction),
+                    "execution_lane": str(execution_lane or "scalp"),
+                    "execution_size_mult": float(execution_size_mult),
+                    "execution_hold_mult": float(execution_hold_mult),
+                    "execution_edge_mult": float(execution_edge_mult),
+                    "execution_lane_detail": str(execution_lane_detail),
+                    "cluster_route_detail": str(cluster_route.get("detail", "")),
+                    "cluster_route_samples": float(cluster_route.get("samples", 0.0) or 0.0),
+                    "cluster_route_avg_net_usd": float(cluster_route.get("avg_net_usd", 0.0) or 0.0),
+                    "cluster_route_loss_share": float(cluster_route.get("loss_share", 0.0) or 0.0),
+                    "cluster_route_probability": float(cluster_route.get("entry_probability", 1.0) or 1.0),
                 }
             )
         edge_dbg = self._edge_debug_components(
@@ -1934,8 +2173,26 @@ class AutoTrader:
         )
         if config.EDGE_FILTER_ENABLED:
             mode = str(getattr(config, "EDGE_FILTER_MODE", "usd") or "usd").strip().lower()
-            min_edge_pct = float(getattr(config, "MIN_EXPECTED_EDGE_PERCENT", 0.0) or 0.0) * float(channel_edge_pct_mult) * float(token_ev_edge_mult)
-            min_edge_usd = float(getattr(config, "MIN_EXPECTED_EDGE_USD", 0.0) or 0.0) * float(channel_edge_usd_mult) * float(token_ev_edge_mult)
+            min_edge_pct = (
+                float(getattr(config, "MIN_EXPECTED_EDGE_PERCENT", 0.0) or 0.0)
+                * float(channel_edge_pct_mult)
+                * float(token_ev_edge_mult)
+                * float(execution_edge_mult)
+            )
+            min_edge_usd = (
+                float(getattr(config, "MIN_EXPECTED_EDGE_USD", 0.0) or 0.0)
+                * float(channel_edge_usd_mult)
+                * float(token_ev_edge_mult)
+                * float(execution_edge_mult)
+            )
+            if (
+                bool(getattr(config, "ENTRY_EDGE_SOFTEN_GREEN_A_CORE_ENABLED", True))
+                and str(market_mode or "").strip().upper() == "GREEN"
+                and str(entry_tier or "").strip().upper() == "A"
+                and str(entry_channel or "").strip().lower() == "core"
+            ):
+                min_edge_pct *= float(getattr(config, "ENTRY_EDGE_SOFTEN_GREEN_A_CORE_PCT_MULT", 0.92) or 0.92)
+                min_edge_usd *= float(getattr(config, "ENTRY_EDGE_SOFTEN_GREEN_A_CORE_USD_MULT", 0.92) or 0.92)
             pct_ok = edge_percent_for_decision >= float(min_edge_pct)
             usd_ok = expected_edge_usd >= float(min_edge_usd)
             if mode == "percent" and not pct_ok:
@@ -1993,9 +2250,10 @@ class AutoTrader:
             (
                 "AUTO_DECISION token=%s mode=%s tier=%s channel=%s score=%s src=%s liq=%.0f vol5m=%.0f chg5m=%.2f%% "
                 "edge=%.2f%% raw=%.2f%% regime_mult=%.2f edge_usd=$%.3f size=$%.2f mult=%.2f(%s) reinvest=%.2f(%s) "
-                "size_mode=%.2f hold_mode=%.2f edge_gate_mult(usd=%.2f,pct=%.2f) costs=%.2f%% gas=$%.3f "
+                "size_mode=%.2f hold_mode=%.2f exec_lane=%s exec_mult(size=%.2f hold=%.2f edge=%.2f) "
+                "edge_gate_mult(usd=%.2f,pct=%.2f) costs=%.2f%% gas=$%.3f "
                 "ev_net=$%.5f ev_samples=%.0f conf=%.2f pwin=%.2f avg_win=$%.4f avg_loss=$%.4f kelly=%.2f(k=%.3f) "
-                "token_ev=%s cluster=%s breakdown=%s"
+                "token_ev=%s cluster=%s cluster_route=%s breakdown=%s"
             ),
             symbol,
             market_mode or "-",
@@ -2017,6 +2275,10 @@ class AutoTrader:
             str(reinvest_detail),
             float(regime_size_mult),
             float(regime_hold_mult),
+            str(execution_lane),
+            float(execution_size_mult),
+            float(execution_hold_mult),
+            float(execution_edge_mult),
             float(channel_edge_usd_mult),
             float(channel_edge_pct_mult),
             float(cost_profile["total_percent"]),
@@ -2031,6 +2293,7 @@ class AutoTrader:
             float(kelly_fraction),
             str(token_ev_memory.get("detail", "")),
             str(cluster_key),
+            str(cluster_route.get("detail", "")),
             breakdown,
         )
         max_hold_seconds = self._choose_hold_seconds(
@@ -2254,19 +2517,25 @@ class AutoTrader:
                 ev_expected_net_usd=float(ev_snapshot.get("expected_net_usd", 0.0) or 0.0),
                 ev_confidence=float(ev_snapshot.get("confidence", 0.0) or 0.0),
                 kelly_mult=float(kelly_mult),
+                execution_lane=str(execution_lane or "scalp"),
+                cluster_ev_avg_net_usd=float(cluster_route.get("avg_net_usd", 0.0) or 0.0),
+                cluster_ev_loss_share=float(cluster_route.get("loss_share", 0.0) or 0.0),
+                cluster_ev_samples=float(cluster_route.get("samples", 0.0) or 0.0),
             )
             self._set_open_position(pos)
             self.total_plans += 1
             self.total_executed += 1
             self.trade_open_timestamps.append(datetime.now(timezone.utc).timestamp())
+            self._record_open_symbol(pos.symbol)
             self._record_tx_event()
             logger.info(
-                "AUTO_BUY Live BUY token=%s address=%s mode=%s tier=%s channel=%s spend=%.8f ETH score=%s edge=%.2f%% edge_usd=$%.3f size=$%.2f mult=%.2f(%s) hold=%ss tx=%s",
+                "AUTO_BUY Live BUY token=%s address=%s mode=%s tier=%s channel=%s lane=%s spend=%.8f ETH score=%s edge=%.2f%% edge_usd=$%.3f size=$%.2f mult=%.2f(%s) hold=%ss tx=%s",
                 pos.symbol,
                 pos.token_address,
                 pos.market_mode or "-",
                 pos.entry_tier or "-",
                 pos.entry_channel or "-",
+                pos.execution_lane or "-",
                 pos.spent_eth,
                 pos.score,
                 pos.expected_edge_percent,
@@ -2296,6 +2565,10 @@ class AutoTrader:
                     "ev_expected_net_usd": float(pos.ev_expected_net_usd),
                     "ev_confidence": float(pos.ev_confidence),
                     "kelly_mult": float(pos.kelly_mult),
+                    "execution_lane": str(pos.execution_lane or ""),
+                    "cluster_ev_avg_net_usd": float(pos.cluster_ev_avg_net_usd),
+                    "cluster_ev_loss_share": float(pos.cluster_ev_loss_share),
+                    "cluster_ev_samples": float(pos.cluster_ev_samples),
                     "max_hold_seconds": int(pos.max_hold_seconds),
                     "tx_hash": pos.buy_tx_hash,
                 }
@@ -2332,22 +2605,28 @@ class AutoTrader:
             ev_expected_net_usd=float(ev_snapshot.get("expected_net_usd", 0.0) or 0.0),
             ev_confidence=float(ev_snapshot.get("confidence", 0.0) or 0.0),
             kelly_mult=float(kelly_mult),
+            execution_lane=str(execution_lane or "scalp"),
+            cluster_ev_avg_net_usd=float(cluster_route.get("avg_net_usd", 0.0) or 0.0),
+            cluster_ev_loss_share=float(cluster_route.get("loss_share", 0.0) or 0.0),
+            cluster_ev_samples=float(cluster_route.get("samples", 0.0) or 0.0),
         )
 
         self._set_open_position(pos)
         self.total_plans += 1
         self.total_executed += 1
         self.trade_open_timestamps.append(datetime.now(timezone.utc).timestamp())
+        self._record_open_symbol(pos.symbol)
         self._record_tx_event()
         self.paper_balance_usd -= position_size_usd
 
         logger.info(
-            "AUTO_BUY Paper BUY token=%s address=%s mode=%s tier=%s channel=%s entry=$%.8f size=$%.2f score=%s edge=%.2f%% edge_usd=$%.3f mult=%.2f(%s) hold=%ss costs=%.2f%% gas=$%.2f",
+            "AUTO_BUY Paper BUY token=%s address=%s mode=%s tier=%s channel=%s lane=%s entry=$%.8f size=$%.2f score=%s edge=%.2f%% edge_usd=$%.3f mult=%.2f(%s) hold=%ss costs=%.2f%% gas=$%.2f",
             pos.symbol,
             pos.token_address,
             pos.market_mode or "-",
             pos.entry_tier or "-",
             pos.entry_channel or "-",
+            pos.execution_lane or "-",
             pos.entry_price_usd,
             pos.position_size_usd,
             pos.score,
@@ -2378,6 +2657,10 @@ class AutoTrader:
                 "ev_expected_net_usd": float(pos.ev_expected_net_usd),
                 "ev_confidence": float(pos.ev_confidence),
                 "kelly_mult": float(pos.kelly_mult),
+                "execution_lane": str(pos.execution_lane or ""),
+                "cluster_ev_avg_net_usd": float(pos.cluster_ev_avg_net_usd),
+                "cluster_ev_loss_share": float(pos.cluster_ev_loss_share),
+                "cluster_ev_samples": float(pos.cluster_ev_samples),
                 "max_hold_seconds": int(pos.max_hold_seconds),
             }
         )
@@ -2457,33 +2740,141 @@ class AutoTrader:
             floor += max(0.0, float(getattr(config, "PAPER_PARTIAL_TP_BE_PROTECT_STAGE2_BONUS_PERCENT", 0.10) or 0.10))
         return float(floor)
 
-    def _effective_timeout_seconds(self, position: PaperPosition) -> int:
+    def _effective_timeout_seconds(self, position: PaperPosition, age_seconds: int | None = None) -> int:
         base_hold = max(1, int(position.max_hold_seconds or 1))
         if not bool(getattr(config, "EXIT_TIMEOUT_EXTENSION_ENABLED", False)):
             position.timeout_extension_seconds = 0
-            return base_hold
+            out_hold = base_hold
+        else:
+            extension = 0
+            max_ext = max(0, int(getattr(config, "EXIT_TIMEOUT_EXTENSION_MAX_SECONDS", 0) or 0))
+            if max_ext <= 0:
+                position.timeout_extension_seconds = 0
+                out_hold = base_hold
+            else:
+                edge_gate = float(getattr(config, "EXIT_TIMEOUT_EXTENSION_MIN_EDGE_PERCENT", 0.0) or 0.0)
+                if float(position.expected_edge_percent) >= edge_gate:
+                    extension += max(0, int(getattr(config, "EXIT_TIMEOUT_EXTENSION_EDGE_SECONDS", 0) or 0))
 
-        extension = 0
-        max_ext = max(0, int(getattr(config, "EXIT_TIMEOUT_EXTENSION_MAX_SECONDS", 0) or 0))
-        if max_ext <= 0:
-            position.timeout_extension_seconds = 0
-            return base_hold
+                peak_gate = float(getattr(config, "EXIT_TIMEOUT_EXTENSION_MIN_PEAK_PERCENT", 0.0) or 0.0)
+                pnl_gate = float(getattr(config, "EXIT_TIMEOUT_EXTENSION_MIN_PNL_PERCENT", -999.0) or -999.0)
+                if float(position.peak_pnl_percent) >= peak_gate and float(position.pnl_percent) >= pnl_gate:
+                    extension += max(0, int(getattr(config, "EXIT_TIMEOUT_EXTENSION_MOMENTUM_SECONDS", 0) or 0))
 
-        edge_gate = float(getattr(config, "EXIT_TIMEOUT_EXTENSION_MIN_EDGE_PERCENT", 0.0) or 0.0)
+                if self._partial_tp_stage(position) > 0:
+                    extension += max(0, int(getattr(config, "EXIT_TIMEOUT_EXTENSION_POST_PARTIAL_SECONDS", 0) or 0))
+
+                if self._is_strong_trade(position):
+                    strong_extra = max(0, int(getattr(config, "EXIT_TIMEOUT_STRONG_TRADE_EXTRA_SECONDS", 0) or 0))
+                    extension += strong_extra
+                    max_ext += strong_extra
+
+                extension = max(0, min(max_ext, int(extension)))
+                position.timeout_extension_seconds = extension
+                out_hold = int(base_hold + extension)
+
+        if bool(getattr(config, "STATEFUL_EXITS_ENABLED", True)):
+            lane = str(getattr(position, "execution_lane", "") or "").strip().lower()
+            if lane == "runner":
+                out_hold += max(0, int(getattr(config, "STATEFUL_TIMEOUT_RUNNER_EXTRA_SECONDS", 26) or 26))
+            elif lane == "scalp":
+                out_hold -= max(0, int(getattr(config, "STATEFUL_TIMEOUT_SCALP_REDUCE_SECONDS", 14) or 14))
+            if age_seconds is not None and lane == "runner":
+                phase = self._execution_phase(position, int(age_seconds))
+                if phase == "late":
+                    out_hold += max(
+                        0,
+                        int(getattr(config, "STATEFUL_TIMEOUT_RUNNER_EXTRA_SECONDS", 26) or 26) // 2,
+                    )
+        return int(max(20, out_hold))
+
+    @staticmethod
+    def _is_strong_trade(position: PaperPosition) -> bool:
+        edge_gate = float(getattr(config, "EXIT_TIMEOUT_STRONG_TRADE_MIN_EXPECTED_EDGE_PERCENT", 2.8) or 2.8)
         if float(position.expected_edge_percent) >= edge_gate:
-            extension += max(0, int(getattr(config, "EXIT_TIMEOUT_EXTENSION_EDGE_SECONDS", 0) or 0))
+            return True
+        if bool(getattr(config, "EXIT_TIMEOUT_STRONG_TRADE_ALLOW_FOR_TIER_A", True)) and str(position.entry_tier or "").strip().upper() == "A":
+            return True
+        if bool(getattr(config, "EXIT_TIMEOUT_STRONG_TRADE_ALLOW_FOR_CORE", True)) and str(position.entry_channel or "").strip().lower() == "core":
+            return True
+        return False
 
-        peak_gate = float(getattr(config, "EXIT_TIMEOUT_EXTENSION_MIN_PEAK_PERCENT", 0.0) or 0.0)
-        pnl_gate = float(getattr(config, "EXIT_TIMEOUT_EXTENSION_MIN_PNL_PERCENT", -999.0) or -999.0)
-        if float(position.peak_pnl_percent) >= peak_gate and float(position.pnl_percent) >= pnl_gate:
-            extension += max(0, int(getattr(config, "EXIT_TIMEOUT_EXTENSION_MOMENTUM_SECONDS", 0) or 0))
+    def _no_momentum_gate(self, position: PaperPosition, age_seconds: int) -> tuple[int, float]:
+        age_gate = max(
+            int(position.max_hold_seconds * max(0.0, min(100.0, float(config.NO_MOMENTUM_EXIT_MIN_AGE_PERCENT))) / 100.0),
+            int(config.NO_MOMENTUM_EXIT_MIN_HOLD_SECONDS),
+        )
+        pnl_gate = float(config.NO_MOMENTUM_EXIT_MAX_PNL_PERCENT)
+        if bool(getattr(config, "NO_MOMENTUM_STRONG_TRADE_PROTECT_ENABLED", True)):
+            strong_edge = float(getattr(config, "NO_MOMENTUM_STRONG_EXPECTED_EDGE_PERCENT", 2.8) or 2.8)
+            if float(position.expected_edge_percent) >= strong_edge or self._is_strong_trade(position):
+                age_gate += max(0, int(position.max_hold_seconds * max(0.0, float(getattr(config, "NO_MOMENTUM_STRONG_MIN_AGE_EXTRA_PERCENT", 18.0) or 18.0)) / 100.0))
+                age_gate += max(0, int(getattr(config, "NO_MOMENTUM_STRONG_MIN_HOLD_EXTRA_SECONDS", 40) or 40))
+                pnl_gate += float(getattr(config, "NO_MOMENTUM_STRONG_MAX_PNL_SHIFT", -0.10) or -0.10)
+        if bool(getattr(config, "STATEFUL_EXITS_ENABLED", True)):
+            lane = str(getattr(position, "execution_lane", "") or "").strip().lower()
+            if lane == "runner":
+                age_gate += int(getattr(config, "STATEFUL_NO_MOMENTUM_RUNNER_AGE_SHIFT_SECONDS", 24) or 24)
+                pnl_gate += float(getattr(config, "STATEFUL_NO_MOMENTUM_RUNNER_PNL_SHIFT", -0.10) or -0.10)
+            elif lane == "scalp":
+                age_gate += int(getattr(config, "STATEFUL_NO_MOMENTUM_SCALP_AGE_SHIFT_SECONDS", -10) or -10)
+                pnl_gate += float(getattr(config, "STATEFUL_NO_MOMENTUM_SCALP_PNL_SHIFT", 0.06) or 0.06)
+            phase = self._execution_phase(position, int(age_seconds))
+            if phase == "late" and lane == "runner":
+                age_gate += 8
+            if phase == "early" and lane == "scalp":
+                age_gate = max(0, age_gate - 5)
+        return int(max(0, age_gate)), float(pnl_gate)
 
-        if self._partial_tp_stage(position) > 0:
-            extension += max(0, int(getattr(config, "EXIT_TIMEOUT_EXTENSION_POST_PARTIAL_SECONDS", 0) or 0))
-
-        extension = max(0, min(max_ext, int(extension)))
-        position.timeout_extension_seconds = extension
-        return int(base_hold + extension)
+    def _weak_trade_early_gate(self, position: PaperPosition, age_seconds: int) -> bool:
+        if not bool(getattr(config, "WEAK_TRADE_EARLY_EXIT_ENABLED", True)):
+            return False
+        if AutoTrader._partial_tp_stage(position) > 0:
+            return False
+        lane = str(getattr(position, "execution_lane", "") or "").strip().lower()
+        if bool(getattr(config, "STATEFUL_EXITS_ENABLED", True)):
+            phase = self._execution_phase(position, int(age_seconds))
+            if phase == "late" and lane == "runner":
+                return False
+        edge_max = float(getattr(config, "WEAK_TRADE_EARLY_EDGE_MAX_PERCENT", 1.85) or 1.85)
+        if bool(getattr(config, "STATEFUL_EXITS_ENABLED", True)):
+            if lane == "runner":
+                edge_max += float(
+                    getattr(config, "STATEFUL_WEAK_EARLY_RUNNER_EDGE_BONUS_PERCENT", 0.35) or 0.35
+                )
+            elif lane == "scalp":
+                edge_max -= float(
+                    getattr(config, "STATEFUL_WEAK_EARLY_SCALP_EDGE_PENALTY_PERCENT", 0.25) or 0.25
+                )
+        if float(position.expected_edge_percent) > edge_max:
+            return False
+        min_age_ratio = max(
+            0.0,
+            min(100.0, float(getattr(config, "WEAK_TRADE_EARLY_MIN_AGE_PERCENT", 22.0) or 22.0)),
+        ) / 100.0
+        min_age = max(
+            int(position.max_hold_seconds * min_age_ratio),
+            int(getattr(config, "WEAK_TRADE_EARLY_MIN_HOLD_SECONDS", 55) or 55),
+        )
+        if bool(getattr(config, "STATEFUL_EXITS_ENABLED", True)):
+            if lane == "runner":
+                min_age += 8
+            elif lane == "scalp":
+                min_age = max(0, min_age - 6)
+        if int(age_seconds) < int(min_age):
+            return False
+        max_peak = float(getattr(config, "WEAK_TRADE_EARLY_MAX_PEAK_PERCENT", 0.95) or 0.95)
+        if float(position.peak_pnl_percent) > max_peak:
+            return False
+        max_pnl = float(getattr(config, "WEAK_TRADE_EARLY_MAX_PNL_PERCENT", 0.18) or 0.18)
+        if bool(getattr(config, "STATEFUL_EXITS_ENABLED", True)):
+            if lane == "runner":
+                max_pnl += 0.08
+            elif lane == "scalp":
+                max_pnl -= 0.05
+        if float(position.pnl_percent) > max_pnl:
+            return False
+        return True
 
     def _trailing_floor_percent(self, position: PaperPosition) -> float | None:
         if not bool(getattr(config, "PAPER_TRAILING_EXIT_ENABLED", False)):
@@ -2539,15 +2930,23 @@ class AutoTrader:
             return False
 
         min_age = max(0, int(getattr(config, "ASYM_PRE_PARTIAL_MIN_AGE_SECONDS", 24) or 24))
+        max_loss = float(getattr(config, "ASYM_PRE_PARTIAL_MAX_LOSS_PERCENT", -1.35) or -1.35)
+        if bool(getattr(config, "STATEFUL_EXITS_ENABLED", True)):
+            lane = str(getattr(position, "execution_lane", "") or "").strip().lower()
+            if lane == "runner":
+                min_age += int(getattr(config, "STATEFUL_PRE_PARTIAL_RUNNER_MIN_AGE_EXTRA_SECONDS", 14) or 14)
+                max_loss += float(getattr(config, "STATEFUL_PRE_PARTIAL_RUNNER_MAX_LOSS_SHIFT", -0.18) or -0.18)
+            elif lane == "scalp":
+                min_age += int(getattr(config, "STATEFUL_PRE_PARTIAL_SCALP_MIN_AGE_SHIFT_SECONDS", -8) or -8)
+                max_loss += float(getattr(config, "STATEFUL_PRE_PARTIAL_SCALP_MAX_LOSS_SHIFT", 0.15) or 0.15)
         if int(age_seconds) < min_age:
             return False
         peak_cap = float(getattr(config, "ASYM_PRE_PARTIAL_MAX_PEAK_PERCENT", 0.90) or 0.90)
-        max_loss = float(getattr(config, "ASYM_PRE_PARTIAL_MAX_LOSS_PERCENT", -1.35) or -1.35)
         if float(position.peak_pnl_percent) > peak_cap:
             return False
         return float(position.pnl_percent) <= max_loss
 
-    def _asym_post_partial_floor_percent(self, position: PaperPosition) -> float | None:
+    def _asym_post_partial_floor_percent(self, position: PaperPosition, age_seconds: int = 0) -> float | None:
         if not bool(getattr(config, "ASYMMETRIC_EXITS_ENABLED", True)):
             return None
         if not bool(getattr(config, "ASYM_POST_PARTIAL_PROTECT_ENABLED", True)):
@@ -2561,6 +2960,14 @@ class AutoTrader:
             return None
         min_floor = float(getattr(config, "ASYM_POST_PARTIAL_PROTECT_MIN_FLOOR_PERCENT", 0.12) or 0.12)
         giveback = max(0.0, float(getattr(config, "ASYM_POST_PARTIAL_PROTECT_GIVEBACK_PERCENT", 0.55) or 0.55))
+        if bool(getattr(config, "STATEFUL_EXITS_ENABLED", True)):
+            lane = str(getattr(position, "execution_lane", "") or "").strip().lower()
+            if lane == "runner":
+                giveback *= float(getattr(config, "STATEFUL_POST_PARTIAL_RUNNER_GIVEBACK_MULT", 0.82) or 0.82)
+            elif lane == "scalp":
+                giveback *= float(getattr(config, "STATEFUL_POST_PARTIAL_SCALP_GIVEBACK_MULT", 1.12) or 1.12)
+            if self._execution_phase(position, int(age_seconds)) == "late" and lane == "runner":
+                giveback *= 0.90
         return float(max(min_floor, peak - giveback))
 
     async def process_open_positions(self, bot=None) -> None:
@@ -2611,12 +3018,15 @@ class AutoTrader:
             trailing_floor = self._trailing_floor_percent(position) if has_price_update else None
             partial_stage = self._partial_tp_stage(position)
             age_seconds = int((datetime.now(timezone.utc) - position.opened_at).total_seconds())
+            position.execution_phase = self._execution_phase(position, age_seconds)
             be_protect_floor = (
                 self._partial_tp_be_protect_floor_percent(position)
                 if (has_price_update and partial_stage > 0 and bool(getattr(config, "PAPER_PARTIAL_TP_BE_PROTECT_ENABLED", True)))
                 else None
             )
-            asym_post_partial_floor = self._asym_post_partial_floor_percent(position) if has_price_update else None
+            asym_post_partial_floor = (
+                self._asym_post_partial_floor_percent(position, age_seconds) if has_price_update else None
+            )
 
             if has_price_update and position.pnl_percent >= position.take_profit_percent:
                 should_close = True
@@ -2658,19 +3068,21 @@ class AutoTrader:
                 should_close = True
                 close_reason = "TRAIL_FLOOR"
             else:
-                effective_hold_seconds = self._effective_timeout_seconds(position)
-                no_momentum_age_gate = max(
-                    int(position.max_hold_seconds * max(0.0, min(100.0, float(config.NO_MOMENTUM_EXIT_MIN_AGE_PERCENT))) / 100.0),
-                    int(config.NO_MOMENTUM_EXIT_MIN_HOLD_SECONDS),
-                )
+                effective_hold_seconds = self._effective_timeout_seconds(position, age_seconds)
+                no_momentum_age_gate, no_momentum_pnl_gate = self._no_momentum_gate(position, age_seconds)
+                if has_price_update and self._weak_trade_early_gate(position, age_seconds):
+                    should_close = True
+                    close_reason = "WEAK_EARLY"
                 # Close "flat" positions early: token never showed real impulse and still sits near breakeven.
                 if (
+                    (not should_close)
+                    and
                     has_price_update
                     and
                     config.NO_MOMENTUM_EXIT_ENABLED
                     and age_seconds >= no_momentum_age_gate
                     and float(position.peak_pnl_percent) <= float(config.NO_MOMENTUM_EXIT_MAX_PEAK_PERCENT)
-                    and float(position.pnl_percent) <= float(config.NO_MOMENTUM_EXIT_MAX_PNL_PERCENT)
+                    and float(position.pnl_percent) <= float(no_momentum_pnl_gate)
                 ):
                     should_close = True
                     close_reason = "NO_MOMENTUM"
@@ -3041,6 +3453,7 @@ class AutoTrader:
                 "score": int(position.score),
                 "entry_tier": str(position.entry_tier or ""),
                 "entry_channel": str(position.entry_channel or ""),
+                "execution_lane": str(position.execution_lane or ""),
                 "market_mode": str(position.market_mode or ""),
                 "pnl_percent": float(position.pnl_percent),
                 "pnl_usd": float(position.pnl_usd),
@@ -3144,6 +3557,7 @@ class AutoTrader:
                 "score": int(position.score),
                 "entry_tier": str(position.entry_tier or ""),
                 "entry_channel": str(position.entry_channel or ""),
+                "execution_lane": str(position.execution_lane or ""),
                 "market_mode": str(position.market_mode or ""),
                 "pnl_percent": float(position.pnl_percent),
                 "pnl_usd": float(position.pnl_usd),
@@ -3395,7 +3809,9 @@ class AutoTrader:
                 continue
             liq = float((pair.get("liquidity") or {}).get("usd") or 0)
             price = float(pair.get("priceUsd") or 0)
-            if price <= 0:
+            if (not math.isfinite(price)) or price <= 0:
+                continue
+            if price > float(getattr(config, "PAPER_PRICE_MAX_ABSOLUTE_USD", 1_000_000.0) or 1_000_000.0):
                 continue
             if liq > best_liq:
                 best_liq = liq
@@ -3458,6 +3874,21 @@ class AutoTrader:
         if current_price <= 0 or next_price_usd <= 0:
             return True
 
+        # Hard reject physically implausible spikes even if repeated.
+        ratio = max(next_price_usd, current_price) / max(min(next_price_usd, current_price), 1e-18)
+        max_ratio = max(1.5, float(getattr(config, "PAPER_PRICE_GUARD_MAX_RATIO", 50.0) or 50.0))
+        if (not math.isfinite(ratio)) or ratio > max_ratio:
+            logger.warning(
+                "AUTO_SELL price_guard_reject token=%s reason=abs_ratio ratio=%.6g max_ratio=%.2f current=%g next=%g",
+                position.symbol,
+                ratio,
+                max_ratio,
+                current_price,
+                next_price_usd,
+            )
+            self.price_guard_pending.pop(position.token_address, None)
+            return False
+
         jump_percent = abs((next_price_usd - current_price) / current_price) * 100
         if jump_percent <= float(config.PAPER_PRICE_GUARD_MAX_JUMP_PERCENT):
             self.price_guard_pending.pop(position.token_address, None)
@@ -3508,6 +3939,17 @@ class AutoTrader:
     def get_stats(self) -> dict[str, float]:
         self._prune_hourly_window()
         self._prune_daily_tx_window()
+        conc_window = max(300, int(getattr(config, "SYMBOL_CONCENTRATION_WINDOW_SECONDS", 3600) or 3600))
+        self._prune_symbol_open_window(conc_window)
+        symbol_counts: dict[str, int] = {}
+        for _, sym in self._recent_open_symbols:
+            symbol_counts[sym] = int(symbol_counts.get(sym, 0)) + 1
+        top_symbol = ""
+        top_count = 0
+        if symbol_counts:
+            top_symbol, top_count = max(symbol_counts.items(), key=lambda item: int(item[1]))
+        conc_total = len(self._recent_open_symbols)
+        top_share = (float(top_count) / float(conc_total)) if conc_total > 0 else 0.0
         win_rate = (self.total_wins / self.total_closed * 100) if self.total_closed else 0.0
         unrealized_pnl = sum(pos.pnl_usd for pos in self.open_positions.values())
         equity = self.paper_balance_usd + sum(pos.position_size_usd + pos.pnl_usd for pos in self.open_positions.values())
@@ -3526,6 +3968,10 @@ class AutoTrader:
             "realized_pnl_usd": round(self.realized_pnl_usd, 2),
             "session_peak_realized_pnl_usd": round(self._session_peak_realized_pnl_usd, 2),
             "session_profit_lock_last_trigger_ts": round(self._session_profit_lock_last_trigger_ts, 2),
+            "session_profit_lock_armed": bool(self._session_profit_lock_armed),
+            "session_profit_lock_floor_usd": round(float(self._session_profit_lock_last_floor_usd or 0.0), 4),
+            "session_profit_lock_metric_usd": round(float(self._session_profit_lock_last_metric_usd or 0.0), 4),
+            "session_profit_lock_rearm_ready_ts": round(float(self._session_profit_lock_rearm_ready_ts or 0.0), 2),
             "day_realized_pnl_usd": round(self.day_realized_pnl_usd, 2),
             "unrealized_pnl_usd": round(unrealized_pnl, 2),
             "equity_usd": round(equity, 2),
@@ -3533,6 +3979,8 @@ class AutoTrader:
             "initial_balance_usd": round(self.initial_balance_usd, 2),
             "loss_streak": self.current_loss_streak,
             "trading_pause_until_ts": round(self.trading_pause_until_ts, 2),
+            "last_pause_reason": self._last_pause_reason,
+            "last_pause_trigger_ts": round(float(self._last_pause_trigger_ts or 0.0), 2),
             "risk_block_reason": risk_block_reason,
             "trades_last_hour": len(self.trade_open_timestamps),
             "tx_last_day": len(self.tx_event_timestamps),
@@ -3550,6 +3998,10 @@ class AutoTrader:
             "skip_reasons_window": dict(self._skip_reason_counts_window),
             "anti_choke_active": self._anti_choke_active(),
             "entry_idle_seconds": round(self._entry_idle_seconds(), 1),
+            "symbol_concentration_window_seconds": int(conc_window),
+            "symbol_concentration_recent_opens": int(conc_total),
+            "symbol_concentration_top_symbol": top_symbol,
+            "symbol_concentration_top_share": round(float(top_share), 3),
         }
 
     def reset_paper_state(self, keep_closed: bool = True) -> None:
@@ -3558,15 +4010,24 @@ class AutoTrader:
         self.realized_pnl_usd = 0.0
         self._session_peak_realized_pnl_usd = 0.0
         self._session_profit_lock_last_trigger_ts = 0.0
+        self._session_profit_lock_armed = True
+        self._session_profit_lock_rearm_ready_ts = 0.0
+        self._session_profit_lock_rearm_floor_usd = 0.0
+        self._session_profit_lock_last_floor_usd = 0.0
+        self._session_profit_lock_last_metric_usd = 0.0
         self.day_id = self._current_day_id()
         self.day_start_equity_usd = float(config.WALLET_BALANCE_USD)
         self.day_realized_pnl_usd = 0.0
         self.current_loss_streak = 0
         self.trading_pause_until_ts = 0.0
+        self._last_pause_reason = ""
+        self._last_pause_detail = ""
+        self._last_pause_trigger_ts = 0.0
         self.token_cooldowns.clear()
         self.token_cooldown_strikes.clear()
         self.symbol_cooldowns.clear()
         self.trade_open_timestamps.clear()
+        self._recent_open_symbols.clear()
         self.tx_event_timestamps.clear()
         self.price_guard_pending.clear()
         self.emergency_halt_reason = ""
@@ -3842,7 +4303,194 @@ class AutoTrader:
             "avg_net_usd": float(blended.get("avg_net_usd", 0.0) or 0.0),
             "expected_net_usd": float(expected_net_usd),
             "fallback_edge_usd": float(fallback_edge_usd),
+            "loss_share": float(blended.get("loss_share", 0.0) or 0.0),
         }
+
+    @staticmethod
+    def _execution_phase(position: PaperPosition, age_seconds: int) -> str:
+        hold = max(1, int(getattr(position, "max_hold_seconds", 1) or 1))
+        age = max(0, int(age_seconds))
+        ratio = float(age) / float(max(1, hold))
+        early_ratio = max(
+            0.05,
+            min(0.95, float(getattr(config, "STATEFUL_EXITS_EARLY_PHASE_RATIO", 0.33) or 0.33)),
+        )
+        late_ratio = max(
+            early_ratio + 0.05,
+            min(0.99, float(getattr(config, "STATEFUL_EXITS_LATE_PHASE_RATIO", 0.78) or 0.78)),
+        )
+        if ratio < early_ratio:
+            return "early"
+        if ratio >= late_ratio:
+            return "late"
+        return "mid"
+
+    def _execution_lane_profile(
+        self,
+        *,
+        symbol: str,
+        market_mode: str,
+        entry_tier: str,
+        entry_channel: str,
+        score: int,
+        expected_edge_percent: float,
+        ev_snapshot: dict[str, float],
+    ) -> dict[str, float | str]:
+        out: dict[str, float | str] = {
+            "enabled": bool(getattr(config, "EXECUTION_ARCH_ENABLED", True)),
+            "lane": "scalp",
+            "size_mult": 1.0,
+            "hold_mult": 1.0,
+            "edge_mult": 1.0,
+            "detail": "disabled",
+        }
+        if not bool(out["enabled"]):
+            return out
+
+        if not bool(getattr(config, "EXECUTION_DUAL_LANE_ENABLED", True)):
+            out["detail"] = "dual_lane_off"
+            return out
+
+        mm = str(market_mode or "").strip().upper()
+        tier = str(entry_tier or "").strip().upper()
+        channel = str(entry_channel or "").strip().lower()
+        expected_net = float(ev_snapshot.get("expected_net_usd", 0.0) or 0.0)
+        edge = float(expected_edge_percent)
+        s = int(score)
+
+        runner_min_edge = float(getattr(config, "EXECUTION_RUNNER_MIN_EDGE_PERCENT", 2.90) or 2.90)
+        runner_min_ev = float(getattr(config, "EXECUTION_RUNNER_MIN_EV_USD", 0.0055) or 0.0055)
+        runner_min_score = int(getattr(config, "EXECUTION_RUNNER_MIN_SCORE", 92) or 92)
+        runner_allow_red = bool(getattr(config, "EXECUTION_RUNNER_ALLOW_IN_RED", False))
+        runner_allow_explore = bool(getattr(config, "EXECUTION_RUNNER_ALLOW_EXPLORE", False))
+
+        allow_runner = True
+        reasons: list[str] = []
+        if mm == "RED" and not runner_allow_red:
+            allow_runner = False
+            reasons.append("red_guard")
+        if channel == "explore" and not runner_allow_explore:
+            allow_runner = False
+            reasons.append("explore_guard")
+
+        runner_signal = (
+            edge >= runner_min_edge
+            or expected_net >= runner_min_ev
+            or (s >= runner_min_score and tier == "A" and channel == "core")
+        )
+        lane = "runner" if (allow_runner and runner_signal) else "scalp"
+
+        if lane == "runner":
+            out["size_mult"] = float(getattr(config, "EXECUTION_RUNNER_SIZE_MULT", 1.10) or 1.10)
+            out["hold_mult"] = float(getattr(config, "EXECUTION_RUNNER_HOLD_MULT", 1.32) or 1.32)
+            out["edge_mult"] = float(getattr(config, "EXECUTION_RUNNER_EDGE_GATE_MULT", 0.94) or 0.94)
+            out["detail"] = (
+                f"runner edge={edge:.2f}/{runner_min_edge:.2f} ev=${expected_net:.4f}/${runner_min_ev:.4f} "
+                f"score={s}/{runner_min_score}"
+            )
+        else:
+            out["size_mult"] = float(getattr(config, "EXECUTION_SCALP_SIZE_MULT", 0.93) or 0.93)
+            out["hold_mult"] = float(getattr(config, "EXECUTION_SCALP_HOLD_MULT", 0.78) or 0.78)
+            out["edge_mult"] = float(getattr(config, "EXECUTION_SCALP_EDGE_GATE_MULT", 1.06) or 1.06)
+            reason_txt = ",".join(reasons) if reasons else "signal_low"
+            out["detail"] = (
+                f"scalp reason={reason_txt} edge={edge:.2f}/{runner_min_edge:.2f} "
+                f"ev=${expected_net:.4f}/${runner_min_ev:.4f}"
+            )
+        out["lane"] = lane
+        return out
+
+    def _cluster_ev_routing_adjustments(
+        self,
+        *,
+        cluster_key: str,
+        market_mode: str,
+        entry_tier: str,
+        entry_channel: str,
+        candidate_id: str,
+    ) -> dict[str, float | str | bool]:
+        out: dict[str, float | str | bool] = {
+            "enabled": bool(getattr(config, "EXECUTION_CLUSTER_ROUTING_ENABLED", True)),
+            "size_mult": 1.0,
+            "hold_mult": 1.0,
+            "edge_mult": 1.0,
+            "entry_probability": 1.0,
+            "bad_ev": False,
+            "severe_ev": False,
+            "avg_net_usd": 0.0,
+            "loss_share": 0.0,
+            "samples": 0.0,
+            "seed": "",
+            "detail": "neutral",
+        }
+        if not bool(out["enabled"]):
+            return out
+
+        stats = self._cluster_window_metrics(cluster_key)
+        samples = float(stats.get("samples", 0.0) or 0.0)
+        avg_net = float(stats.get("avg_net_usd", 0.0) or 0.0)
+        loss_share = float(stats.get("loss_share", 0.0) or 0.0)
+        out["samples"] = samples
+        out["avg_net_usd"] = avg_net
+        out["loss_share"] = loss_share
+
+        min_trades = max(2.0, float(getattr(config, "EXECUTION_CLUSTER_ROUTING_MIN_TRADES", 10) or 10))
+        if samples < min_trades:
+            out["detail"] = f"sparse samples={int(samples)}<{int(min_trades)}"
+            return out
+
+        bad_avg = float(getattr(config, "EXECUTION_CLUSTER_ROUTING_BAD_AVG_NET_USD", -0.0002) or -0.0002)
+        bad_loss = float(getattr(config, "EXECUTION_CLUSTER_ROUTING_BAD_LOSS_SHARE", 0.60) or 0.60)
+        severe_avg = float(getattr(config, "EXECUTION_CLUSTER_ROUTING_SEVERE_AVG_NET_USD", -0.0012) or -0.0012)
+        severe_loss = float(getattr(config, "EXECUTION_CLUSTER_ROUTING_SEVERE_LOSS_SHARE", 0.72) or 0.72)
+
+        bad = (avg_net <= bad_avg) or (loss_share >= bad_loss)
+        severe = (avg_net <= severe_avg) or (loss_share >= severe_loss)
+        out["bad_ev"] = bool(bad)
+        out["severe_ev"] = bool(severe)
+        if not bad:
+            out["detail"] = f"ok samples={int(samples)} avg={avg_net:.5f} loss_share={loss_share:.2f}"
+            return out
+
+        if severe:
+            out["size_mult"] = float(
+                getattr(config, "EXECUTION_CLUSTER_ROUTING_SEVERE_SIZE_MULT", 0.62) or 0.62
+            )
+            out["hold_mult"] = float(
+                getattr(config, "EXECUTION_CLUSTER_ROUTING_SEVERE_HOLD_MULT", 0.72) or 0.72
+            )
+            out["edge_mult"] = float(
+                getattr(config, "EXECUTION_CLUSTER_ROUTING_SEVERE_EDGE_MULT", 1.28) or 1.28
+            )
+            out["entry_probability"] = float(
+                getattr(config, "EXECUTION_CLUSTER_ROUTING_SEVERE_ENTRY_PROBABILITY", 0.48) or 0.48
+            )
+        else:
+            out["size_mult"] = float(getattr(config, "EXECUTION_CLUSTER_ROUTING_BAD_SIZE_MULT", 0.84) or 0.84)
+            out["hold_mult"] = float(getattr(config, "EXECUTION_CLUSTER_ROUTING_BAD_HOLD_MULT", 0.90) or 0.90)
+            out["edge_mult"] = float(getattr(config, "EXECUTION_CLUSTER_ROUTING_BAD_EDGE_MULT", 1.10) or 1.10)
+            out["entry_probability"] = float(
+                getattr(config, "EXECUTION_CLUSTER_ROUTING_BAD_ENTRY_PROBABILITY", 0.80) or 0.80
+            )
+
+        if str(entry_tier or "").strip().upper() == "A" and str(entry_channel or "").strip().lower() == "core":
+            out["edge_mult"] *= float(getattr(config, "EXECUTION_CLUSTER_ROUTING_A_CORE_RELAX_EDGE_MULT", 0.94) or 0.94)
+        if str(market_mode or "").strip().upper() == "RED":
+            out["edge_mult"] = float(out["edge_mult"]) * 1.04
+
+        minute_slot = int(time.time() // 60)
+        seed = (
+            f"{str(cluster_key).lower()}|{str(market_mode).upper()}|{str(entry_tier).upper()}|"
+            f"{str(entry_channel).lower()}|{str(candidate_id)}|{minute_slot}"
+        )
+        out["seed"] = seed
+        out["detail"] = (
+            f"bad={bad} severe={severe} samples={int(samples)} avg={avg_net:.5f} "
+            f"loss_share={loss_share:.2f} size_mult={float(out['size_mult']):.2f} "
+            f"hold_mult={float(out['hold_mult']):.2f} edge_mult={float(out['edge_mult']):.2f} "
+            f"p={float(out['entry_probability']):.2f}"
+        )
+        return out
 
     def _token_ev_memory_adjustments(
         self,
@@ -4176,6 +4824,11 @@ class AutoTrader:
             "ev_expected_net_usd": pos.ev_expected_net_usd,
             "ev_confidence": pos.ev_confidence,
             "kelly_mult": pos.kelly_mult,
+            "execution_lane": pos.execution_lane,
+            "execution_phase": pos.execution_phase,
+            "cluster_ev_avg_net_usd": pos.cluster_ev_avg_net_usd,
+            "cluster_ev_loss_share": pos.cluster_ev_loss_share,
+            "cluster_ev_samples": pos.cluster_ev_samples,
         }
 
     @staticmethod
@@ -4246,6 +4899,11 @@ class AutoTrader:
                 ev_expected_net_usd=float(row.get("ev_expected_net_usd", 0.0) or 0.0),
                 ev_confidence=float(row.get("ev_confidence", 0.0) or 0.0),
                 kelly_mult=float(row.get("kelly_mult", 1.0) or 1.0),
+                execution_lane=str(row.get("execution_lane", "") or ""),
+                execution_phase=str(row.get("execution_phase", "") or ""),
+                cluster_ev_avg_net_usd=float(row.get("cluster_ev_avg_net_usd", 0.0) or 0.0),
+                cluster_ev_loss_share=float(row.get("cluster_ev_loss_share", 0.0) or 0.0),
+                cluster_ev_samples=float(row.get("cluster_ev_samples", 0.0) or 0.0),
             )
         except Exception:
             return None

@@ -8,6 +8,31 @@ if (-not (Test-Path $sessionsDir)) {
 
 Get-ChildItem -Path $sessionsDir -Directory | ForEach-Object {
   $id = $_.Name
+  $tradeDecisionFile = Join-Path $_.FullName 'trade_decisions.jsonl'
+  if (Test-Path $tradeDecisionFile) {
+    $buy = 0
+    $sell = 0
+    $pnl = 0.0
+    Get-Content -Path $tradeDecisionFile -Encoding UTF8 -ErrorAction SilentlyContinue | ForEach-Object {
+      $line = [string]$_
+      if ([string]::IsNullOrWhiteSpace($line)) { return }
+      try {
+        $row = $line | ConvertFrom-Json -ErrorAction Stop
+      } catch {
+        return
+      }
+      $decision = [string]$row.decision
+      if ($decision -eq 'open') {
+        $buy += 1
+      } elseif ($decision -eq 'close') {
+        $sell += 1
+        try { $pnl += [double]$row.pnl_usd } catch {}
+      }
+    }
+    "{0}`tbuys={1}`tsells={2}`trealized={3:N2}`tfile={4}" -f $id,$buy,$sell,$pnl,'trade_decisions.jsonl'
+    return
+  }
+
   $latest = Get-ChildItem -Path $_.FullName -Recurse -Filter 'main_local_*.log' -ErrorAction SilentlyContinue |
     Sort-Object LastWriteTime -Descending |
     Select-Object -First 1

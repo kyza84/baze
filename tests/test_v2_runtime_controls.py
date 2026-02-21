@@ -174,6 +174,8 @@ class RollingEdgeTests(ConfigPatchMixin, unittest.TestCase):
             V2_ROLLING_EDGE_LOSS_SHARE_TIGHTEN=0.50,
             MIN_EXPECTED_EDGE_USD=0.010,
             MIN_EXPECTED_EDGE_PERCENT=0.80,
+            V2_ANTI_SELF_TIGHTEN_ENABLED=False,
+            V2_RUNTIME_EDGE_RELAX_UNTIL_TS=0.0,
         )
         gov = RollingEdgeGovernor()
         gov._next_eval_ts = 0.0
@@ -191,6 +193,35 @@ class RollingEdgeTests(ConfigPatchMixin, unittest.TestCase):
         payload = gov.maybe_apply(auto_trader=type("T", (), {"closed_positions": [_ClosedPos(0.01)] * 5})(), auto_stats={"closed": 5})
         self.assertIsNone(payload)
         self.assertAlmostEqual(float(getattr(config, "MIN_EXPECTED_EDGE_USD")), 0.020, places=6)
+
+    def test_anti_self_tighten_blocks_tighten_on_low_flow(self) -> None:
+        self.patch_cfg(
+            V2_ROLLING_EDGE_ENABLED=True,
+            V2_ROLLING_EDGE_INTERVAL_SECONDS=60,
+            V2_ROLLING_EDGE_MIN_CLOSED=10,
+            V2_ROLLING_EDGE_WINDOW_CLOSED=30,
+            V2_ROLLING_EDGE_TIGHTEN_STEP_USD=0.003,
+            V2_ROLLING_EDGE_TIGHTEN_STEP_PERCENT=0.20,
+            V2_ROLLING_EDGE_RELAX_STEP_USD=0.002,
+            V2_ROLLING_EDGE_RELAX_STEP_PERCENT=0.10,
+            V2_ROLLING_EDGE_EDGE_LOW_SHARE_RELAX=0.60,
+            V2_ROLLING_EDGE_LOSS_SHARE_TIGHTEN=0.50,
+            V2_ANTI_SELF_TIGHTEN_ENABLED=True,
+            V2_ANTI_SELF_TIGHTEN_OPEN_RATE_THRESHOLD=0.04,
+            V2_ANTI_SELF_TIGHTEN_EDGE_LOW_SHARE_THRESHOLD=0.60,
+            V2_ANTI_SELF_TIGHTEN_COOLDOWN_SECONDS=900,
+            MIN_EXPECTED_EDGE_USD=0.020,
+            MIN_EXPECTED_EDGE_PERCENT=1.20,
+            V2_RUNTIME_EDGE_RELAX_UNTIL_TS=0.0,
+        )
+        gov = RollingEdgeGovernor()
+        gov._next_eval_ts = 0.0
+        gov.record_cycle(candidates=100, opened=1, skip_reasons_cycle={"edge_low": 70, "negative_edge": 20})
+        losses = [_ClosedPos(-0.02) for _ in range(20)] + [_ClosedPos(0.01) for _ in range(10)]
+        payload = gov.maybe_apply(auto_trader=type("T", (), {"closed_positions": losses})(), auto_stats={"closed": 30})
+        self.assertIsNotNone(payload)
+        self.assertNotEqual(payload.get("action"), "tighten")
+        self.assertLessEqual(float(getattr(config, "MIN_EXPECTED_EDGE_USD")), 0.020)
 
 
 class KpiLoopTests(ConfigPatchMixin, unittest.TestCase):
@@ -362,6 +393,94 @@ class QualityGateTests(ConfigPatchMixin, unittest.TestCase):
         aa_count = sum(1 for token, _ in out if str((token or {}).get("symbol", "")).upper() == "AAA")
         self.assertLessEqual(aa_count, 2)
         self.assertGreater(int(meta.get("drop_counts", {}).get("symbol_concentration", 0) or 0), 0)
+
+    def test_quality_gate_reserves_explore_even_with_core_overflow(self) -> None:
+        self.patch_cfg(
+            V2_QUALITY_GATE_ENABLED=True,
+            V2_QUALITY_REFRESH_SECONDS=60,
+            V2_QUALITY_WINDOW_SECONDS=3600,
+            V2_QUALITY_MIN_SYMBOL_TRADES=3,
+            V2_QUALITY_MIN_CLUSTER_TRADES=99,
+            V2_QUALITY_MIN_AVG_PNL_USD=0.0,
+            V2_QUALITY_MAX_LOSS_SHARE=0.90,
+            V2_QUALITY_BAD_AVG_PNL_USD=-1.0,
+            V2_QUALITY_BAD_LOSS_SHARE=1.0,
+            V2_QUALITY_EXPLORE_MAX_SHARE=0.10,
+            V2_QUALITY_EXPLORE_RESERVE_SHARE=0.30,
+            V2_QUALITY_EXPLORE_MIN_ABS=1,
+            V2_QUALITY_COOLDOWN_PROBE_PROBABILITY=0.0,
+            V2_QUALITY_SOURCE_BUDGET_ENABLED=False,
+            V2_QUALITY_SYMBOL_MAX_SHARE=1.0,
+        )
+        q = UniverseQualityGateController()
+        now = datetime.now(timezone.utc)
+        closed = [
+            _ClosedRichPos(
+                symbol="CORE",
+                token_cluster_key="",
+                pnl_usd=0.01,
+                candidate_id=f"core_{i}",
+                closed_at=now,
+            )
+            for i in range(4)
+        ]
+        trader = type("T", (), {"closed_positions": closed})()
+        rows = [
+            (
+                {"_candidate_id": f"c_core_{i}", "symbol": "CORE", "source": "watchlist", "liquidity": 20000, "volume_5m": 5000},
+                {"score": 90 - i},
+            )
+            for i in range(4)
+        ] + [
+            (
+                {"_candidate_id": "c_new", "symbol": "NEW", "source": "dexscreener", "liquidity": 21000, "volume_5m": 5200},
+                {"score": 86},
+            )
+        ]
+        out, meta = q.filter_candidates(candidates=rows, auto_trader=trader, market_mode="GREEN")
+        out_symbols = [str((token or {}).get("symbol", "")).upper() for token, _ in out]
+        self.assertIn("NEW", out_symbols)
+        self.assertGreaterEqual(int(meta.get("explore_out", 0) or 0), 1)
+        self.assertGreaterEqual(int(meta.get("explore_target", 0) or 0), 1)
+
+    def test_quality_gate_provisional_core_promotes_tier_a(self) -> None:
+        self.patch_cfg(
+            V2_QUALITY_GATE_ENABLED=True,
+            V2_QUALITY_REFRESH_SECONDS=60,
+            V2_QUALITY_WINDOW_SECONDS=3600,
+            V2_QUALITY_MIN_SYMBOL_TRADES=99,
+            V2_QUALITY_MIN_CLUSTER_TRADES=99,
+            V2_QUALITY_EXPLORE_MAX_SHARE=0.0,
+            V2_QUALITY_EXPLORE_RESERVE_SHARE=0.0,
+            V2_QUALITY_SOURCE_BUDGET_ENABLED=False,
+            V2_QUALITY_SYMBOL_MAX_SHARE=1.0,
+            V2_QUALITY_PROVISIONAL_CORE_ENABLED=True,
+            V2_QUALITY_PROVISIONAL_CORE_MIN_SCORE=92,
+            V2_QUALITY_PROVISIONAL_CORE_MIN_LIQUIDITY_USD=50000,
+            V2_QUALITY_PROVISIONAL_CORE_MIN_VOLUME_5M_USD=3000,
+            V2_QUALITY_PROVISIONAL_CORE_MIN_ABS_CHANGE_5M=2.0,
+            V2_QUALITY_PROVISIONAL_CORE_MAX_SHARE=1.0,
+        )
+        q = UniverseQualityGateController()
+        trader = type("T", (), {"closed_positions": []})()
+        rows = [
+            (
+                {
+                    "_candidate_id": "cid_prov",
+                    "symbol": "IMP",
+                    "source": "onchain",
+                    "liquidity": 100000,
+                    "volume_5m": 4500,
+                    "price_change_5m": 4.5,
+                },
+                {"score": 95},
+            )
+        ]
+        out, meta = q.filter_candidates(candidates=rows, auto_trader=trader, market_mode="GREEN")
+        self.assertEqual(len(out), 1)
+        self.assertEqual(str(out[0][0].get("_entry_tier", "")), "A")
+        self.assertEqual(str(out[0][0].get("_quality_bucket", "")), "core_provisional")
+        self.assertGreaterEqual(int(meta.get("core_provisional_out", 0) or 0), 1)
 
 
 if __name__ == "__main__":
