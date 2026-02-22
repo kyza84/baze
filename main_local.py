@@ -55,6 +55,7 @@ WINDOWS_MUTEX_NAME = (
     else "Global\\solana_alert_bot_main_local_single_instance"
 )
 PID_FILE = os.path.join(PROJECT_ROOT, "bot.pid")
+HEARTBEAT_FILE = os.path.join(LOG_DIR, "heartbeat.json")
 
 
 def _should_manage_single_pid_file() -> bool:
@@ -107,6 +108,28 @@ def _clear_graceful_stop_flag() -> None:
         if os.path.exists(path):
             os.remove(path)
     except Exception:
+        pass
+
+
+def _write_heartbeat(*, stage: str, cycle_index: int, open_trades: int = 0, detail: str = "") -> None:
+    try:
+        payload = {
+            "run_tag": RUN_TAG,
+            "pid": int(os.getpid()),
+            "ts": float(time.time()),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "stage": str(stage or "").strip() or "loop",
+            "cycle_index": int(cycle_index),
+            "open_trades": int(max(0, int(open_trades))),
+            "detail": str(detail or "").strip(),
+        }
+        os.makedirs(os.path.dirname(HEARTBEAT_FILE), exist_ok=True)
+        tmp = HEARTBEAT_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(tmp, HEARTBEAT_FILE)
+    except Exception:
+        # Heartbeat must never break runtime loop.
         pass
 
 
@@ -656,6 +679,7 @@ class AdaptiveFilterController:
         skip_negative_edge = int(self.window_skip_reasons.get("negative_edge", 0))
         skip_edge_usd_low = int(self.window_skip_reasons.get("edge_usd_low", 0))
         skip_edge_low = int(self.window_skip_reasons.get("edge_low", 0))
+        skip_ev_net_low = int(self.window_skip_reasons.get("ev_net_low", 0))
         skip_min_trade = int(self.window_skip_reasons.get("min_trade_size", 0))
         regime_top = _format_top_counts(self.window_regime_counts, limit=1)
 
@@ -689,7 +713,10 @@ class AdaptiveFilterController:
                 ttl_next = ttl_max_bound
         edge_mode = str(getattr(config, "EDGE_FILTER_MODE", "usd") or "usd").strip().lower()
         edge_knob_movable = self.edge_enabled and bool(getattr(config, "EDGE_FILTER_ENABLED", True))
-        edge_negative_blocked = (skip_negative_edge + skip_edge_low) > 0 and edge_mode in {"percent", "both"}
+        edge_negative_blocked = (skip_negative_edge + skip_edge_low + skip_ev_net_low) > 0 and edge_mode in {
+            "percent",
+            "both",
+        }
         if str(policy_state).upper() == "OK" and int(self.window_opened) <= 0 and avg_candidates >= float(self.zero_open_min_candidates):
             self.zero_open_streak += 1
         elif int(self.window_opened) > 0:
@@ -793,7 +820,7 @@ class AdaptiveFilterController:
             action = "loosen_edge"
             reason = (
                 f"blocked_by_edge avg_cand={avg_candidates:.2f} "
-                f"neg_edge={skip_negative_edge + skip_edge_low}"
+                f"neg_edge={skip_negative_edge + skip_edge_low} ev_net={skip_ev_net_low}"
             )
         elif avg_candidates < float(self.target_cand_min) and avg_opened < float(self.target_open_min):
             if fail_volume >= fail_score and volume_now > self.volume_min_bound:
@@ -857,7 +884,7 @@ class AdaptiveFilterController:
                 self.zero_open_streak = 0
 
         logger.warning(
-            "ADAPTIVE_FILTERS mode=%s action=%s changed=%s reason=%s regime=%s avg_cand=%.2f avg_opened=%.2f closed_delta=%s realized_delta=$%.2f pnl_signal=%s pressure=%s score=%s->%s volume=%.0f->%.0f dedup_ttl=%s->%s dyn_dedup(p=%.1f,target=%s,range=%s-%s,samples=%s) edge=%.2f->%.2f lock_floor=%.2f->%.2f no_mom_pnl=%.2f->%.2f weakness_pnl=%.2f->%.2f fails(score=%s,volume=%s,dedup=%s) skips(neg_edge=%s,edge_usd=%s,min_trade=%s) zero_open=%s/%s",
+            "ADAPTIVE_FILTERS mode=%s action=%s changed=%s reason=%s regime=%s avg_cand=%.2f avg_opened=%.2f closed_delta=%s realized_delta=$%.2f pnl_signal=%s pressure=%s score=%s->%s volume=%.0f->%.0f dedup_ttl=%s->%s dyn_dedup(p=%.1f,target=%s,range=%s-%s,samples=%s) edge=%.2f->%.2f lock_floor=%.2f->%.2f no_mom_pnl=%.2f->%.2f weakness_pnl=%.2f->%.2f fails(score=%s,volume=%s,dedup=%s) skips(neg_edge=%s,ev_net=%s,edge_usd=%s,min_trade=%s) zero_open=%s/%s",
             self.mode,
             action,
             changed,
@@ -892,6 +919,7 @@ class AdaptiveFilterController:
             fail_volume,
             fail_dedup,
             (skip_negative_edge + skip_edge_low),
+            skip_ev_net_low,
             skip_edge_usd_low,
             skip_min_trade,
             self.zero_open_streak,
@@ -2014,9 +2042,11 @@ async def run_local_loop() -> None:
     cycle_index = 0
 
     logger.info("Local mode started (Telegram disabled).")
+    _write_heartbeat(stage="startup", cycle_index=cycle_index, open_trades=0)
     try:
         while True:
             cycle_index += 1
+            _write_heartbeat(stage="cycle_begin", cycle_index=cycle_index, open_trades=len(auto_trader.open_positions))
             if _graceful_stop_requested():
                 logger.warning("GRACEFUL_STOP requested path=%s", _graceful_stop_file_path())
                 break
@@ -2657,7 +2687,7 @@ async def run_local_loop() -> None:
                     market_regime=market_regime_current,
                     auto_stats=auto_stats,
                 )
-                kpi_event = v2_kpi_loop.maybe_apply()
+                kpi_event = v2_kpi_loop.maybe_apply(auto_trader=auto_trader)
                 if isinstance(kpi_event, dict):
                     try:
                         await local_alerter.send_event(
@@ -2795,9 +2825,11 @@ async def run_local_loop() -> None:
                     (sum(cycle_times) / len(cycle_times)) if cycle_times else 0.0,
                 )
             except Exception:
+                _write_heartbeat(stage="cycle_error", cycle_index=cycle_index, open_trades=len(auto_trader.open_positions))
                 logger.exception("Local monitoring loop error")
             finally:
                 cycle_times.append(max(0.0, time.perf_counter() - cycle_started))
+                _write_heartbeat(stage="cycle_end", cycle_index=cycle_index, open_trades=len(auto_trader.open_positions))
 
             sleep_seconds = (
                 max(1, int(config.ONCHAIN_POLL_INTERVAL_SECONDS))
@@ -2806,6 +2838,7 @@ async def run_local_loop() -> None:
             )
             await asyncio.sleep(sleep_seconds)
     finally:
+        _write_heartbeat(stage="shutdown", cycle_index=cycle_index, open_trades=len(auto_trader.open_positions))
         auto_trader.flush_state()
         await auto_trader.shutdown("main_local_shutdown")
         if onchain_monitor is not None:

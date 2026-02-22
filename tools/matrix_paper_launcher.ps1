@@ -67,6 +67,38 @@ if ($Run) {
       Write-Warning ("Failed to start unified dataset sync: {0}" -f $_.Exception.Message)
     }
   }
+
+  # Ensure matrix watchdog is running: restarts stale workers by heartbeat.
+  $watchdogScript = Join-Path $PSScriptRoot 'matrix_watchdog.py'
+  if (Test-Path $watchdogScript) {
+    $wdExisting = Get-CimInstance Win32_Process -Filter "name='python.exe'" -ErrorAction SilentlyContinue |
+      Where-Object { [string]$_.CommandLine -match 'tools[\\\/]matrix_watchdog\.py' -and [string]$_.CommandLine -match '--follow' }
+    foreach ($proc in @($wdExisting)) {
+      $wdPid = 0
+      try { $wdPid = [int]$proc.ProcessId } catch { $wdPid = 0 }
+      if ($wdPid -gt 0) {
+        try {
+          Stop-Process -Id $wdPid -Force -ErrorAction SilentlyContinue
+          Write-Host ("Matrix watchdog restarted: stopped stale pid={0}" -f $wdPid)
+        } catch {}
+      }
+    }
+    try {
+      $wdPsi = New-Object System.Diagnostics.ProcessStartInfo
+      $wdPsi.FileName = $python
+      $wdPsi.Arguments = "tools/matrix_watchdog.py --root . --follow --loop-seconds 20 --stale-seconds 180 --restart-cooldown-seconds 120"
+      $wdPsi.WorkingDirectory = $root
+      $wdPsi.UseShellExecute = $false
+      $wdPsi.RedirectStandardOutput = $false
+      $wdPsi.RedirectStandardError = $false
+      $wdProc = [System.Diagnostics.Process]::Start($wdPsi)
+      if ($wdProc -and -not $wdProc.HasExited) {
+        Write-Host ("Matrix watchdog started pid={0}" -f [int]$wdProc.Id)
+      }
+    } catch {
+      Write-Warning ("Failed to start matrix watchdog: {0}" -f $_.Exception.Message)
+    }
+  }
 }
 
 function Test-MainLocalProcess {
@@ -1658,11 +1690,32 @@ $variants = @(
       ENTRY_EDGE_SOFTEN_GREEN_A_CORE_PCT_MULT='0.93';
       ENTRY_EDGE_SOFTEN_GREEN_A_CORE_USD_MULT='0.93';
       EV_FIRST_ENTRY_MIN_NET_USD_GREEN_A_CORE_MULT='0.94';
+      ENTRY_A_CORE_MIN_TRADE_USD_ENABLED='true';
+      ENTRY_A_CORE_MIN_TRADE_USD='0.45';
+      ENTRY_A_CORE_MIN_TRADE_APPLY_IN_RED='false';
+      ENTRY_SMALL_SIZE_EV_RELAX_ENABLED='true';
+      ENTRY_SMALL_SIZE_EV_RELAX_NOMINAL_USD='1.00';
+      ENTRY_SMALL_SIZE_EV_RELAX_MIN_FACTOR='0.45';
+      ENTRY_SMALL_SIZE_EDGE_RELAX_ENABLED='true';
+      ENTRY_SMALL_SIZE_EDGE_RELAX_NOMINAL_USD='1.00';
+      ENTRY_SMALL_SIZE_EDGE_RELAX_MIN_FACTOR='0.45';
+      EV_FIRST_ENTRY_MIN_NET_USD='0.00035';
+      PAPER_GAS_PER_TX_USD='0.012';
+      PAPER_APPROVE_TX_ALWAYS='false';
+      PAPER_APPROVE_TX_PROBABILITY='0.28';
+      EV_FIRST_ENTRY_CORE_PROBE_ENABLED='true';
+      EV_FIRST_ENTRY_CORE_PROBE_RELAX_ONLY='true';
+      EV_FIRST_ENTRY_CORE_PROBE_WINDOW_SECONDS='900';
+      EV_FIRST_ENTRY_CORE_PROBE_MAX_OPENS='1';
+      EV_FIRST_ENTRY_CORE_PROBE_MIN_NET_USD='-0.0010';
+      EV_FIRST_ENTRY_CORE_PROBE_EV_TOLERANCE_USD='0.0026';
+      EV_FIRST_ENTRY_CORE_PROBE_EDGE_PERCENT_RELAX_RATIO='0.18';
+      EV_FIRST_ENTRY_CORE_PROBE_EDGE_USD_RELAX_ABS='0.0016';
       WEAK_TRADE_EARLY_EXIT_ENABLED='true';
       WEAK_TRADE_EARLY_EDGE_MAX_PERCENT='2.40';
       WEAK_TRADE_EARLY_MIN_AGE_PERCENT='20';
       WEAK_TRADE_EARLY_MIN_HOLD_SECONDS='52';
-      WEAK_TRADE_EARLY_MAX_PNL_PERCENT='0.22';
+      WEAK_TRADE_EARLY_MAX_PNL_PERCENT='0.08';
       WEAK_TRADE_EARLY_MAX_PEAK_PERCENT='1.00';
       SYMBOL_CONCENTRATION_GUARD_ENABLED='true';
       SYMBOL_CONCENTRATION_WINDOW_SECONDS='3600';
@@ -1731,11 +1784,30 @@ $variants = @(
       STATEFUL_PRE_PARTIAL_SCALP_MAX_LOSS_SHIFT='0.18';
       STATEFUL_POST_PARTIAL_RUNNER_GIVEBACK_MULT='0.78';
       STATEFUL_POST_PARTIAL_SCALP_GIVEBACK_MULT='1.10';
-      MIN_EXPECTED_EDGE_USD='0.0115';
+      MIN_EXPECTED_EDGE_USD='0.0098';
       MIN_EXPECTED_EDGE_PERCENT='0.58';
       SAFE_MIN_VOLUME_5M_USD='40';
+      V2_KPI_EDGE_LOW_HARD_TRIGGER='0.78';
+      V2_KPI_QUALITY_REBALANCE_ENABLED='true';
+      V2_KPI_QUALITY_REBALANCE_EXPLORE_STEP='0.04';
+      V2_KPI_QUALITY_REBALANCE_NOVELTY_STEP='0.03';
+      V2_KPI_QUALITY_REBALANCE_TOPN_STEP='1';
+      V2_KPI_QUALITY_REBALANCE_MAX_BUYS_STEP='4';
+      V2_QUALITY_CORE_MIN_ABS='1';
+      V2_QUALITY_CORE_FALLBACK_FROM_EXPLORE_ENABLED='true';
+      V2_QUALITY_CORE_FALLBACK_SCORE_MIN='90';
+      V2_QUALITY_CORE_FALLBACK_MAX_SHARE='0.22';
+      V2_CALIBRATION_CLAMP_ENABLED='true';
+      V2_CALIBRATION_EDGE_PERCENT_MAX_FROM_BASE='0.06';
+      V2_CALIBRATION_EDGE_PERCENT_MIN_FROM_BASE='0.08';
+      V2_CALIBRATION_EDGE_USD_MAX_FROM_BASE='0.0018';
+      V2_CALIBRATION_EDGE_USD_MIN_FROM_BASE='0.0022';
+      V2_CALIBRATION_SAFE_VOLUME_MAX_FROM_BASE='45';
+      V2_CALIBRATION_NO_MOMENTUM_MIN='0.10';
+      V2_CALIBRATION_WEAKNESS_MAX_NEG_DRIFT='0.30';
+      V2_CALIBRATION_HOLD_MAX_ABS='245';
       V2_QUALITY_SOURCE_BUDGET_ENABLED='true';
-      NO_MOMENTUM_EXIT_MAX_PNL_PERCENT='0.18';
+      NO_MOMENTUM_EXIT_MAX_PNL_PERCENT='0.00';
       WEAKNESS_EXIT_PNL_PERCENT='-2.75';
       HOLD_MAX_SECONDS='175';
       MAX_BUYS_PER_HOUR='76';
@@ -1771,11 +1843,31 @@ $variants = @(
       ENTRY_EDGE_SOFTEN_GREEN_A_CORE_PCT_MULT='0.91';
       ENTRY_EDGE_SOFTEN_GREEN_A_CORE_USD_MULT='0.91';
       EV_FIRST_ENTRY_MIN_NET_USD_GREEN_A_CORE_MULT='0.92';
+      ENTRY_A_CORE_MIN_TRADE_USD_ENABLED='true';
+      ENTRY_A_CORE_MIN_TRADE_USD='0.44';
+      ENTRY_A_CORE_MIN_TRADE_APPLY_IN_RED='false';
+      ENTRY_SMALL_SIZE_EV_RELAX_ENABLED='true';
+      ENTRY_SMALL_SIZE_EV_RELAX_NOMINAL_USD='1.00';
+      ENTRY_SMALL_SIZE_EV_RELAX_MIN_FACTOR='0.52';
+      ENTRY_SMALL_SIZE_EDGE_RELAX_ENABLED='true';
+      ENTRY_SMALL_SIZE_EDGE_RELAX_NOMINAL_USD='1.00';
+      ENTRY_SMALL_SIZE_EDGE_RELAX_MIN_FACTOR='0.48';
+      PAPER_GAS_PER_TX_USD='0.012';
+      PAPER_APPROVE_TX_ALWAYS='false';
+      PAPER_APPROVE_TX_PROBABILITY='0.30';
+      EV_FIRST_ENTRY_CORE_PROBE_ENABLED='true';
+      EV_FIRST_ENTRY_CORE_PROBE_RELAX_ONLY='true';
+      EV_FIRST_ENTRY_CORE_PROBE_WINDOW_SECONDS='900';
+      EV_FIRST_ENTRY_CORE_PROBE_MAX_OPENS='2';
+      EV_FIRST_ENTRY_CORE_PROBE_MIN_NET_USD='-0.0012';
+      EV_FIRST_ENTRY_CORE_PROBE_EV_TOLERANCE_USD='0.0030';
+      EV_FIRST_ENTRY_CORE_PROBE_EDGE_PERCENT_RELAX_RATIO='0.22';
+      EV_FIRST_ENTRY_CORE_PROBE_EDGE_USD_RELAX_ABS='0.0019';
       WEAK_TRADE_EARLY_EXIT_ENABLED='true';
       WEAK_TRADE_EARLY_EDGE_MAX_PERCENT='2.60';
       WEAK_TRADE_EARLY_MIN_AGE_PERCENT='18';
       WEAK_TRADE_EARLY_MIN_HOLD_SECONDS='45';
-      WEAK_TRADE_EARLY_MAX_PNL_PERCENT='0.28';
+      WEAK_TRADE_EARLY_MAX_PNL_PERCENT='0.10';
       WEAK_TRADE_EARLY_MAX_PEAK_PERCENT='1.10';
       SYMBOL_CONCENTRATION_GUARD_ENABLED='true';
       SYMBOL_CONCENTRATION_WINDOW_SECONDS='3600';
@@ -1847,8 +1939,27 @@ $variants = @(
       MIN_EXPECTED_EDGE_USD='0.0105';
       MIN_EXPECTED_EDGE_PERCENT='0.56';
       SAFE_MIN_VOLUME_5M_USD='34';
+      V2_KPI_EDGE_LOW_HARD_TRIGGER='0.78';
+      V2_KPI_QUALITY_REBALANCE_ENABLED='true';
+      V2_KPI_QUALITY_REBALANCE_EXPLORE_STEP='0.04';
+      V2_KPI_QUALITY_REBALANCE_NOVELTY_STEP='0.03';
+      V2_KPI_QUALITY_REBALANCE_TOPN_STEP='1';
+      V2_KPI_QUALITY_REBALANCE_MAX_BUYS_STEP='4';
+      V2_QUALITY_CORE_MIN_ABS='1';
+      V2_QUALITY_CORE_FALLBACK_FROM_EXPLORE_ENABLED='true';
+      V2_QUALITY_CORE_FALLBACK_SCORE_MIN='89';
+      V2_QUALITY_CORE_FALLBACK_MAX_SHARE='0.24';
+      V2_CALIBRATION_CLAMP_ENABLED='true';
+      V2_CALIBRATION_EDGE_PERCENT_MAX_FROM_BASE='0.06';
+      V2_CALIBRATION_EDGE_PERCENT_MIN_FROM_BASE='0.08';
+      V2_CALIBRATION_EDGE_USD_MAX_FROM_BASE='0.0018';
+      V2_CALIBRATION_EDGE_USD_MIN_FROM_BASE='0.0022';
+      V2_CALIBRATION_SAFE_VOLUME_MAX_FROM_BASE='45';
+      V2_CALIBRATION_NO_MOMENTUM_MIN='0.10';
+      V2_CALIBRATION_WEAKNESS_MAX_NEG_DRIFT='0.30';
+      V2_CALIBRATION_HOLD_MAX_ABS='250';
       V2_QUALITY_SOURCE_BUDGET_ENABLED='true';
-      NO_MOMENTUM_EXIT_MAX_PNL_PERCENT='0.18';
+      NO_MOMENTUM_EXIT_MAX_PNL_PERCENT='0.00';
       WEAKNESS_EXIT_PNL_PERCENT='-2.75';
       HOLD_MAX_SECONDS='175';
       MAX_BUYS_PER_HOUR='88';
@@ -2053,6 +2164,109 @@ $variants = @(
     }
   }
 )
+
+function ConvertTo-StringHashtable {
+  param(
+    $InputObject
+  )
+  $result = @{}
+  if ($null -eq $InputObject) {
+    return $result
+  }
+  if ($InputObject -is [hashtable]) {
+    foreach ($k in $InputObject.Keys) {
+      if ([string]::IsNullOrWhiteSpace([string]$k)) { continue }
+      $result[[string]$k] = [string]$InputObject[$k]
+    }
+    return $result
+  }
+  if ($InputObject -is [System.Collections.IDictionary]) {
+    foreach ($entry in $InputObject.GetEnumerator()) {
+      $k = [string]$entry.Key
+      if ([string]::IsNullOrWhiteSpace($k)) { continue }
+      $result[$k] = [string]$entry.Value
+    }
+    return $result
+  }
+  if ($InputObject -is [System.Management.Automation.PSObject]) {
+    foreach ($prop in $InputObject.PSObject.Properties) {
+      $k = [string]$prop.Name
+      if ([string]::IsNullOrWhiteSpace($k)) { continue }
+      $result[$k] = [string]$prop.Value
+    }
+    return $result
+  }
+  throw "User preset overrides must be an object map."
+}
+
+function Get-UserPresetVariants {
+  param(
+    [string]$RootPath,
+    [hashtable]$BuiltinNames,
+    [string]$PythonPath
+  )
+  $out = @()
+  $dir = Join-Path $RootPath 'data\matrix\user_presets'
+  if (-not (Test-Path $dir)) {
+    return $out
+  }
+
+  $files = Get-ChildItem -Path $dir -Filter '*.json' -File -ErrorAction SilentlyContinue | Sort-Object Name
+  $guardScript = Join-Path $RootPath 'tools\matrix_preset_guard.py'
+  foreach ($f in @($files)) {
+    try {
+      if ((Test-Path $guardScript) -and (Test-Path $PythonPath)) {
+        $guardOut = & $PythonPath $guardScript validate-preset-file --root $RootPath --path $f.FullName --quiet 2>&1
+        if ($LASTEXITCODE -ne 0) {
+          $msg = [string]($guardOut -join "`n")
+          if ([string]::IsNullOrWhiteSpace($msg)) {
+            $msg = "guard validation failed"
+          }
+          Write-Warning ("Skip unsafe user preset {0}: {1}" -f $f.Name, $msg)
+          continue
+        }
+      }
+
+      $rawText = Get-Content -Path $f.FullName -Raw -Encoding UTF8
+      $obj = $rawText | ConvertFrom-Json -ErrorAction Stop
+      if ($null -eq $obj) { continue }
+
+      $name = [string]$obj.name
+      $base = [string]$obj.base
+      if ([string]::IsNullOrWhiteSpace($name)) {
+        Write-Warning ("Skip user preset without name: {0}" -f $f.Name)
+        continue
+      }
+      if ([string]::IsNullOrWhiteSpace($base)) {
+        Write-Warning ("Skip user preset without base: {0}" -f $f.Name)
+        continue
+      }
+      if ($BuiltinNames.ContainsKey($name)) {
+        Write-Warning ("Skip user preset name collision with built-in profile: {0}" -f $name)
+        continue
+      }
+      $overrides = ConvertTo-StringHashtable -InputObject $obj.overrides
+      $out += @{
+        name = $name
+        base = $base
+        overrides = $overrides
+      }
+    } catch {
+      Write-Warning ("Failed to load user preset {0}: {1}" -f $f.Name, $_.Exception.Message)
+    }
+  }
+  return $out
+}
+
+$builtinVariantNames = @{}
+foreach ($variant in $variants) {
+  $builtinVariantNames[[string]$variant.name] = $true
+}
+$userPresetVariants = Get-UserPresetVariants -RootPath $root -BuiltinNames $builtinVariantNames -PythonPath $python
+if (@($userPresetVariants).Count -gt 0) {
+  $variants += $userPresetVariants
+  Write-Host ("Loaded user presets: {0}" -f @($userPresetVariants).Count)
+}
 
 $variantLookup = @{}
 foreach ($variant in $variants) {

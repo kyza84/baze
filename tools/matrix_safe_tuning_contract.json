@@ -1,0 +1,245 @@
+{
+  "schema_version": "matrix.safe_tuning_contract.v1",
+  "description": "Safe tuning envelope for user presets. Keys outside this allow-list are blocked.",
+  "allowed_keys": {
+    "AUTO_TRADE_TOP_N": {
+      "type": "int",
+      "min": 8,
+      "max": 80,
+      "sensitivity": "medium",
+      "importance": "flow"
+    },
+    "MAX_OPEN_TRADES": {
+      "type": "int",
+      "min": 2,
+      "max": 12,
+      "sensitivity": "high",
+      "importance": "risk"
+    },
+    "MAX_BUYS_PER_HOUR": {
+      "type": "int",
+      "min": 20,
+      "max": 220,
+      "sensitivity": "high",
+      "importance": "flow"
+    },
+    "MIN_TOKEN_SCORE": {
+      "type": "int",
+      "min": 45,
+      "max": 95,
+      "sensitivity": "medium",
+      "importance": "entry_quality"
+    },
+    "MIN_EXPECTED_EDGE_PERCENT": {
+      "type": "float",
+      "min": 0.2,
+      "max": 3.0,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "MIN_EXPECTED_EDGE_USD": {
+      "type": "float",
+      "min": 0.002,
+      "max": 0.05,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "SAFE_MIN_VOLUME_5M_USD": {
+      "type": "float",
+      "min": 8.0,
+      "max": 8000.0,
+      "sensitivity": "medium",
+      "importance": "entry_quality"
+    },
+    "SAFE_MIN_LIQUIDITY_USD": {
+      "type": "float",
+      "min": 2000.0,
+      "max": 600000.0,
+      "sensitivity": "medium",
+      "importance": "entry_quality"
+    },
+    "PAPER_TRADE_SIZE_MIN_USD": {
+      "type": "float",
+      "min": 0.2,
+      "max": 2.0,
+      "sensitivity": "high",
+      "importance": "risk"
+    },
+    "PAPER_TRADE_SIZE_MAX_USD": {
+      "type": "float",
+      "min": 0.3,
+      "max": 2.5,
+      "sensitivity": "high",
+      "importance": "risk"
+    },
+    "PAPER_MAX_HOLD_SECONDS": {
+      "type": "int",
+      "min": 60,
+      "max": 900,
+      "sensitivity": "medium",
+      "importance": "exit"
+    },
+    "HOLD_MIN_SECONDS": {
+      "type": "int",
+      "min": 10,
+      "max": 480,
+      "sensitivity": "medium",
+      "importance": "exit"
+    },
+    "HOLD_MAX_SECONDS": {
+      "type": "int",
+      "min": 30,
+      "max": 1200,
+      "sensitivity": "medium",
+      "importance": "exit"
+    },
+    "PAPER_PARTIAL_TP_TRIGGER_PERCENT": {
+      "type": "float",
+      "min": 0.3,
+      "max": 8.0,
+      "sensitivity": "medium",
+      "importance": "exit"
+    },
+    "PAPER_PARTIAL_TP_SELL_FRACTION": {
+      "type": "float",
+      "min": 0.1,
+      "max": 0.9,
+      "sensitivity": "medium",
+      "importance": "exit"
+    },
+    "NO_MOMENTUM_EXIT_MAX_PNL_PERCENT": {
+      "type": "float",
+      "min": -0.5,
+      "max": 1.2,
+      "sensitivity": "medium",
+      "importance": "exit"
+    },
+    "WEAKNESS_EXIT_PNL_PERCENT": {
+      "type": "float",
+      "min": -8.0,
+      "max": -0.2,
+      "sensitivity": "high",
+      "importance": "risk"
+    },
+    "MAX_TOKEN_COOLDOWN_SECONDS": {
+      "type": "int",
+      "min": 10,
+      "max": 3600,
+      "sensitivity": "medium",
+      "importance": "flow"
+    },
+    "STOP_LOSS_PERCENT": {
+      "type": "float",
+      "min": 1.0,
+      "max": 8.0,
+      "sensitivity": "high",
+      "importance": "risk"
+    },
+    "PROFIT_TARGET_PERCENT": {
+      "type": "float",
+      "min": 0.6,
+      "max": 20.0,
+      "sensitivity": "medium",
+      "importance": "exit"
+    },
+    "V2_ENTRY_EXPLORE_MAX_SHARE": {
+      "type": "float",
+      "min": 0.05,
+      "max": 0.7,
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "V2_UNIVERSE_NOVELTY_MIN_SHARE": {
+      "type": "float",
+      "min": 0.05,
+      "max": 0.9,
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "SYMBOL_CONCENTRATION_MAX_SHARE": {
+      "type": "float",
+      "min": 0.05,
+      "max": 0.5,
+      "sensitivity": "high",
+      "importance": "diversification"
+    },
+    "AUTO_TRADE_EXCLUDED_SYMBOLS": {
+      "type": "csv_symbol_list",
+      "max_items": 40,
+      "sensitivity": "low",
+      "importance": "routing"
+    },
+    "ENTRY_REQUIRE_POSITIVE_CHANGE_5M": {
+      "type": "bool",
+      "sensitivity": "medium",
+      "importance": "entry_quality"
+    },
+    "ENTRY_MIN_PRICE_CHANGE_5M_PERCENT": {
+      "type": "float",
+      "min": -2.0,
+      "max": 8.0,
+      "sensitivity": "medium",
+      "importance": "entry_quality"
+    },
+    "ENTRY_MIN_VOLUME_5M_MULT": {
+      "type": "float",
+      "min": 0.5,
+      "max": 3.0,
+      "sensitivity": "medium",
+      "importance": "entry_quality"
+    }
+  },
+  "protected_keys": [
+    "WALLET_BALANCE_USD",
+    "WALLET_MODE",
+    "AUTO_TRADE_ENABLED",
+    "AUTO_TRADE_PAPER",
+    "PROFILE_AUTOSTOP_ENABLED",
+    "PROFILE_AUTOSTOP_MIN_RUNTIME_SECONDS",
+    "PROFILE_AUTOSTOP_MIN_CLOSED_TRADES",
+    "PROFILE_AUTOSTOP_MIN_REALIZED_PNL_USD",
+    "PROFILE_AUTOSTOP_MIN_AVG_PNL_PER_TRADE_USD",
+    "PROFILE_AUTOSTOP_MAX_LOSS_SHARE",
+    "PROFILE_AUTOSTOP_MAX_DRAWDOWN_FROM_PEAK_USD",
+    "PROFILE_AUTOSTOP_MIN_FAIL_SIGNALS",
+    "TOKEN_SAFETY_FAIL_CLOSED",
+    "HONEYPOT_API_FAIL_CLOSED",
+    "SAFE_REQUIRE_CONTRACT_SAFE",
+    "SAFE_REQUIRE_RISK_LEVEL",
+    "V2_POLICY_ROUTER_ENABLED",
+    "V2_POLICY_FAIL_CLOSED_ACTION",
+    "V2_POLICY_DEGRADED_ACTION",
+    "MARKET_MODE_OWNS_STRICTNESS",
+    "MARKET_MODE_ENTER_STREAK",
+    "MARKET_MODE_EXIT_STREAK",
+    "PAPER_RESET_ON_START",
+    "PERSIST_TRADING_PAUSE_ON_RESTART",
+    "CANDIDATE_SHARD_MOD",
+    "CANDIDATE_SHARD_SLOT",
+    "RUN_TAG",
+    "BOT_INSTANCE_ID",
+    "LOG_DIR",
+    "PAPER_STATE_FILE"
+  ],
+  "blocked_prefixes": [
+    "LIVE_",
+    "PRIVATE_",
+    "SECRET_",
+    "API_KEY",
+    "TELEGRAM_"
+  ],
+  "global_rules": [
+    {
+      "id": "trade_size_range",
+      "left": "PAPER_TRADE_SIZE_MIN_USD",
+      "op": "<=",
+      "right": "PAPER_TRADE_SIZE_MAX_USD"
+    },
+    {
+      "id": "hold_range",
+      "left": "HOLD_MIN_SECONDS",
+      "op": "<=",
+      "right": "HOLD_MAX_SECONDS"
+    }
+  ]
+}

@@ -146,6 +146,49 @@ class AutoTraderExitEngineTests(ConfigPatchMixin, unittest.TestCase):
         pos.pnl_percent = 1.1
         self.assertFalse(trader._should_exit_momentum_decay(pos, age_seconds=55))
 
+    def test_exit_profile_strong_extends_timeout(self) -> None:
+        self.patch_cfg(
+            EXIT_PROFILE_ENABLED=True,
+            EXIT_PROFILE_STRONG_MIN_EV_USD=0.0050,
+            EXIT_PROFILE_STRONG_MIN_CONFIDENCE=0.30,
+            EXIT_PROFILE_STRONG_HOLD_MULT=1.20,
+            STATEFUL_EXITS_ENABLED=False,
+            EXIT_TIMEOUT_EXTENSION_ENABLED=False,
+        )
+        trader = self._blank_trader()
+        pos = self._mk_position()
+        pos.max_hold_seconds = 120
+        pos.ev_expected_net_usd = 0.010
+        pos.ev_confidence = 0.80
+        profile = trader._exit_profile(pos, age_seconds=40)
+        self.assertEqual(str(profile.get("label", "")), "strong")
+        hold = trader._effective_timeout_seconds(pos, age_seconds=40, exit_profile=profile)
+        self.assertEqual(hold, 144)
+
+    def test_exit_profile_weak_tightens_no_momentum(self) -> None:
+        self.patch_cfg(
+            EXIT_PROFILE_ENABLED=True,
+            EXIT_PROFILE_WEAK_MAX_EV_USD=0.0015,
+            EXIT_PROFILE_WEAK_MIN_CONFIDENCE=0.25,
+            EXIT_PROFILE_WEAK_HOLD_MULT=0.80,
+            EXIT_PROFILE_WEAK_NO_MOMENTUM_AGE_SHIFT_SECONDS=-20,
+            EXIT_PROFILE_WEAK_NO_MOMENTUM_PNL_SHIFT=0.12,
+            NO_MOMENTUM_EXIT_MIN_AGE_PERCENT=50.0,
+            NO_MOMENTUM_EXIT_MIN_HOLD_SECONDS=120,
+            NO_MOMENTUM_EXIT_MAX_PNL_PERCENT=0.30,
+            STATEFUL_EXITS_ENABLED=False,
+        )
+        trader = self._blank_trader()
+        pos = self._mk_position()
+        pos.max_hold_seconds = 200
+        pos.ev_expected_net_usd = 0.0008
+        pos.ev_confidence = 0.90
+        profile = trader._exit_profile(pos, age_seconds=80)
+        self.assertEqual(str(profile.get("label", "")), "weak")
+        age_gate, pnl_gate = trader._no_momentum_gate(pos, age_seconds=80, exit_profile=profile)
+        self.assertEqual(age_gate, 120 - 20)
+        self.assertAlmostEqual(pnl_gate, 0.42, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()

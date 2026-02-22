@@ -228,6 +228,7 @@ class KpiLoopTests(ConfigPatchMixin, unittest.TestCase):
     def test_low_flow_boosts_throughput_and_diversity(self) -> None:
         self.patch_cfg(
             V2_KPI_LOOP_ENABLED=True,
+            V2_KPI_QUALITY_REBALANCE_ENABLED=False,
             V2_KPI_LOOP_INTERVAL_SECONDS=60,
             V2_KPI_LOOP_WINDOW_CYCLES=3,
             V2_KPI_EDGE_LOW_RELAX_TRIGGER=0.50,
@@ -264,7 +265,12 @@ class KpiLoopTests(ConfigPatchMixin, unittest.TestCase):
         self.assertGreater(float(getattr(config, "V2_UNIVERSE_NOVELTY_MIN_SHARE")), 0.20)
 
     def test_no_apply_when_window_not_full(self) -> None:
-        self.patch_cfg(V2_KPI_LOOP_ENABLED=True, V2_KPI_LOOP_WINDOW_CYCLES=4, V2_KPI_LOOP_INTERVAL_SECONDS=60)
+        self.patch_cfg(
+            V2_KPI_LOOP_ENABLED=True,
+            V2_KPI_QUALITY_REBALANCE_ENABLED=False,
+            V2_KPI_LOOP_WINDOW_CYCLES=4,
+            V2_KPI_LOOP_INTERVAL_SECONDS=60,
+        )
         loop = RuntimeKpiLoop()
         loop._next_eval_ts = 0.0
         for _ in range(3):
@@ -274,6 +280,7 @@ class KpiLoopTests(ConfigPatchMixin, unittest.TestCase):
     def test_caps_are_respected(self) -> None:
         self.patch_cfg(
             V2_KPI_LOOP_ENABLED=True,
+            V2_KPI_QUALITY_REBALANCE_ENABLED=False,
             V2_KPI_LOOP_WINDOW_CYCLES=3,
             V2_KPI_LOOP_INTERVAL_SECONDS=60,
             V2_KPI_MAX_BUYS_BOOST_STEP=10,
@@ -299,6 +306,141 @@ class KpiLoopTests(ConfigPatchMixin, unittest.TestCase):
         self.assertLessEqual(int(getattr(config, "AUTO_TRADE_TOP_N")), 14)
         self.assertLessEqual(float(getattr(config, "V2_ENTRY_EXPLORE_MAX_SHARE")), 0.40)
         self.assertLessEqual(float(getattr(config, "V2_UNIVERSE_NOVELTY_MIN_SHARE")), 0.50)
+
+    def test_quality_rebalance_cuts_explore_when_edge_low_is_extreme(self) -> None:
+        self.patch_cfg(
+            V2_KPI_LOOP_ENABLED=True,
+            V2_KPI_QUALITY_REBALANCE_ENABLED=True,
+            V2_KPI_LOOP_WINDOW_CYCLES=3,
+            V2_KPI_LOOP_INTERVAL_SECONDS=60,
+            V2_KPI_EDGE_LOW_HARD_TRIGGER=0.75,
+            V2_KPI_QUALITY_REBALANCE_EXPLORE_STEP=0.05,
+            V2_KPI_QUALITY_REBALANCE_NOVELTY_STEP=0.04,
+            V2_KPI_QUALITY_REBALANCE_TOPN_STEP=1,
+            V2_KPI_QUALITY_REBALANCE_MAX_BUYS_STEP=4,
+            MAX_BUYS_PER_HOUR=70,
+            AUTO_TRADE_TOP_N=20,
+            V2_ENTRY_EXPLORE_MAX_SHARE=0.42,
+            V2_UNIVERSE_NOVELTY_MIN_SHARE=0.48,
+        )
+        loop = RuntimeKpiLoop()
+        loop._next_eval_ts = 0.0
+        for _ in range(3):
+            loop.record_cycle(
+                candidates=100,
+                opened=1,
+                policy_state="OK",
+                symbols=["ONE", "TWO"],
+                skip_reasons_cycle={"edge_low": 80, "negative_edge": 10},
+            )
+        payload = loop.maybe_apply()
+        self.assertIsNotNone(payload)
+        self.assertIn("quality_rebalance", str(payload.get("action", "")))
+        self.assertLess(int(getattr(config, "AUTO_TRADE_TOP_N")), 20)
+        self.assertLess(float(getattr(config, "V2_ENTRY_EXPLORE_MAX_SHARE")), 0.42)
+
+    def test_explore_failsafe_shrinks_share_on_bad_explore_window(self) -> None:
+        class _ExplorePos:
+            def __init__(self, pnl_usd: float) -> None:
+                self.entry_channel = "explore"
+                self.pnl_usd = float(pnl_usd)
+
+        self.patch_cfg(
+            V2_KPI_LOOP_ENABLED=True,
+            V2_KPI_QUALITY_REBALANCE_ENABLED=False,
+            V2_KPI_FAST_ANTISTALL_ENABLED=False,
+            V2_KPI_LOOP_WINDOW_CYCLES=3,
+            V2_KPI_LOOP_INTERVAL_SECONDS=60,
+            V2_KPI_EXPLORE_FAILSAFE_ENABLED=True,
+            V2_KPI_EXPLORE_FAILSAFE_WINDOW_CLOSED=20,
+            V2_KPI_EXPLORE_FAILSAFE_MIN_CLOSED=10,
+            V2_KPI_EXPLORE_FAILSAFE_LOSS_SHARE_TRIGGER=0.60,
+            V2_KPI_EXPLORE_FAILSAFE_AVG_PNL_TRIGGER_USD=-0.0010,
+            V2_KPI_EXPLORE_FAILSAFE_SHRINK_STEP=0.06,
+            V2_KPI_EXPLORE_FAILSAFE_MIN_SHARE=0.08,
+            V2_KPI_EXPLORE_FAILSAFE_COOLDOWN_SECONDS=0,
+            V2_ENTRY_EXPLORE_MAX_SHARE=0.30,
+            V2_KPI_EXPLORE_SHARE_MAX=0.55,
+            MAX_BUYS_PER_HOUR=30,
+            AUTO_TRADE_TOP_N=12,
+        )
+        loop = RuntimeKpiLoop()
+        loop._next_eval_ts = 0.0
+        for _ in range(3):
+            loop.record_cycle(
+                candidates=100,
+                opened=8,
+                policy_state="OK",
+                symbols=["A", "B", "C", "D"],
+                skip_reasons_cycle={"cooldown": 4},
+            )
+        trader = type("T", (), {"closed_positions": [_ExplorePos(-0.010) for _ in range(12)]})()
+        payload = loop.maybe_apply(auto_trader=trader)
+        self.assertIsNotNone(payload)
+        self.assertIn("explore_failsafe_shrink", str(payload.get("action", "")))
+        self.assertLess(float(getattr(config, "V2_ENTRY_EXPLORE_MAX_SHARE")), 0.30)
+
+    def test_explore_failsafe_can_recover_share_after_shrink(self) -> None:
+        class _ExplorePos:
+            def __init__(self, pnl_usd: float) -> None:
+                self.entry_channel = "explore"
+                self.pnl_usd = float(pnl_usd)
+
+        self.patch_cfg(
+            V2_KPI_LOOP_ENABLED=True,
+            V2_KPI_QUALITY_REBALANCE_ENABLED=False,
+            V2_KPI_FAST_ANTISTALL_ENABLED=False,
+            V2_KPI_LOOP_WINDOW_CYCLES=3,
+            V2_KPI_LOOP_INTERVAL_SECONDS=60,
+            V2_KPI_EXPLORE_FAILSAFE_ENABLED=True,
+            V2_KPI_EXPLORE_FAILSAFE_WINDOW_CLOSED=20,
+            V2_KPI_EXPLORE_FAILSAFE_MIN_CLOSED=10,
+            V2_KPI_EXPLORE_FAILSAFE_LOSS_SHARE_TRIGGER=0.60,
+            V2_KPI_EXPLORE_FAILSAFE_AVG_PNL_TRIGGER_USD=-0.0010,
+            V2_KPI_EXPLORE_FAILSAFE_SHRINK_STEP=0.06,
+            V2_KPI_EXPLORE_FAILSAFE_MIN_SHARE=0.08,
+            V2_KPI_EXPLORE_FAILSAFE_RECOVERY_WINRATE_MIN=0.55,
+            V2_KPI_EXPLORE_FAILSAFE_RECOVERY_AVG_PNL_MIN_USD=0.0005,
+            V2_KPI_EXPLORE_FAILSAFE_RECOVERY_STEP=0.03,
+            V2_KPI_EXPLORE_FAILSAFE_COOLDOWN_SECONDS=0,
+            V2_ENTRY_EXPLORE_MAX_SHARE=0.30,
+            V2_KPI_EXPLORE_SHARE_MAX=0.55,
+            MAX_BUYS_PER_HOUR=30,
+            AUTO_TRADE_TOP_N=12,
+        )
+        loop = RuntimeKpiLoop()
+        loop._next_eval_ts = 0.0
+        # First apply shrink.
+        for _ in range(3):
+            loop.record_cycle(
+                candidates=100,
+                opened=8,
+                policy_state="OK",
+                symbols=["A", "B", "C", "D"],
+                skip_reasons_cycle={},
+            )
+        bad_trader = type("T", (), {"closed_positions": [_ExplorePos(-0.010) for _ in range(12)]})()
+        p1 = loop.maybe_apply(auto_trader=bad_trader)
+        self.assertIsNotNone(p1)
+        shrunk = float(getattr(config, "V2_ENTRY_EXPLORE_MAX_SHARE"))
+        self.assertLess(shrunk, 0.30)
+
+        # Then recover on strong explore window.
+        loop._next_eval_ts = 0.0
+        for _ in range(3):
+            loop.record_cycle(
+                candidates=100,
+                opened=8,
+                policy_state="OK",
+                symbols=["A", "B", "C", "D"],
+                skip_reasons_cycle={},
+            )
+        good_rows = [_ExplorePos(0.010) for _ in range(10)] + [_ExplorePos(-0.001) for _ in range(2)]
+        good_trader = type("T", (), {"closed_positions": good_rows})()
+        p2 = loop.maybe_apply(auto_trader=good_trader)
+        self.assertIsNotNone(p2)
+        self.assertIn("explore_failsafe_recover", str(p2.get("action", "")))
+        self.assertGreater(float(getattr(config, "V2_ENTRY_EXPLORE_MAX_SHARE")), shrunk)
 
 
 class QualityGateTests(ConfigPatchMixin, unittest.TestCase):
@@ -481,6 +623,105 @@ class QualityGateTests(ConfigPatchMixin, unittest.TestCase):
         self.assertEqual(str(out[0][0].get("_entry_tier", "")), "A")
         self.assertEqual(str(out[0][0].get("_quality_bucket", "")), "core_provisional")
         self.assertGreaterEqual(int(meta.get("core_provisional_out", 0) or 0), 1)
+
+    def test_quality_gate_core_fallback_promotes_high_score_explore(self) -> None:
+        self.patch_cfg(
+            V2_QUALITY_GATE_ENABLED=True,
+            V2_QUALITY_REFRESH_SECONDS=60,
+            V2_QUALITY_WINDOW_SECONDS=3600,
+            V2_QUALITY_MIN_SYMBOL_TRADES=99,
+            V2_QUALITY_MIN_CLUSTER_TRADES=99,
+            V2_QUALITY_EXPLORE_MAX_SHARE=1.0,
+            V2_QUALITY_EXPLORE_MIN_ABS=0,
+            V2_QUALITY_COOLDOWN_PROBE_PROBABILITY=0.0,
+            V2_QUALITY_SOURCE_BUDGET_ENABLED=False,
+            V2_QUALITY_SYMBOL_MAX_SHARE=1.0,
+            V2_QUALITY_CORE_MIN_ABS=1,
+            V2_QUALITY_CORE_FALLBACK_FROM_EXPLORE_ENABLED=True,
+            V2_QUALITY_CORE_FALLBACK_SCORE_MIN=90,
+            V2_QUALITY_CORE_FALLBACK_MAX_SHARE=0.5,
+        )
+        q = UniverseQualityGateController()
+        trader = type("T", (), {"closed_positions": []})()
+        rows = [
+            (
+                {"_candidate_id": "cid_hi", "symbol": "HIGHS", "source": "onchain", "liquidity": 90000, "volume_5m": 6000},
+                {"score": 95},
+            ),
+            (
+                {"_candidate_id": "cid_lo", "symbol": "LOWS", "source": "onchain", "liquidity": 50000, "volume_5m": 2500},
+                {"score": 78},
+            ),
+        ]
+        out, meta = q.filter_candidates(candidates=rows, auto_trader=trader, market_mode="GREEN")
+        self.assertTrue(out)
+        self.assertGreaterEqual(int(meta.get("core_fallback_in", 0) or 0), 1)
+        self.assertGreaterEqual(int(meta.get("core_fallback_out", 0) or 0), 1)
+        high_row = next((row for row in out if str((row[0] or {}).get("symbol", "")).upper() == "HIGHS"), None)
+        self.assertIsNotNone(high_row)
+        self.assertEqual(str(high_row[0].get("_entry_tier", "")), "A")
+        self.assertEqual(str(high_row[0].get("_quality_bucket", "")), "core_fallback")
+
+    def test_quality_gate_source_ev_cooldown_drops_bad_source(self) -> None:
+        self.patch_cfg(
+            V2_QUALITY_GATE_ENABLED=True,
+            V2_QUALITY_REFRESH_SECONDS=60,
+            V2_QUALITY_WINDOW_SECONDS=7200,
+            V2_QUALITY_MIN_SYMBOL_TRADES=99,
+            V2_QUALITY_MIN_CLUSTER_TRADES=99,
+            V2_QUALITY_SOURCE_BUDGET_ENABLED=True,
+            V2_QUALITY_SOURCE_MIN_TRADES=5,
+            V2_QUALITY_SOURCE_GOOD_AVG_PNL_USD=0.0020,
+            V2_QUALITY_SOURCE_BAD_AVG_PNL_USD=-0.0010,
+            V2_QUALITY_SOURCE_BAD_LOSS_SHARE=0.60,
+            V2_QUALITY_SOURCE_SEVERE_AVG_PNL_USD=-0.0020,
+            V2_QUALITY_SOURCE_SEVERE_LOSS_SHARE=0.70,
+            V2_QUALITY_SOURCE_BAD_ENTRY_PROBABILITY=0.0,
+            V2_QUALITY_SOURCE_SEVERE_ENTRY_PROBABILITY=0.0,
+            V2_QUALITY_SOURCE_COOLDOWN_IN_RED_MULT=1.0,
+            V2_QUALITY_EXPLORE_MAX_SHARE=1.0,
+            V2_QUALITY_EXPLORE_MIN_ABS=0,
+            V2_QUALITY_COOLDOWN_PROBE_PROBABILITY=0.0,
+            V2_QUALITY_SYMBOL_MAX_SHARE=1.0,
+        )
+        q = UniverseQualityGateController()
+        now = datetime.now(timezone.utc)
+        closed = []
+        for i in range(12):
+            closed.append(
+                _ClosedRichPos(
+                    symbol="BADSRC",
+                    token_cluster_key="s1|l1|v1|m1|r1",
+                    pnl_usd=-0.02,
+                    candidate_id="cid_bad_src",
+                    closed_at=now,
+                )
+            )
+            closed.append(
+                _ClosedRichPos(
+                    symbol="GOODSRC",
+                    token_cluster_key="s3|l3|v2|m1|r0",
+                    pnl_usd=0.02,
+                    candidate_id="cid_good_src",
+                    closed_at=now,
+                )
+            )
+        trader = type("T", (), {"closed_positions": closed})()
+        rows = [
+            (
+                {"_candidate_id": "cid_bad_src", "symbol": "BADSRC", "source": "dexscreener", "liquidity": 60000, "volume_5m": 7000},
+                {"score": 92},
+            ),
+            (
+                {"_candidate_id": "cid_good_src", "symbol": "GOODSRC", "source": "watchlist", "liquidity": 65000, "volume_5m": 7200},
+                {"score": 90},
+            ),
+        ]
+        out, meta = q.filter_candidates(candidates=rows, auto_trader=trader, market_mode="YELLOW")
+        out_syms = {str((row[0] or {}).get("symbol", "")).upper() for row in out}
+        self.assertIn("GOODSRC", out_syms)
+        self.assertNotIn("BADSRC", out_syms)
+        self.assertGreater(int(meta.get("drop_counts", {}).get("source_ev_cooldown", 0) or 0), 0)
 
 
 if __name__ == "__main__":

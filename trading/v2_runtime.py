@@ -529,6 +529,24 @@ class UniverseQualityGateController:
         self.source_window_seconds = max(300, int(_cfg("V2_QUALITY_SOURCE_WINDOW_SECONDS", 14400)))
         self.source_good_avg = float(_cfg("V2_QUALITY_SOURCE_GOOD_AVG_PNL_USD", 0.0020))
         self.source_bad_avg = float(_cfg("V2_QUALITY_SOURCE_BAD_AVG_PNL_USD", -0.0015))
+        self.source_bad_loss_share = _clamp(float(_cfg("V2_QUALITY_SOURCE_BAD_LOSS_SHARE", 0.64)), 0.0, 1.0)
+        self.source_severe_avg = float(_cfg("V2_QUALITY_SOURCE_SEVERE_AVG_PNL_USD", -0.0030))
+        self.source_severe_loss_share = _clamp(float(_cfg("V2_QUALITY_SOURCE_SEVERE_LOSS_SHARE", 0.76)), 0.0, 1.0)
+        self.source_bad_entry_probability = _clamp(
+            float(_cfg("V2_QUALITY_SOURCE_BAD_ENTRY_PROBABILITY", 0.72)),
+            0.0,
+            1.0,
+        )
+        self.source_severe_entry_probability = _clamp(
+            float(_cfg("V2_QUALITY_SOURCE_SEVERE_ENTRY_PROBABILITY", 0.46)),
+            0.0,
+            1.0,
+        )
+        self.source_cooldown_in_red_mult = _clamp(
+            float(_cfg("V2_QUALITY_SOURCE_COOLDOWN_IN_RED_MULT", 0.88)),
+            0.10,
+            1.0,
+        )
         self.source_boost_mult = max(0.50, float(_cfg("V2_QUALITY_SOURCE_BOOST_MULT", 1.28)))
         self.source_cut_mult = _clamp(float(_cfg("V2_QUALITY_SOURCE_CUT_MULT", 0.62)), 0.10, 1.0)
         self.source_min_share = _clamp(float(_cfg("V2_QUALITY_SOURCE_MIN_SHARE", 0.08)), 0.0, 0.40)
@@ -553,6 +571,17 @@ class UniverseQualityGateController:
             0.80,
         )
         self.log_top_symbols = max(1, int(_cfg("V2_QUALITY_LOG_TOP_SYMBOLS", 8)))
+        self.core_min_abs = max(0, int(_cfg("V2_QUALITY_CORE_MIN_ABS", 1)))
+        self.core_fallback_from_explore_enabled = bool(_cfg("V2_QUALITY_CORE_FALLBACK_FROM_EXPLORE_ENABLED", True))
+        self.core_fallback_score_min = max(
+            0.0,
+            _safe_float(_cfg("V2_QUALITY_CORE_FALLBACK_SCORE_MIN", 90), 90.0),
+        )
+        self.core_fallback_max_share = _clamp(
+            _safe_float(_cfg("V2_QUALITY_CORE_FALLBACK_MAX_SHARE", 0.25), 0.25),
+            0.0,
+            0.60,
+        )
         self._next_refresh_ts = 0.0
         self._symbol_stats: dict[str, dict[str, float]] = {}
         self._cluster_stats: dict[str, dict[str, float]] = {}
@@ -675,6 +704,32 @@ class UniverseQualityGateController:
         span = max(0.000001, abs(bad))
         k = _clamp(abs(avg) / span, 0.0, 1.0)
         return float(1.0 - ((1.0 - float(self.source_cut_mult)) * k))
+
+    def _source_quality_flags(self, source: str) -> tuple[bool, bool]:
+        src = str(source or "unknown").strip().lower() or "unknown"
+        stats = dict(self._source_stats.get(src, {}))
+        trades = int(stats.get("trades", 0.0) or 0.0)
+        if trades < int(self.source_min_trades):
+            return False, False
+        avg = float(stats.get("avg_pnl", 0.0) or 0.0)
+        loss_share = float(stats.get("loss_share", 0.0) or 0.0)
+        bad = (avg <= float(self.source_bad_avg)) or (loss_share >= float(self.source_bad_loss_share))
+        severe = (avg <= float(self.source_severe_avg)) or (loss_share >= float(self.source_severe_loss_share))
+        return bool(bad), bool(severe)
+
+    def _source_entry_probability(self, source: str, regime: str) -> float:
+        if not self.source_budget_enabled:
+            return 1.0
+        bad, severe = self._source_quality_flags(source)
+        if severe:
+            p = float(self.source_severe_entry_probability)
+        elif bad:
+            p = float(self.source_bad_entry_probability)
+        else:
+            p = 1.0
+        if str(regime or "").strip().upper() == "RED" and p < 1.0:
+            p *= float(self.source_cooldown_in_red_mult)
+        return _clamp(float(p), 0.0, 1.0)
 
     def _prune_candidate_source(self, now_ts: float) -> None:
         ttl = max(float(self.source_window_seconds) * 2.0, float(self.window_seconds) * 2.0, 7200.0)
@@ -931,6 +986,7 @@ class UniverseQualityGateController:
             ev_signal = max(float(sym_stats.get("avg_pnl", 0.0) or 0.0), float(clu_stats.get("avg_pnl", 0.0) or 0.0))
             ev_bonus = _clamp(ev_signal * 360.0, -6.0, 8.0)
             src_mult = self._source_mult(src)
+            source_entry_prob = self._source_entry_probability(src, regime)
             if bucket in {"core", "core_provisional"}:
                 bucket_bias = 6.0
             elif bucket == "cooldown":
@@ -950,6 +1006,7 @@ class UniverseQualityGateController:
                     "priority": float(priority),
                     "ev_signal": float(ev_signal),
                     "src_mult": float(src_mult),
+                    "source_entry_probability": float(source_entry_prob),
                     "is_probe": False,
                     "is_fresh_symbol": bool(is_fresh_symbol),
                     "is_provisional_core": bool(provisional_core),
@@ -962,6 +1019,56 @@ class UniverseQualityGateController:
         core_rows = list(core_rows_native) + list(core_rows_provisional)
         explore_rows = [row for row in rows if str(row.get("bucket")) == "explore"]
         cooldown_rows = [row for row in rows if str(row.get("bucket")) == "cooldown"]
+        core_fallback_rows: list[dict[str, Any]] = []
+
+        # Anti-stall fallback: when quality says "no core", promote best explore rows to A/core.
+        if (
+            bool(self.core_fallback_from_explore_enabled)
+            and str(regime) != "RED"
+            and int(self.core_min_abs) > 0
+            and len(core_rows) < int(self.core_min_abs)
+            and explore_rows
+        ):
+            need = int(self.core_min_abs) - len(core_rows)
+            fallback_cap = int(math.floor(float(len(rows)) * float(self.core_fallback_max_share)))
+            if fallback_cap <= 0 and need > 0:
+                fallback_cap = 1
+            fallback_cap = max(0, fallback_cap)
+            used_cids: set[str] = set()
+            for row in core_rows:
+                cid = str((row.get("token") or {}).get("_candidate_id", "") or "")
+                if cid:
+                    used_cids.add(cid)
+            for row in explore_rows:
+                if need <= 0 or len(core_fallback_rows) >= fallback_cap:
+                    break
+                score_data = dict(row.get("score_data") or {})
+                score = _safe_float(score_data.get("score"), 0.0)
+                if score < float(self.core_fallback_score_min):
+                    continue
+                cid = str((row.get("token") or {}).get("_candidate_id", "") or "")
+                if cid and cid in used_cids:
+                    continue
+                row2 = dict(row)
+                row2["bucket"] = "core_fallback"
+                row2["priority"] = float(row2.get("priority", 0.0) or 0.0) + 5.0
+                core_fallback_rows.append(row2)
+                if cid:
+                    used_cids.add(cid)
+                need -= 1
+            if core_fallback_rows:
+                promoted_cids = {
+                    str((row.get("token") or {}).get("_candidate_id", "") or "")
+                    for row in core_fallback_rows
+                    if str((row.get("token") or {}).get("_candidate_id", "") or "")
+                }
+                explore_rows = [
+                    row
+                    for row in explore_rows
+                    if str((row.get("token") or {}).get("_candidate_id", "") or "") not in promoted_cids
+                ]
+                core_rows_native.extend(core_fallback_rows)
+                core_rows.extend(core_fallback_rows)
 
         dropped: list[dict[str, Any]] = []
         drop_counts: dict[str, int] = defaultdict(int)
@@ -1028,6 +1135,21 @@ class UniverseQualityGateController:
             if uniq_key in selected_addrs:
                 drop_counts["duplicate_address"] += 1
                 return False
+            source_p = _clamp(_safe_float(row.get("source_entry_probability"), 1.0), 0.0, 1.0)
+            if source_p < 1.0:
+                slot = int(now_ts // 600)
+                seed = f"{candidate_id or uniq_key}|{source}|{regime}|srcp|{slot}"
+                if _deterministic_probability(seed) > source_p:
+                    drop_counts["source_ev_cooldown"] += 1
+                    dropped.append(
+                        {
+                            "candidate_id": str(token.get("_candidate_id", "") or ""),
+                            "symbol": str(token.get("symbol", "") or ""),
+                            "reason": "source_ev_cooldown",
+                            "bucket": str(row.get("bucket", "")),
+                        }
+                    )
+                    return False
             cap = int(source_caps.get(source, 10**9))
             if int(source_used.get(source, 0)) >= cap:
                 drop_counts["source_budget"] += 1
@@ -1146,6 +1268,7 @@ class UniverseQualityGateController:
         tagged: list[tuple[dict[str, Any], dict[str, Any]]] = []
         core_out = 0
         provisional_core_out = 0
+        fallback_core_out = 0
         explore_out = 0
         probe_out = 0
         fresh_symbol_out = 0
@@ -1157,17 +1280,23 @@ class UniverseQualityGateController:
             token["_quality_priority"] = float(row.get("priority", 0.0) or 0.0)
             token["_quality_ev_signal"] = float(row.get("ev_signal", 0.0) or 0.0)
             token["_quality_source_mult"] = float(row.get("src_mult", 1.0) or 1.0)
+            token["_quality_source_entry_probability"] = float(
+                _safe_float(row.get("source_entry_probability"), 1.0)
+            )
             token["_quality_source"] = str(row.get("source", "unknown") or "unknown")
             token["_quality_cluster_key"] = str(row.get("cluster_key", "") or "")
             token["_quality_is_fresh_symbol"] = bool(row.get("is_fresh_symbol", False))
             if bool(row.get("is_fresh_symbol", False)):
                 fresh_symbol_out += 1
-            if bucket in {"core", "core_provisional"}:
+            if bucket in {"core", "core_provisional", "core_fallback"}:
                 token["_entry_tier"] = "A"
                 core_out += 1
                 if bucket == "core_provisional":
                     provisional_core_out += 1
                     token["_quality_provisional_core"] = True
+                elif bucket == "core_fallback":
+                    fallback_core_out += 1
+                    token["_quality_core_fallback"] = True
             else:
                 token["_entry_tier"] = "B"
                 explore_out += 1
@@ -1208,10 +1337,12 @@ class UniverseQualityGateController:
             "core_in": len(core_rows),
             "core_native_in": len(core_rows_native),
             "core_provisional_in": len(core_rows_provisional),
+            "core_fallback_in": len(core_fallback_rows),
             "explore_in": len(explore_rows),
             "cooldown_in": len(cooldown_rows),
             "core_out": int(core_out),
             "core_provisional_out": int(provisional_core_out),
+            "core_fallback_out": int(fallback_core_out),
             "explore_out": int(explore_out),
             "probe_out": int(probe_out),
             "fresh_symbol_out": int(fresh_symbol_out),
@@ -1328,7 +1459,42 @@ class UnifiedCalibrator:
         self.reanchor_blend = _clamp(float(getattr(config, "V2_CALIBRATION_REANCHOR_BLEND", 0.22) or 0.22), 0.0, 1.0)
         self.volume_floor_min = max(0.0, float(getattr(config, "V2_CALIBRATION_VOLUME_MIN", 20.0) or 20.0))
         self.volume_floor_max = max(self.volume_floor_min, float(getattr(config, "V2_CALIBRATION_VOLUME_MAX", 450.0) or 450.0))
+        self.ev_min_net_min = max(0.0, float(getattr(config, "V2_CALIBRATION_EV_MIN_NET_MIN", 0.0004) or 0.0004))
+        self.ev_min_net_max = max(
+            self.ev_min_net_min,
+            float(getattr(config, "V2_CALIBRATION_EV_MIN_NET_MAX", 0.0038) or 0.0038),
+        )
+        self.runner_min_ev_min = max(
+            0.0,
+            float(getattr(config, "V2_CALIBRATION_RUNNER_MIN_EV_MIN", 0.0030) or 0.0030),
+        )
+        self.runner_min_ev_max = max(
+            self.runner_min_ev_min,
+            float(getattr(config, "V2_CALIBRATION_RUNNER_MIN_EV_MAX", 0.0140) or 0.0140),
+        )
+        self.source_bad_entry_prob_min = _clamp(
+            float(getattr(config, "V2_CALIBRATION_SOURCE_BAD_ENTRY_PROB_MIN", 0.45) or 0.45),
+            0.0,
+            1.0,
+        )
+        self.source_bad_entry_prob_max = _clamp(
+            float(getattr(config, "V2_CALIBRATION_SOURCE_BAD_ENTRY_PROB_MAX", 0.86) or 0.86),
+            self.source_bad_entry_prob_min,
+            1.0,
+        )
+        self.source_severe_entry_prob_min = _clamp(
+            float(getattr(config, "V2_CALIBRATION_SOURCE_SEVERE_ENTRY_PROB_MIN", 0.25) or 0.25),
+            0.0,
+            1.0,
+        )
+        self.source_severe_entry_prob_max = _clamp(
+            float(getattr(config, "V2_CALIBRATION_SOURCE_SEVERE_ENTRY_PROB_MAX", 0.68) or 0.68),
+            self.source_severe_entry_prob_min,
+            1.0,
+        )
         self._next_eval_ts = time.time() + max(30, int(self.apply_interval_seconds))
+        self.run_tag = str(getattr(config, "RUN_TAG", os.getenv("RUN_TAG", "")) or "").strip()
+        self.scope_by_run_tag = bool(getattr(config, "V2_CALIBRATION_SCOPE_BY_RUN_TAG", True))
         root = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
         db_default = os.path.join(root, "data", "unified_dataset", "unified.db")
         self.db_path = str(getattr(config, "V2_CALIBRATION_DB_PATH", db_default) or db_default)
@@ -1337,6 +1503,47 @@ class UnifiedCalibrator:
         self._last_applied_signature = ""
         self._baseline_edge_percent = _safe_float(getattr(config, "MIN_EXPECTED_EDGE_PERCENT", 1.0), 1.0)
         self._baseline_edge_usd = _safe_float(getattr(config, "MIN_EXPECTED_EDGE_USD", 0.02), 0.02)
+        self._baseline_volume_floor = _safe_float(getattr(config, "SAFE_MIN_VOLUME_5M_USD", 0.0), 0.0)
+        self._baseline_no_momentum = _safe_float(getattr(config, "NO_MOMENTUM_EXIT_MAX_PNL_PERCENT", 0.25), 0.25)
+        self._baseline_weakness = _safe_float(getattr(config, "WEAKNESS_EXIT_PNL_PERCENT", -2.6), -2.6)
+        self._baseline_hold_max = float(max(90, int(getattr(config, "HOLD_MAX_SECONDS", 150) or 150)))
+        self._baseline_ev_min_net = _safe_float(getattr(config, "EV_FIRST_ENTRY_MIN_NET_USD", 0.0010), 0.0010)
+        self._baseline_runner_min_ev = _safe_float(getattr(config, "EXECUTION_RUNNER_MIN_EV_USD", 0.0055), 0.0055)
+        self._baseline_source_bad_prob = _safe_float(
+            getattr(config, "V2_QUALITY_SOURCE_BAD_ENTRY_PROBABILITY", 0.72),
+            0.72,
+        )
+        self._baseline_source_severe_prob = _safe_float(
+            getattr(config, "V2_QUALITY_SOURCE_SEVERE_ENTRY_PROBABILITY", 0.46),
+            0.46,
+        )
+        self.clamp_enabled = bool(getattr(config, "V2_CALIBRATION_CLAMP_ENABLED", True))
+        self.clamp_edge_percent_max_from_base = max(
+            0.0,
+            _safe_float(getattr(config, "V2_CALIBRATION_EDGE_PERCENT_MAX_FROM_BASE", 0.08), 0.08),
+        )
+        self.clamp_edge_percent_min_from_base = max(
+            0.0,
+            _safe_float(getattr(config, "V2_CALIBRATION_EDGE_PERCENT_MIN_FROM_BASE", 0.10), 0.10),
+        )
+        self.clamp_edge_usd_max_from_base = max(
+            0.0,
+            _safe_float(getattr(config, "V2_CALIBRATION_EDGE_USD_MAX_FROM_BASE", 0.0020), 0.0020),
+        )
+        self.clamp_edge_usd_min_from_base = max(
+            0.0,
+            _safe_float(getattr(config, "V2_CALIBRATION_EDGE_USD_MIN_FROM_BASE", 0.0030), 0.0030),
+        )
+        self.clamp_safe_volume_max_from_base = max(
+            0.0,
+            _safe_float(getattr(config, "V2_CALIBRATION_SAFE_VOLUME_MAX_FROM_BASE", 60.0), 60.0),
+        )
+        self.clamp_no_momentum_min = _safe_float(getattr(config, "V2_CALIBRATION_NO_MOMENTUM_MIN", 0.08), 0.08)
+        self.clamp_weakness_max_neg_drift = max(
+            0.0,
+            _safe_float(getattr(config, "V2_CALIBRATION_WEAKNESS_MAX_NEG_DRIFT", 0.35), 0.35),
+        )
+        self.clamp_hold_max_abs = float(max(90, int(getattr(config, "V2_CALIBRATION_HOLD_MAX_ABS", 280) or 280)))
         self._anchor_edge_percent = float(self._baseline_edge_percent)
         self._anchor_edge_usd = float(self._baseline_edge_usd)
         self._anchor_ts = time.time()
@@ -1365,27 +1572,68 @@ class UnifiedCalibrator:
         self._apply_config_overrides(applied)
         self._write_payload(payload)
         logger.warning(
-            "V2_CALIBRATION applied closed=%s edge_usd=%.4f volume_floor=%.0f hold_max=%s no_momentum=%.2f weakness=%.2f",
+            (
+                "V2_CALIBRATION applied scope=%s:%s closed=%s edge_usd=%.4f volume_floor=%.0f hold_max=%s "
+                "no_momentum=%.2f weakness=%.2f ev_min=$%.4f runner_min_ev=$%.4f src_bad_p=%.2f src_severe_p=%.2f"
+            ),
+            str(payload.get("scope_field", "") or "global"),
+            str(payload.get("scope_run_tag", "") or "-"),
             int(payload.get("rows_closed", 0) or 0),
             float(applied.get("MIN_EXPECTED_EDGE_USD", 0.0) or 0.0),
             float(applied.get("SAFE_MIN_VOLUME_5M_USD", 0.0) or 0.0),
             int(applied.get("HOLD_MAX_SECONDS", 0) or 0),
             float(applied.get("NO_MOMENTUM_EXIT_MAX_PNL_PERCENT", 0.0) or 0.0),
             float(applied.get("WEAKNESS_EXIT_PNL_PERCENT", 0.0) or 0.0),
+            float(applied.get("EV_FIRST_ENTRY_MIN_NET_USD", 0.0) or 0.0),
+            float(applied.get("EXECUTION_RUNNER_MIN_EV_USD", 0.0) or 0.0),
+            float(applied.get("V2_QUALITY_SOURCE_BAD_ENTRY_PROBABILITY", 0.0) or 0.0),
+            float(applied.get("V2_QUALITY_SOURCE_SEVERE_ENTRY_PROBABILITY", 0.0) or 0.0),
         )
         return payload
 
     def _build_payload(self) -> dict[str, Any] | None:
         conn = sqlite3.connect(self.db_path)
         try:
+            closed_cols = {
+                str(row[1] or "").strip().lower()
+                for row in conn.execute("PRAGMA table_info(closed_trades)").fetchall()
+            }
+            scope_clause = ""
+            scope_params: list[Any] = []
+            scope_field = ""
+            if bool(self.scope_by_run_tag) and bool(self.run_tag):
+                if "run_tag" in closed_cols:
+                    hit = conn.execute(
+                        "SELECT 1 FROM closed_trades WHERE run_tag = ? LIMIT 1",
+                        (str(self.run_tag),),
+                    ).fetchone()
+                    if hit:
+                        scope_clause = "WHERE run_tag = ?"
+                        scope_params = [str(self.run_tag)]
+                        scope_field = "run_tag"
+                if (not scope_clause) and ("profile" in closed_cols):
+                    hit = conn.execute(
+                        "SELECT 1 FROM closed_trades WHERE profile = ? LIMIT 1",
+                        (str(self.run_tag),),
+                    ).fetchone()
+                    if hit:
+                        scope_clause = "WHERE profile = ?"
+                        scope_params = [str(self.run_tag)]
+                        scope_field = "profile"
+                if (not scope_clause) and ("run_tag" in closed_cols):
+                    scope_clause = "WHERE run_tag = ?"
+                    scope_params = [str(self.run_tag)]
+                    scope_field = "run_tag"
+
             closed_rows = conn.execute(
-                """
+                f"""
                 SELECT pnl_usd, pnl_percent, position_size_usd, close_reason, max_hold_seconds
                 FROM closed_trades
+                {scope_clause}
                 ORDER BY rowid DESC
                 LIMIT ?
                 """,
-                (int(self.lookback_rows),),
+                tuple(list(scope_params) + [int(self.lookback_rows)]),
             ).fetchall()
             if not closed_rows:
                 return None
@@ -1417,18 +1665,24 @@ class UnifiedCalibrator:
             )
 
             # Winner volume via candidates.raw_json (portable across schema migrations).
+            winner_scope_clause = ""
+            winner_scope_params: list[Any] = []
+            if scope_clause and scope_field:
+                winner_scope_clause = f" AND {scope_field} = ?"
+                winner_scope_params = [str(self.run_tag)]
             winner_ids = [
                 str(row[0] or "")
                 for row in conn.execute(
-                    """
+                    f"""
                     SELECT candidate_id
                     FROM closed_trades
                     WHERE pnl_usd > 0
                       AND candidate_id != ''
+                      {winner_scope_clause}
                     ORDER BY rowid DESC
                     LIMIT ?
                     """,
-                    (int(self.lookback_rows),),
+                    tuple(list(winner_scope_params) + [int(self.lookback_rows)]),
                 ).fetchall()
             ]
             winner_vol: list[float] = []
@@ -1494,6 +1748,63 @@ class UnifiedCalibrator:
                     360,
                 )
             )
+            reason_u = [str(r or "").upper() for r in reasons]
+            timeout_count = sum(1 for r in reason_u if r.startswith("TIMEOUT"))
+            no_momentum_count = sum(1 for r in reason_u if r.startswith("NO_MOMENTUM"))
+            tp_count = sum(1 for r in reason_u if r.startswith("TP"))
+            sl_count = sum(1 for r in reason_u if r.startswith("SL"))
+            total_closed = max(1, len(reason_u))
+            timeout_nm_share = float(timeout_count + no_momentum_count) / float(total_closed)
+            tp_share = float(tp_count) / float(total_closed)
+            sl_share = float(sl_count) / float(total_closed)
+            loss_share_total = float(len(losses)) / float(max(1, len(pnl_usd)))
+
+            ev_min_net_target = (
+                (p50_win * 0.14)
+                + (max(0.0, ev_proxy) * 0.35)
+                + (p50_loss * 0.02)
+            )
+            if timeout_nm_share >= 0.45 and ev_proxy < 0.0:
+                ev_min_net_target *= 1.08
+            if tp_share >= 0.14 and ev_proxy > 0.0:
+                ev_min_net_target *= 0.96
+            ev_min_net_target = _clamp(
+                ev_min_net_target,
+                float(self.ev_min_net_min),
+                float(self.ev_min_net_max),
+            )
+
+            runner_min_ev_target = max(
+                ev_min_net_target * 2.20,
+                p65_win * 0.30,
+                p50_win * 0.45,
+            )
+            if timeout_nm_share >= 0.50 and tp_share <= 0.10:
+                runner_min_ev_target *= 1.06
+            if tp_share >= 0.16 and loss_share_total <= 0.52:
+                runner_min_ev_target *= 0.96
+            runner_min_ev_target = _clamp(
+                runner_min_ev_target,
+                float(self.runner_min_ev_min),
+                float(self.runner_min_ev_max),
+            )
+
+            source_penalty = (
+                (max(0.0, loss_share_total - 0.50) * 0.60)
+                + (max(0.0, timeout_nm_share - 0.40) * 0.45)
+                - (max(0.0, tp_share - 0.12) * 0.35)
+            )
+            source_penalty = _clamp(source_penalty, -0.18, 0.25)
+            source_bad_prob_target = _clamp(
+                0.74 - source_penalty,
+                float(self.source_bad_entry_prob_min),
+                float(self.source_bad_entry_prob_max),
+            )
+            source_severe_prob_target = _clamp(
+                source_bad_prob_target - 0.22,
+                float(self.source_severe_entry_prob_min),
+                float(self.source_severe_entry_prob_max),
+            )
 
             edge_usd_next = self._bounded_edge_usd_target(edge_target)
             edge_pct_next = self._bounded_edge_percent_target(edge_pct_target)
@@ -1511,7 +1822,18 @@ class UnifiedCalibrator:
                 "NO_MOMENTUM_EXIT_MAX_PNL_PERCENT": self._smooth("NO_MOMENTUM_EXIT_MAX_PNL_PERCENT", nm_target),
                 "WEAKNESS_EXIT_PNL_PERCENT": self._smooth("WEAKNESS_EXIT_PNL_PERCENT", weak_target),
                 "HOLD_MAX_SECONDS": int(round(self._smooth("HOLD_MAX_SECONDS", float(hold_target)))),
+                "EV_FIRST_ENTRY_MIN_NET_USD": self._smooth("EV_FIRST_ENTRY_MIN_NET_USD", ev_min_net_target),
+                "EXECUTION_RUNNER_MIN_EV_USD": self._smooth("EXECUTION_RUNNER_MIN_EV_USD", runner_min_ev_target),
+                "V2_QUALITY_SOURCE_BAD_ENTRY_PROBABILITY": self._smooth(
+                    "V2_QUALITY_SOURCE_BAD_ENTRY_PROBABILITY",
+                    source_bad_prob_target,
+                ),
+                "V2_QUALITY_SOURCE_SEVERE_ENTRY_PROBABILITY": self._smooth(
+                    "V2_QUALITY_SOURCE_SEVERE_ENTRY_PROBABILITY",
+                    source_severe_prob_target,
+                ),
             }
+            applied = self._apply_runtime_clamp(applied)
             return {
                 "ts": int(time.time()),
                 "db_path": self.db_path,
@@ -1520,6 +1842,13 @@ class UnifiedCalibrator:
                 "p50_win_usd": round(p50_win, 6),
                 "p50_loss_usd": round(p50_loss, 6),
                 "ev_proxy_usd": round(ev_proxy, 6),
+                "timeout_nm_share": round(timeout_nm_share, 6),
+                "tp_share": round(tp_share, 6),
+                "sl_share": round(sl_share, 6),
+                "loss_share": round(loss_share_total, 6),
+                "scope_applied": bool(scope_clause),
+                "scope_field": scope_field,
+                "scope_run_tag": str(self.run_tag) if scope_clause else "",
                 "anchor_edge_percent": round(self._anchor_edge_percent, 6),
                 "anchor_edge_usd": round(self._anchor_edge_usd, 6),
                 "applied": applied,
@@ -1578,6 +1907,84 @@ class UnifiedCalibrator:
                 setattr(config, str(key), value)
             except Exception:
                 continue
+
+    def _apply_runtime_clamp(self, applied: dict[str, Any]) -> dict[str, Any]:
+        out = dict(applied or {})
+        if not bool(self.clamp_enabled):
+            return out
+
+        base_edge_pct = float(self._baseline_edge_percent)
+        base_edge_usd = float(self._baseline_edge_usd)
+        edge_pct_lo = max(float(self.edge_percent_min), base_edge_pct - float(self.clamp_edge_percent_min_from_base))
+        edge_pct_hi = min(float(self.edge_percent_max), base_edge_pct + float(self.clamp_edge_percent_max_from_base))
+        edge_usd_lo = max(float(self.edge_usd_min), base_edge_usd - float(self.clamp_edge_usd_min_from_base))
+        edge_usd_hi = min(float(self.edge_usd_max), base_edge_usd + float(self.clamp_edge_usd_max_from_base))
+
+        out["MIN_EXPECTED_EDGE_PERCENT"] = _clamp(
+            _safe_float(out.get("MIN_EXPECTED_EDGE_PERCENT"), base_edge_pct),
+            edge_pct_lo,
+            edge_pct_hi,
+        )
+        out["MIN_EXPECTED_EDGE_USD"] = _clamp(
+            _safe_float(out.get("MIN_EXPECTED_EDGE_USD"), base_edge_usd),
+            edge_usd_lo,
+            edge_usd_hi,
+        )
+
+        volume_cap = float(self._baseline_volume_floor) + float(self.clamp_safe_volume_max_from_base)
+        volume_cap = max(float(self.volume_floor_min), min(float(self.volume_floor_max), volume_cap))
+        out["SAFE_MIN_VOLUME_5M_USD"] = _clamp(
+            _safe_float(out.get("SAFE_MIN_VOLUME_5M_USD"), self._baseline_volume_floor),
+            float(self.volume_floor_min),
+            volume_cap,
+        )
+
+        out["NO_MOMENTUM_EXIT_MAX_PNL_PERCENT"] = max(
+            float(self.clamp_no_momentum_min),
+            _safe_float(out.get("NO_MOMENTUM_EXIT_MAX_PNL_PERCENT"), self._baseline_no_momentum),
+        )
+
+        weakness_floor = float(self._baseline_weakness) - float(self.clamp_weakness_max_neg_drift)
+        out["WEAKNESS_EXIT_PNL_PERCENT"] = _clamp(
+            _safe_float(out.get("WEAKNESS_EXIT_PNL_PERCENT"), self._baseline_weakness),
+            weakness_floor,
+            -0.20,
+        )
+
+        hold_now = float(_safe_float(out.get("HOLD_MAX_SECONDS"), self._baseline_hold_max))
+        out["HOLD_MAX_SECONDS"] = int(round(_clamp(hold_now, 90.0, float(self.clamp_hold_max_abs))))
+
+        out["EV_FIRST_ENTRY_MIN_NET_USD"] = _clamp(
+            _safe_float(out.get("EV_FIRST_ENTRY_MIN_NET_USD"), self._baseline_ev_min_net),
+            float(self.ev_min_net_min),
+            float(self.ev_min_net_max),
+        )
+        out["EXECUTION_RUNNER_MIN_EV_USD"] = _clamp(
+            _safe_float(out.get("EXECUTION_RUNNER_MIN_EV_USD"), self._baseline_runner_min_ev),
+            float(self.runner_min_ev_min),
+            float(self.runner_min_ev_max),
+        )
+        out["V2_QUALITY_SOURCE_BAD_ENTRY_PROBABILITY"] = _clamp(
+            _safe_float(out.get("V2_QUALITY_SOURCE_BAD_ENTRY_PROBABILITY"), self._baseline_source_bad_prob),
+            float(self.source_bad_entry_prob_min),
+            float(self.source_bad_entry_prob_max),
+        )
+        out["V2_QUALITY_SOURCE_SEVERE_ENTRY_PROBABILITY"] = _clamp(
+            _safe_float(
+                out.get("V2_QUALITY_SOURCE_SEVERE_ENTRY_PROBABILITY"),
+                self._baseline_source_severe_prob,
+            ),
+            float(self.source_severe_entry_prob_min),
+            float(self.source_severe_entry_prob_max),
+        )
+        if float(out["V2_QUALITY_SOURCE_SEVERE_ENTRY_PROBABILITY"]) > float(out["V2_QUALITY_SOURCE_BAD_ENTRY_PROBABILITY"]):
+            out["V2_QUALITY_SOURCE_SEVERE_ENTRY_PROBABILITY"] = float(
+                max(
+                    self.source_severe_entry_prob_min,
+                    float(out["V2_QUALITY_SOURCE_BAD_ENTRY_PROBABILITY"]) - 0.05,
+                )
+            )
+        return out
 
     def _write_payload(self, payload: dict[str, Any]) -> None:
         try:
@@ -1989,8 +2396,11 @@ class RollingEdgeGovernor:
         avg_pnl = float(sum(pnl_rows)) / float(max(1, len(pnl_rows)))
 
         skip_total = int(sum(int(v or 0) for v in self._skip_totals.values()))
-        edge_low = int(self._skip_totals.get("edge_usd_low", 0)) + int(self._skip_totals.get("edge_low", 0)) + int(
-            self._skip_totals.get("negative_edge", 0)
+        edge_low = (
+            int(self._skip_totals.get("edge_usd_low", 0))
+            + int(self._skip_totals.get("edge_low", 0))
+            + int(self._skip_totals.get("negative_edge", 0))
+            + int(self._skip_totals.get("ev_net_low", 0))
         )
         edge_low_share = (float(edge_low) / float(skip_total)) if skip_total > 0 else 0.0
         open_rate = (
@@ -2118,6 +2528,80 @@ class RuntimeKpiLoop:
             0.05,
             1.0,
         )
+        self.quality_rebalance_enabled = bool(getattr(config, "V2_KPI_QUALITY_REBALANCE_ENABLED", True))
+        self.edge_low_hard_trigger = _clamp(
+            float(getattr(config, "V2_KPI_EDGE_LOW_HARD_TRIGGER", 0.80) or 0.80),
+            0.0,
+            1.0,
+        )
+        self.quality_rebalance_explore_step = _clamp(
+            float(getattr(config, "V2_KPI_QUALITY_REBALANCE_EXPLORE_STEP", 0.04) or 0.04),
+            0.0,
+            0.30,
+        )
+        self.quality_rebalance_novelty_step = _clamp(
+            float(getattr(config, "V2_KPI_QUALITY_REBALANCE_NOVELTY_STEP", 0.03) or 0.03),
+            0.0,
+            0.30,
+        )
+        self.quality_rebalance_topn_step = max(
+            0,
+            int(getattr(config, "V2_KPI_QUALITY_REBALANCE_TOPN_STEP", 1) or 1),
+        )
+        self.quality_rebalance_max_buys_step = max(
+            0,
+            int(getattr(config, "V2_KPI_QUALITY_REBALANCE_MAX_BUYS_STEP", 4) or 4),
+        )
+        self.explore_failsafe_enabled = bool(getattr(config, "V2_KPI_EXPLORE_FAILSAFE_ENABLED", True))
+        self.explore_failsafe_window_closed = max(
+            8,
+            int(getattr(config, "V2_KPI_EXPLORE_FAILSAFE_WINDOW_CLOSED", 40) or 40),
+        )
+        self.explore_failsafe_min_closed = max(
+            6,
+            int(getattr(config, "V2_KPI_EXPLORE_FAILSAFE_MIN_CLOSED", 12) or 12),
+        )
+        self.explore_failsafe_loss_share_trigger = _clamp(
+            float(getattr(config, "V2_KPI_EXPLORE_FAILSAFE_LOSS_SHARE_TRIGGER", 0.62) or 0.62),
+            0.0,
+            1.0,
+        )
+        self.explore_failsafe_avg_pnl_trigger = float(
+            getattr(config, "V2_KPI_EXPLORE_FAILSAFE_AVG_PNL_TRIGGER_USD", -0.0015) or -0.0015
+        )
+        self.explore_failsafe_shrink_step = _clamp(
+            float(getattr(config, "V2_KPI_EXPLORE_FAILSAFE_SHRINK_STEP", 0.06) or 0.06),
+            0.0,
+            0.30,
+        )
+        self.explore_failsafe_min_share = _clamp(
+            float(getattr(config, "V2_KPI_EXPLORE_FAILSAFE_MIN_SHARE", 0.08) or 0.08),
+            0.01,
+            0.60,
+        )
+        self.explore_failsafe_recovery_winrate_min = _clamp(
+            float(getattr(config, "V2_KPI_EXPLORE_FAILSAFE_RECOVERY_WINRATE_MIN", 0.54) or 0.54),
+            0.0,
+            1.0,
+        )
+        self.explore_failsafe_recovery_avg_pnl_min = float(
+            getattr(config, "V2_KPI_EXPLORE_FAILSAFE_RECOVERY_AVG_PNL_MIN_USD", 0.0005) or 0.0005
+        )
+        self.explore_failsafe_recovery_step = _clamp(
+            float(getattr(config, "V2_KPI_EXPLORE_FAILSAFE_RECOVERY_STEP", 0.03) or 0.03),
+            0.0,
+            0.30,
+        )
+        self.explore_failsafe_cooldown_seconds = max(
+            0,
+            int(getattr(config, "V2_KPI_EXPLORE_FAILSAFE_COOLDOWN_SECONDS", 900) or 900),
+        )
+        self._explore_share_baseline = _clamp(
+            float(getattr(config, "V2_ENTRY_EXPLORE_MAX_SHARE", 0.35) or 0.35),
+            0.0,
+            1.0,
+        )
+        self._explore_failsafe_until_ts = 0.0
         self.fast_antistall_enabled = bool(getattr(config, "V2_KPI_FAST_ANTISTALL_ENABLED", True))
         self.fast_antistall_interval_seconds = max(
             60,
@@ -2178,7 +2662,37 @@ class RuntimeKpiLoop:
             }
         )
 
-    def maybe_apply(self) -> dict[str, Any] | None:
+    def _explore_window_metrics(self, auto_trader: Any | None) -> dict[str, Any] | None:
+        if auto_trader is None:
+            return None
+        closed = list(getattr(auto_trader, "closed_positions", []) or [])
+        if not closed:
+            return None
+        pnl_rows: list[float] = []
+        for pos in reversed(closed):
+            ch = str(getattr(pos, "entry_channel", "") or "").strip().lower()
+            if ch != "explore":
+                continue
+            pnl_rows.append(float(getattr(pos, "pnl_usd", 0.0) or 0.0))
+            if len(pnl_rows) >= int(self.explore_failsafe_window_closed):
+                break
+        if len(pnl_rows) < int(self.explore_failsafe_min_closed):
+            return None
+        wins = sum(1 for x in pnl_rows if x > 0.0)
+        losses = sum(1 for x in pnl_rows if x < 0.0)
+        count = len(pnl_rows)
+        avg_pnl = float(sum(pnl_rows)) / float(max(1, count))
+        loss_share = float(losses) / float(max(1, count))
+        win_rate = float(wins) / float(max(1, count))
+        return {
+            "count": int(count),
+            "avg_pnl_usd": float(avg_pnl),
+            "loss_share": float(loss_share),
+            "win_rate": float(win_rate),
+            "sum_pnl_usd": float(sum(pnl_rows)),
+        }
+
+    def maybe_apply(self, *, auto_trader: Any | None = None) -> dict[str, Any] | None:
         if not self.enabled:
             return None
         now_ts = time.time()
@@ -2208,7 +2722,7 @@ class RuntimeKpiLoop:
                 iv = int(value or 0)
                 skip_total += iv
                 kk = str(key or "").strip().lower()
-                if kk in {"negative_edge", "edge_low", "edge_usd_low"}:
+                if kk in {"negative_edge", "edge_low", "edge_usd_low", "ev_net_low"}:
                     skip_edge_low += iv
         edge_low_share = (float(skip_edge_low) / float(skip_total)) if skip_total > 0 else 0.0
         unique_symbols = len(symbols)
@@ -2220,6 +2734,7 @@ class RuntimeKpiLoop:
             0.0,
             1.0,
         )
+        self._explore_share_baseline = max(float(self._explore_share_baseline), float(explore_share_now))
         novelty_share_now = _clamp(
             float(getattr(config, "V2_UNIVERSE_NOVELTY_MIN_SHARE", 0.30) or 0.30),
             0.0,
@@ -2231,8 +2746,38 @@ class RuntimeKpiLoop:
         explore_share_next = explore_share_now
         novelty_share_next = novelty_share_now
         action_parts: list[str] = []
+        explore_stats = self._explore_window_metrics(auto_trader=auto_trader)
+        explore_failsafe_active = now_ts < float(self._explore_failsafe_until_ts)
+        explore_failsafe_shrunk = False
+
+        if bool(self.explore_failsafe_enabled) and isinstance(explore_stats, dict):
+            exp_loss_share = float(explore_stats.get("loss_share", 0.0) or 0.0)
+            exp_avg_pnl = float(explore_stats.get("avg_pnl_usd", 0.0) or 0.0)
+            exp_win_rate = float(explore_stats.get("win_rate", 0.0) or 0.0)
+            degrade = (
+                exp_loss_share >= float(self.explore_failsafe_loss_share_trigger)
+                or exp_avg_pnl <= float(self.explore_failsafe_avg_pnl_trigger)
+            )
+            recover = (
+                exp_win_rate >= float(self.explore_failsafe_recovery_winrate_min)
+                and exp_avg_pnl >= float(self.explore_failsafe_recovery_avg_pnl_min)
+            )
+            if (not explore_failsafe_active) and degrade:
+                explore_floor = max(0.0, float(self.explore_failsafe_min_share))
+                explore_share_next = max(explore_floor, float(explore_share_now) - float(self.explore_failsafe_shrink_step))
+                self._explore_failsafe_until_ts = now_ts + float(self.explore_failsafe_cooldown_seconds)
+                explore_failsafe_active = True
+                explore_failsafe_shrunk = abs(explore_share_next - explore_share_now) >= 0.0001
+                if explore_failsafe_shrunk:
+                    action_parts.append("explore_failsafe_shrink")
+            elif recover and float(explore_share_now) < float(self._explore_share_baseline):
+                recovery_cap = min(float(self.explore_share_max), float(self._explore_share_baseline))
+                explore_share_next = min(recovery_cap, float(explore_share_now) + float(self.explore_failsafe_recovery_step))
+                if abs(explore_share_next - explore_share_now) >= 0.0001:
+                    action_parts.append("explore_failsafe_recover")
 
         low_flow = open_rate <= float(self.open_rate_low_trigger) or edge_low_share >= float(self.edge_low_relax_trigger)
+        hard_edge_regime = edge_low_share >= float(self.edge_low_hard_trigger)
         policy_drag = policy_block_share >= float(self.policy_block_trigger)
         if bool(getattr(config, "V2_ANTI_SELF_TIGHTEN_ENABLED", True)) and low_flow:
             cooldown = max(60, int(getattr(config, "V2_ANTI_SELF_TIGHTEN_COOLDOWN_SECONDS", 1800) or 1800))
@@ -2240,12 +2785,22 @@ class RuntimeKpiLoop:
             relax_until_next = now_ts + float(cooldown)
             if relax_until_next > float(relax_until_now):
                 setattr(config, "V2_RUNTIME_EDGE_RELAX_UNTIL_TS", float(relax_until_next))
-        if low_flow:
+        if bool(self.quality_rebalance_enabled) and hard_edge_regime:
+            if self.quality_rebalance_max_buys_step > 0:
+                max_buys_next = max(1, max_buys_now - int(self.quality_rebalance_max_buys_step))
+            if self.quality_rebalance_topn_step > 0:
+                top_n_next = max(1, top_n_now - int(self.quality_rebalance_topn_step))
+            explore_share_next = max(0.05, explore_share_now - float(self.quality_rebalance_explore_step))
+            novelty_share_next = max(0.10, novelty_share_now - float(self.quality_rebalance_novelty_step))
+            setattr(config, "V2_QUALITY_SOURCE_BUDGET_ENABLED", True)
+            action_parts.append("quality_rebalance")
+        elif low_flow:
             if self.max_buys_boost_step > 0:
                 max_buys_next = min(int(self.max_buys_cap), max_buys_now + int(self.max_buys_boost_step))
             if self.topn_boost_step > 0:
                 top_n_next = min(int(self.topn_cap), top_n_now + int(self.topn_boost_step))
-            explore_share_next = min(float(self.explore_share_max), explore_share_now + float(self.explore_share_step))
+            if (not explore_failsafe_active) and (not explore_failsafe_shrunk):
+                explore_share_next = min(float(self.explore_share_max), explore_share_now + float(self.explore_share_step))
             action_parts.append("throughput_boost")
         if unique_symbols < int(self.unique_symbols_min):
             novelty_share_next = min(float(self.novelty_share_max), novelty_share_now + float(self.novelty_share_step))
@@ -2272,7 +2827,8 @@ class RuntimeKpiLoop:
         logger.warning(
             (
                 "V2_KPI_LOOP action=%s open_rate=%.3f edge_low_share=%.3f policy_share=%.3f "
-                "unique_symbols=%s max_buys=%s->%s top_n=%s->%s explore_share=%.2f->%.2f novelty_share=%.2f->%.2f"
+                "unique_symbols=%s max_buys=%s->%s top_n=%s->%s explore_share=%.2f->%.2f novelty_share=%.2f->%.2f "
+                "explore_failsafe(active=%s until=%.0f count=%s wr=%.3f loss=%.3f avg=$%.4f)"
             ),
             action,
             open_rate,
@@ -2287,6 +2843,12 @@ class RuntimeKpiLoop:
             explore_share_next,
             novelty_share_now,
             novelty_share_next,
+            bool(explore_failsafe_active),
+            float(self._explore_failsafe_until_ts or 0.0),
+            int((explore_stats or {}).get("count", 0) or 0),
+            float((explore_stats or {}).get("win_rate", 0.0) or 0.0),
+            float((explore_stats or {}).get("loss_share", 0.0) or 0.0),
+            float((explore_stats or {}).get("avg_pnl_usd", 0.0) or 0.0),
         )
         return {
             "event_type": "V2_KPI_LOOP",
@@ -2301,6 +2863,13 @@ class RuntimeKpiLoop:
             "top_n_next": int(top_n_next),
             "explore_share_prev": round(explore_share_now, 6),
             "explore_share_next": round(explore_share_next, 6),
+            "explore_share_baseline": round(float(self._explore_share_baseline), 6),
+            "explore_failsafe_active": bool(explore_failsafe_active),
+            "explore_failsafe_until_ts": round(float(self._explore_failsafe_until_ts or 0.0), 3),
+            "explore_perf_count": int((explore_stats or {}).get("count", 0) or 0),
+            "explore_perf_win_rate": round(float((explore_stats or {}).get("win_rate", 0.0) or 0.0), 6),
+            "explore_perf_loss_share": round(float((explore_stats or {}).get("loss_share", 0.0) or 0.0), 6),
+            "explore_perf_avg_pnl_usd": round(float((explore_stats or {}).get("avg_pnl_usd", 0.0) or 0.0), 6),
             "novelty_share_prev": round(novelty_share_now, 6),
             "novelty_share_next": round(novelty_share_next, 6),
             "window_cycles": int(len(rows)),
@@ -2321,7 +2890,7 @@ class RuntimeKpiLoop:
                 iv = int(value or 0)
                 skip_total += iv
                 kk = str(key or "").strip().lower()
-                if kk in {"negative_edge", "edge_low", "edge_usd_low"}:
+                if kk in {"negative_edge", "edge_low", "edge_usd_low", "ev_net_low"}:
                     skip_edge_low += iv
         edge_low_share = (float(skip_edge_low) / float(skip_total)) if skip_total > 0 else 0.0
         policy_bad = sum(1 for row in rows if str(row.get("policy_state", "UNKNOWN")) != "OK")
@@ -2342,6 +2911,9 @@ class RuntimeKpiLoop:
             open_rate <= float(self.fast_antistall_open_rate_trigger)
             and edge_low_share >= float(self.fast_antistall_edge_low_share_trigger)
         )
+        if bool(self.quality_rebalance_enabled) and edge_low_share >= float(self.edge_low_hard_trigger):
+            self._low_flow_streak = 0
+            return None
         if low_flow_now:
             self._low_flow_streak += 1
         else:

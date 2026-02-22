@@ -62,6 +62,8 @@ MATRIX_ACTIVE_FILE = os.path.join(PROJECT_ROOT, "data", "matrix", "runs", "activ
 MATRIX_LAUNCHER = os.path.join(PROJECT_ROOT, "tools", "matrix_paper_launcher.ps1")
 MATRIX_STOPPER = os.path.join(PROJECT_ROOT, "tools", "matrix_paper_stop.ps1")
 MATRIX_SUMMARY = os.path.join(PROJECT_ROOT, "tools", "matrix_paper_summary.ps1")
+MATRIX_PROFILE_CATALOG = os.path.join(PROJECT_ROOT, "tools", "matrix_profile_catalog.ps1")
+MATRIX_USER_PRESETS = os.path.join(PROJECT_ROOT, "tools", "matrix_user_presets.ps1")
 GRACEFUL_STOP_FILE_DEFAULT = os.path.join(PROJECT_ROOT, "data", "graceful_stop.signal")
 GRACEFUL_STOP_TIMEOUT_SECONDS_DEFAULT = 12
 WALLET_MODE_KEY = "WALLET_MODE"
@@ -259,6 +261,29 @@ GUI_SETTINGS_FIELDS = [
     ("V2_ENTRY_EXPLORE_MAX_SHARE", "V2 explore share"),
     ("V2_UNIVERSE_NOVELTY_MIN_SHARE", "V2 novelty min share"),
 ]
+
+MATRIX_OVERRIDE_COMMON_KEYS = (
+    "AUTO_TRADE_TOP_N",
+    "MAX_OPEN_TRADES",
+    "MAX_BUYS_PER_HOUR",
+    "MIN_TOKEN_SCORE",
+    "MIN_EXPECTED_EDGE_PERCENT",
+    "MIN_EXPECTED_EDGE_USD",
+    "SAFE_MIN_VOLUME_5M_USD",
+    "SAFE_MIN_LIQUIDITY_USD",
+    "PAPER_TRADE_SIZE_MIN_USD",
+    "PAPER_TRADE_SIZE_MAX_USD",
+    "PAPER_MAX_HOLD_SECONDS",
+    "HOLD_MIN_SECONDS",
+    "HOLD_MAX_SECONDS",
+    "PAPER_PARTIAL_TP_TRIGGER_PERCENT",
+    "PAPER_PARTIAL_TP_SELL_FRACTION",
+    "NO_MOMENTUM_EXIT_MAX_PNL_PERCENT",
+    "WEAKNESS_EXIT_PNL_PERCENT",
+    "MAX_TOKEN_COOLDOWN_SECONDS",
+    "STOP_LOSS_PERCENT",
+    "PROFIT_TARGET_PERCENT",
+)
 
 FIELD_OPTIONS = {
     "WALLET_MODE": ["paper", "live"],
@@ -1000,6 +1025,16 @@ class App(tk.Tk):
         self.status_var = tk.StringVar(value="Status: unknown")
         self.hint_var = tk.StringVar(value="Hint: validate in paper mode first, then enable live.")
         self.matrix_count_var = tk.StringVar(value="2")
+        self.matrix_profiles_hint_var = tk.StringVar(value="Matrix profiles: default by count")
+        self.matrix_user_name_var = tk.StringVar(value="")
+        self.matrix_user_base_var = tk.StringVar(value="")
+        self.matrix_user_note_var = tk.StringVar(value="")
+        self.matrix_override_key_var = tk.StringVar(value="")
+        self.matrix_override_value_var = tk.StringVar(value="")
+        self.matrix_recent_winners_var = tk.StringVar(value="Recent winners: --")
+        self._matrix_selected_profile_ids: list[str] = []
+        self._matrix_catalog_rows: dict[str, dict] = {}
+        self._matrix_user_overrides_map: dict[str, str] = {}
         self.positions_source_var = tk.StringVar(value="single")
         self.positions_source_map: dict[str, str] = {"single": PAPER_STATE_FILE}
         self.refresh_meta_var = tk.StringVar(value="Refresh: --")
@@ -1009,6 +1044,7 @@ class App(tk.Tk):
         self._build_header()
         self._build_tabs()
         self._load_settings()
+        self._refresh_matrix_catalog()
 
         self._last_feed_signature = ""
         self._last_raw_signature = ""
@@ -1112,7 +1148,7 @@ class App(tk.Tk):
             width=3,
             state="readonly",
             textvariable=self.matrix_count_var,
-            values=("2", "3", "4"),
+            values=("1", "2", "3", "4"),
         ).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(right, text="Matrix Start", command=self.on_matrix_start, style="Accent.TButton").pack(side=tk.LEFT, padx=4)
         ttk.Button(right, text="Matrix Stop", command=self.on_matrix_stop).pack(side=tk.LEFT, padx=4)
@@ -1130,12 +1166,14 @@ class App(tk.Tk):
         self.signals_tab = ttk.Frame(self.tabs, style="Card.TFrame", padding=12)
         self.wallet_tab = ttk.Frame(self.tabs, style="Card.TFrame", padding=12)
         self.positions_tab = ttk.Frame(self.tabs, style="Card.TFrame", padding=12)
+        self.matrix_presets_tab = ttk.Frame(self.tabs, style="Card.TFrame", padding=12)
         self.settings_tab = ttk.Frame(self.tabs, style="Card.TFrame", padding=12)
         self.emergency_tab = ttk.Frame(self.tabs, style="Card.TFrame", padding=12)
         self.tabs.add(self.activity_tab, text="Activity")
         self.tabs.add(self.signals_tab, text="Signals")
         self.tabs.add(self.wallet_tab, text="Wallet")
         self.tabs.add(self.positions_tab, text="Trades")
+        self.tabs.add(self.matrix_presets_tab, text="Matrix Presets")
         self.tabs.add(self.settings_tab, text="Settings")
         self.tabs.add(self.emergency_tab, text="Emergency")
 
@@ -1143,6 +1181,7 @@ class App(tk.Tk):
         self._build_signals_tab()
         self._build_wallet_tab()
         self._build_positions_tab()
+        self._build_matrix_presets_tab()
         self._build_settings_tab()
         self._build_emergency_tab()
 
@@ -1235,6 +1274,391 @@ class App(tk.Tk):
         self.signals_tree.pack(fill=tk.BOTH, expand=True)
         self.signals_tree.tag_configure("row_even", background="#0b1428")
         self.signals_tree.tag_configure("row_odd", background="#0d1a31")
+
+    def _build_matrix_presets_tab(self) -> None:
+        top = ttk.Frame(self.matrix_presets_tab, style="Card.TFrame")
+        top.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(top, text="Matrix Preset Manager", font=("Segoe UI Semibold", 12)).pack(anchor="w")
+        ttk.Label(top, textvariable=self.matrix_profiles_hint_var, foreground="#93c5fd").pack(anchor="w", pady=(4, 0))
+        ttk.Label(top, textvariable=self.matrix_recent_winners_var, foreground="#a7f3d0").pack(anchor="w", pady=(2, 0))
+
+        body = ttk.Frame(self.matrix_presets_tab, style="Card.TFrame")
+        body.pack(fill=tk.BOTH, expand=True)
+        body.columnconfigure(0, weight=3)
+        body.columnconfigure(1, weight=2)
+        body.rowconfigure(0, weight=1)
+
+        left = ttk.Frame(body, style="Card.TFrame")
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        ttk.Label(left, text="All Profiles (built-in + user)", font=("Segoe UI Semibold", 11)).pack(anchor="w", pady=(0, 6))
+        self.matrix_profiles_tree = ttk.Treeview(
+            left,
+            columns=("kind", "name", "base", "updated"),
+            show="headings",
+            height=18,
+            selectmode="extended",
+        )
+        for col, title, width in (
+            ("kind", "Kind", 90),
+            ("name", "Name", 240),
+            ("base", "Base", 200),
+            ("updated", "Updated", 190),
+        ):
+            self.matrix_profiles_tree.heading(col, text=title)
+            self.matrix_profiles_tree.column(col, width=width, anchor="center")
+        self.matrix_profiles_tree.pack(fill=tk.BOTH, expand=True)
+        self.matrix_profiles_tree.tag_configure("builtin", foreground="#bfdbfe")
+        self.matrix_profiles_tree.tag_configure("user", foreground="#86efac")
+        self.matrix_profiles_tree.bind("<Double-1>", lambda _e: self._on_load_selected_user_preset())
+
+        left_actions = ttk.Frame(left, style="Card.TFrame")
+        left_actions.pack(fill=tk.X, pady=(8, 0))
+        ttk.Button(left_actions, text="Refresh Catalog", command=self._refresh_matrix_catalog).pack(side=tk.LEFT)
+        ttk.Button(left_actions, text="Use Selected For Matrix", command=self._on_use_selected_matrix_profiles).pack(side=tk.LEFT, padx=8)
+        ttk.Button(left_actions, text="Clear Matrix Selection", command=self._on_clear_matrix_profile_selection).pack(side=tk.LEFT)
+
+        right = ttk.Frame(body, style="Card.TFrame")
+        right.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+        ttk.Label(right, text="Create / Update User Preset", font=("Segoe UI Semibold", 11)).pack(anchor="w", pady=(0, 6))
+
+        form = ttk.Frame(right, style="Card.TFrame")
+        form.pack(fill=tk.X)
+        form.columnconfigure(0, weight=1)
+
+        ttk.Label(form, text="Preset name", foreground="#bfdbfe").grid(row=0, column=0, sticky="w")
+        ttk.Entry(form, textvariable=self.matrix_user_name_var, width=46).grid(row=1, column=0, sticky="ew", pady=(0, 8))
+
+        ttk.Label(form, text="Base profile", foreground="#bfdbfe").grid(row=2, column=0, sticky="w")
+        self.matrix_user_base_combo = ttk.Combobox(
+            form,
+            textvariable=self.matrix_user_base_var,
+            state="readonly",
+            values=(),
+            width=44,
+        )
+        self.matrix_user_base_combo.grid(row=3, column=0, sticky="ew", pady=(0, 8))
+
+        ttk.Label(form, text="Note", foreground="#bfdbfe").grid(row=4, column=0, sticky="w")
+        ttk.Entry(form, textvariable=self.matrix_user_note_var, width=46).grid(row=5, column=0, sticky="ew", pady=(0, 8))
+
+        ttk.Label(form, text="Overrides editor", foreground="#bfdbfe").grid(row=6, column=0, sticky="w")
+        key_row = ttk.Frame(form, style="Card.TFrame")
+        key_row.grid(row=7, column=0, sticky="ew", pady=(2, 6))
+        key_row.columnconfigure(0, weight=1)
+        key_row.columnconfigure(1, weight=1)
+        self.matrix_override_key_combo = ttk.Combobox(
+            key_row,
+            textvariable=self.matrix_override_key_var,
+            values=MATRIX_OVERRIDE_COMMON_KEYS,
+            width=26,
+        )
+        self.matrix_override_key_combo.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        ttk.Entry(key_row, textvariable=self.matrix_override_value_var, width=24).grid(row=0, column=1, sticky="ew", padx=(0, 6))
+        ttk.Button(key_row, text="Add / Update", command=self._on_add_or_update_override).grid(row=0, column=2, sticky="w")
+
+        self.matrix_overrides_tree = ttk.Treeview(
+            form,
+            columns=("key", "value"),
+            show="headings",
+            height=10,
+            selectmode="browse",
+        )
+        self.matrix_overrides_tree.heading("key", text="Key")
+        self.matrix_overrides_tree.heading("value", text="Value")
+        self.matrix_overrides_tree.column("key", width=210, anchor="w")
+        self.matrix_overrides_tree.column("value", width=220, anchor="w")
+        self.matrix_overrides_tree.grid(row=8, column=0, sticky="nsew", pady=(0, 6))
+        self.matrix_overrides_tree.bind("<<TreeviewSelect>>", self._on_override_row_selected)
+
+        overrides_actions = ttk.Frame(form, style="Card.TFrame")
+        overrides_actions.grid(row=9, column=0, sticky="w", pady=(0, 8))
+        ttk.Button(overrides_actions, text="Remove Selected", command=self._on_remove_selected_override).pack(side=tk.LEFT)
+        ttk.Button(overrides_actions, text="Clear Overrides", command=self._on_clear_overrides).pack(side=tk.LEFT, padx=8)
+
+        right_actions = ttk.Frame(right, style="Card.TFrame")
+        right_actions.pack(fill=tk.X, pady=(8, 0))
+        ttk.Button(right_actions, text="Create / Update User Preset", command=self._on_create_or_update_user_preset).pack(side=tk.LEFT)
+        ttk.Button(right_actions, text="Delete Selected User Preset", command=self._on_delete_selected_user_preset).pack(side=tk.LEFT, padx=8)
+        ttk.Button(right_actions, text="Fill Base From Selected", command=self._on_fill_base_from_selected).pack(side=tk.LEFT)
+        ttk.Button(right_actions, text="Load Selected User Preset", command=self._on_load_selected_user_preset).pack(side=tk.LEFT, padx=8)
+
+    def _on_fill_base_from_selected(self) -> None:
+        if not hasattr(self, "matrix_profiles_tree"):
+            return
+        sel = self.matrix_profiles_tree.selection()
+        if not sel:
+            messagebox.showwarning("Matrix Presets", "Select one profile in catalog first.")
+            return
+        row = self._matrix_catalog_rows.get(sel[0], {})
+        name = str(row.get("name", "") or "").strip()
+        if not name:
+            return
+        self.matrix_user_base_var.set(name)
+        self.hint_var.set(f"Base profile selected: {name}")
+
+    def _refresh_overrides_tree(self) -> None:
+        if not hasattr(self, "matrix_overrides_tree"):
+            return
+        tree = self.matrix_overrides_tree
+        tree.delete(*tree.get_children())
+        for idx, key in enumerate(sorted(self._matrix_user_overrides_map.keys())):
+            tree.insert("", tk.END, iid=f"ovr:{idx}", values=(key, self._matrix_user_overrides_map[key]))
+
+    def _on_add_or_update_override(self) -> None:
+        key = str(self.matrix_override_key_var.get() or "").strip()
+        value = str(self.matrix_override_value_var.get() or "").strip()
+        if not key:
+            messagebox.showwarning("Matrix Presets", "Override key is required.")
+            return
+        self._matrix_user_overrides_map[key] = value
+        self._refresh_overrides_tree()
+        self.hint_var.set(f"Override set: {key}={value}")
+
+    def _on_override_row_selected(self, _event=None) -> None:
+        if not hasattr(self, "matrix_overrides_tree"):
+            return
+        sel = self.matrix_overrides_tree.selection()
+        if not sel:
+            return
+        vals = self.matrix_overrides_tree.item(sel[0], "values") or ()
+        if len(vals) >= 2:
+            self.matrix_override_key_var.set(str(vals[0]))
+            self.matrix_override_value_var.set(str(vals[1]))
+
+    def _on_remove_selected_override(self) -> None:
+        if not hasattr(self, "matrix_overrides_tree"):
+            return
+        sel = self.matrix_overrides_tree.selection()
+        if not sel:
+            return
+        vals = self.matrix_overrides_tree.item(sel[0], "values") or ()
+        if not vals:
+            return
+        key = str(vals[0] or "").strip()
+        if key in self._matrix_user_overrides_map:
+            del self._matrix_user_overrides_map[key]
+        self._refresh_overrides_tree()
+        self.hint_var.set(f"Override removed: {key}")
+
+    def _on_clear_overrides(self) -> None:
+        self._matrix_user_overrides_map = {}
+        self._refresh_overrides_tree()
+        self.hint_var.set("Overrides cleared.")
+
+    def _on_load_selected_user_preset(self) -> None:
+        if not hasattr(self, "matrix_profiles_tree"):
+            return
+        sel = self.matrix_profiles_tree.selection()
+        if not sel:
+            messagebox.showwarning("Matrix Presets", "Select user preset row first.")
+            return
+        row = self._matrix_catalog_rows.get(sel[0], {})
+        kind = str(row.get("kind", "") or "").strip()
+        name = str(row.get("name", "") or "").strip()
+        if kind != "user" or not name:
+            messagebox.showwarning("Matrix Presets", "Selected row is not a user preset.")
+            return
+        self.hint_var.set(f"Loading user preset {name}...")
+
+        def _worker() -> tuple[bool, str]:
+            ok, msg = run_powershell_script(
+                MATRIX_USER_PRESETS,
+                ["show", "--name", name, "--json-only"],
+                timeout_seconds=60,
+            )
+            if not ok:
+                return False, msg
+            row_data = json.loads(msg)
+            if not isinstance(row_data, dict):
+                return False, "Invalid user preset payload."
+
+            def _finish() -> None:
+                self.matrix_user_name_var.set(str(row_data.get("name", "") or ""))
+                self.matrix_user_base_var.set(str(row_data.get("base", "") or ""))
+                self.matrix_user_note_var.set(str(row_data.get("note", "") or ""))
+                overrides = row_data.get("overrides", {})
+                parsed: dict[str, str] = {}
+                if isinstance(overrides, dict):
+                    for k, v in overrides.items():
+                        kk = str(k or "").strip()
+                        if kk:
+                            parsed[kk] = str(v)
+                self._matrix_user_overrides_map = parsed
+                self._refresh_overrides_tree()
+                self.hint_var.set(f"User preset loaded: {name}")
+
+            self.after(0, _finish)
+            return True, "ok"
+
+        def _task() -> None:
+            ok, msg = _worker()
+            if ok:
+                return
+            self.after(0, lambda: messagebox.showerror("Matrix Presets", str(msg)[:4000]))
+            self.after(0, lambda: self.hint_var.set("User preset load failed."))
+
+        threading.Thread(target=_task, daemon=True).start()
+
+    def _refresh_matrix_catalog(self) -> None:
+        self.hint_var.set("Matrix catalog refresh in progress...")
+
+        def _worker() -> tuple[bool, str]:
+            ok, msg = run_powershell_script(MATRIX_PROFILE_CATALOG, ["--json"], timeout_seconds=90)
+            if not ok:
+                return False, msg
+            payload = json.loads(msg)
+            if not isinstance(payload, dict):
+                return False, "Invalid catalog payload."
+            ok_allowed, msg_allowed = run_powershell_script(MATRIX_USER_PRESETS, ["allowed", "--json"], timeout_seconds=90)
+            allowed_payload: dict = {}
+            if ok_allowed:
+                try:
+                    allowed_payload = json.loads(msg_allowed)
+                    if not isinstance(allowed_payload, dict):
+                        allowed_payload = {}
+                except Exception:
+                    allowed_payload = {}
+
+            def _finish() -> None:
+                profiles = payload.get("profiles", [])
+                winners = payload.get("recent_winners", [])
+                self._populate_matrix_catalog_ui(profiles, winners)
+                self._apply_allowed_override_keys(allowed_payload)
+                self.hint_var.set("Matrix catalog refreshed.")
+
+            self.after(0, _finish)
+            return True, "ok"
+
+        def _task() -> None:
+            ok, msg = _worker()
+            if ok:
+                return
+            self.after(0, lambda: messagebox.showerror("Matrix Presets", str(msg)[:4000]))
+            self.after(0, lambda: self.hint_var.set("Matrix catalog refresh failed."))
+
+        threading.Thread(target=_task, daemon=True).start()
+
+    def _apply_allowed_override_keys(self, payload: dict) -> None:
+        if not hasattr(self, "matrix_override_key_combo"):
+            return
+        allow = payload.get("allowed_keys", {}) if isinstance(payload, dict) else {}
+        keys = sorted([str(k) for k in (allow or {}).keys() if str(k).strip()])
+        if not keys:
+            keys = list(MATRIX_OVERRIDE_COMMON_KEYS)
+        self.matrix_override_key_combo.configure(values=tuple(keys))
+
+    def _populate_matrix_catalog_ui(self, profiles: list, winners: list) -> None:
+        if not hasattr(self, "matrix_profiles_tree"):
+            return
+        tree = self.matrix_profiles_tree
+        tree.delete(*tree.get_children())
+        self._matrix_catalog_rows = {}
+
+        base_candidates: list[str] = []
+        for idx, row in enumerate(profiles or []):
+            if not isinstance(row, dict):
+                continue
+            kind = str(row.get("kind", "") or "").strip() or "builtin"
+            name = str(row.get("name", "") or "").strip()
+            base = str(row.get("base", "") or "").strip()
+            upd = str(row.get("updated_at", "") or "").strip()
+            if not name:
+                continue
+            iid = f"{kind}:{name}:{idx}"
+            tree.insert("", tk.END, iid=iid, values=(kind, name, base, upd), tags=(kind,))
+            self._matrix_catalog_rows[iid] = {"kind": kind, "name": name, "base": base, "updated_at": upd}
+            base_candidates.append(name)
+
+        base_candidates = sorted(set(base_candidates))
+        if hasattr(self, "matrix_user_base_combo"):
+            self.matrix_user_base_combo.configure(values=tuple(base_candidates))
+            if not self.matrix_user_base_var.get().strip() and base_candidates:
+                self.matrix_user_base_var.set(base_candidates[0])
+
+        winner_parts: list[str] = []
+        for row in winners or []:
+            if not isinstance(row, dict):
+                continue
+            winner = str(row.get("winner_id", "") or "").strip()
+            if winner:
+                winner_parts.append(winner)
+        if winner_parts:
+            self.matrix_recent_winners_var.set("Recent winners: " + ", ".join(winner_parts[:6]))
+        else:
+            self.matrix_recent_winners_var.set("Recent winners: --")
+
+    def _on_use_selected_matrix_profiles(self) -> None:
+        if not hasattr(self, "matrix_profiles_tree"):
+            return
+        names: list[str] = []
+        for iid in self.matrix_profiles_tree.selection():
+            row = self._matrix_catalog_rows.get(iid, {})
+            name = str(row.get("name", "") or "").strip()
+            if name:
+                names.append(name)
+        names = list(dict.fromkeys(names))
+        if not names:
+            messagebox.showwarning("Matrix Presets", "Select profiles in catalog first.")
+            return
+        if len(names) > 4:
+            messagebox.showwarning("Matrix Presets", "Select up to 4 profiles.")
+            return
+        self._matrix_selected_profile_ids = names
+        self.matrix_count_var.set(str(len(names)))
+        self.matrix_profiles_hint_var.set("Matrix profiles: " + ",".join(names))
+        self.hint_var.set(f"Matrix profile selection set: {','.join(names)}")
+
+    def _on_clear_matrix_profile_selection(self) -> None:
+        self._matrix_selected_profile_ids = []
+        self.matrix_profiles_hint_var.set("Matrix profiles: default by count")
+        self.hint_var.set("Matrix profile selection cleared. Default launcher selection will be used.")
+
+    def _on_create_or_update_user_preset(self) -> None:
+        name = str(self.matrix_user_name_var.get() or "").strip()
+        base = str(self.matrix_user_base_var.get() or "").strip()
+        note = str(self.matrix_user_note_var.get() or "").strip()
+        if not name:
+            messagebox.showwarning("Matrix Presets", "Preset name is required.")
+            return
+        if not base:
+            messagebox.showwarning("Matrix Presets", "Base profile is required.")
+            return
+        sets: list[str] = [f"{k}={v}" for k, v in sorted(self._matrix_user_overrides_map.items())]
+        args = ["create", "--name", name, "--base", base, "--force"]
+        if note:
+            args.extend(["--note", note])
+        for item in sets:
+            args.extend(["--set", item])
+        self.hint_var.set(f"Saving user preset {name}...")
+        self._run_background(
+            title="Matrix User Preset",
+            worker=lambda: run_powershell_script(MATRIX_USER_PRESETS, args, timeout_seconds=90),
+            on_success=lambda _msg: self._refresh_matrix_catalog(),
+            on_error=lambda _msg: self.hint_var.set("User preset save failed."),
+        )
+
+    def _on_delete_selected_user_preset(self) -> None:
+        if not hasattr(self, "matrix_profiles_tree"):
+            return
+        sel = self.matrix_profiles_tree.selection()
+        if not sel:
+            messagebox.showwarning("Matrix Presets", "Select user preset row first.")
+            return
+        row = self._matrix_catalog_rows.get(sel[0], {})
+        kind = str(row.get("kind", "") or "").strip()
+        name = str(row.get("name", "") or "").strip()
+        if kind != "user" or not name:
+            messagebox.showwarning("Matrix Presets", "Selected row is not a user preset.")
+            return
+        if not messagebox.askyesno("Matrix Presets", f"Delete user preset '{name}'?"):
+            return
+        self.hint_var.set(f"Deleting user preset {name}...")
+        self._run_background(
+            title="Matrix User Preset",
+            worker=lambda: run_powershell_script(MATRIX_USER_PRESETS, ["delete", "--name", name], timeout_seconds=60),
+            on_success=lambda _msg: self._refresh_matrix_catalog(),
+            on_error=lambda _msg: self.hint_var.set("User preset delete failed."),
+        )
 
     def _build_settings_tab(self) -> None:
         shell = ttk.Frame(self.settings_tab, style="Card.TFrame")
@@ -3796,16 +4220,25 @@ class App(tk.Tk):
         self.refresh()
 
     def on_matrix_start(self) -> None:
-        count = str(self.matrix_count_var.get() or "3").strip()
-        if count not in {"2", "3", "4"}:
-            count = "3"
+        profile_ids = list(self._matrix_selected_profile_ids)
+        if profile_ids:
+            count = str(len(profile_ids))
             self.matrix_count_var.set(count)
-        self.hint_var.set(f"Matrix start in progress ({count})...")
+        else:
+            count = str(self.matrix_count_var.get() or "2").strip()
+        if count not in {"1", "2", "3", "4"}:
+            count = "2"
+            self.matrix_count_var.set(count)
+        profile_hint = f" profiles={','.join(profile_ids)}" if profile_ids else ""
+        self.hint_var.set(f"Matrix start in progress ({count})...{profile_hint}")
 
         def _matrix_start_worker() -> tuple[bool, str]:
+            args = ["-Count", count, "-Run"]
+            if profile_ids:
+                args.extend(["-ProfileIds", ",".join(profile_ids)])
             ok, msg = run_powershell_script(
                 MATRIX_LAUNCHER,
-                ["-Count", count, "-Run"],
+                args,
                 timeout_seconds=180,
             )
             if ok:
@@ -3822,7 +4255,9 @@ class App(tk.Tk):
         self._run_background(
             title="Matrix Start",
             worker=_matrix_start_worker,
-            on_success=lambda _msg: self.hint_var.set(f"Matrix started: {count} instances."),
+            on_success=lambda _msg: self.hint_var.set(
+                f"Matrix started: {count} instances." if not profile_ids else f"Matrix started: {','.join(profile_ids)}"
+            ),
             on_error=lambda _msg: self.hint_var.set("Matrix start failed. Check popup/logs."),
         )
 

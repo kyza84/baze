@@ -1,5 +1,39 @@
 # NEXT_CHAT_CONTEXT
 
+## Latest Operator Update (2026-02-21)
+- Added user preset operator layer (no manual edits in launcher required):
+  - `tools/matrix_user_presets.py`
+  - `tools/matrix_user_presets.ps1`
+  - `tools/matrix_profile_catalog.py`
+  - `tools/matrix_profile_catalog.ps1`
+- `tools/matrix_paper_launcher.ps1` now auto-loads user presets from:
+  - `data/matrix/user_presets/*.json`
+- Added manual:
+  - `docs/MATRIX_PRESET_MANUAL.md`
+  - `docs/SAFE_TUNING_AGENT_PROTOCOL.md`
+- Added safe-tuning guardrail:
+  - contract: `tools/matrix_safe_tuning_contract.json`
+  - validator: `tools/matrix_preset_guard.py`
+  - enforced in `tools/matrix_user_presets.py` (create/clone)
+  - enforced in `tools/matrix_paper_launcher.ps1` (pre-run user preset validation)
+- Added runtime stall protection:
+  - `main_local.py` writes heartbeat to `logs/**/heartbeat.json`
+  - `tools/matrix_watchdog.py` monitors stale heartbeat and restarts stuck profile
+  - launcher autostarts watchdog on matrix run
+
+### Quick Commands
+- Catalog all profiles + recent winners:
+  - `powershell -NoProfile -ExecutionPolicy Bypass -File tools/matrix_profile_catalog.ps1`
+- List user presets:
+  - `powershell -NoProfile -ExecutionPolicy Bypass -File tools/matrix_user_presets.ps1 list`
+- Create user preset from winner:
+  - `powershell -NoProfile -ExecutionPolicy Bypass -File tools/matrix_user_presets.ps1 create --name u_mx30_safe --base mx30_guarded_balanced --set MAX_OPEN_TRADES=5 --set AUTO_TRADE_TOP_N=24`
+- Launch two user presets:
+  - `powershell -NoProfile -ExecutionPolicy Bypass -File tools/matrix_paper_launcher.ps1 -Run -Count 2 -ProfileIds u_mx30_safe,u_mx31_probe`
+
+### Guarantee
+- Existing running matrix is not touched by these files until explicit relaunch.
+
 ## Project Snapshot (2026-02-20)
 - Repo: `d:\earnforme\solana-alert-bot`
 - Mode in focus: `MATRIX` only (paper test runs for preset selection).

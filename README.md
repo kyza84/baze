@@ -37,6 +37,10 @@ Recommended flow:
 ## GUI (Current)
 - Top bar is simplified to core controls:
   - `Start`, `Stop`, `Matrix Start/Stop/Summary`, `Save`, `Restart`, `Clear Logs`, `Refresh`.
+- New tab `Matrix Presets`:
+  - catalog of built-in + user presets + recent winners,
+  - create/update/delete user presets,
+  - select presets for next `Matrix Start` directly from GUI.
 - Settings tab is curated (critical runtime keys only), not legacy full `.env` dump.
 - Activity feed focuses on:
   - market mode changes (`MARKET_MODE_CHANGE`),
@@ -47,6 +51,13 @@ Recommended flow:
 Run matrix:
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\matrix_paper_launcher.ps1 -Count 2 -Run
+```
+Note:
+- launcher now also starts `tools\matrix_watchdog.py` (stale-heartbeat auto-restart).
+
+Run selected profiles (built-in or user presets):
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\matrix_paper_launcher.ps1 -Run -Count 2 -ProfileIds mx30_guarded_balanced,mx31_guarded_aggressive
 ```
 
 Stop matrix:
@@ -63,6 +74,21 @@ Promote winner to live parity:
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\matrix_promote_live.ps1 -ProfileId <profile_id>
 ```
+
+Profile catalog (built-in + user + recent winners):
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\matrix_profile_catalog.ps1
+```
+
+User preset manager:
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\matrix_user_presets.ps1 list
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\matrix_user_presets.ps1 create --name u_mx30_safe --base mx30_guarded_balanced --set MAX_OPEN_TRADES=5
+```
+
+Full operator guide:
+- `docs/MATRIX_PRESET_MANUAL.md`
+- `docs/SAFE_TUNING_AGENT_PROTOCOL.md`
 
 ## Live Precheck
 No trading actions, only readiness checks:
