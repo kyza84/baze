@@ -1,4 +1,4 @@
-﻿"""CryptoBot webhook HTTP server."""
+"""CryptoBot webhook HTTP server."""
 
 import logging
 

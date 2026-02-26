@@ -1,4 +1,4 @@
-﻿$ErrorActionPreference = 'Stop'
+$ErrorActionPreference = 'Stop'
 $root = Resolve-Path (Join-Path $PSScriptRoot '..')
 $sessionsDir = Join-Path $root 'logs\matrix'
 if (-not (Test-Path $sessionsDir)) {

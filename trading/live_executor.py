@@ -234,19 +234,23 @@ class LiveExecutor:
         return int(token_contract.functions.balanceOf(self.wallet).call())
 
     def is_buy_route_supported(self, token_address: str, spend_eth: float) -> tuple[bool, str]:
+        ok, reason, _raw = self.quote_buy_token_amount_raw(token_address, spend_eth)
+        return bool(ok), str(reason)
+
+    def quote_buy_token_amount_raw(self, token_address: str, spend_eth: float) -> tuple[bool, str, int]:
         try:
             token = self.w3.to_checksum_address(token_address)
         except Exception as exc:
-            return False, f"invalid_token_address:{exc}"
+            return False, f"invalid_token_address:{exc}", 0
 
         amount_in = int(self.w3.to_wei(max(0.0, float(spend_eth)), "ether"))
         if amount_in <= 0:
             amount_in = 1
 
-        ok, reason, router_addr, _, path, _ = self._best_quote(int(amount_in), self._buy_paths(token))
+        ok, reason, router_addr, _, path, token_out = self._best_quote(int(amount_in), self._buy_paths(token))
         if not ok:
-            return False, reason
-        return True, f"ok:router={router_addr} path={'->'.join(path)}"
+            return False, reason, 0
+        return True, f"ok:router={router_addr} path={'->'.join(path)}", int(token_out)
 
     def token_decimals(self, token_address: str) -> int:
         """Best-effort ERC20 decimals() with a safe fallback."""
@@ -283,12 +287,28 @@ class LiveExecutor:
         if amount_in <= 0:
             amount_in = 1
 
+        return self.is_sell_route_supported_raw(token_address, int(amount_in))
+
+    def is_sell_route_supported_raw(self, token_address: str, token_amount_raw: int) -> tuple[bool, str]:
+        """Sanity-check that router can quote token->WETH for an exact raw amount."""
+        try:
+            token = self.w3.to_checksum_address(token_address)
+        except Exception as exc:
+            return False, f"invalid_token_address:{exc}"
+        amount_in = int(token_amount_raw or 0)
+        if amount_in <= 0:
+            amount_in = 1
         ok, reason, router_addr, _, path, _ = self._best_quote(int(amount_in), self._sell_paths(token))
         if not ok:
             return False, reason
         return True, f"ok:router={router_addr} path={'->'.join(path)}"
 
-    def roundtrip_quote(self, token_address: str, spend_eth: float) -> tuple[bool, str, float]:
+    def roundtrip_quote(
+        self,
+        token_address: str,
+        spend_eth: float,
+        sell_fraction_override: float | None = None,
+    ) -> tuple[bool, str, float]:
         """
         Quote WETH->token for the intended spend size, then quote token->WETH for a fraction of that output.
         This helps filter out ultra-thin liquidity where selling is effectively impossible for our size.
@@ -307,7 +327,10 @@ class LiveExecutor:
             return False, "invalid_amount_in", 0.0
 
         try:
-            sell_fraction = float(getattr(config, "LIVE_ROUNDTRIP_SELL_FRACTION", 0.25) or 0.25)
+            if sell_fraction_override is None:
+                sell_fraction = float(getattr(config, "LIVE_ROUNDTRIP_SELL_FRACTION", 0.25) or 0.25)
+            else:
+                sell_fraction = float(sell_fraction_override)
         except Exception:
             sell_fraction = 0.25
         sell_fraction = max(0.01, min(1.0, sell_fraction))

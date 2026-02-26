@@ -1,4 +1,4 @@
-﻿"""Telegram handlers."""
+"""Telegram handlers."""
 
 from datetime import datetime
 

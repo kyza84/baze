@@ -1,4 +1,4 @@
-﻿"""SQLAlchemy models."""
+"""SQLAlchemy models."""
 
 from datetime import datetime, timedelta
 

@@ -72,6 +72,7 @@ class PaperPosition:
     market_mode: str = ""
     entry_tier: str = ""
     entry_channel: str = ""
+    source: str = ""
     partial_tp_trigger_mult: float = 1.0
     partial_tp_sell_mult: float = 1.0
     candidate_id: str = ""
@@ -139,7 +140,14 @@ class AutoTrader:
         self._recovery_attempts: dict[str, int] = {}
         self._recovery_last_attempt_ts: dict[str, float] = {}
         self._skip_reason_counts_window: dict[str, int] = {}
+        self._plan_attempts_by_source_window: dict[str, int] = {}
+        self._opens_by_source_window: dict[str, int] = {}
+        self._skip_reasons_by_source_window: dict[str, dict[str, int]] = {}
         self._recent_open_symbols: list[tuple[float, str]] = []
+        self._recent_batch_open_timestamps: list[float] = []
+        self._new_token_pause_until_ts = 0.0
+        self._quarantine_rows: dict[str, dict[str, float | int]] = {}
+        self._verified_sell_tokens: set[str] = set()
         self._last_market_mode_seen = "YELLOW"
         self._last_reinvest_mult = 1.0
         self._ev_db_cache: dict[str, tuple[float, dict[str, float]]] = {}
@@ -200,10 +208,12 @@ class AutoTrader:
             self.live_start_balance_eth = 0.0
             self.live_start_balance_usd = 0.0
         self._load_blacklist()
+        self._seed_hard_blocked_addresses()
         if config.PAPER_RESET_ON_START:
             self._apply_startup_reset()
         self._sync_stair_state()
         self._prune_closed_positions()
+        self._rebuild_verified_sell_tokens()
         if self._is_live_mode():
             try:
                 self.live_executor = LiveExecutor()
@@ -213,6 +223,91 @@ class AutoTrader:
             except Exception as exc:
                 self.live_executor = None
                 logger.error("Live executor init failed: %s", exc)
+
+    @staticmethod
+    def _chain_key() -> str:
+        chain = str(getattr(config, "CHAIN_ID", "") or getattr(config, "EVM_CHAIN_ID", "") or "base").strip().lower()
+        return chain or "base"
+
+    def _blacklist_key(self, token_address: str) -> str:
+        addr = normalize_address(token_address)
+        if not addr:
+            return ""
+        return f"{self._chain_key()}:{addr}"
+
+    def _blacklist_lookup_keys(self, token_address: str) -> list[str]:
+        addr = normalize_address(token_address)
+        if not addr:
+            return []
+        keys: list[str] = [self._blacklist_key(addr), addr]
+        evm_chain = str(getattr(config, "EVM_CHAIN_ID", "") or "").strip().lower()
+        if evm_chain:
+            keys.append(f"{evm_chain}:{addr}")
+        chain_name = str(getattr(config, "CHAIN_NAME", "") or "").strip().lower()
+        if chain_name:
+            keys.append(f"{chain_name}:{addr}")
+        out: list[str] = []
+        seen: set[str] = set()
+        for key in keys:
+            k = str(key or "").strip().lower()
+            if not k or k in seen:
+                continue
+            seen.add(k)
+            out.append(k)
+        return out
+
+    def _is_hard_blocked_token(self, token_address: str, symbol: str = "") -> bool:
+        addr = normalize_address(token_address)
+        if not addr:
+            return False
+        raw = set(getattr(config, "AUTO_TRADE_HARD_BLOCKED_ADDRESSES", []) or [])
+        blocked = {normalize_address(x) for x in raw if str(x or "").strip()}
+        if addr in blocked:
+            return True
+        # Optional fallback by symbol if address is unavailable in a source row.
+        symbol_u = str(symbol or "").strip().upper()
+        if not symbol_u:
+            return False
+        blocked_symbols = {str(x).strip().upper() for x in (getattr(config, "AUTO_TRADE_EXCLUDED_SYMBOLS", []) or []) if str(x).strip()}
+        return symbol_u in blocked_symbols
+
+    def _seed_hard_blocked_addresses(self) -> None:
+        # Ensure project-level hard-block addresses are persisted per-profile blacklist too.
+        for raw_addr in (getattr(config, "AUTO_TRADE_HARD_BLOCKED_ADDRESSES", []) or []):
+            addr = normalize_address(raw_addr)
+            if not addr:
+                continue
+            self._blacklist_add(addr, "hard_blocklist:config", ttl_seconds=90 * 24 * 3600)
+
+    @staticmethod
+    def _is_transient_safety_reason(reason: str) -> bool:
+        key = str(reason or "").strip().lower()
+        return ("safety_source_transient:" in key) or ("safety_fail_transient:" in key)
+
+    @staticmethod
+    def _blacklist_reason_is_hard_block(reason: str) -> bool:
+        key = str(reason or "").strip().lower()
+        if not key:
+            return False
+        hard_prefixes = (
+            "hard_blocklist:",
+            "honeypot_guard:",
+            "safety_guard:risky_contract_flags",
+            "abandoned:",
+            "unsupported_sell_route:",
+            "unstable_route:",
+            "roundtrip_ratio:",
+            "proof_sell_fail:",
+            "sell_fail:",
+        )
+        return any(key.startswith(prefix) for prefix in hard_prefixes)
+
+    def _blacklist_reason_blocks_current_mode(self, reason: str) -> bool:
+        if self._is_live_mode():
+            return True
+        if not bool(getattr(config, "AUTOTRADE_BLACKLIST_PAPER_HARD_ONLY", True)):
+            return True
+        return self._blacklist_reason_is_hard_block(reason)
 
     def _load_blacklist(self) -> None:
         if not bool(getattr(config, "AUTOTRADE_BLACKLIST_ENABLED", True)):
@@ -229,7 +324,39 @@ class AutoTrader:
             with open(path, "r", encoding="utf-8") as f:
                 payload = json.load(f)
             if isinstance(payload, dict):
-                self._blacklist = payload  # type: ignore[assignment]
+                # Backward compatibility: migrate legacy address-only keys to chain-aware keys.
+                mapped: dict[str, dict[str, Any]] = {}
+                for raw_key, raw_row in payload.items():
+                    if not isinstance(raw_row, dict):
+                        continue
+                    key_text = str(raw_key or "").strip().lower()
+                    addr = key_text
+                    if ":" in key_text:
+                        addr = key_text.rsplit(":", 1)[-1]
+                    addr = normalize_address(addr)
+                    if not addr:
+                        continue
+                    key = self._blacklist_key(addr)
+                    if not key:
+                        continue
+                    row = dict(raw_row)
+                    prev = mapped.get(key)
+                    if not isinstance(prev, dict):
+                        mapped[key] = row
+                        continue
+                    prev_until = float(prev.get("until_ts") or 0.0)
+                    row_until = float(row.get("until_ts") or 0.0)
+                    if row_until >= prev_until:
+                        mapped[key] = row
+                # Transient safety failures should not create persistent hard blocks by default.
+                if not bool(getattr(config, "ENTRY_TRANSIENT_SAFETY_TO_BLACKLIST", False)):
+                    mapped = {
+                        k: v
+                        for k, v in mapped.items()
+                        if not self._is_transient_safety_reason(str((v or {}).get("reason") or ""))
+                    }
+                self._blacklist = mapped
+                self._blacklist_prune()
             else:
                 self._blacklist = {}
         except Exception:
@@ -270,22 +397,31 @@ class AutoTrader:
     def _blacklist_is_blocked(self, token_address: str) -> tuple[bool, str]:
         if not bool(getattr(config, "AUTOTRADE_BLACKLIST_ENABLED", True)):
             return False, ""
-        key = normalize_address(token_address)
-        if not key:
-            return False, ""
-        row = self._blacklist.get(key)
-        if not isinstance(row, dict):
-            return False, ""
-        until_ts = float(row.get("until_ts") or 0.0)
         now_ts = datetime.now(timezone.utc).timestamp()
-        if until_ts <= now_ts:
-            return False, ""
-        return True, str(row.get("reason") or "blacklisted")
+        keys = self._blacklist_lookup_keys(token_address)
+        for key in keys:
+            row = self._blacklist.get(key)
+            if not isinstance(row, dict):
+                continue
+            until_ts = float(row.get("until_ts") or 0.0)
+            if until_ts <= now_ts:
+                self._blacklist.pop(key, None)
+                continue
+            # Lazy migration from legacy keys on read path.
+            canonical = self._blacklist_key(token_address)
+            if canonical and key != canonical and canonical not in self._blacklist:
+                self._blacklist[canonical] = dict(row)
+                self._blacklist.pop(key, None)
+            reason = str(row.get("reason") or "blacklisted")
+            if not self._blacklist_reason_blocks_current_mode(reason):
+                continue
+            return True, reason
+        return False, ""
 
     def _blacklist_add(self, token_address: str, reason: str, ttl_seconds: int | None = None) -> None:
         if not bool(getattr(config, "AUTOTRADE_BLACKLIST_ENABLED", True)):
             return
-        key = normalize_address(token_address)
+        key = self._blacklist_key(token_address)
         if not key:
             return
         now_ts = datetime.now(timezone.utc).timestamp()
@@ -304,6 +440,11 @@ class AutoTrader:
         """Shorten TTL for transient routing/quote failures to keep throughput healthy."""
         base_ttl = int(getattr(config, "AUTOTRADE_BLACKLIST_TTL_SECONDS", 86400) or 86400)
         key = str(reason or "").strip().lower()
+        if key.startswith("hard_blocklist:"):
+            return max(base_ttl, 30 * 24 * 3600)
+        if ("safety_source_transient:" in key) or ("safety_fail_transient:" in key):
+            tuned = int(getattr(config, "AUTOTRADE_BLACKLIST_TRANSIENT_SAFETY_TTL_SECONDS", 900) or 900)
+            return min(base_ttl, max(300, tuned))
         if key.startswith("unsupported_buy_route:") or key.startswith("unsupported_sell_route:"):
             tuned = int(getattr(config, "LIVE_BLACKLIST_UNSUPPORTED_ROUTE_TTL_SECONDS", 7200) or 7200)
             return min(base_ttl, tuned)
@@ -316,9 +457,365 @@ class AutoTrader:
         if key.startswith("live_buy_zero_amount") or key.startswith("live_buy_failed:"):
             tuned = int(getattr(config, "LIVE_BLACKLIST_ZERO_AMOUNT_TTL_SECONDS", 1800) or 1800)
             return min(base_ttl, tuned)
+        if key.startswith("sell_fail:") or key.startswith("proof_sell_fail:"):
+            tuned = int(getattr(config, "LIVE_BLACKLIST_SELL_FAIL_TTL_SECONDS", 21600) or 21600)
+            return min(base_ttl, tuned)
         if key.startswith("honeypot_guard:") or key.startswith("abandoned:"):
             return max(base_ttl, 24 * 3600)
         return base_ttl
+
+    def _apply_transient_safety_cooldown(self, token_address: str, reason: str) -> None:
+        addr = normalize_address(token_address)
+        if not addr:
+            return
+        seconds = int(getattr(config, "ENTRY_TRANSIENT_SAFETY_COOLDOWN_SECONDS", 180) or 180)
+        if seconds <= 0:
+            return
+        now_ts = datetime.now(timezone.utc).timestamp()
+        prev_until = float(self.token_cooldowns.get(addr, 0.0) or 0.0)
+        until_ts = max(prev_until, now_ts + float(seconds))
+        self.token_cooldowns[addr] = until_ts
+        logger.info(
+            "TRANSIENT_SAFETY_COOLDOWN token=%s reason=%s cooldown=%ss",
+            addr,
+            self._short_error_text(reason),
+            int(max(0, until_ts - now_ts)),
+        )
+
+    def _rebuild_verified_sell_tokens(self) -> None:
+        out: set[str] = set()
+        for pos in self.closed_positions:
+            addr = normalize_address(getattr(pos, "token_address", ""))
+            if not addr:
+                continue
+            status = str(getattr(pos, "sell_tx_status", "") or "").strip().lower()
+            tx_hash = str(getattr(pos, "sell_tx_hash", "") or "").strip().lower()
+            if status == "confirmed" and tx_hash:
+                out.add(addr)
+        self._verified_sell_tokens = out
+
+    def _is_token_sell_verified(self, token_address: str) -> bool:
+        addr = normalize_address(token_address)
+        if not addr:
+            return False
+        return addr in self._verified_sell_tokens
+
+    def _mark_token_sell_verified(self, token_address: str) -> None:
+        addr = normalize_address(token_address)
+        if not addr:
+            return
+        self._verified_sell_tokens.add(addr)
+
+    @staticmethod
+    def _truthy_flag(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(int(value))
+        return str(value or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+    @staticmethod
+    def _safe_int_or_none(value: Any) -> int | None:
+        try:
+            return int(float(value))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _safe_float_or_none(value: Any) -> float | None:
+        try:
+            return float(value)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _honeypot_bool_or_none(value: Any) -> bool | None:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return bool(value)
+        if isinstance(value, (int, float)):
+            return bool(int(value))
+        text = str(value or "").strip().lower()
+        if text in {"1", "true", "yes", "y", "on"}:
+            return True
+        if text in {"0", "false", "no", "n", "off"}:
+            return False
+        return None
+
+    @staticmethod
+    def _honeypot_float_or_none(value: Any) -> float | None:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        text = str(value or "").strip()
+        if not text:
+            return None
+        text = text.replace("%", "").replace(",", ".")
+        try:
+            return float(text)
+        except Exception:
+            pass
+        match = re.search(r"-?\d+(?:\.\d+)?", text)
+        if not match:
+            return None
+        try:
+            return float(match.group(0))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _candidate_cycle_index(candidate_id: str, token_data: dict[str, Any]) -> int | None:
+        direct = AutoTrader._safe_int_or_none((token_data or {}).get("_cycle_index"))
+        if direct is not None and direct >= 0:
+            return int(direct)
+        cid = str(candidate_id or "")
+        # candidate_id format: <run_tag>:<cycle_index>:<token_idx>:<address>
+        parts = cid.split(":")
+        if len(parts) >= 4:
+            cycle = AutoTrader._safe_int_or_none(parts[-3])
+            if cycle is not None and cycle >= 0:
+                return int(cycle)
+        return None
+
+    @staticmethod
+    def _extract_optional_float(token_data: dict[str, Any], keys: list[str]) -> float | None:
+        for key in keys:
+            if key in token_data:
+                out = AutoTrader._safe_float_or_none(token_data.get(key))
+                if out is not None:
+                    return float(out)
+        return None
+
+    def _extract_safety_risky_flags(self, token_data: dict[str, Any]) -> list[str]:
+        safety = token_data.get("safety") if isinstance(token_data.get("safety"), dict) else {}
+        out: set[str] = set()
+
+        raw_flags = (safety or {}).get("risky_flags")
+        if isinstance(raw_flags, list):
+            for item in raw_flags:
+                code = str(item or "").strip().lower()
+                if code:
+                    out.add(code)
+
+        safety_flags = (safety or {}).get("safety_flags")
+        if isinstance(safety_flags, dict):
+            mapping = {
+                "is_mintable": "mint",
+                "is_freezeable": "freeze",
+                "is_blacklisted": "blacklist",
+                "is_proxy": "proxy",
+                "can_take_back_ownership": "owner_takeback",
+                "owner_change_balance": "owner_change_balance",
+            }
+            for raw_key, code in mapping.items():
+                if self._truthy_flag(safety_flags.get(raw_key)):
+                    out.add(code)
+
+        if self._truthy_flag((safety or {}).get("is_mintable")):
+            out.add("mint")
+        if self._truthy_flag((safety or {}).get("is_freezeable")):
+            out.add("freeze")
+        if self._truthy_flag((safety or {}).get("is_blacklisted")):
+            out.add("blacklist")
+        if self._truthy_flag((safety or {}).get("is_proxy")):
+            out.add("proxy")
+        if self._truthy_flag((safety or {}).get("can_take_back_ownership")):
+            out.add("owner_takeback")
+        if self._truthy_flag((safety or {}).get("owner_change_balance")):
+            out.add("owner_change_balance")
+
+        warnings = (safety or {}).get("warnings")
+        if isinstance(warnings, list):
+            txt = " ".join(str(x or "") for x in warnings).lower()
+            if "mint" in txt:
+                out.add("mint")
+            if "freeze" in txt:
+                out.add("freeze")
+            if "blacklist" in txt:
+                out.add("blacklist")
+            if "proxy" in txt:
+                out.add("proxy")
+            if "ownership can be reclaimed" in txt:
+                out.add("owner_takeback")
+            if "owner can change balances" in txt:
+                out.add("owner_change_balance")
+        return sorted(out)
+
+    def _token_guard_result(self, token_data: dict[str, Any]) -> tuple[bool, str]:
+        if abs(float(token_data.get("price_change_5m") or 0)) > float(config.MAX_TOKEN_PRICE_CHANGE_5M_ABS_PERCENT):
+            return False, "price_change_5m_limit"
+
+        safety = token_data.get("safety") if isinstance(token_data.get("safety"), dict) else {}
+        safety_source = str((safety or {}).get("source", "") or "").strip().lower()
+        fail_reason = str((safety or {}).get("fail_reason", "") or "").strip().lower()
+
+        if bool(getattr(config, "ENTRY_FAIL_CLOSED_ON_SAFETY_GAP", True)):
+            allowed_sources = set(getattr(config, "ENTRY_ALLOWED_SAFETY_SOURCES", ["goplus"]) or ["goplus"])
+            if not safety_source or safety_source not in allowed_sources:
+                return False, f"safety_source:{safety_source or 'missing'}"
+            is_transient_source = safety_source in {"transient_fallback", "cache_transient", "fallback"}
+            allow_transient_source = bool(getattr(config, "ENTRY_ALLOW_TRANSIENT_SAFETY_SOURCE", False))
+            if is_transient_source and (not allow_transient_source):
+                return False, f"safety_source_transient:{safety_source}"
+            if fail_reason:
+                if is_transient_source and allow_transient_source:
+                    # In paper calibration mode with transient safety allowance enabled,
+                    # do not hard-fail on transient API fail_reason alone.
+                    fail_reason = ""
+                elif is_transient_source:
+                    return False, f"safety_fail_transient:{fail_reason}"
+                if fail_reason:
+                    return False, f"safety_fail:{fail_reason}"
+
+        risky_flags = self._extract_safety_risky_flags(token_data)
+        if bool(getattr(config, "ENTRY_BLOCK_RISKY_CONTRACT_FLAGS", True)):
+            hard = set(getattr(config, "ENTRY_HARD_RISKY_FLAG_CODES", []) or [])
+            hit = [x for x in risky_flags if x in hard]
+            if hit:
+                return False, f"risky_contract_flags:{','.join(hit)}"
+
+        is_contract_safe = bool(token_data.get("is_contract_safe", (safety or {}).get("is_safe", False)))
+        warning_flags = int(token_data.get("warning_flags", len((safety or {}).get("warnings") or [])) or 0)
+        risk_level = str(token_data.get("risk_level", (safety or {}).get("risk_level", "HIGH"))).upper()
+
+        if config.SAFE_TEST_MODE:
+            if float(token_data.get("liquidity") or 0) < float(config.SAFE_MIN_LIQUIDITY_USD):
+                return False, "safe_min_liquidity"
+            if float(token_data.get("volume_5m") or 0) < float(config.SAFE_MIN_VOLUME_5M_USD):
+                return False, "safe_min_volume_5m"
+            if int(token_data.get("age_seconds") or 0) < int(config.SAFE_MIN_AGE_SECONDS):
+                return False, "safe_min_age"
+            if abs(float(token_data.get("price_change_5m") or 0)) > float(config.SAFE_MAX_PRICE_CHANGE_5M_ABS_PERCENT):
+                return False, "safe_max_price_change_5m"
+            if config.SAFE_REQUIRE_CONTRACT_SAFE and not is_contract_safe:
+                return False, "safe_contract"
+            required_risk = str(config.SAFE_REQUIRE_RISK_LEVEL).upper()
+            rank = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
+            if rank.get(risk_level, 2) > rank.get(required_risk, 1):
+                return False, "safe_risk"
+            if warning_flags > int(config.SAFE_MAX_WARNING_FLAGS):
+                return False, "safe_warnings"
+
+        min_holders = max(0, int(getattr(config, "SAFE_MIN_HOLDERS", 0) or 0))
+        if min_holders > 0:
+            holders = None
+            for k in ("holders", "holder_count", "holders_count", "unique_holders"):
+                if k in token_data:
+                    holders = self._safe_int_or_none(token_data.get(k))
+                    if holders is not None:
+                        break
+            if holders is None:
+                return False, "holders_missing"
+            if int(holders) < int(min_holders):
+                return False, f"holders_low:{holders}<{min_holders}"
+
+        return True, "ok"
+
+    def _quarantine_gate(self, token_data: dict[str, Any], *, candidate_id: str, token_address: str) -> tuple[bool, str]:
+        if (not self._is_live_mode()) or (not bool(getattr(config, "ENTRY_QUARANTINE_ENABLED", True))):
+            return True, "disabled"
+        if self._is_token_sell_verified(token_address):
+            return True, "verified_token"
+
+        required = max(0, int(getattr(config, "ENTRY_QUARANTINE_REQUIRED_CYCLES", 2) or 2))
+        if required <= 0:
+            return True, "disabled_required_0"
+
+        liq = max(0.0, float(token_data.get("liquidity") or 0.0))
+        vol = max(0.0, float(token_data.get("volume_5m") or 0.0))
+        spread_bps = self._extract_optional_float(
+            token_data,
+            ["spread_bps", "spread_basis_points", "pool_spread_bps"],
+        )
+        if spread_bps is None:
+            spread_pct = self._extract_optional_float(token_data, ["spread_percent", "spread_pct"])
+            if spread_pct is not None:
+                spread_bps = float(spread_pct) * 100.0
+        source_div_pct = self._extract_optional_float(
+            token_data,
+            [
+                "source_divergence_percent",
+                "price_source_divergence_percent",
+                "source_price_dispersion_percent",
+            ],
+        )
+
+        max_spread_bps = max(0.0, float(getattr(config, "ENTRY_QUARANTINE_MAX_SPREAD_BPS", 220.0) or 220.0))
+        if spread_bps is not None and float(spread_bps) > max_spread_bps:
+            return False, f"quarantine_spread_high:{spread_bps:.1f}>{max_spread_bps:.1f}"
+
+        max_source_div = max(0.0, float(getattr(config, "ENTRY_QUARANTINE_MAX_SOURCE_DIVERGENCE_PCT", 2.50) or 2.50))
+        if source_div_pct is not None and float(source_div_pct) > max_source_div:
+            return False, f"source_divergence:{source_div_pct:.3f}>{max_source_div:.3f}"
+
+        cycle_idx = self._candidate_cycle_index(candidate_id, token_data)
+        now_ts = time.time()
+        row = self._quarantine_rows.get(token_address)
+        if not isinstance(row, dict):
+            self._quarantine_rows[token_address] = {
+                "last_ts": float(now_ts),
+                "last_cycle": float(cycle_idx if cycle_idx is not None else -1),
+                "last_liq": float(liq),
+                "last_vol": float(vol),
+                "stable_cycles": 1.0,
+            }
+            return False, f"quarantine_warmup:1/{required}"
+
+        prev_cycle = int(float(row.get("last_cycle", -1.0) or -1.0))
+        same_cycle = (cycle_idx is not None) and (prev_cycle == int(cycle_idx))
+        if same_cycle:
+            stable_now = int(float(row.get("stable_cycles", 1.0) or 1.0))
+            if stable_now < required:
+                return False, f"quarantine_warmup:{stable_now}/{required}"
+            return True, f"quarantine_ok:{stable_now}/{required}"
+
+        prev_liq = max(1e-9, float(row.get("last_liq", liq) or liq))
+        prev_vol = max(1e-9, float(row.get("last_vol", vol) or vol))
+        liq_delta = abs(float(liq) - prev_liq) / prev_liq
+        vol_delta = abs(float(vol) - prev_vol) / prev_vol
+        max_liq_delta = max(0.0, min(1.0, float(getattr(config, "ENTRY_QUARANTINE_MAX_LIQUIDITY_DELTA_PCT", 0.35) or 0.35)))
+        max_vol_delta = max(0.0, min(1.5, float(getattr(config, "ENTRY_QUARANTINE_MAX_VOLUME_DELTA_PCT", 0.80) or 0.80)))
+        stable = (liq_delta <= max_liq_delta) and (vol_delta <= max_vol_delta)
+        stable_cycles = int(float(row.get("stable_cycles", 1.0) or 1.0))
+        stable_cycles = (stable_cycles + 1) if stable else 1
+        self._quarantine_rows[token_address] = {
+            "last_ts": float(now_ts),
+            "last_cycle": float(cycle_idx if cycle_idx is not None else prev_cycle + 1),
+            "last_liq": float(liq),
+            "last_vol": float(vol),
+            "stable_cycles": float(stable_cycles),
+        }
+        if stable_cycles < required:
+            if not stable:
+                return False, (
+                    f"quarantine_unstable:liq_delta={liq_delta:.3f}/{max_liq_delta:.3f} "
+                    f"vol_delta={vol_delta:.3f}/{max_vol_delta:.3f}"
+                )
+            return False, f"quarantine_warmup:{stable_cycles}/{required}"
+        return True, f"quarantine_ok:{stable_cycles}/{required}"
+
+    def _count_open_unverified_positions(self) -> int:
+        n = 0
+        for pos in self.open_positions.values():
+            if not self._is_token_sell_verified(pos.token_address):
+                n += 1
+        return int(n)
+
+    def _pause_new_tokens_after_sell_fail(self, detail: str) -> None:
+        pause_seconds = max(0, int(getattr(config, "LIVE_NEW_TOKEN_PAUSE_ON_SELL_FAIL_SECONDS", 900) or 900))
+        if pause_seconds <= 0:
+            return
+        until_ts = time.time() + float(pause_seconds)
+        if until_ts > float(self._new_token_pause_until_ts):
+            self._new_token_pause_until_ts = float(until_ts)
+        logger.warning(
+            "NEW_TOKEN_PAUSE reason=sell_fail pause=%ss until_ts=%s detail=%s",
+            pause_seconds,
+            int(self._new_token_pause_until_ts),
+            self._short_error_text(detail),
+        )
 
     def _apply_startup_reset(self) -> None:
         force_reset = bool(getattr(config, "PAPER_RESET_FORCE_ON_START", True))
@@ -495,6 +992,9 @@ class AutoTrader:
         recovery_step = max(1, int(getattr(config, "AUTO_TRADE_TOKEN_COOLDOWN_RECOVERY_STEP", 1) or 1))
         cap_seconds = max(base, int(getattr(config, "AUTO_TRADE_TOKEN_COOLDOWN_MAX_SECONDS", base) or base))
         patterns = list(getattr(config, "AUTO_TRADE_TOKEN_COOLDOWN_ESCALATE_REASONS", []) or [])
+        if "EARLY_RISK" not in {str(x or "").strip().upper() for x in patterns}:
+            # Always escalate quick re-entry after early-risk exits to prevent churn loops.
+            patterns.append("EARLY_RISK")
 
         strikes_prev = int(self.token_cooldown_strikes.get(normalized, 0) or 0)
         strikes_next = strikes_prev
@@ -868,6 +1368,151 @@ class AutoTrader:
         last_ts = max(float(ts) for ts in self.trade_open_timestamps)
         return max(0.0, now_ts - last_ts)
 
+    def _prune_batch_open_window(self) -> None:
+        window = max(5, int(getattr(config, "BURST_GOVERNOR_WINDOW_SECONDS", 45) or 45))
+        now_ts = datetime.now(timezone.utc).timestamp()
+        self._recent_batch_open_timestamps = [
+            float(ts) for ts in (self._recent_batch_open_timestamps or []) if (now_ts - float(ts)) <= float(window)
+        ]
+
+    def _opens_in_burst_window(self) -> int:
+        self._prune_batch_open_window()
+        return int(len(self._recent_batch_open_timestamps))
+
+    def _profit_engine_window_metrics(self) -> dict[str, float]:
+        mins = max(15, int(getattr(config, "PROFIT_ENGINE_WINDOW_MINUTES", 60) or 60))
+        rows = self._closed_rows_window(window_minutes=mins)
+        closed = int(len(rows))
+        realized = float(sum(float(getattr(p, "pnl_usd", 0.0) or 0.0) for p in rows))
+        avg_net = float(realized) / float(max(1, closed))
+        wins = sum(1 for p in rows if float(getattr(p, "pnl_usd", 0.0) or 0.0) > 0.0)
+        losses = sum(1 for p in rows if float(getattr(p, "pnl_usd", 0.0) or 0.0) < 0.0)
+        non_be = max(1, int(wins + losses))
+        loss_share = float(losses) / float(non_be)
+        pnl_per_hour = float(realized) / max(1.0 / 60.0, float(mins) / 60.0)
+        return {
+            "closed": float(closed),
+            "realized": float(realized),
+            "avg_net": float(avg_net),
+            "loss_share": float(loss_share),
+            "pnl_per_hour": float(pnl_per_hour),
+            "window_minutes": float(mins),
+        }
+
+    def _profit_engine_batch_limit(
+        self,
+        *,
+        mode: str,
+        selected_cap: int,
+    ) -> tuple[int, bool, str]:
+        cap = max(1, int(selected_cap))
+        if not bool(getattr(config, "PROFIT_ENGINE_ENABLED", True)):
+            return cap, False, "off"
+
+        m = self._profit_engine_window_metrics()
+        min_closed = max(1, int(getattr(config, "PROFIT_ENGINE_MIN_CLOSED", 8) or 8))
+        target_pnl_h = float(getattr(config, "PROFIT_ENGINE_TARGET_PNL_PER_HOUR_USD", 0.50) or 0.50)
+        strict_avg = float(getattr(config, "PROFIT_ENGINE_STRICT_AVG_NET_USD", 0.010) or 0.010)
+        good_avg = float(getattr(config, "PROFIT_ENGINE_GOOD_AVG_NET_USD", 0.020) or 0.020)
+        hard_n_cap = max(1, int(getattr(config, "PROFIT_ENGINE_MAX_N_CAP", 4) or 4))
+
+        closed = int(m["closed"])
+        avg_net = float(m["avg_net"])
+        pnl_h = float(m["pnl_per_hour"])
+        loss_share = float(m["loss_share"])
+        strict_mode = False
+
+        # Cold start stays conservative until enough samples.
+        if closed < min_closed:
+            strict_mode = True
+            out = min(cap, 1)
+            return out, strict_mode, f"cold_start closed={closed}<{min_closed}"
+
+        # Tighten aggressively when model drifts toward flat/negative regime.
+        if pnl_h < (target_pnl_h * 0.6) or avg_net < strict_avg or loss_share >= 0.62:
+            strict_mode = True
+            out = min(cap, 1)
+            return out, strict_mode, f"tighten pnl_h={pnl_h:.3f} avg={avg_net:.4f} loss={loss_share:.2f}"
+
+        # Middle zone: controlled conveyor.
+        if pnl_h < target_pnl_h or avg_net < good_avg:
+            out = min(cap, 2, hard_n_cap)
+            return out, strict_mode, f"neutral pnl_h={pnl_h:.3f} avg={avg_net:.4f}"
+
+        # Good zone: allow more flow but capped.
+        out = min(cap + 1, hard_n_cap)
+        return out, strict_mode, f"expand pnl_h={pnl_h:.3f} avg={avg_net:.4f}"
+
+    def _source_window_metrics(self, source: str) -> dict[str, float]:
+        key = str(source or "").strip().lower()
+        if not key:
+            return self._ev_stats_from_pnls([])
+        mins = max(30, int(getattr(config, "SOURCE_ROUTER_WINDOW_MINUTES", 120) or 120))
+        rows = [
+            p
+            for p in self._closed_rows_window(window_minutes=mins)
+            if str(getattr(p, "source", "") or "").strip().lower() == key
+        ]
+        return self._ev_stats_from_pnls([float(getattr(p, "pnl_usd", 0.0) or 0.0) for p in rows])
+
+    def _source_routing_adjustments(self, *, source: str, candidate_id: str) -> dict[str, float | str]:
+        out: dict[str, float | str] = {
+            "entry_probability": 1.0,
+            "samples": 0.0,
+            "avg_net_usd": 0.0,
+            "loss_share": 0.0,
+            "detail": "neutral",
+            "seed": "",
+        }
+        if not bool(getattr(config, "SOURCE_ROUTER_ENABLED", True)):
+            return out
+        stats = self._source_window_metrics(source)
+        samples = float(stats.get("samples", 0.0) or 0.0)
+        avg_net = float(stats.get("avg_net_usd", 0.0) or 0.0)
+        loss_share = float(stats.get("loss_share", 0.0) or 0.0)
+        out["samples"] = samples
+        out["avg_net_usd"] = avg_net
+        out["loss_share"] = loss_share
+        min_trades = max(1.0, float(getattr(config, "SOURCE_ROUTER_MIN_TRADES", 8) or 8))
+        if samples < min_trades:
+            out["detail"] = f"sparse samples={int(samples)}<{int(min_trades)}"
+            return out
+        bad = (
+            avg_net <= float(getattr(config, "SOURCE_ROUTER_BAD_AVG_NET_USD", -0.0005) or -0.0005)
+            or loss_share >= float(getattr(config, "SOURCE_ROUTER_BAD_LOSS_SHARE", 0.62) or 0.62)
+        )
+        severe = (
+            avg_net <= float(getattr(config, "SOURCE_ROUTER_SEVERE_AVG_NET_USD", -0.0012) or -0.0012)
+            or loss_share >= float(getattr(config, "SOURCE_ROUTER_SEVERE_LOSS_SHARE", 0.72) or 0.72)
+        )
+        if severe:
+            out["entry_probability"] = float(
+                getattr(config, "SOURCE_ROUTER_SEVERE_ENTRY_PROBABILITY", 0.35) or 0.35
+            )
+            out["detail"] = f"severe samples={int(samples)} avg={avg_net:.5f} loss={loss_share:.2f}"
+        elif bad:
+            out["entry_probability"] = float(
+                getattr(config, "SOURCE_ROUTER_BAD_ENTRY_PROBABILITY", 0.55) or 0.55
+            )
+            out["detail"] = f"bad samples={int(samples)} avg={avg_net:.5f} loss={loss_share:.2f}"
+        else:
+            out["detail"] = f"ok samples={int(samples)} avg={avg_net:.5f} loss={loss_share:.2f}"
+            return out
+        minute_slot = int(time.time() // 60)
+        out["seed"] = f"src|{str(source).lower()}|{str(candidate_id)}|{minute_slot}"
+        return out
+
+    @staticmethod
+    def _paper_entry_impact_ok(position_size_usd: float, liquidity_usd: float) -> tuple[bool, float]:
+        if not bool(getattr(config, "PAPER_ENTRY_IMPACT_GUARD_ENABLED", True)):
+            return True, 0.0
+        liq = max(0.0, float(liquidity_usd or 0.0))
+        if liq <= 0.0:
+            return False, 10**9
+        impact = (max(0.0, float(position_size_usd)) / liq) * 100.0
+        max_impact = max(0.05, float(getattr(config, "PAPER_MAX_ENTRY_IMPACT_PERCENT", 1.20) or 1.20))
+        return bool(impact <= max_impact), float(impact)
+
     def _prune_core_probe_window(self, window_seconds: int | None = None) -> None:
         ts = list(getattr(self, "_core_probe_open_timestamps", []) or [])
         window = max(
@@ -1169,6 +1814,9 @@ class AutoTrader:
         key = str(reason or "unknown").strip().lower() or "unknown"
         self._skip_reason_counts_window[key] = int(self._skip_reason_counts_window.get(key, 0)) + 1
         ctx = dict(self._active_trade_decision_context or {})
+        source_key = str(ctx.get("source", "unknown") or "unknown").strip().lower() or "unknown"
+        src_skips = self._skip_reasons_by_source_window.setdefault(source_key, {})
+        src_skips[key] = int(src_skips.get(key, 0)) + 1
         if ctx:
             payload = {
                 "ts": time.time(),
@@ -1183,6 +1831,29 @@ class AutoTrader:
     def pop_skip_reason_counts_window(self) -> dict[str, int]:
         out = dict(self._skip_reason_counts_window)
         self._skip_reason_counts_window = {}
+        return out
+
+    def pop_source_flow_window(self) -> dict[str, dict[str, int]]:
+        sources = set(self._plan_attempts_by_source_window.keys())
+        sources.update(self._opens_by_source_window.keys())
+        sources.update(self._skip_reasons_by_source_window.keys())
+        out: dict[str, dict[str, int]] = {}
+        for raw_src in sources:
+            src = str(raw_src or "unknown").strip().lower() or "unknown"
+            plan_attempts = int(self._plan_attempts_by_source_window.get(src, 0) or 0)
+            opens = int(self._opens_by_source_window.get(src, 0) or 0)
+            skip_map = dict(self._skip_reasons_by_source_window.get(src, {}) or {})
+            ev_net_low_skips = int(skip_map.get("ev_net_low", 0) or 0)
+            ev_positive = max(0, plan_attempts - ev_net_low_skips)
+            out[src] = {
+                "plan_attempts": plan_attempts,
+                "opens": opens,
+                "ev_net_low_skips": ev_net_low_skips,
+                "ev_positive": int(ev_positive),
+            }
+        self._plan_attempts_by_source_window = {}
+        self._opens_by_source_window = {}
+        self._skip_reasons_by_source_window = {}
         return out
 
     @staticmethod
@@ -1216,6 +1887,154 @@ class AutoTrader:
         if len(text) <= limit:
             return text
         return f"{text[:limit]}..."
+
+    @staticmethod
+    def _token_source_key(token: dict[str, Any]) -> str:
+        return str((token or {}).get("source", "unknown") or "unknown").strip().lower() or "unknown"
+
+    @staticmethod
+    def _is_watchlist_source(source_key: str) -> bool:
+        return str(source_key or "").strip().lower().startswith("watchlist")
+
+    @staticmethod
+    def _batch_candidate_key(token: dict[str, Any]) -> str:
+        addr = normalize_address(str((token or {}).get("address", "") or ""))
+        if addr:
+            return f"addr:{addr}"
+        cid = str((token or {}).get("_candidate_id", "") or "").strip()
+        if cid:
+            return f"cid:{cid}"
+        sym = str((token or {}).get("symbol", "") or "").strip().upper()
+        if sym:
+            return f"sym:{sym}"
+        return f"obj:{id(token)}"
+
+    def _rebalance_plan_batch_sources(
+        self,
+        *,
+        selected: list[tuple[dict[str, Any], dict[str, Any]]],
+        eligible: list[tuple[dict[str, Any], dict[str, Any]]],
+    ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+        if not selected:
+            return selected
+        if not bool(getattr(config, "PLAN_SOURCE_DIVERSITY_ENABLED", True)):
+            return selected
+
+        budget = int(len(selected))
+        if budget <= 1:
+            return selected
+
+        max_single_share = _safe_float(getattr(config, "PLAN_MAX_SINGLE_SOURCE_SHARE", 0.50), 0.50)
+        max_single_share = max(0.20, min(1.00, float(max_single_share)))
+        max_watch_share = _safe_float(getattr(config, "PLAN_MAX_WATCHLIST_SHARE", 0.30), 0.30)
+        max_watch_share = max(0.00, min(1.00, float(max_watch_share)))
+        min_non_watch = max(0, int(getattr(config, "PLAN_MIN_NON_WATCHLIST_PER_BATCH", 1) or 1))
+        min_non_watch = min(min_non_watch, budget)
+
+        max_per_source = max(1, int(math.floor(float(budget) * float(max_single_share))))
+        max_watch = int(math.floor(float(budget) * float(max_watch_share)))
+        if max_watch_share <= 0.0:
+            max_watch = 0
+        elif max_watch <= 0:
+            max_watch = 1
+
+        pool: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        pool_seen: set[str] = set()
+        for token_data, score_data in list(selected) + list(eligible):
+            key = self._batch_candidate_key(token_data)
+            if key in pool_seen:
+                continue
+            pool_seen.add(key)
+            pool.append((token_data, score_data))
+
+        picked: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        picked_keys: set[str] = set()
+        source_counts: dict[str, int] = {}
+        watch_count = 0
+        non_watch_count = 0
+
+        def _try_add(
+            item: tuple[dict[str, Any], dict[str, Any]],
+            *,
+            enforce_watch_cap: bool,
+            enforce_source_cap: bool,
+        ) -> bool:
+            nonlocal watch_count, non_watch_count
+            token_data, _ = item
+            key = self._batch_candidate_key(token_data)
+            if key in picked_keys:
+                return False
+            src = self._token_source_key(token_data)
+            is_watch = self._is_watchlist_source(src)
+            cur_src = int(source_counts.get(src, 0))
+            if enforce_watch_cap and is_watch and watch_count >= max_watch:
+                return False
+            if enforce_source_cap and cur_src >= max_per_source:
+                return False
+            picked.append(item)
+            picked_keys.add(key)
+            source_counts[src] = cur_src + 1
+            if is_watch:
+                watch_count += 1
+            else:
+                non_watch_count += 1
+            return True
+
+        # Pass 1: reserve capacity for non-watchlist symbols if available.
+        if min_non_watch > 0:
+            for item in pool:
+                if non_watch_count >= min_non_watch:
+                    break
+                src = self._token_source_key(item[0])
+                if self._is_watchlist_source(src):
+                    continue
+                _try_add(item, enforce_watch_cap=True, enforce_source_cap=True)
+
+        # Pass 2: normal strict fill under caps.
+        for item in pool:
+            if len(picked) >= budget:
+                break
+            _try_add(item, enforce_watch_cap=True, enforce_source_cap=True)
+
+        # Pass 3: relax per-source cap (keep watchlist cap) to avoid empty batches.
+        if len(picked) < budget:
+            for item in pool:
+                if len(picked) >= budget:
+                    break
+                _try_add(item, enforce_watch_cap=True, enforce_source_cap=False)
+
+        # Pass 4: final fallback fill (do not return empty if market is thin).
+        if len(picked) < budget:
+            for item in pool:
+                if len(picked) >= budget:
+                    break
+                _try_add(item, enforce_watch_cap=False, enforce_source_cap=False)
+
+        if not picked:
+            return selected
+
+        def _source_hist(rows: list[tuple[dict[str, Any], dict[str, Any]]]) -> dict[str, int]:
+            out: dict[str, int] = {}
+            for token_data, _ in rows:
+                src = self._token_source_key(token_data)
+                out[src] = int(out.get(src, 0)) + 1
+            return out
+
+        old_hist = _source_hist(selected)
+        new_hist = _source_hist(picked)
+        if old_hist != new_hist or len(picked) != len(selected):
+            logger.info(
+                "PLAN_SOURCE_DIVERSITY budget=%s old=%s new=%s watch_cap=%s source_cap=%s min_non_watch=%s non_watch_final=%s",
+                budget,
+                old_hist,
+                new_hist,
+                max_watch,
+                max_per_source,
+                min_non_watch,
+                non_watch_count,
+            )
+
+        return picked
 
     @staticmethod
     def _pnl_outcome(pnl_usd: float) -> str:
@@ -1516,15 +2335,58 @@ class AutoTrader:
 
         # Parse common honeypot.is fields. We keep it defensive because the response can change.
         hp = payload if isinstance(payload, dict) else {}
-        is_honeypot = bool((hp.get("honeypotResult") or {}).get("isHoneypot", False))
+        is_honeypot = bool(self._honeypot_bool_or_none((hp.get("honeypotResult") or {}).get("isHoneypot")) is True)
         simulation = hp.get("simulationResult") or {}
-        buy_tax = float(simulation.get("buyTax") or 0)
-        sell_tax = float(simulation.get("sellTax") or 0)
+        buy_tax = float(self._honeypot_float_or_none(simulation.get("buyTax")) or 0.0)
+        sell_tax = float(self._honeypot_float_or_none(simulation.get("sellTax")) or 0.0)
+        simulation_success = self._honeypot_bool_or_none(hp.get("simulationSuccess"))
+        simulation_error = str(hp.get("simulationError", "") or "").strip()
         can_sell = simulation.get("canSell")
         if can_sell is None:
             # Some versions expose it under a different key.
             can_sell = simulation.get("sellSuccess")
-        can_sell_bool = True if can_sell is None else bool(can_sell)
+        if can_sell is None:
+            can_sell = simulation.get("isSellable")
+        if can_sell is None:
+            # Newer payloads can expose max sell amount instead of boolean.
+            max_sell = self._honeypot_float_or_none(
+                simulation.get("maxSell")
+                or simulation.get("maxSellToken")
+                or simulation.get("maxSellAmount")
+            )
+            if max_sell is not None:
+                can_sell = max_sell > 0
+        can_sell_parsed = self._honeypot_bool_or_none(can_sell)
+        can_sell_bool = True if can_sell_parsed is None else bool(can_sell_parsed)
+
+        summary_flags: list[tuple[str, str]] = []
+        summary_obj = hp.get("summary")
+        if isinstance(summary_obj, dict):
+            raw = summary_obj.get("flags")
+            if isinstance(raw, list):
+                for item in raw:
+                    if isinstance(item, dict):
+                        code = str(item.get("flag", "") or "").strip().lower()
+                        severity = str(item.get("severity", "") or "").strip().lower()
+                    else:
+                        code = str(item or "").strip().lower()
+                        severity = ""
+                    if code:
+                        summary_flags.append((code, severity))
+
+        top_flags = hp.get("flags")
+        if isinstance(top_flags, list):
+            for item in top_flags:
+                code = str(item or "").strip().lower()
+                if code and not any(code == exist for exist, _sev in summary_flags):
+                    summary_flags.append((code, ""))
+
+        holder_analysis = hp.get("holderAnalysis")
+        holder_failed = None
+        holder_success = None
+        if isinstance(holder_analysis, dict):
+            holder_failed = self._safe_int_or_none(holder_analysis.get("failed"))
+            holder_success = self._safe_int_or_none(holder_analysis.get("successful"))
 
         max_buy_tax = float(config.HONEYPOT_MAX_BUY_TAX_PERCENT)
         max_sell_tax = float(config.HONEYPOT_MAX_SELL_TAX_PERCENT)
@@ -1534,9 +2396,22 @@ class AutoTrader:
         if is_honeypot:
             ok = False
             reasons.append("is_honeypot")
+        if simulation_success is False:
+            ok = False
+            reasons.append("simulation_failed")
+        if simulation_error:
+            ok = False
+            reasons.append("simulation_error")
         if not can_sell_bool:
             ok = False
             reasons.append("cannot_sell")
+        if holder_failed is not None and holder_success is not None and holder_failed > 0 and holder_success <= 0:
+            ok = False
+            reasons.append("holder_sell_failed")
+        for code, severity in summary_flags:
+            if severity == "critical" or code in {"high_fail_rate", "cannot_sell"}:
+                ok = False
+                reasons.append(f"flag:{code}")
         if max_buy_tax > 0 and buy_tax > max_buy_tax:
             ok = False
             reasons.append(f"buy_tax>{max_buy_tax:.1f}%({buy_tax:.1f}%)")
@@ -1612,13 +2487,78 @@ class AutoTrader:
         if await self._check_live_profit_stop():
             return 0
 
-        # only BUY recommendations above configured threshold
+        # Base path: BUY recommendations above configured threshold.
         eligible = [
             (token, score)
             for token, score in candidates
             if str(score.get("recommendation", "SKIP")) == "BUY"
             and int(score.get("score", 0)) >= int(config.MIN_TOKEN_SCORE)
         ]
+        # Do not waste planner slots on rows that cannot be opened by construction.
+        # They would fail in plan_trade with address_or_duplicate anyway.
+        prefilter_missing_addr = 0
+        prefilter_open_dup = 0
+        if eligible:
+            eligible_prefiltered: list[tuple[dict[str, Any], dict[str, Any]]] = []
+            for token, score in eligible:
+                token_address = normalize_address(str((token or {}).get("address", "") or ""))
+                if not token_address:
+                    prefilter_missing_addr += 1
+                    self._bump_skip_reason("address_or_duplicate")
+                    continue
+                if token_address in self.open_positions:
+                    prefilter_open_dup += 1
+                    self._bump_skip_reason("address_or_duplicate")
+                    continue
+                eligible_prefiltered.append((token, score))
+            eligible = eligible_prefiltered
+            if (prefilter_missing_addr + prefilter_open_dup) > 0:
+                logger.info(
+                    "AutoTrade batch prefilter removed=%s missing_addr=%s open_duplicate=%s",
+                    prefilter_missing_addr + prefilter_open_dup,
+                    prefilter_missing_addr,
+                    prefilter_open_dup,
+                )
+        # Underflow fallback (matrix tuning mode): if there are no BUY candidates in cycle,
+        # allow HOLD candidates with a separate floor to keep exploration alive.
+        if (not eligible) and bool(getattr(config, "PLAN_UNDERFLOW_ALLOW_HOLD", False)):
+            hold_floor = max(0, int(getattr(config, "PLAN_UNDERFLOW_HOLD_MIN_SCORE", 35) or 35))
+            eligible = [
+                (token, score)
+                for token, score in candidates
+                if str(score.get("recommendation", "SKIP")).strip().upper() in {"HOLD", "BUY"}
+                and int(score.get("score", 0)) >= hold_floor
+            ]
+            if eligible:
+                logger.warning(
+                    "PLAN_UNDERFLOW enabled=1 hold_floor=%s eligible=%s",
+                    hold_floor,
+                    len(eligible),
+                )
+        if eligible:
+            # Fallback path can inject rows that were not part of BUY prefilter.
+            post_prefilter_missing_addr = 0
+            post_prefilter_open_dup = 0
+            eligible_post_prefilter: list[tuple[dict[str, Any], dict[str, Any]]] = []
+            for token, score in eligible:
+                token_address = normalize_address(str((token or {}).get("address", "") or ""))
+                if not token_address:
+                    post_prefilter_missing_addr += 1
+                    self._bump_skip_reason("address_or_duplicate")
+                    continue
+                if token_address in self.open_positions:
+                    post_prefilter_open_dup += 1
+                    self._bump_skip_reason("address_or_duplicate")
+                    continue
+                eligible_post_prefilter.append((token, score))
+            eligible = eligible_post_prefilter
+            if (post_prefilter_missing_addr + post_prefilter_open_dup) > 0:
+                logger.info(
+                    "AutoTrade batch post-prefilter removed=%s missing_addr=%s open_duplicate=%s",
+                    post_prefilter_missing_addr + post_prefilter_open_dup,
+                    post_prefilter_missing_addr,
+                    post_prefilter_open_dup,
+                )
         if not eligible:
             return 0
 
@@ -1644,17 +2584,88 @@ class AutoTrader:
         else:
             selected = eligible
 
+        # Profit-engine: dynamic per-cycle throughput by realized pnl/hour + avg net/trade.
+        dynamic_cap, strict_mode, pe_detail = self._profit_engine_batch_limit(mode=mode, selected_cap=len(selected))
+        if strict_mode and bool(getattr(config, "PROFIT_ENGINE_STRICT_CORE_ONLY", True)):
+            selected = [
+                (token, score)
+                for token, score in selected
+                if str((token or {}).get("_entry_channel", "core") or "core").strip().lower() == "core"
+            ]
+        selected = selected[: max(1, int(dynamic_cap))]
+        selected = self._rebalance_plan_batch_sources(selected=selected, eligible=eligible)
+
+        # Burst governor: avoid correlated packet opens in one cycle/window.
+        open_budget: int | None = None
+        if bool(getattr(config, "BURST_GOVERNOR_ENABLED", True)):
+            max_batch = max(1, int(getattr(config, "BURST_GOVERNOR_MAX_OPENS_PER_BATCH", 2) or 2))
+            max_sym = max(1, int(getattr(config, "BURST_GOVERNOR_MAX_PER_SYMBOL_PER_BATCH", 1) or 1))
+            max_cluster = max(1, int(getattr(config, "BURST_GOVERNOR_MAX_PER_CLUSTER_PER_BATCH", 1) or 1))
+            max_window = max(1, int(getattr(config, "BURST_GOVERNOR_MAX_OPENS_PER_WINDOW", 2) or 2))
+            opens_window = self._opens_in_burst_window()
+            allow_now = max(0, int(max_window) - int(opens_window))
+            budget = min(int(max_batch), int(allow_now))
+            open_budget = int(budget)
+            if budget <= 0:
+                selected = []
+            else:
+                # Try more than open budget to survive pre-trade skips (cooldowns/duplicates)
+                # while still enforcing the strict opens-per-batch budget.
+                attempt_mult = max(
+                    1,
+                    int(getattr(config, "BURST_GOVERNOR_ATTEMPT_MULTIPLIER", 4) or 4),
+                )
+                attempt_budget = min(len(selected), max(int(budget), int(budget) * int(attempt_mult)))
+                picked: list[tuple[dict[str, Any], dict[str, Any]]] = []
+                sym_counts: dict[str, int] = {}
+                cluster_counts: dict[str, int] = {}
+                for token, score in selected:
+                    symbol = self._symbol_key(str((token or {}).get("symbol", "") or ""))
+                    try:
+                        cluster = self._token_cluster_key(
+                            score=int((score or {}).get("score", 0) or 0),
+                            liquidity_usd=float((token or {}).get("liquidity") or 0.0),
+                            volume_5m=float((token or {}).get("volume_5m") or 0.0),
+                            price_change_5m=float((token or {}).get("price_change_5m") or 0.0),
+                            risk_level=str((token or {}).get("risk_level", "MEDIUM") or "MEDIUM").upper(),
+                        )
+                    except Exception as exc:
+                        # Keep batch planner alive even if cluster-key input contract drifts.
+                        logger.warning(
+                            "AutoTrade cluster_key_fallback token=%s reason=%s",
+                            symbol or "-",
+                            self._short_error_text(exc),
+                        )
+                        cluster = "fallback_cluster"
+                    if int(sym_counts.get(symbol, 0)) >= int(max_sym):
+                        continue
+                    if int(cluster_counts.get(cluster, 0)) >= int(max_cluster):
+                        continue
+                    picked.append((token, score))
+                    sym_counts[symbol] = int(sym_counts.get(symbol, 0)) + 1
+                    cluster_counts[cluster] = int(cluster_counts.get(cluster, 0)) + 1
+                    if len(picked) >= int(attempt_budget):
+                        break
+                selected = picked
+
         opened = 0
         for token_data, score_data in selected:
+            if open_budget is not None and opened >= int(open_budget):
+                break
             pos = await self.plan_trade(token_data, score_data)
             if pos:
                 opened += 1
+                self._recent_batch_open_timestamps.append(datetime.now(timezone.utc).timestamp())
+        self._prune_batch_open_window()
         logger.info(
-            "AutoTrade batch mode=%s candidates=%s eligible=%s opened=%s",
+            "AutoTrade batch mode=%s candidates=%s eligible=%s selected=%s opened=%s pe=%s burst_window=%s",
             mode,
             len(candidates),
             len(eligible),
+            len(selected),
             opened,
+            pe_detail,
+            self._opens_in_burst_window(),
         )
         return opened
 
@@ -1773,12 +2784,31 @@ class AutoTrader:
             "market_mode": ctx_market_mode,
             "source": str(token_data.get("source", "") or ""),
         }
+        source_key_ctx = str(token_data.get("source", "unknown") or "unknown").strip().lower() or "unknown"
+        self._plan_attempts_by_source_window[source_key_ctx] = (
+            int(self._plan_attempts_by_source_window.get(source_key_ctx, 0)) + 1
+        )
         symbol_upper = symbol.strip().upper()
         excluded_symbols = set(getattr(config, "AUTO_TRADE_EXCLUDED_SYMBOLS", []) or [])
         if symbol_upper and symbol_upper in excluded_symbols:
             self._bump_skip_reason("excluded_symbol")
             logger.info("AutoTrade skip token=%s reason=excluded_symbol", symbol)
             return None
+        excluded_symbol_keywords = [
+            str(x or "").strip().upper()
+            for x in (getattr(config, "AUTO_TRADE_EXCLUDED_SYMBOL_KEYWORDS", []) or [])
+            if str(x or "").strip()
+        ]
+        if symbol_upper and excluded_symbol_keywords:
+            matched_keyword = next((kw for kw in excluded_symbol_keywords if kw in symbol_upper), "")
+            if matched_keyword:
+                self._bump_skip_reason("excluded_symbol_keyword")
+                logger.info(
+                    "AutoTrade skip token=%s reason=excluded_symbol_keyword keyword=%s",
+                    symbol,
+                    matched_keyword,
+                )
+                return None
         if not self.can_open_trade():
             self._bump_skip_reason("disabled_or_limits")
             logger.info("AutoTrade skip token=%s reason=disabled_or_limits detail=%s", symbol, self._cannot_open_trade_detail())
@@ -1824,6 +2854,43 @@ class AutoTrader:
         entry_channel = str(token_data.get("_entry_channel", "core") or "core").strip().lower()
         if entry_channel not in {"core", "explore"}:
             entry_channel = "core"
+        source_name = str(token_data.get("source", "") or "").strip().lower()
+        source_is_watchlist = source_name.startswith("watchlist")
+        if source_is_watchlist and (not self._is_live_mode()) and (not bool(getattr(config, "PAPER_ALLOW_WATCHLIST_SOURCE", False))):
+            strict_guard_enabled = bool(getattr(config, "PAPER_WATCHLIST_STRICT_GUARD_ENABLED", True))
+            if not strict_guard_enabled:
+                self._bump_skip_reason("watchlist_source_disabled")
+                logger.info("AutoTrade skip token=%s reason=watchlist_source_disabled source=%s", symbol, source_name or "-")
+                return None
+            watch_score = int(score_data.get("score", 0) or 0)
+            watch_liq = float(token_data.get("liquidity") or 0.0)
+            watch_vol = float(token_data.get("volume_5m") or 0.0)
+            watch_abs_chg = abs(float(token_data.get("price_change_5m") or 0.0))
+            min_score = int(getattr(config, "PAPER_WATCHLIST_MIN_SCORE", 90) or 90)
+            min_liq = float(getattr(config, "PAPER_WATCHLIST_MIN_LIQUIDITY_USD", 150000.0) or 150000.0)
+            min_vol = float(getattr(config, "PAPER_WATCHLIST_MIN_VOLUME_5M_USD", 500.0) or 500.0)
+            min_abs_chg = float(getattr(config, "PAPER_WATCHLIST_MIN_ABS_CHANGE_5M", 0.30) or 0.30)
+            if (
+                watch_score < min_score
+                or watch_liq < min_liq
+                or watch_vol < min_vol
+                or watch_abs_chg < min_abs_chg
+            ):
+                self._bump_skip_reason("watchlist_strict_guard")
+                logger.info(
+                    "AutoTrade skip token=%s reason=watchlist_strict_guard source=%s score=%s/%s liq=%.0f/%.0f vol5m=%.0f/%.0f abs5m=%.2f/%.2f",
+                    symbol,
+                    source_name or "-",
+                    watch_score,
+                    min_score,
+                    watch_liq,
+                    min_liq,
+                    watch_vol,
+                    min_vol,
+                    watch_abs_chg,
+                    min_abs_chg,
+                )
+                return None
         concentration_blocked, concentration_detail = self._symbol_concentration_blocked(
             symbol=symbol,
             entry_tier=entry_tier,
@@ -1847,13 +2914,44 @@ class AutoTrader:
                 str(token_data.get("source", "-")),
             )
             return None
+        if self._is_hard_blocked_token(token_address, symbol=symbol):
+            self._bump_skip_reason("hard_blocklist")
+            self._blacklist_add(token_address, "hard_blocklist:config", ttl_seconds=90 * 24 * 3600)
+            logger.warning("AutoTrade skip token=%s reason=hard_blocklist address=%s", symbol, token_address)
+            return None
+        anti_choke = self._anti_choke_active()
         cooldown_until = float(self.token_cooldowns.get(token_address, 0.0))
         now_ts = datetime.now(timezone.utc).timestamp()
         if cooldown_until > now_ts:
-            self._bump_skip_reason("cooldown")
-            logger.info("AutoTrade skip token=%s reason=cooldown_left_%ss", symbol, int(cooldown_until - now_ts))
+            cooldown_left = int(max(1, cooldown_until - now_ts))
+            bypass_max_seconds = max(
+                0,
+                int(getattr(config, "ANTI_CHOKE_BYPASS_TOKEN_COOLDOWN_MAX_SECONDS", 180) or 180),
+            )
+            allow_token_cooldown_bypass = (
+                anti_choke
+                and bool(getattr(config, "ANTI_CHOKE_ALLOW_TOKEN_COOLDOWN_BYPASS", True))
+                and cooldown_left <= bypass_max_seconds
+            )
+            if allow_token_cooldown_bypass:
+                logger.info(
+                    "AutoTrade bypass token=%s reason=token_cooldown anti_choke=true left=%ss",
+                    symbol,
+                    cooldown_left,
+                )
+            else:
+                self._bump_skip_reason("cooldown")
+                logger.info("AutoTrade skip token=%s reason=cooldown_left_%ss", symbol, cooldown_left)
+                return None
+        is_unverified_token = self._is_live_mode() and (not self._is_token_sell_verified(token_address))
+        if is_unverified_token and float(self._new_token_pause_until_ts or 0.0) > now_ts:
+            self._bump_skip_reason("new_token_pause")
+            logger.warning(
+                "AutoTrade skip token=%s reason=new_token_pause left=%ss",
+                symbol,
+                int(float(self._new_token_pause_until_ts) - now_ts),
+            )
             return None
-        anti_choke = self._anti_choke_active()
         symbol_cd_left = self._symbol_cooldown_left_seconds(symbol_upper)
         if symbol_cd_left > 0:
             bypass_max_seconds = max(
@@ -1874,6 +2972,39 @@ class AutoTrader:
             else:
                 self._bump_skip_reason("symbol_cooldown")
                 logger.info("AutoTrade skip token=%s reason=symbol_cooldown_left_%ss", symbol, symbol_cd_left)
+                return None
+        if is_unverified_token and bool(getattr(config, "LIVE_UNVERIFIED_RISK_CAPS_ENABLED", True)):
+            unverified_open = int(self._count_open_unverified_positions())
+            max_unverified_open = max(
+                1,
+                int(getattr(config, "LIVE_UNVERIFIED_MAX_OPEN_POSITIONS", 1) or 1),
+            )
+            if unverified_open >= max_unverified_open:
+                self._bump_skip_reason("unverified_open_cap")
+                logger.info(
+                    "AutoTrade skip token=%s reason=unverified_open_cap open=%s cap=%s",
+                    symbol,
+                    unverified_open,
+                    max_unverified_open,
+                )
+                return None
+
+        source_route = self._source_routing_adjustments(
+            source=source_name,
+            candidate_id=candidate_id,
+        )
+        src_prob = float(source_route.get("entry_probability", 1.0) or 1.0)
+        if src_prob < 1.0:
+            seed = str(source_route.get("seed", "") or f"src|{source_name}|{candidate_id}")
+            if not self._passes_probability_gate(seed=seed, probability=src_prob):
+                self._bump_skip_reason("source_route_prob")
+                logger.info(
+                    "AutoTrade skip token=%s reason=source_route_prob source=%s p=%.2f detail=%s",
+                    symbol,
+                    source_name or "-",
+                    src_prob,
+                    str(source_route.get("detail", "")),
+                )
                 return None
 
         symbol_metrics = self._symbol_window_metrics(symbol_upper)
@@ -2015,6 +3146,42 @@ class AutoTrader:
         volume_5m = float(token_data.get("volume_5m") or 0)
         price_change_5m = float(token_data.get("price_change_5m") or 0)
         risk_level = str(token_data.get("risk_level", "MEDIUM")).upper()
+        guard_ok, guard_reason = self._token_guard_result(token_data)
+        if not guard_ok:
+            self._bump_skip_reason("safety_guards")
+            logger.info(
+                "AutoTrade skip token=%s reason=safety_guards detail=%s",
+                symbol,
+                self._short_error_text(guard_reason),
+            )
+            guard_reason_s = str(guard_reason or "")
+            if guard_reason_s.startswith("risky_contract_flags:"):
+                self._blacklist_add(token_address, f"safety_guard:{self._short_error_text(guard_reason)}")
+            elif self._is_transient_safety_reason(guard_reason_s):
+                self._apply_transient_safety_cooldown(token_address, guard_reason_s)
+                if bool(getattr(config, "ENTRY_TRANSIENT_SAFETY_TO_BLACKLIST", False)):
+                    self._blacklist_add(token_address, f"safety_guard:{self._short_error_text(guard_reason)}")
+            return None
+        quarantine_ok, quarantine_reason = self._quarantine_gate(
+            token_data,
+            candidate_id=candidate_id,
+            token_address=token_address,
+        )
+        if not quarantine_ok:
+            reason_l = str(quarantine_reason).lower()
+            if reason_l.startswith("source_divergence"):
+                self._bump_skip_reason("source_divergence")
+            elif reason_l.startswith("quarantine_spread_high"):
+                self._bump_skip_reason("quarantine_spread")
+            else:
+                self._bump_skip_reason("quarantine")
+            logger.info(
+                "AutoTrade skip token=%s reason=%s detail=%s",
+                symbol,
+                ("source_divergence" if reason_l.startswith("source_divergence") else "quarantine"),
+                self._short_error_text(quarantine_reason),
+            )
+            return None
         cluster_key = self._token_cluster_key(
             score=int(score),
             liquidity_usd=float(liquidity_usd),
@@ -2073,10 +3240,6 @@ class AutoTrader:
                     required_volume,
                 )
                 return None
-        if not self._passes_token_guards(token_data):
-            self._bump_skip_reason("safety_guards")
-            logger.info("AutoTrade skip token=%s reason=safety_guards", symbol)
-            return None
 
         # First pass cost model (neutral size), then re-price using actual position size below.
         cost_profile = self._estimate_cost_profile(liquidity_usd, risk_level, score)
@@ -2155,6 +3318,12 @@ class AutoTrader:
         position_size_usd *= float(quality_size_mult)
         reinvest_mult, reinvest_detail = self._reinvest_multiplier(expected_edge_percent=float(expected_edge_percent))
         position_size_usd *= float(reinvest_mult)
+        if is_unverified_token and bool(getattr(config, "LIVE_UNVERIFIED_RISK_CAPS_ENABLED", True)):
+            unverified_size_mult = max(
+                0.05,
+                min(1.0, float(getattr(config, "LIVE_UNVERIFIED_SIZE_MULT", 0.60) or 0.60)),
+            )
+            position_size_usd *= float(unverified_size_mult)
 
         position_size_usd = min(position_size_usd, self._available_balance_usd())
         position_size_usd = self._apply_max_loss_per_trade_cap(
@@ -2282,7 +3451,14 @@ class AutoTrader:
             is_tier_a
             and is_core_channel
         )
-        if bool(getattr(config, "ENTRY_A_CORE_MIN_TRADE_USD_ENABLED", True)) and is_tier_a:
+        apply_a_core_min_trade_floor = bool(getattr(config, "ENTRY_A_CORE_MIN_TRADE_USD_ENABLED", True)) and (
+            is_a_core
+            or (
+                is_tier_a
+                and bool(getattr(config, "ENTRY_A_CORE_MIN_TRADE_APPLY_ANY_TIER_A", False))
+            )
+        )
+        if apply_a_core_min_trade_floor:
             allow_red = bool(getattr(config, "ENTRY_A_CORE_MIN_TRADE_APPLY_IN_RED", False))
             if allow_red or mm != "RED":
                 floor_usd = max(0.0, float(getattr(config, "ENTRY_A_CORE_MIN_TRADE_USD", 0.45) or 0.45))
@@ -2302,6 +3478,33 @@ class AutoTrader:
                     edge_percent_for_decision = float(expected_edge_percent) * float(regime_edge_mult)
 
         min_trade_usd = max(0.01, float(getattr(config, "MIN_TRADE_USD", 0.25) or 0.25))
+        if position_size_usd < min_trade_usd and (not self._is_live_mode()):
+            paper_floor = max(
+                min_trade_usd,
+                float(getattr(config, "PAPER_TRADE_SIZE_MIN_USD", min_trade_usd) or min_trade_usd),
+            )
+            available_usd = float(self._available_balance_usd())
+            if max_buy_weth > 0:
+                paper_floor = min(paper_floor, float(cap_usd))
+            paper_floor = min(paper_floor, available_usd)
+            if paper_floor >= min_trade_usd and paper_floor > position_size_usd:
+                prev_size = float(position_size_usd)
+                position_size_usd = float(paper_floor)
+                cost_profile = self._estimate_cost_profile(
+                    liquidity_usd,
+                    risk_level,
+                    score,
+                    position_size_usd=position_size_usd,
+                )
+                expected_edge_percent = self._estimate_edge_percent(score, tp, sl, cost_profile["total_percent"], risk_level)
+                edge_percent_for_decision = float(expected_edge_percent) * float(regime_edge_mult)
+                logger.info(
+                    "AutoTrade adjust token=%s reason=min_trade_floor size=$%.2f->$%.2f min=$%.2f",
+                    symbol,
+                    prev_size,
+                    position_size_usd,
+                    min_trade_usd,
+                )
         if position_size_usd < min_trade_usd:
             self._bump_skip_reason("min_trade_size")
             logger.info(
@@ -2325,6 +3528,7 @@ class AutoTrader:
         core_probe_ev_override = False
         core_probe_edge_override = False
         core_probe_detail = ""
+        probe_tail = ""
         core_probe_budget_used = 0
         core_probe_budget_cap = max(0, int(getattr(config, "EV_FIRST_ENTRY_CORE_PROBE_MAX_OPENS", 1) or 1))
         if bool(getattr(config, "EV_FIRST_ENTRY_ENABLED", True)):
@@ -2381,32 +3585,31 @@ class AutoTrader:
                                 f"min={ev_min:.5f} budget={probe_used}/{probe_cap}"
                             )
                 if not core_probe_ev_override:
-                    probe_tail = ""
                     if core_probe_eligible and core_probe_budget_cap > 0:
                         probe_tail = (
                             f" probe_budget={core_probe_budget_used}/{core_probe_budget_cap} "
                             f"probe_detail={core_probe_detail or '-'}"
                         )
-                self._bump_skip_reason("ev_net_low")
-                logger.info(
-                    (
-                        "AutoTrade skip token=%s reason=ev_net_low expected_net=$%.5f min=$%.5f "
-                        "samples=%.0f conf=%.2f pwin=%.2f avg_win=$%.4f avg_loss=$%.4f "
-                        "kelly=%.3f mem=%s%s"
-                    ),
-                    symbol,
-                    ev_expected_net,
-                    ev_min,
-                    ev_samples,
-                    float(ev_snapshot.get("confidence", 0.0) or 0.0),
-                    float(ev_snapshot.get("win_rate", 0.0) or 0.0),
-                    float(ev_snapshot.get("avg_win_usd", 0.0) or 0.0),
-                    float(ev_snapshot.get("avg_loss_usd", 0.0) or 0.0),
-                    float(kelly_fraction),
-                    str(token_ev_memory.get("detail", "")),
-                    probe_tail,
-                )
-                return None
+                    self._bump_skip_reason("ev_net_low")
+                    logger.info(
+                        (
+                            "AutoTrade skip token=%s reason=ev_net_low expected_net=$%.5f min=$%.5f "
+                            "samples=%.0f conf=%.2f pwin=%.2f avg_win=$%.4f avg_loss=$%.4f "
+                            "kelly=%.3f mem=%s%s"
+                        ),
+                        symbol,
+                        ev_expected_net,
+                        ev_min,
+                        ev_samples,
+                        float(ev_snapshot.get("confidence", 0.0) or 0.0),
+                        float(ev_snapshot.get("win_rate", 0.0) or 0.0),
+                        float(ev_snapshot.get("avg_win_usd", 0.0) or 0.0),
+                        float(ev_snapshot.get("avg_loss_usd", 0.0) or 0.0),
+                        float(kelly_fraction),
+                        str(token_ev_memory.get("detail", "")),
+                        probe_tail,
+                    )
+                    return None
         if self._active_trade_decision_context is not None:
             self._active_trade_decision_context.update(
                 {
@@ -2675,6 +3878,43 @@ class AutoTrader:
             price_change_5m=price_change_5m,
         )
         max_hold_seconds = int(max(30, round(float(max_hold_seconds) * float(regime_hold_mult))))
+        if is_unverified_token and bool(getattr(config, "LIVE_UNVERIFIED_RISK_CAPS_ENABLED", True)):
+            max_hold_cap = max(
+                15,
+                int(getattr(config, "LIVE_UNVERIFIED_MAX_HOLD_SECONDS", 120) or 120),
+            )
+            max_hold_seconds = min(int(max_hold_seconds), int(max_hold_cap))
+
+        apply_honeypot_guard = self._is_live_mode() or bool(getattr(config, "HONEYPOT_GUARD_IN_PAPER", True))
+        if apply_honeypot_guard:
+            hp_ok, hp_detail = await self._honeypot_guard_passes(token_address)
+            if not hp_ok:
+                self._bump_skip_reason("honeypot_guard")
+                logger.warning(
+                    "AutoTrade skip token=%s reason=honeypot_guard detail=%s mode=%s",
+                    symbol,
+                    self._short_error_text(hp_detail),
+                    "live" if self._is_live_mode() else "paper",
+                )
+                self._blacklist_add(token_address, f"honeypot_guard:{self._short_error_text(hp_detail)}")
+                return None
+
+        if not self._is_live_mode():
+            impact_ok, impact_pct = self._paper_entry_impact_ok(
+                position_size_usd=float(position_size_usd),
+                liquidity_usd=float(liquidity_usd),
+            )
+            if not impact_ok:
+                self._bump_skip_reason("paper_impact_high")
+                logger.info(
+                    "AutoTrade skip token=%s reason=paper_impact_high impact=%.3f%% max=%.3f%% liq=$%.0f size=$%.2f",
+                    symbol,
+                    float(impact_pct),
+                    float(getattr(config, "PAPER_MAX_ENTRY_IMPACT_PERCENT", 1.20) or 1.20),
+                    float(liquidity_usd),
+                    float(position_size_usd),
+                )
+                return None
 
         if self._is_live_mode():
             if self.live_executor is None:
@@ -2687,12 +3927,14 @@ class AutoTrader:
                 logger.info("AutoTrade skip token=%s reason=no_weth_price", symbol)
                 return None
             spend_eth = position_size_usd / weth_price_usd
-            # Route/roundtrip checks on tiny notional can false-fail due integer rounding/quote dust.
-            # Use a bounded probe size for prechecks, while keeping the real buy size unchanged.
-            probe_min_usd = float(getattr(config, "LIVE_PRECHECK_MIN_SPEND_USD", 2.0) or 2.0)
-            probe_max_eth = float(getattr(config, "LIVE_PRECHECK_MAX_SPEND_ETH", 0.0030) or 0.0030)
-            probe_spend_eth = max(float(spend_eth), float(probe_min_usd) / max(1e-9, float(weth_price_usd)))
-            probe_spend_eth = min(probe_spend_eth, max(1e-8, float(probe_max_eth)))
+            if bool(getattr(config, "LIVE_PRECHECK_USE_REAL_SIZE", True)):
+                probe_spend_eth = max(1e-8, float(spend_eth))
+            else:
+                # Legacy fallback to reduce quote dust false-negatives.
+                probe_min_usd = float(getattr(config, "LIVE_PRECHECK_MIN_SPEND_USD", 2.0) or 2.0)
+                probe_max_eth = float(getattr(config, "LIVE_PRECHECK_MAX_SPEND_ETH", 0.0030) or 0.0030)
+                probe_spend_eth = max(float(spend_eth), float(probe_min_usd) / max(1e-9, float(weth_price_usd)))
+                probe_spend_eth = min(probe_spend_eth, max(1e-8, float(probe_max_eth)))
             inv_ok, inv_reason = self._pre_buy_invariants(token_address, spend_eth)
             if not inv_ok:
                 self._bump_skip_reason("pre_buy_invariants")
@@ -2725,12 +3967,12 @@ class AutoTrader:
                         return None
                 except Exception:
                     pass
-            route_ok, route_reason = await asyncio.to_thread(
-                self.live_executor.is_buy_route_supported,
+            buy_quote_ok, route_reason, buy_quote_out_raw = await asyncio.to_thread(
+                self.live_executor.quote_buy_token_amount_raw,
                 token_address,
                 probe_spend_eth,
             )
-            if not route_ok:
+            if not buy_quote_ok:
                 dex = str(token_data.get("dex", "unknown"))
                 labels = token_data.get("dex_labels") or []
                 labels_text = ",".join(str(x) for x in labels) if isinstance(labels, list) else str(labels)
@@ -2745,12 +3987,21 @@ class AutoTrader:
                 self._blacklist_add(token_address, f"unsupported_buy_route:{self._short_error_text(route_reason)}")
                 return None
             if bool(getattr(config, "LIVE_SELLABILITY_CHECK_ENABLED", True)):
-                amt_tokens = float(getattr(config, "LIVE_SELLABILITY_CHECK_AMOUNT_TOKENS", 1.0) or 1.0)
-                sell_ok, sell_reason = await asyncio.to_thread(
-                    self.live_executor.is_sell_route_supported,
-                    token_address,
-                    amt_tokens,
-                )
+                sell_ok = False
+                sell_reason = ""
+                if int(buy_quote_out_raw or 0) > 0:
+                    sell_ok, sell_reason = await asyncio.to_thread(
+                        self.live_executor.is_sell_route_supported_raw,
+                        token_address,
+                        int(buy_quote_out_raw),
+                    )
+                if not sell_ok:
+                    amt_tokens = float(getattr(config, "LIVE_SELLABILITY_CHECK_AMOUNT_TOKENS", 1.0) or 1.0)
+                    sell_ok, sell_reason = await asyncio.to_thread(
+                        self.live_executor.is_sell_route_supported,
+                        token_address,
+                        amt_tokens,
+                    )
                 if not sell_ok:
                     logger.info(
                         "AutoTrade skip token=%s reason=unsellable_or_no_quote detail=%s",
@@ -2765,6 +4016,7 @@ class AutoTrader:
                     self.live_executor.roundtrip_quote,
                     token_address,
                     probe_spend_eth,
+                    1.0,
                 )
                 if not ok:
                     logger.info(
@@ -2775,7 +4027,32 @@ class AutoTrader:
                     self._bump_skip_reason("roundtrip_quote_failed")
                     self._blacklist_add(token_address, f"roundtrip_quote_failed:{self._short_error_text(rt_reason)}")
                     return None
-                min_ratio = float(getattr(config, "LIVE_ROUNDTRIP_MIN_RETURN_RATIO", 0.70) or 0.70)
+                min_ratio_cfg = float(getattr(config, "LIVE_ROUNDTRIP_MIN_RETURN_RATIO", 0.70) or 0.70)
+                max_loss_pct = max(
+                    0.0,
+                    min(99.0, float(getattr(config, "LIVE_ROUNDTRIP_MAX_LOSS_PERCENT", 8.0) or 8.0)),
+                )
+                min_ratio_loss = max(0.0, 1.0 - (max_loss_pct / 100.0))
+                min_ratio = max(float(min_ratio_cfg), float(min_ratio_loss))
+                if bool(getattr(config, "LIVE_ROUNDTRIP_REQUIRE_STABLE_ROUTER", True)):
+                    txt = str(rt_reason or "")
+                    buy_router = ""
+                    sell_router = ""
+                    for chunk in txt.split():
+                        if chunk.startswith("buy_router="):
+                            buy_router = chunk.split("=", 1)[1].strip().lower()
+                        if chunk.startswith("sell_router="):
+                            sell_router = chunk.split("=", 1)[1].strip().lower()
+                    if buy_router and sell_router and buy_router != sell_router:
+                        logger.info(
+                            "AutoTrade skip token=%s reason=unstable_route buy_router=%s sell_router=%s",
+                            symbol,
+                            buy_router,
+                            sell_router,
+                        )
+                        self._bump_skip_reason("unstable_route")
+                        self._blacklist_add(token_address, "unstable_route:router_mismatch")
+                        return None
                 if float(rt_ratio) < float(min_ratio):
                     logger.info(
                         "AutoTrade skip token=%s reason=roundtrip_ratio ratio=%.3f min=%.3f",
@@ -2786,16 +4063,6 @@ class AutoTrader:
                     self._bump_skip_reason("roundtrip_ratio")
                     self._blacklist_add(token_address, f"roundtrip_ratio:{rt_ratio:.3f}")
                     return None
-            hp_ok, hp_detail = await self._honeypot_guard_passes(token_address)
-            if not hp_ok:
-                self._bump_skip_reason("honeypot_guard")
-                logger.warning(
-                    "AutoTrade skip token=%s reason=honeypot_guard detail=%s",
-                    symbol,
-                    self._short_error_text(hp_detail),
-                )
-                self._blacklist_add(token_address, f"honeypot_guard:{self._short_error_text(hp_detail)}")
-                return None
             try:
                 buy_result = await asyncio.to_thread(self.live_executor.buy_token, token_address, spend_eth)
             except Exception as exc:
@@ -2882,6 +4149,7 @@ class AutoTrader:
                 market_mode=market_mode,
                 entry_tier=entry_tier,
                 entry_channel=entry_channel,
+                source=source_name,
                 partial_tp_trigger_mult=regime_partial_tp_trigger_mult,
                 partial_tp_sell_mult=regime_partial_tp_sell_mult,
                 token_cluster_key=cluster_key,
@@ -2897,6 +4165,8 @@ class AutoTrader:
             self.total_plans += 1
             self.total_executed += 1
             self.trade_open_timestamps.append(datetime.now(timezone.utc).timestamp())
+            source_key_open = str(source_name or "unknown").strip().lower() or "unknown"
+            self._opens_by_source_window[source_key_open] = int(self._opens_by_source_window.get(source_key_open, 0)) + 1
             if core_probe_applied:
                 self._record_core_probe_open()
             self._record_open_symbol(pos.symbol)
@@ -2976,6 +4246,7 @@ class AutoTrader:
             market_mode=market_mode,
             entry_tier=entry_tier,
             entry_channel=entry_channel,
+            source=source_name,
             partial_tp_trigger_mult=regime_partial_tp_trigger_mult,
             partial_tp_sell_mult=regime_partial_tp_sell_mult,
             token_cluster_key=cluster_key,
@@ -2992,6 +4263,8 @@ class AutoTrader:
         self.total_plans += 1
         self.total_executed += 1
         self.trade_open_timestamps.append(datetime.now(timezone.utc).timestamp())
+        source_key_open = str(source_name or "unknown").strip().lower() or "unknown"
+        self._opens_by_source_window[source_key_open] = int(self._opens_by_source_window.get(source_key_open, 0)) + 1
         if core_probe_applied:
             self._record_core_probe_open()
         self._record_open_symbol(pos.symbol)
@@ -3052,32 +4325,8 @@ class AutoTrader:
         return pos
 
     def _passes_token_guards(self, token_data: dict[str, Any]) -> bool:
-        if abs(float(token_data.get("price_change_5m") or 0)) > float(config.MAX_TOKEN_PRICE_CHANGE_5M_ABS_PERCENT):
-            return False
-
-        safety = token_data.get("safety") if isinstance(token_data.get("safety"), dict) else {}
-        is_contract_safe = bool(token_data.get("is_contract_safe", safety.get("is_safe", False)))
-        warning_flags = int(token_data.get("warning_flags", len((safety or {}).get("warnings") or [])) or 0)
-        risk_level = str(token_data.get("risk_level", (safety or {}).get("risk_level", "HIGH"))).upper()
-
-        if config.SAFE_TEST_MODE:
-            if float(token_data.get("liquidity") or 0) < float(config.SAFE_MIN_LIQUIDITY_USD):
-                return False
-            if float(token_data.get("volume_5m") or 0) < float(config.SAFE_MIN_VOLUME_5M_USD):
-                return False
-            if int(token_data.get("age_seconds") or 0) < int(config.SAFE_MIN_AGE_SECONDS):
-                return False
-            if abs(float(token_data.get("price_change_5m") or 0)) > float(config.SAFE_MAX_PRICE_CHANGE_5M_ABS_PERCENT):
-                return False
-            if config.SAFE_REQUIRE_CONTRACT_SAFE and not is_contract_safe:
-                return False
-            required_risk = str(config.SAFE_REQUIRE_RISK_LEVEL).upper()
-            rank = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
-            if rank.get(risk_level, 2) > rank.get(required_risk, 1):
-                return False
-            if warning_flags > int(config.SAFE_MAX_WARNING_FLAGS):
-                return False
-        return True
+        ok, _reason = self._token_guard_result(token_data)
+        return bool(ok)
 
     def _apply_max_loss_per_trade_cap(
         self,
@@ -3091,10 +4340,17 @@ class AutoTrader:
             return position_size_usd
         equity = max(0.1, self._equity_usd())
         max_allowed_loss_usd = equity * (max_loss_pct / 100)
-        worst_loss_ratio = max(0.0, abs(float(stop_loss_percent)) + float(total_cost_percent)) / 100
-        if worst_loss_ratio <= 0:
+        size_ref = max(0.000001, float(position_size_usd))
+        gas_percent = max(0.0, (float(gas_usd) / size_ref) * 100.0)
+        # total_cost_percent already includes gas as a percent of position size;
+        # subtract that component here so gas is not counted twice in sizing cap.
+        non_gas_cost_percent = max(0.0, float(total_cost_percent) - gas_percent)
+        worst_loss_ratio = max(0.0, abs(float(stop_loss_percent)) + non_gas_cost_percent) / 100.0
+        if worst_loss_ratio <= 0.0:
             return position_size_usd
-        max_size_by_risk = max(0.0, (max_allowed_loss_usd - gas_usd) / worst_loss_ratio)
+        if max_allowed_loss_usd <= float(gas_usd):
+            return 0.0
+        max_size_by_risk = max(0.0, (max_allowed_loss_usd - float(gas_usd)) / worst_loss_ratio)
         return max(0.0, min(position_size_usd, max_size_by_risk))
 
     @staticmethod
@@ -3738,6 +4994,8 @@ class AutoTrader:
                 except Exception as exc:
                     txt = str(exc).lower()
                     logger.warning("RECOVERY untracked_sell_failed address=%s err=%s", normalized, exc)
+                    self._blacklist_add(normalized, f"sell_fail:{self._short_error_text(exc)}")
+                    self._pause_new_tokens_after_sell_fail(str(exc))
                     if bool(getattr(config, "LIVE_ABANDON_UNSELLABLE_POSITIONS", False)) and (
                         "execution reverted" in txt
                         or "quote_failed" in txt
@@ -3867,6 +5125,8 @@ class AutoTrader:
 
         if self.live_executor is None:
             logger.error("AUTO_SELL live_failed token=%s reason=no_executor", position.symbol)
+            self._blacklist_add(position.token_address, "sell_fail:no_executor")
+            self._pause_new_tokens_after_sell_fail("no_executor")
             self._live_sell_failures += 1
             if self._live_sell_failures >= 3:
                 self._activate_emergency_halt("LIVE_SELL_FAILED", "live_executor_unavailable")
@@ -3874,6 +5134,8 @@ class AutoTrader:
         inv_ok, inv_reason = self._pre_sell_invariants(position)
         if not inv_ok:
             logger.error("AUTO_SELL live_failed token=%s reason=pre_sell_invariants detail=%s", position.symbol, inv_reason)
+            self._blacklist_add(position.token_address, f"sell_fail:{self._short_error_text(inv_reason)}")
+            self._pause_new_tokens_after_sell_fail(inv_reason)
             self._live_sell_failures += 1
             if self._live_sell_failures >= 3:
                 self._activate_emergency_halt("LIVE_SELL_FAILED", inv_reason)
@@ -3886,6 +5148,8 @@ class AutoTrader:
             )
         except Exception as exc:
             logger.error("AUTO_SELL live_failed token=%s reason=%s", position.symbol, exc)
+            self._blacklist_add(position.token_address, f"sell_fail:{self._short_error_text(exc)}")
+            self._pause_new_tokens_after_sell_fail(str(exc))
             # If we cannot even fund the gas for SELL, continuing to retry is pointless and can
             # trap the session in a noisy loop. Fail closed into emergency halt.
             txt = str(exc).lower()
@@ -3917,25 +5181,28 @@ class AutoTrader:
         if weth_price <= 0:
             weth_price = max(1.0, float(self.last_weth_price_usd))
         received_usd = float(sell_result.received_eth) * weth_price
-        pnl_usd = received_usd - float(position.position_size_usd)
-        pnl_percent = (pnl_usd / position.position_size_usd * 100) if position.position_size_usd > 0 else 0.0
+        pnl_usd_remaining = received_usd - float(position.position_size_usd)
+        total_pnl_usd = float(pnl_usd_remaining) + float(position.partial_realized_pnl_usd)
+        base_size_usd = max(float(position.original_position_size_usd or 0.0), float(position.position_size_usd), 0.000001)
+        total_pnl_percent = (total_pnl_usd / base_size_usd * 100) if base_size_usd > 0 else 0.0
 
         position.status = "CLOSED"
         position.close_reason = reason
         position.closed_at = datetime.now(timezone.utc)
-        position.pnl_usd = pnl_usd
-        position.pnl_percent = pnl_percent
+        position.pnl_usd = total_pnl_usd
+        position.pnl_percent = total_pnl_percent
         position.sell_tx_hash = str(sell_result.tx_hash)
         position.sell_tx_status = "confirmed"
         self._record_tx_event()
+        self._mark_token_sell_verified(position.token_address)
 
         self._pop_open_position(position.token_address)
         self._recovery_forget_address(position.token_address)
         self.closed_positions.append(position)
         self._prune_closed_positions()
         self.total_closed += 1
-        self.realized_pnl_usd += position.pnl_usd
-        self.day_realized_pnl_usd += position.pnl_usd
+        self.realized_pnl_usd += pnl_usd_remaining
+        self.day_realized_pnl_usd += pnl_usd_remaining
 
         outcome = self._pnl_outcome(position.pnl_usd)
         if outcome == "win":
@@ -4481,6 +5748,31 @@ class AutoTrader:
         equity = self.paper_balance_usd + sum(pos.position_size_usd + pos.pnl_usd for pos in self.open_positions.values())
         drawdown_pct = self._risk_drawdown_percent()
         risk_block_reason = self._risk_governor_block_reason() or ""
+        window_minutes = max(5, int(getattr(config, "PROFILE_AUTOSTOP_WINDOW_MINUTES", 60) or 60))
+        window_rows = self._closed_rows_window(window_minutes=window_minutes)
+        window_closed = len(window_rows)
+        window_realized = float(sum(float(getattr(p, "pnl_usd", 0.0) or 0.0) for p in window_rows))
+        window_wins = sum(1 for p in window_rows if float(getattr(p, "pnl_usd", 0.0) or 0.0) > 0.0)
+        window_losses = sum(1 for p in window_rows if float(getattr(p, "pnl_usd", 0.0) or 0.0) < 0.0)
+        window_non_be = max(1, int(window_wins + window_losses))
+        window_loss_share = float(window_losses) / float(window_non_be)
+        window_avg_pnl = float(window_realized) / float(max(1, window_closed))
+        window_hours = max(1.0 / 60.0, float(window_minutes) / 60.0)
+        window_pnl_per_hour = float(window_realized) / float(window_hours)
+        window_sl_sum_usd = float(
+            sum(
+                float(getattr(p, "pnl_usd", 0.0) or 0.0)
+                for p in window_rows
+                if str(getattr(p, "close_reason", "") or "").strip().upper().startswith("SL")
+            )
+        )
+        window_no_momentum_sum_usd = float(
+            sum(
+                float(getattr(p, "pnl_usd", 0.0) or 0.0)
+                for p in window_rows
+                if str(getattr(p, "close_reason", "") or "").strip().upper().startswith("NO_MOMENTUM")
+            )
+        )
 
         return {
             "open_trades": len(self.open_positions),
@@ -4529,6 +5821,14 @@ class AutoTrader:
             "symbol_concentration_recent_opens": int(conc_total),
             "symbol_concentration_top_symbol": top_symbol,
             "symbol_concentration_top_share": round(float(top_share), 3),
+            "autostop_window_minutes": int(window_minutes),
+            "autostop_window_closed": int(window_closed),
+            "autostop_window_realized_pnl_usd": float(window_realized),
+            "autostop_window_avg_pnl_per_trade_usd": float(window_avg_pnl),
+            "autostop_window_pnl_per_hour_usd": float(window_pnl_per_hour),
+            "autostop_window_loss_share": float(window_loss_share),
+            "autostop_window_sl_sum_usd": float(window_sl_sum_usd),
+            "autostop_window_no_momentum_sum_usd": float(window_no_momentum_sum_usd),
         }
 
     def reset_paper_state(self, keep_closed: bool = True) -> None:
@@ -5351,6 +6651,7 @@ class AutoTrader:
             "market_mode": pos.market_mode,
             "entry_tier": pos.entry_tier,
             "entry_channel": pos.entry_channel,
+            "source": pos.source,
             "partial_tp_trigger_mult": pos.partial_tp_trigger_mult,
             "partial_tp_sell_mult": pos.partial_tp_sell_mult,
             "token_cluster_key": pos.token_cluster_key,
@@ -5426,6 +6727,7 @@ class AutoTrader:
                 market_mode=str(row.get("market_mode", "")),
                 entry_tier=str(row.get("entry_tier", "")),
                 entry_channel=str(row.get("entry_channel", "")),
+                source=str(row.get("source", "")),
                 partial_tp_trigger_mult=float(row.get("partial_tp_trigger_mult", 1.0) or 1.0),
                 partial_tp_sell_mult=float(row.get("partial_tp_sell_mult", 1.0) or 1.0),
                 token_cluster_key=str(row.get("token_cluster_key", "")),

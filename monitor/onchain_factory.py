@@ -54,6 +54,16 @@ class OnChainFactoryMonitor:
         self.web3 = self._build_web3()
         self.last_processed_block = self._load_last_block()
         self.seen_pairs = self._load_seen_pairs()
+        self._pending_enrich: dict[str, PairCandidate] = {}
+        self._pending_enrich_ts: dict[str, float] = {}
+        self._pending_enrich_ttl_seconds = max(
+            60,
+            int(getattr(config, "ONCHAIN_PENDING_ENRICH_TTL_SECONDS", 900) or 900),
+        )
+        self._pending_enrich_max = max(
+            100,
+            int(getattr(config, "ONCHAIN_PENDING_ENRICH_MAX", 1200) or 1200),
+        )
 
         self._weth_price_usd = 0.0
         self._weth_price_ts = 0.0
@@ -84,6 +94,26 @@ class OnChainFactoryMonitor:
             return None
         payload = result.data
         return payload if isinstance(payload, dict) else None
+
+    @staticmethod
+    def _pick_best_pair(payload: dict[str, Any] | None, *, preferred_pair: str = "") -> dict[str, Any] | None:
+        if not isinstance(payload, dict):
+            return None
+        pairs = payload.get("pairs", []) or []
+        pref = str(preferred_pair or "").lower()
+        best_pair: dict[str, Any] | None = None
+        best_liq = -1.0
+        for pair in pairs:
+            if str(pair.get("chainId", "")).lower() != str(config.CHAIN_ID).lower():
+                continue
+            pair_address = str(pair.get("pairAddress", "") or "").lower()
+            liq = float((pair.get("liquidity") or {}).get("usd") or 0.0)
+            if pref and pair_address and pair_address == pref:
+                return pair
+            if liq > best_liq:
+                best_liq = liq
+                best_pair = pair
+        return best_pair
 
     def _build_web3(self) -> Web3:
         if not self.providers:
@@ -158,6 +188,29 @@ class OnChainFactoryMonitor:
     def _mark_pair_seen(self, pair_address: str) -> None:
         self._prune_seen_pairs()
         self.seen_pairs[pair_address] = datetime.now(timezone.utc).timestamp()
+
+    def _prune_pending_enrich(self) -> None:
+        now_ts = datetime.now(timezone.utc).timestamp()
+        ttl = max(60, int(self._pending_enrich_ttl_seconds))
+        stale_keys = [
+            pair
+            for pair, ts in self._pending_enrich_ts.items()
+            if (now_ts - float(ts)) > ttl
+        ]
+        for key in stale_keys:
+            self._pending_enrich.pop(key, None)
+            self._pending_enrich_ts.pop(key, None)
+        cap = max(100, int(self._pending_enrich_max))
+        if len(self._pending_enrich) <= cap:
+            return
+        oldest_pairs = sorted(
+            self._pending_enrich_ts.items(),
+            key=lambda kv: float(kv[1]),
+        )
+        drop_count = max(0, len(oldest_pairs) - cap)
+        for pair, _ts in oldest_pairs[:drop_count]:
+            self._pending_enrich.pop(pair, None)
+            self._pending_enrich_ts.pop(pair, None)
 
     async def _rpc_with_backoff(self, call: Callable[[], Any], op_name: str) -> Any:
         delays = [1, 2, 4]
@@ -399,27 +452,25 @@ class OnChainFactoryMonitor:
 
     async def _candidate_to_token(self, candidate: PairCandidate) -> dict[str, Any] | None:
         token_address = candidate.token0 if candidate.token1 == self.weth_address else candidate.token1
-        url = f"{config.DEXSCREENER_API}/tokens/{token_address}"
+        token_url = f"{config.DEXSCREENER_API}/tokens/{token_address}"
+        pair_url = f"{config.DEXSCREENER_API}/pairs/{config.CHAIN_ID}/{candidate.pair_address}"
 
         best_pair: dict[str, Any] | None = None
         retries = int(config.ONCHAIN_ENRICH_RETRIES)
         retry_delay = int(config.ONCHAIN_ENRICH_RETRY_DELAY_SECONDS)
         for attempt in range(1, retries + 1):
-            payload = await self._http_get_json(url)
-
-            best_liq = -1.0
-            pairs = (payload or {}).get("pairs", []) or []
-            for pair in pairs:
-                if str(pair.get("chainId", "")).lower() != str(config.CHAIN_ID).lower():
-                    continue
-                pair_address = str(pair.get("pairAddress", "") or "").lower()
-                liq = float((pair.get("liquidity") or {}).get("usd") or 0)
-                if pair_address and pair_address == candidate.pair_address:
-                    best_pair = pair
-                    break
-                if liq > best_liq:
-                    best_liq = liq
-                    best_pair = pair
+            # Pair endpoint usually indexes new pools earlier than token endpoint.
+            pair_payload = await self._http_get_json(pair_url)
+            best_pair = self._pick_best_pair(
+                pair_payload,
+                preferred_pair=candidate.pair_address,
+            )
+            if not best_pair:
+                token_payload = await self._http_get_json(token_url)
+                best_pair = self._pick_best_pair(
+                    token_payload,
+                    preferred_pair=candidate.pair_address,
+                )
 
             if best_pair:
                 break
@@ -507,7 +558,17 @@ class OnChainFactoryMonitor:
         }
 
     async def fetch_new_tokens(self) -> list[dict[str, Any]]:
-        candidates = await self.poll_pair_candidates_once()
+        self._prune_pending_enrich()
+        fresh = await self.poll_pair_candidates_once()
+        pending = list(self._pending_enrich.values())
+        candidates: list[PairCandidate] = []
+        seen_pairs: set[str] = set()
+        for cand in list(fresh) + pending:
+            pair = str(cand.pair_address or "").lower()
+            if not pair or pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            candidates.append(cand)
         if not candidates:
             return []
         enriched = await asyncio.gather(
@@ -515,12 +576,34 @@ class OnChainFactoryMonitor:
             return_exceptions=True,
         )
         out: list[dict[str, Any]] = []
-        for row in enriched:
+        now_ts = datetime.now(timezone.utc).timestamp()
+        for candidate, row in zip(candidates, enriched):
+            pair_key = str(candidate.pair_address or "").lower()
             if isinstance(row, Exception):
                 logger.warning("On-chain candidate enrich failed: %s", row)
+                if pair_key:
+                    self._pending_enrich[pair_key] = candidate
+                    self._pending_enrich_ts[pair_key] = now_ts
                 continue
-            if row:
-                out.append(row)
+            if not row:
+                if pair_key:
+                    self._pending_enrich[pair_key] = candidate
+                    self._pending_enrich_ts[pair_key] = now_ts
+                continue
+            liq = float(row.get("liquidity") or 0.0)
+            vol = float(row.get("volume_5m") or 0.0)
+            price = float(row.get("price_usd") or 0.0)
+            unresolved = liq <= 0.0 and vol <= 0.0 and price <= 0.0
+            if unresolved:
+                if pair_key:
+                    self._pending_enrich[pair_key] = candidate
+                    self._pending_enrich_ts[pair_key] = now_ts
+                continue
+            if pair_key:
+                self._pending_enrich.pop(pair_key, None)
+                self._pending_enrich_ts.pop(pair_key, None)
+            out.append(row)
+        self._prune_pending_enrich()
         return out
 
 

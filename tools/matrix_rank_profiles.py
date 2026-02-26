@@ -50,10 +50,94 @@ def _read_json(path: str) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def _read_env(path: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    if not os.path.exists(path):
+        return out
+    try:
+        with open(path, "r", encoding="utf-8-sig", errors="ignore") as f:
+            for line in f:
+                s = line.strip()
+                if not s or s.startswith("#") or "=" not in s:
+                    continue
+                key, value = s.split("=", 1)
+                k = key.strip()
+                if not k:
+                    continue
+                out[k] = value.strip()
+    except Exception:
+        return {}
+    return out
+
+
+def _resolve_candidate_log(
+    *,
+    root: str,
+    profile_id: str,
+    item: dict[str, Any] | None = None,
+) -> str:
+    row = item or {}
+    raw = str(row.get("candidate_log_file", "") or "").strip()
+    if raw:
+        return raw if os.path.isabs(raw) else os.path.join(root, raw)
+    env_file = str(row.get("env_file", "") or "").strip()
+    if env_file and os.path.exists(env_file):
+        env_map = _read_env(env_file)
+        cand_env = str(env_map.get("CANDIDATE_DECISIONS_LOG_FILE", "") or "").strip()
+        if cand_env:
+            return cand_env if os.path.isabs(cand_env) else os.path.join(root, cand_env)
+    log_dir = str(row.get("log_dir", "") or "").strip()
+    if log_dir:
+        base = log_dir if os.path.isabs(log_dir) else os.path.join(root, log_dir)
+        return os.path.join(base, "candidates.jsonl")
+    return os.path.join(root, "logs", "matrix", profile_id, "candidates.jsonl")
+
+
+def _window_blocked_counts(candidate_log_file: str, *, cutoff: datetime) -> dict[str, int]:
+    out = {
+        "blocked_by_safe_source": 0,
+        "blocked_by_watchlist_guard": 0,
+        "blocked_by_safety_budget": 0,
+    }
+    if not os.path.exists(candidate_log_file):
+        return out
+    try:
+        with open(candidate_log_file, "r", encoding="utf-8-sig", errors="ignore") as f:
+            for line in f:
+                s = line.strip()
+                if not s:
+                    continue
+                try:
+                    row = json.loads(s)
+                except Exception:
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                stage = str(row.get("decision_stage", "") or "").strip().lower()
+                if stage != "filter_fail":
+                    continue
+                ts = _parse_ts(row.get("timestamp"))
+                if ts is None:
+                    ts = _parse_ts(row.get("ts"))
+                if ts is None or ts < cutoff:
+                    continue
+                reason = str(row.get("reason", "") or "").strip().lower()
+                if reason == "safe_source":
+                    out["blocked_by_safe_source"] += 1
+                elif reason == "watchlist_strict_guard":
+                    out["blocked_by_watchlist_guard"] += 1
+                elif reason == "safety_budget":
+                    out["blocked_by_safety_budget"] += 1
+    except Exception:
+        return out
+    return out
+
+
 @dataclass
 class ProfileStats:
     profile_id: str
     state_file: str
+    candidate_log_file: str
     open_now: int
     closed_total: int
     wins: int
@@ -68,6 +152,9 @@ class ProfileStats:
     current_loss_streak: int
     entries_last_window: int
     exits_last_window: int
+    blocked_by_safe_source_window: int
+    blocked_by_watchlist_guard_window: int
+    blocked_by_safety_budget_window: int
     score_total: float
     score_breakdown: dict[str, float]
 
@@ -89,6 +176,15 @@ class ProfileStats:
             "current_loss_streak": self.current_loss_streak,
             "entries_last_window": self.entries_last_window,
             "exits_last_window": self.exits_last_window,
+            "blocked_by_safe_source_window": int(self.blocked_by_safe_source_window),
+            "blocked_by_watchlist_guard_window": int(self.blocked_by_watchlist_guard_window),
+            "blocked_by_safety_budget_window": int(self.blocked_by_safety_budget_window),
+            "blocked_total_window": int(
+                self.blocked_by_safe_source_window
+                + self.blocked_by_watchlist_guard_window
+                + self.blocked_by_safety_budget_window
+            ),
+            "candidate_log_file": self.candidate_log_file,
             "score_total": round(self.score_total, 4),
             "score_breakdown": {k: round(v, 4) for k, v in self.score_breakdown.items()},
         }
@@ -109,7 +205,17 @@ def _load_items(project_root: str) -> list[dict[str, str]]:
             if not profile_id or not state_file:
                 continue
             state_abs = state_file if os.path.isabs(state_file) else os.path.join(project_root, state_file)
-            out.append({"id": profile_id, "state_file": state_abs})
+            env_file = str(row.get("env_file", "") or "").strip()
+            if env_file and not os.path.isabs(env_file):
+                env_file = os.path.join(project_root, env_file)
+            out.append(
+                {
+                    "id": profile_id,
+                    "state_file": state_abs,
+                    "env_file": env_file,
+                    "log_dir": str(row.get("log_dir", "") or ""),
+                }
+            )
     if out:
         return out
 
@@ -125,6 +231,8 @@ def _load_items(project_root: str) -> list[dict[str, str]]:
             {
                 "id": profile_id,
                 "state_file": os.path.join(trading_dir, name),
+                "env_file": "",
+                "log_dir": os.path.join("logs", "matrix", profile_id),
             }
         )
     return out
@@ -148,6 +256,7 @@ def _current_loss_streak(closed_rows: list[dict[str, Any]]) -> int:
 def _build_stats(
     profile_id: str,
     state_file: str,
+    candidate_log_file: str,
     *,
     lookback_hours: float,
     min_closed: int,
@@ -200,6 +309,7 @@ def _build_stats(
 
     now_utc = datetime.now(timezone.utc)
     cutoff = now_utc - timedelta(hours=max(0.5, float(lookback_hours)))
+    blocked = _window_blocked_counts(candidate_log_file, cutoff=cutoff)
 
     entries_last = 0
     exits_last = 0
@@ -245,6 +355,7 @@ def _build_stats(
     return ProfileStats(
         profile_id=profile_id,
         state_file=state_file,
+        candidate_log_file=candidate_log_file,
         open_now=len(open_rows),
         closed_total=len(closed_rows),
         wins=wins,
@@ -259,6 +370,9 @@ def _build_stats(
         current_loss_streak=current_loss_streak,
         entries_last_window=entries_last,
         exits_last_window=exits_last,
+        blocked_by_safe_source_window=int(blocked.get("blocked_by_safe_source", 0) or 0),
+        blocked_by_watchlist_guard_window=int(blocked.get("blocked_by_watchlist_guard", 0) or 0),
+        blocked_by_safety_budget_window=int(blocked.get("blocked_by_safety_budget", 0) or 0),
         score_total=float(total),
         score_breakdown=breakdown,
     )
@@ -281,12 +395,14 @@ def main() -> int:
     for row in items:
         profile_id = str(row.get("id", "")).strip()
         state_file = str(row.get("state_file", "")).strip()
+        candidate_log_file = _resolve_candidate_log(root=root, profile_id=profile_id, item=row)
         if not profile_id or not state_file:
             continue
         stats.append(
             _build_stats(
                 profile_id=profile_id,
                 state_file=state_file,
+                candidate_log_file=candidate_log_file,
                 lookback_hours=float(args.lookback_hours),
                 min_closed=max(1, int(args.min_closed)),
             )
@@ -328,7 +444,9 @@ def main() -> int:
             f"realized=${s.realized_pnl_usd:+.4f} clipped=${s.realized_pnl_clipped_usd:+.4f} "
             f"closed={s.closed_total:>3} top_sym={s.top_symbol_share:>4.2f} "
             f"W/L/BE={s.wins}/{s.losses}/{s.breakeven} wr={s.winrate_pct:>5.1f}% "
-            f"pf={pf} act={s.entries_last_window + s.exits_last_window}"
+            f"pf={pf} act={s.entries_last_window + s.exits_last_window} "
+            f"blocked(safe_source/watchlist/safety_budget)="
+            f"{s.blocked_by_safe_source_window}/{s.blocked_by_watchlist_guard_window}/{s.blocked_by_safety_budget_window}"
         )
     print(f"WINNER {winner.profile_id}")
     return 0

@@ -12,7 +12,7 @@ import os
 import time
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import config
@@ -196,8 +196,15 @@ class WatchlistMonitor:
                     except Exception:
                         created_at = None
                 if created_at is None:
-                    created_at = datetime.now(timezone.utc)
-                age_seconds = int((datetime.now(timezone.utc) - created_at).total_seconds())
+                    # Some DexScreener search rows miss pairCreatedAt even for mature pools.
+                    # Treat missing timestamp as aged watchlist data instead of age=0 to avoid false safe_age drops.
+                    fallback_age_seconds = int(
+                        getattr(config, "WATCHLIST_MISSING_PAIR_AGE_FALLBACK_SECONDS", 86400) or 86400
+                    )
+                    age_seconds = max(0, fallback_age_seconds)
+                    created_at = datetime.now(timezone.utc) - timedelta(seconds=age_seconds)
+                else:
+                    age_seconds = int((datetime.now(timezone.utc) - created_at).total_seconds())
 
                 try:
                     vol_5m = float((vol or {}).get("m5") or 0.0)

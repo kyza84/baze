@@ -9,6 +9,16 @@
       "sensitivity": "medium",
       "importance": "flow"
     },
+    "AUTO_TRADE_ENTRY_MODE": {
+      "type": "enum",
+      "values": [
+        "single",
+        "top_n",
+        "all"
+      ],
+      "sensitivity": "high",
+      "importance": "routing"
+    },
     "MAX_OPEN_TRADES": {
       "type": "int",
       "min": 2,
@@ -25,43 +35,99 @@
     },
     "MIN_TOKEN_SCORE": {
       "type": "int",
-      "min": 45,
+      "min": 15,
       "max": 95,
       "sensitivity": "medium",
       "importance": "entry_quality"
     },
+    "MARKET_MODE_STRICT_SCORE": {
+      "type": "int",
+      "min": 15,
+      "max": 95,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "MARKET_MODE_SOFT_SCORE": {
+      "type": "int",
+      "min": 10,
+      "max": 90,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
     "MIN_EXPECTED_EDGE_PERCENT": {
       "type": "float",
-      "min": 0.2,
+      "min": 0.05,
       "max": 3.0,
       "sensitivity": "high",
       "importance": "entry_quality"
     },
     "MIN_EXPECTED_EDGE_USD": {
       "type": "float",
-      "min": 0.002,
+      "min": 0.0005,
       "max": 0.05,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "EV_FIRST_ENTRY_MIN_NET_USD": {
+      "type": "float",
+      "min": -0.002,
+      "max": 0.02,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "EV_FIRST_ENTRY_CORE_PROBE_EV_TOLERANCE_USD": {
+      "type": "float",
+      "min": 0.001,
+      "max": 0.01,
       "sensitivity": "high",
       "importance": "entry_quality"
     },
     "SAFE_MIN_VOLUME_5M_USD": {
       "type": "float",
-      "min": 8.0,
+      "min": 5.0,
       "max": 8000.0,
       "sensitivity": "medium",
       "importance": "entry_quality"
     },
     "SAFE_MIN_LIQUIDITY_USD": {
       "type": "float",
-      "min": 2000.0,
+      "min": 100.0,
       "max": 600000.0,
       "sensitivity": "medium",
       "importance": "entry_quality"
     },
+    "MIN_LIQUIDITY": {
+      "type": "float",
+      "min": 100.0,
+      "max": 100000.0,
+      "sensitivity": "medium",
+      "importance": "source_quality"
+    },
+    "SAFE_MIN_AGE_SECONDS": {
+      "type": "int",
+      "min": 0,
+      "max": 3600,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
     "PAPER_TRADE_SIZE_MIN_USD": {
       "type": "float",
-      "min": 0.2,
+      "min": 0.1,
       "max": 2.0,
+      "sensitivity": "high",
+      "importance": "risk"
+    },
+    "MIN_TRADE_USD": {
+      "type": "float",
+      "min": 0.01,
+      "max": 2.0,
+      "sensitivity": "high",
+      "importance": "risk"
+    },
+    "ENTRY_A_CORE_MIN_TRADE_USD": {
+      "type": "float",
+      "min": 0.1,
+      "max": 2.5,
       "sensitivity": "high",
       "importance": "risk"
     },
@@ -123,10 +189,17 @@
     },
     "MAX_TOKEN_COOLDOWN_SECONDS": {
       "type": "int",
-      "min": 10,
+      "min": 0,
       "max": 3600,
       "sensitivity": "medium",
       "importance": "flow"
+    },
+    "HEAVY_CHECK_DEDUP_TTL_SECONDS": {
+      "type": "int",
+      "min": 0,
+      "max": 120,
+      "sensitivity": "medium",
+      "importance": "routing"
     },
     "STOP_LOSS_PERCENT": {
       "type": "float",
@@ -155,6 +228,27 @@
       "max": 0.9,
       "sensitivity": "high",
       "importance": "routing"
+    },
+    "V2_QUALITY_SYMBOL_MAX_SHARE": {
+      "type": "float",
+      "min": 0.05,
+      "max": 0.5,
+      "sensitivity": "high",
+      "importance": "diversification"
+    },
+    "V2_QUALITY_SYMBOL_MIN_ABS_CAP": {
+      "type": "int",
+      "min": 1,
+      "max": 10,
+      "sensitivity": "high",
+      "importance": "diversification"
+    },
+    "V2_QUALITY_SYMBOL_REENTRY_MIN_SECONDS": {
+      "type": "int",
+      "min": 0,
+      "max": 3600,
+      "sensitivity": "medium",
+      "importance": "diversification"
     },
     "SYMBOL_CONCENTRATION_MAX_SHARE": {
       "type": "float",
@@ -187,6 +281,287 @@
       "max": 3.0,
       "sensitivity": "medium",
       "importance": "entry_quality"
+    },
+    "PAPER_ALLOW_WATCHLIST_SOURCE": {
+      "type": "bool",
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "WATCHLIST_ENABLED": {
+      "type": "bool",
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "WATCHLIST_REFRESH_SECONDS": {
+      "type": "int",
+      "min": 30,
+      "max": 3600,
+      "sensitivity": "medium",
+      "importance": "routing"
+    },
+    "WATCHLIST_MAX_TOKENS": {
+      "type": "int",
+      "min": 5,
+      "max": 120,
+      "sensitivity": "medium",
+      "importance": "routing"
+    },
+    "WATCHLIST_MIN_LIQUIDITY_USD": {
+      "type": "float",
+      "min": 5000.0,
+      "max": 1000000.0,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "WATCHLIST_MIN_VOLUME_24H_USD": {
+      "type": "float",
+      "min": 10000.0,
+      "max": 5000000.0,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "WATCHLIST_GECKO_TRENDING_PAGES": {
+      "type": "int",
+      "min": 1,
+      "max": 5,
+      "sensitivity": "medium",
+      "importance": "routing"
+    },
+    "WATCHLIST_GECKO_POOLS_PAGES": {
+      "type": "int",
+      "min": 0,
+      "max": 5,
+      "sensitivity": "medium",
+      "importance": "routing"
+    },
+    "PAPER_WATCHLIST_MIN_SCORE": {
+      "type": "int",
+      "min": 70,
+      "max": 98,
+      "sensitivity": "medium",
+      "importance": "entry_quality"
+    },
+    "PAPER_WATCHLIST_MIN_LIQUIDITY_USD": {
+      "type": "float",
+      "min": 10000.0,
+      "max": 500000.0,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "PAPER_WATCHLIST_MIN_VOLUME_5M_USD": {
+      "type": "float",
+      "min": 10.0,
+      "max": 20000.0,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "PAPER_WATCHLIST_MIN_ABS_CHANGE_5M": {
+      "type": "float",
+      "min": 0.0,
+      "max": 12.0,
+      "sensitivity": "medium",
+      "importance": "entry_quality"
+    },
+    "V2_SAFETY_BUDGET_ENABLED": {
+      "type": "bool",
+      "sensitivity": "high",
+      "importance": "safety"
+    },
+    "V2_SAFETY_BUDGET_MAX_PER_CYCLE": {
+      "type": "int",
+      "min": 10,
+      "max": 300,
+      "sensitivity": "high",
+      "importance": "safety"
+    },
+    "V2_SAFETY_BUDGET_PER_SOURCE": {
+      "type": "source_cap_map",
+      "max_items": 16,
+      "min_value": 1,
+      "max_value": 300,
+      "sensitivity": "high",
+      "importance": "safety"
+    },
+    "V2_SOURCE_QOS_ENABLED": {
+      "type": "bool",
+      "sensitivity": "medium",
+      "importance": "routing"
+    },
+    "V2_QUALITY_SOURCE_BUDGET_ENABLED": {
+      "type": "bool",
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "ONCHAIN_ENRICH_RETRIES": {
+      "type": "int",
+      "min": 1,
+      "max": 6,
+      "sensitivity": "medium",
+      "importance": "source_quality"
+    },
+    "ONCHAIN_ENRICH_RETRY_DELAY_SECONDS": {
+      "type": "int",
+      "min": 1,
+      "max": 20,
+      "sensitivity": "medium",
+      "importance": "source_quality"
+    },
+    "V2_SOURCE_QOS_FORCE_DUAL_ENTRY": {
+      "type": "bool",
+      "sensitivity": "medium",
+      "importance": "routing"
+    },
+    "V2_SOURCE_QOS_TOPK_PER_CYCLE": {
+      "type": "int",
+      "min": 20,
+      "max": 600,
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "V2_SOURCE_QOS_MAX_PER_SYMBOL_PER_CYCLE": {
+      "type": "int",
+      "min": 1,
+      "max": 20,
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "V2_SOURCE_QOS_COOLDOWN_SECONDS": {
+      "type": "int",
+      "min": 60,
+      "max": 3600,
+      "sensitivity": "medium",
+      "importance": "routing"
+    },
+    "V2_SOURCE_QOS_MIN_PASS_RATE": {
+      "type": "float",
+      "min": 0.0,
+      "max": 0.2,
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "V2_SOURCE_QOS_MIN_EV_POSITIVE_RATE": {
+      "type": "float",
+      "min": 0.0,
+      "max": 0.5,
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "V2_SOURCE_QOS_MIN_OPEN_RATE": {
+      "type": "float",
+      "min": 0.0,
+      "max": 0.3,
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "V2_SOURCE_QOS_SOURCE_CAPS": {
+      "type": "source_cap_map",
+      "max_items": 16,
+      "min_value": 1,
+      "max_value": 600,
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "V2_UNIVERSE_SOURCE_CAPS": {
+      "type": "source_cap_map",
+      "max_items": 16,
+      "min_value": 1,
+      "max_value": 600,
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "PLAN_SOURCE_DIVERSITY_ENABLED": {
+      "type": "bool",
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "PLAN_MAX_SINGLE_SOURCE_SHARE": {
+      "type": "float",
+      "min": 0.2,
+      "max": 1.0,
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "PLAN_MAX_WATCHLIST_SHARE": {
+      "type": "float",
+      "min": 0.0,
+      "max": 1.0,
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "PLAN_MIN_NON_WATCHLIST_PER_BATCH": {
+      "type": "int",
+      "min": 0,
+      "max": 20,
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "PLAN_UNDERFLOW_ALLOW_HOLD": {
+      "type": "bool",
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "PLAN_UNDERFLOW_HOLD_MIN_SCORE": {
+      "type": "int",
+      "min": 0,
+      "max": 95,
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "V2_KPI_POLICY_MODE": {
+      "type": "enum",
+      "values": [
+        "normal",
+        "lock_zero_open"
+      ],
+      "sensitivity": "medium",
+      "importance": "routing"
+    },
+    "SOURCE_ROUTER_MIN_TRADES": {
+      "type": "int",
+      "min": 4,
+      "max": 40,
+      "sensitivity": "medium",
+      "importance": "routing"
+    },
+    "SOURCE_ROUTER_BAD_ENTRY_PROBABILITY": {
+      "type": "float",
+      "min": 0.35,
+      "max": 0.95,
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "SOURCE_ROUTER_SEVERE_ENTRY_PROBABILITY": {
+      "type": "float",
+      "min": 0.2,
+      "max": 0.9,
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "TOKEN_EV_MEMORY_MIN_TRADES": {
+      "type": "int",
+      "min": 2,
+      "max": 30,
+      "sensitivity": "medium",
+      "importance": "entry_quality"
+    },
+    "TOKEN_EV_MEMORY_BAD_ENTRY_PROBABILITY": {
+      "type": "float",
+      "min": 0.35,
+      "max": 0.95,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "TOKEN_EV_MEMORY_SEVERE_ENTRY_PROBABILITY": {
+      "type": "float",
+      "min": 0.2,
+      "max": 0.9,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "PROFIT_ENGINE_ENABLED": {
+      "type": "bool",
+      "sensitivity": "high",
+      "importance": "routing"
     }
   },
   "protected_keys": [
@@ -206,6 +581,9 @@
     "HONEYPOT_API_FAIL_CLOSED",
     "SAFE_REQUIRE_CONTRACT_SAFE",
     "SAFE_REQUIRE_RISK_LEVEL",
+    "ENTRY_FAIL_CLOSED_ON_SAFETY_GAP",
+    "ENTRY_ALLOWED_SAFETY_SOURCES",
+    "PAPER_WATCHLIST_STRICT_GUARD_ENABLED",
     "V2_POLICY_ROUTER_ENABLED",
     "V2_POLICY_FAIL_CLOSED_ACTION",
     "V2_POLICY_DEGRADED_ACTION",
@@ -240,6 +618,12 @@
       "left": "HOLD_MIN_SECONDS",
       "op": "<=",
       "right": "HOLD_MAX_SECONDS"
+    },
+    {
+      "id": "market_mode_score_order",
+      "left": "MARKET_MODE_SOFT_SCORE",
+      "op": "<=",
+      "right": "MARKET_MODE_STRICT_SCORE"
     }
   ]
 }

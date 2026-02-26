@@ -1,4 +1,4 @@
-﻿"""Message templates."""
+"""Message templates."""
 
 WELCOME_MESSAGE = (
     "👋 <b>Welcome to Base Alert Bot</b>\n\n"

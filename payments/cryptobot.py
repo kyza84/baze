@@ -1,4 +1,4 @@
-﻿"""CryptoBot payment integration."""
+"""CryptoBot payment integration."""
 
 import logging
 from typing import Any, Optional

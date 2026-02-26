@@ -1,4 +1,4 @@
-﻿"""Alert delivery for new tokens."""
+"""Alert delivery for new tokens."""
 
 import asyncio
 import logging

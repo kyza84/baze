@@ -1,4 +1,4 @@
-﻿"""Token monitor with DexScreener primary source and GeckoTerminal fallback."""
+"""Token monitor with DexScreener primary source and GeckoTerminal fallback."""
 
 import asyncio
 import logging

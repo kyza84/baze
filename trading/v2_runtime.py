@@ -53,6 +53,13 @@ def _parse_float_map(raw: str) -> dict[str, float]:
     return out
 
 
+def _parse_int_map(raw: str) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for key, value in _parse_float_map(raw).items():
+        out[key] = int(max(0, round(float(value))))
+    return out
+
+
 def _percentile(values: list[float], p: float) -> float:
     if not values:
         return 0.0
@@ -482,6 +489,335 @@ class UniverseFlowController:
         return float(score * src_w)
 
 
+class SourceQosController:
+    """Source-level QoS guard: cooldowns + pre-safety top-K + anti-noise caps."""
+
+    def __init__(self) -> None:
+        def _cfg(name: str, default: Any) -> Any:
+            value = getattr(config, name, default)
+            return default if value is None else value
+
+        self.enabled = bool(_cfg("V2_SOURCE_QOS_ENABLED", True))
+        self.window_cycles = max(3, int(_cfg("V2_SOURCE_QOS_WINDOW_CYCLES", 12)))
+        self.min_eval_cycles = max(3, int(_cfg("V2_SOURCE_QOS_MIN_EVAL_CYCLES", 6)))
+        self.min_seen_per_window = max(1, int(_cfg("V2_SOURCE_QOS_MIN_SEEN_PER_WINDOW", 120)))
+        self.min_plan_per_window = max(1, int(_cfg("V2_SOURCE_QOS_MIN_PLAN_PER_WINDOW", 8)))
+        self.min_pass_rate = _clamp(float(_cfg("V2_SOURCE_QOS_MIN_PASS_RATE", 0.005)), 0.0, 1.0)
+        self.min_ev_positive_rate = _clamp(float(_cfg("V2_SOURCE_QOS_MIN_EV_POSITIVE_RATE", 0.05)), 0.0, 1.0)
+        self.min_open_rate = _clamp(float(_cfg("V2_SOURCE_QOS_MIN_OPEN_RATE", 0.03)), 0.0, 1.0)
+        self.required_fail_signals = max(1, int(_cfg("V2_SOURCE_QOS_REQUIRED_FAIL_SIGNALS", 2)))
+        self.cooldown_seconds = max(60, int(_cfg("V2_SOURCE_QOS_COOLDOWN_SECONDS", 900)))
+        self.topk_enabled = bool(_cfg("V2_SOURCE_QOS_TOPK_ENABLED", True))
+        self.topk_per_cycle = max(0, int(_cfg("V2_SOURCE_QOS_TOPK_PER_CYCLE", 220)))
+        self.max_per_symbol_per_cycle = max(0, int(_cfg("V2_SOURCE_QOS_MAX_PER_SYMBOL_PER_CYCLE", 3)))
+        self.source_caps = _parse_int_map(
+            str(
+                _cfg(
+                    "V2_SOURCE_QOS_SOURCE_CAPS",
+                    "onchain:140,onchain+market:140,dexscreener:120,geckoterminal:120,watchlist:50,dex_boosts:40",
+                )
+                or ""
+            )
+        )
+        self.source_priority = _parse_float_map(
+            str(
+                _cfg(
+                    "V2_SOURCE_QOS_SOURCE_PRIORITY",
+                    "onchain:1.10,onchain+market:1.12,dexscreener:1.00,geckoterminal:1.02,watchlist:0.95,dex_boosts:1.00",
+                )
+                or ""
+            )
+        )
+        self.cap_mult_floor = _clamp(float(_cfg("V2_SOURCE_QOS_CAP_MULT_FLOOR", 0.40)), 0.10, 1.0)
+        self.cap_mult_ceil = max(
+            self.cap_mult_floor,
+            float(_cfg("V2_SOURCE_QOS_CAP_MULT_CEIL", 1.40)),
+        )
+        self.boost_pass_rate = _clamp(float(_cfg("V2_SOURCE_QOS_BOOST_PASS_RATE", 0.02)), 0.0, 1.0)
+        self.boost_ev_positive_rate = _clamp(float(_cfg("V2_SOURCE_QOS_BOOST_EV_POSITIVE_RATE", 0.20)), 0.0, 1.0)
+        self.boost_open_rate = _clamp(float(_cfg("V2_SOURCE_QOS_BOOST_OPEN_RATE", 0.08)), 0.0, 1.0)
+
+        self._rows: deque[dict[str, dict[str, float]]] = deque(maxlen=self.window_cycles)
+        self._cooldown_until: dict[str, float] = {}
+        self._source_cap_mult: dict[str, float] = {}
+        self._last_filter_meta: dict[str, Any] = {
+            "enabled": bool(self.enabled),
+            "in_total": 0,
+            "out_total": 0,
+            "drop_counts": {},
+            "active_cooldowns": 0,
+            "source_caps_effective": {},
+        }
+
+    @staticmethod
+    def _source_key(value: Any) -> str:
+        return str(value or "unknown").strip().lower() or "unknown"
+
+    @staticmethod
+    def _symbol_key(token: dict[str, Any]) -> str:
+        sym = str((token or {}).get("symbol", "") or "").strip().upper()
+        if sym:
+            return sym
+        name = str((token or {}).get("name", "") or "").strip().upper()
+        return name or "UNKNOWN"
+
+    def _priority_score(self, token: dict[str, Any]) -> float:
+        src = self._source_key((token or {}).get("source", "unknown"))
+        src_mult = float(self.source_priority.get(src, 1.0))
+        liq = max(0.0, _safe_float((token or {}).get("liquidity"), 0.0))
+        vol5m = max(0.0, _safe_float((token or {}).get("volume_5m"), 0.0))
+        abs_chg = abs(_safe_float((token or {}).get("price_change_5m"), 0.0))
+        age = max(0.0, _safe_float((token or {}).get("age_seconds"), 0.0))
+        age_term = 1.0 if age <= 0.0 else min(1.25, max(0.65, 1.0 - (age / 86_400.0) * 0.25))
+        score = (0.62 * math.log1p(vol5m)) + (0.30 * math.log1p(liq)) + (0.08 * math.log1p(abs_chg))
+        return float(score * src_mult * age_term)
+
+    def _effective_source_cap(self, source: str) -> int:
+        src = self._source_key(source)
+        base_cap = int(self.source_caps.get(src, 0) or 0)
+        if base_cap <= 0:
+            return 0
+        mult = float(self._source_cap_mult.get(src, 1.0) or 1.0)
+        mult = _clamp(mult, self.cap_mult_floor, self.cap_mult_ceil)
+        return max(1, int(round(float(base_cap) * float(mult))))
+
+    def _prune_cooldowns(self, now_ts: float) -> None:
+        for src in list(self._cooldown_until.keys()):
+            if float(self._cooldown_until.get(src, 0.0) or 0.0) <= now_ts:
+                self._cooldown_until.pop(src, None)
+
+    def filter_tokens(self, tokens: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+        if not self.enabled or not tokens:
+            meta = {
+                "enabled": bool(self.enabled),
+                "in_total": len(tokens or []),
+                "out_total": len(tokens or []),
+                "drop_counts": {},
+                "active_cooldowns": len(self._cooldown_until),
+                "source_caps_effective": {},
+            }
+            self._last_filter_meta = dict(meta)
+            return list(tokens or []), [], meta
+
+        now_ts = time.time()
+        self._prune_cooldowns(now_ts)
+        rows = []
+        for token in tokens:
+            if not isinstance(token, dict):
+                continue
+            src = self._source_key(token.get("source", "unknown"))
+            rows.append(
+                {
+                    "token": token,
+                    "source": src,
+                    "symbol": self._symbol_key(token),
+                    "priority": self._priority_score(token),
+                }
+            )
+        rows.sort(key=lambda row: float(row.get("priority", 0.0)), reverse=True)
+
+        accepted: list[dict[str, Any]] = []
+        dropped: list[dict[str, Any]] = []
+        drop_counts: dict[str, int] = defaultdict(int)
+        source_used: dict[str, int] = defaultdict(int)
+        symbol_used: dict[str, int] = defaultdict(int)
+
+        source_caps_effective: dict[str, int] = {}
+        for src in {str(row.get("source", "unknown")) for row in rows}:
+            source_caps_effective[src] = int(self._effective_source_cap(src))
+        single_source_cap_floor: dict[str, int] = {}
+        if len(source_caps_effective) == 1:
+            # Anti-stall guard: when only one source is present in a cycle,
+            # keep enough rows to preserve symbol rotation instead of cap=1.
+            only_src = next(iter(source_caps_effective.keys()))
+            available = sum(1 for row in rows if str(row.get("source", "unknown")) == only_src)
+            if available > 0:
+                symbol_cap = int(self.max_per_symbol_per_cycle)
+                floor_target = 3 if symbol_cap <= 0 else int(symbol_cap + 2)
+                if self.topk_enabled and int(self.topk_per_cycle) > 0:
+                    floor_target = min(floor_target, int(self.topk_per_cycle))
+                floor_target = max(2, min(int(available), int(floor_target)))
+                current_cap = int(source_caps_effective.get(only_src, 0) or 0)
+                if current_cap > 0 and current_cap < floor_target:
+                    source_caps_effective[only_src] = int(floor_target)
+                    single_source_cap_floor[only_src] = int(floor_target)
+
+        for row in rows:
+            token = dict(row.get("token") or {})
+            src = str(row.get("source", "unknown"))
+            symbol = str(row.get("symbol", "UNKNOWN"))
+            reason = ""
+            extra = ""
+
+            until_ts = float(self._cooldown_until.get(src, 0.0) or 0.0)
+            if until_ts > now_ts:
+                reason = "source_qos_cooldown"
+                extra = f"source={src} left={int(until_ts - now_ts)}s"
+            else:
+                src_cap = int(source_caps_effective.get(src, 0) or 0)
+                if src_cap > 0 and int(source_used[src]) >= src_cap:
+                    reason = "source_qos_cap"
+                    extra = f"source={src} used={int(source_used[src])}/{src_cap}"
+                elif (
+                    self.max_per_symbol_per_cycle > 0
+                    and int(symbol_used[symbol]) >= int(self.max_per_symbol_per_cycle)
+                ):
+                    reason = "source_qos_symbol_cap"
+                    extra = f"symbol={symbol} used={int(symbol_used[symbol])}/{int(self.max_per_symbol_per_cycle)}"
+                elif self.topk_enabled and self.topk_per_cycle > 0 and len(accepted) >= int(self.topk_per_cycle):
+                    reason = "source_qos_topk"
+                    extra = f"topk={int(self.topk_per_cycle)}"
+
+            if reason:
+                drop_counts[reason] = int(drop_counts[reason]) + 1
+                dropped.append({"token": token, "reason": reason, "extra": extra})
+                continue
+
+            accepted.append(token)
+            source_used[src] = int(source_used[src]) + 1
+            symbol_used[symbol] = int(symbol_used[symbol]) + 1
+
+        meta = {
+            "enabled": True,
+            "in_total": len(tokens),
+            "out_total": len(accepted),
+            "drop_counts": dict(drop_counts),
+            "active_cooldowns": len(self._cooldown_until),
+            "source_caps_effective": source_caps_effective,
+            "source_used": dict(source_used),
+            "single_source_mode": bool(len(source_caps_effective) == 1),
+            "single_source_cap_floor": dict(single_source_cap_floor),
+        }
+        self._last_filter_meta = dict(meta)
+        return accepted, dropped, meta
+
+    def record_cycle(
+        self,
+        *,
+        seen_by_source: dict[str, int],
+        passed_by_source: dict[str, int],
+        planned_by_source: dict[str, int],
+        source_flow: dict[str, dict[str, Any]] | None = None,
+    ) -> dict[str, Any] | None:
+        if not self.enabled:
+            return None
+
+        now_ts = time.time()
+        self._prune_cooldowns(now_ts)
+        flow = dict(source_flow or {})
+        all_sources = set(str(k) for k in (seen_by_source or {}).keys())
+        all_sources.update(str(k) for k in (passed_by_source or {}).keys())
+        all_sources.update(str(k) for k in (planned_by_source or {}).keys())
+        all_sources.update(str(k) for k in flow.keys())
+        if not all_sources:
+            return None
+
+        row: dict[str, dict[str, float]] = {}
+        for raw_src in all_sources:
+            src = self._source_key(raw_src)
+            f = dict(flow.get(src) or flow.get(raw_src) or {})
+            plan_attempts = int(f.get("plan_attempts", planned_by_source.get(src, 0)) or 0)
+            opens = int(f.get("opens", 0) or 0)
+            ev_low = int(f.get("ev_net_low_skips", 0) or 0)
+            ev_positive = int(f.get("ev_positive", max(0, plan_attempts - ev_low)) or 0)
+            row[src] = {
+                "seen": float(int(seen_by_source.get(src, 0) or 0)),
+                "passed": float(int(passed_by_source.get(src, 0) or 0)),
+                "planned": float(int(plan_attempts)),
+                "opens": float(int(opens)),
+                "ev_positive": float(int(ev_positive)),
+            }
+        self._rows.append(row)
+        if len(self._rows) < int(self.min_eval_cycles):
+            return None
+
+        aggregates: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+        for bucket in self._rows:
+            for src, vals in bucket.items():
+                ag = aggregates[src]
+                ag["seen"] += float(vals.get("seen", 0.0) or 0.0)
+                ag["passed"] += float(vals.get("passed", 0.0) or 0.0)
+                ag["planned"] += float(vals.get("planned", 0.0) or 0.0)
+                ag["opens"] += float(vals.get("opens", 0.0) or 0.0)
+                ag["ev_positive"] += float(vals.get("ev_positive", 0.0) or 0.0)
+
+        cooled_now: list[dict[str, Any]] = []
+        multipliers_changed: dict[str, float] = {}
+        for src, ag in aggregates.items():
+            seen = float(ag.get("seen", 0.0) or 0.0)
+            passed = float(ag.get("passed", 0.0) or 0.0)
+            planned = float(ag.get("planned", 0.0) or 0.0)
+            opens = float(ag.get("opens", 0.0) or 0.0)
+            ev_positive = float(ag.get("ev_positive", 0.0) or 0.0)
+            pass_rate = (passed / seen) if seen > 0.0 else 0.0
+            open_rate = (opens / planned) if planned > 0.0 else 0.0
+            ev_positive_rate = (ev_positive / planned) if planned > 0.0 else 0.0
+
+            fail_signals = 0
+            if seen >= float(self.min_seen_per_window) and pass_rate < float(self.min_pass_rate):
+                fail_signals += 1
+            if planned >= float(self.min_plan_per_window) and ev_positive_rate < float(self.min_ev_positive_rate):
+                fail_signals += 1
+            if planned >= float(self.min_plan_per_window) and open_rate < float(self.min_open_rate):
+                fail_signals += 1
+            if fail_signals >= int(self.required_fail_signals):
+                until_ts = now_ts + float(self.cooldown_seconds)
+                if until_ts > float(self._cooldown_until.get(src, 0.0) or 0.0):
+                    self._cooldown_until[src] = until_ts
+                    cooled_now.append(
+                        {
+                            "source": src,
+                            "until_ts": round(until_ts, 3),
+                            "pass_rate": round(pass_rate, 6),
+                            "open_rate": round(open_rate, 6),
+                            "ev_positive_rate": round(ev_positive_rate, 6),
+                        }
+                    )
+
+            mult_prev = float(self._source_cap_mult.get(src, 1.0) or 1.0)
+            mult_next = 1.0
+            if seen >= float(self.min_seen_per_window):
+                if pass_rate < float(self.min_pass_rate):
+                    mult_next = min(mult_next, float(self.cap_mult_floor))
+                if planned >= float(self.min_plan_per_window) and ev_positive_rate < float(self.min_ev_positive_rate):
+                    mult_next = min(mult_next, float(self.cap_mult_floor))
+                if (
+                    pass_rate >= float(self.boost_pass_rate)
+                    and ev_positive_rate >= float(self.boost_ev_positive_rate)
+                    and open_rate >= float(self.boost_open_rate)
+                ):
+                    mult_next = float(self.cap_mult_ceil)
+            mult_next = _clamp(mult_next, self.cap_mult_floor, self.cap_mult_ceil)
+            self._source_cap_mult[src] = float(mult_next)
+            if abs(float(mult_next) - float(mult_prev)) >= 0.01:
+                multipliers_changed[src] = round(float(mult_next), 4)
+
+        if not cooled_now and not multipliers_changed:
+            return None
+        return {
+            "event_type": "V2_SOURCE_QOS",
+            "cooled_sources": cooled_now,
+            "source_cap_mult_changed": multipliers_changed,
+            "active_cooldowns": int(len(self._cooldown_until)),
+            "window_cycles": int(len(self._rows)),
+        }
+
+    def snapshot(self) -> dict[str, Any]:
+        now_ts = time.time()
+        self._prune_cooldowns(now_ts)
+        cooldowns: dict[str, int] = {}
+        for src, until_ts in self._cooldown_until.items():
+            left = int(max(0.0, float(until_ts) - now_ts))
+            if left > 0:
+                cooldowns[src] = left
+        return {
+            "enabled": bool(self.enabled),
+            "active_cooldowns": dict(cooldowns),
+            "source_cap_mult": {k: round(float(v), 4) for k, v in self._source_cap_mult.items()},
+            "last_filter_meta": dict(self._last_filter_meta),
+        }
+
+
 class UniverseQualityGateController:
     """EV-first pool shaping: core/explore/cooldown + source budgets + anti-concentration."""
 
@@ -522,6 +858,9 @@ class UniverseQualityGateController:
         self.symbol_min_abs_cap = max(1, int(_cfg("V2_QUALITY_SYMBOL_MIN_ABS_CAP", 2)))
         self.symbol_reentry_min_seconds = max(0, int(_cfg("V2_QUALITY_SYMBOL_REENTRY_MIN_SECONDS", 240)))
         self.symbol_reentry_override_vol_mult = max(1.0, float(_cfg("V2_QUALITY_SYMBOL_REENTRY_OVERRIDE_VOL_MULT", 2.3)))
+        self.symbol_concentration_use_open_history = bool(
+            _cfg("V2_QUALITY_SYMBOL_CONCENTRATION_USE_OPEN_HISTORY", True)
+        )
         self.fresh_symbol_window_seconds = max(300, int(_cfg("V2_QUALITY_FRESH_SYMBOL_WINDOW_SECONDS", 3600)))
         self.fresh_symbol_boost = max(0.0, float(_cfg("V2_QUALITY_FRESH_SYMBOL_BOOST", 2.6)))
         self.source_budget_enabled = bool(_cfg("V2_QUALITY_SOURCE_BUDGET_ENABLED", True))
@@ -551,6 +890,7 @@ class UniverseQualityGateController:
         self.source_cut_mult = _clamp(float(_cfg("V2_QUALITY_SOURCE_CUT_MULT", 0.62)), 0.10, 1.0)
         self.source_min_share = _clamp(float(_cfg("V2_QUALITY_SOURCE_MIN_SHARE", 0.08)), 0.0, 0.40)
         self.source_max_share = _clamp(float(_cfg("V2_QUALITY_SOURCE_MAX_SHARE", 0.58)), 0.10, 1.0)
+        self.source_cap_soft_fill_enabled = bool(_cfg("V2_QUALITY_SOURCE_CAP_SOFT_FILL_ENABLED", True))
         self.provisional_core_enabled = bool(_cfg("V2_QUALITY_PROVISIONAL_CORE_ENABLED", True))
         self.provisional_core_min_score = max(0.0, _safe_float(_cfg("V2_QUALITY_PROVISIONAL_CORE_MIN_SCORE", 92), 92.0))
         self.provisional_core_min_liquidity = max(
@@ -868,6 +1208,12 @@ class UniverseQualityGateController:
         return caps
 
     def _prune_symbol_history(self, now_ts: float) -> None:
+        if bool(self.symbol_concentration_use_open_history):
+            # In open-history mode concentration is based on executed opens from auto_trader,
+            # not on every quality-gate selection.
+            self._symbol_history.clear()
+            self._symbol_last_selected_ts = {}
+            return
         cutoff = float(now_ts) - float(self.symbol_concentration_window_seconds)
         while self._symbol_history and float(self._symbol_history[0][0]) < cutoff:
             self._symbol_history.popleft()
@@ -877,6 +1223,52 @@ class UniverseQualityGateController:
             for k, v in self._symbol_last_selected_ts.items()
             if float(v) >= (float(now_ts) - reentry_keep)
         }
+
+    def _symbol_history_snapshot(
+        self,
+        *,
+        auto_trader: Any,
+        now_ts: float,
+    ) -> tuple[dict[str, int], set[str], dict[str, float]]:
+        hist_by_symbol: dict[str, int] = defaultdict(int)
+        fresh_seen_symbols: set[str] = set()
+        last_seen_by_symbol: dict[str, float] = {}
+        fresh_cutoff = float(now_ts) - float(self.fresh_symbol_window_seconds)
+
+        if bool(self.symbol_concentration_use_open_history):
+            rows = list(getattr(auto_trader, "_recent_open_symbols", []) or [])
+            conc_cutoff = float(now_ts) - float(self.symbol_concentration_window_seconds)
+            for ts_raw, sym_raw in rows:
+                try:
+                    ts = float(ts_raw)
+                except Exception:
+                    continue
+                if ts < conc_cutoff:
+                    continue
+                sym = str(sym_raw or "").strip().upper()
+                if not sym:
+                    continue
+                hist_by_symbol[sym] = int(hist_by_symbol.get(sym, 0)) + 1
+                last_seen_by_symbol[sym] = max(float(last_seen_by_symbol.get(sym, 0.0) or 0.0), ts)
+                if ts >= fresh_cutoff:
+                    fresh_seen_symbols.add(sym)
+            return hist_by_symbol, fresh_seen_symbols, last_seen_by_symbol
+
+        self._prune_symbol_history(now_ts)
+        for ts, sym in self._symbol_history:
+            if not sym:
+                continue
+            key = str(sym)
+            hist_by_symbol[key] = int(hist_by_symbol.get(key, 0)) + 1
+            last_seen_by_symbol[key] = max(float(last_seen_by_symbol.get(key, 0.0) or 0.0), float(ts))
+            if float(ts) >= fresh_cutoff:
+                fresh_seen_symbols.add(key)
+        for sym, ts in self._symbol_last_selected_ts.items():
+            key = str(sym or "").strip().upper()
+            if not key:
+                continue
+            last_seen_by_symbol[key] = max(float(last_seen_by_symbol.get(key, 0.0) or 0.0), float(ts))
+        return hist_by_symbol, fresh_seen_symbols, last_seen_by_symbol
 
     def _register_candidate_sources(self, candidates: list[tuple[dict[str, Any], dict[str, Any]]], now_ts: float) -> None:
         for token, _ in candidates:
@@ -933,17 +1325,10 @@ class UniverseQualityGateController:
         if now_ts >= float(self._next_refresh_ts):
             refresh_meta = self._refresh_stats(auto_trader=auto_trader, now_ts=now_ts)
 
-        self._prune_symbol_history(now_ts)
-        hist_by_symbol: dict[str, int] = defaultdict(int)
-        fresh_cutoff = float(now_ts) - float(self.fresh_symbol_window_seconds)
-        fresh_seen_symbols: set[str] = set()
-        for ts, sym in self._symbol_history:
-            if not sym:
-                continue
-            key = str(sym)
-            hist_by_symbol[key] = int(hist_by_symbol.get(key, 0)) + 1
-            if float(ts) >= fresh_cutoff:
-                fresh_seen_symbols.add(key)
+        hist_by_symbol, fresh_seen_symbols, symbol_last_seen_ts = self._symbol_history_snapshot(
+            auto_trader=auto_trader,
+            now_ts=now_ts,
+        )
 
         rows: list[dict[str, Any]] = []
         for token, score_data in candidates:
@@ -1072,10 +1457,43 @@ class UniverseQualityGateController:
 
         dropped: list[dict[str, Any]] = []
         drop_counts: dict[str, int] = defaultdict(int)
+        dropped_seen: set[tuple[str, str]] = set()
         probe_rows: list[dict[str, Any]] = []
         probe_p = float(self.cooldown_probe_probability)
         if regime == "RED":
             probe_p *= 0.75
+
+        def _drop_identity(row: dict[str, Any]) -> str:
+            token = dict(row.get("token") or {})
+            cid = str(token.get("_candidate_id", "") or "").strip()
+            if cid:
+                return f"cid:{cid}"
+            addr = normalize_address(str(token.get("address", "") or ""))
+            if addr:
+                return f"addr:{addr}"
+            symbol = self._symbol_key(token)
+            if symbol:
+                return f"sym:{symbol}"
+            return f"row:{id(row)}"
+
+        def _record_drop(row: dict[str, Any], reason: str, *, bucket: str | None = None) -> None:
+            reason_key = str(reason or "unknown").strip().lower() or "unknown"
+            ident = _drop_identity(row)
+            key = (ident, reason_key)
+            if key in dropped_seen:
+                return
+            dropped_seen.add(key)
+            drop_counts[reason_key] += 1
+            token = dict(row.get("token") or {})
+            dropped.append(
+                {
+                    "candidate_id": str(token.get("_candidate_id", "") or ""),
+                    "symbol": str(token.get("symbol", "") or ""),
+                    "reason": reason_key,
+                    "bucket": str(bucket if bucket is not None else row.get("bucket", "")),
+                }
+            )
+
         for row in cooldown_rows:
             token = dict(row.get("token") or {})
             cid = str(token.get("_candidate_id", "") or "")
@@ -1087,15 +1505,7 @@ class UniverseQualityGateController:
                 row2["priority"] = float(row2.get("priority", 0.0) or 0.0) * 0.92
                 probe_rows.append(row2)
             else:
-                drop_counts["cooldown_bucket"] += 1
-                dropped.append(
-                    {
-                        "candidate_id": str(token.get("_candidate_id", "") or ""),
-                        "symbol": str(token.get("symbol", "") or ""),
-                        "reason": "cooldown_bucket",
-                        "bucket": "cooldown",
-                    }
-                )
+                _record_drop(row, "cooldown_bucket", bucket="cooldown")
 
         explore_pool = sorted(explore_rows + probe_rows, key=lambda row: float(row.get("priority", 0.0) or 0.0), reverse=True)
         target_total = len(rows)
@@ -1116,11 +1526,13 @@ class UniverseQualityGateController:
         selected_symbol_counts: dict[str, int] = defaultdict(int)
         selected: list[dict[str, Any]] = []
         selected_addrs: set[str] = set()
+        selected_symbol_last_ts: dict[str, float] = dict(symbol_last_seen_ts)
         symbol_reentry_override_floor = float(getattr(config, "SAFE_MIN_VOLUME_5M_USD", 0.0) or 0.0) * float(
             self.symbol_reentry_override_vol_mult
         )
+        core_buckets = {"core", "core_provisional", "core_fallback"}
 
-        def _try_take(row: dict[str, Any]) -> bool:
+        def _uniq_key_for_row(row: dict[str, Any]) -> tuple[str, str, str, dict[str, Any]]:
             token = dict(row.get("token") or {})
             addr_norm = normalize_address(str(token.get("address", "") or ""))
             candidate_id = str(token.get("_candidate_id", "") or "")
@@ -1132,72 +1544,46 @@ class UniverseQualityGateController:
                 uniq_key = f"row:{id(row)}"
             source = str(row.get("source", "unknown") or "unknown")
             symbol = str(row.get("symbol", "-") or "-")
+            return uniq_key, source, symbol, token
+
+        def _try_take(row: dict[str, Any], *, ignore_source_cap: bool = False) -> bool:
+            uniq_key, source, symbol, token = _uniq_key_for_row(row)
+            candidate_id = str(token.get("_candidate_id", "") or "")
             if uniq_key in selected_addrs:
-                drop_counts["duplicate_address"] += 1
+                _record_drop(row, "duplicate_address")
                 return False
             source_p = _clamp(_safe_float(row.get("source_entry_probability"), 1.0), 0.0, 1.0)
             if source_p < 1.0:
                 slot = int(now_ts // 600)
                 seed = f"{candidate_id or uniq_key}|{source}|{regime}|srcp|{slot}"
                 if _deterministic_probability(seed) > source_p:
-                    drop_counts["source_ev_cooldown"] += 1
-                    dropped.append(
-                        {
-                            "candidate_id": str(token.get("_candidate_id", "") or ""),
-                            "symbol": str(token.get("symbol", "") or ""),
-                            "reason": "source_ev_cooldown",
-                            "bucket": str(row.get("bucket", "")),
-                        }
-                    )
+                    _record_drop(row, "source_ev_cooldown")
                     return False
             cap = int(source_caps.get(source, 10**9))
-            if int(source_used.get(source, 0)) >= cap:
-                drop_counts["source_budget"] += 1
-                dropped.append(
-                    {
-                        "candidate_id": str(token.get("_candidate_id", "") or ""),
-                        "symbol": str(token.get("symbol", "") or ""),
-                        "reason": "source_budget",
-                        "bucket": str(row.get("bucket", "")),
-                    }
-                )
+            if (not ignore_source_cap) and int(source_used.get(source, 0)) >= cap:
+                _record_drop(row, "source_budget")
                 return False
 
             if int(self.symbol_reentry_min_seconds) > 0:
-                last_selected_ts = float(self._symbol_last_selected_ts.get(symbol, 0.0) or 0.0)
+                last_selected_ts = float(selected_symbol_last_ts.get(symbol, 0.0) or 0.0)
                 reentry_left = float(self.symbol_reentry_min_seconds) - (float(now_ts) - last_selected_ts)
                 vol5m = max(0.0, _safe_float(token.get("volume_5m"), 0.0))
                 if reentry_left > 0.0 and vol5m < symbol_reentry_override_floor:
-                    drop_counts["symbol_reentry_cooldown"] += 1
-                    dropped.append(
-                        {
-                            "candidate_id": str(token.get("_candidate_id", "") or ""),
-                            "symbol": str(token.get("symbol", "") or ""),
-                            "reason": "symbol_reentry_cooldown",
-                            "bucket": str(row.get("bucket", "")),
-                        }
-                    )
+                    _record_drop(row, "symbol_reentry_cooldown")
                     return False
 
-            projected_total = int(len(self._symbol_history)) + int(len(selected)) + 1
+            projected_total = int(sum(hist_by_symbol.values())) + int(len(selected)) + 1
             allowed = max(int(self.symbol_min_abs_cap), int(math.floor(float(projected_total) * float(self.symbol_max_share))))
             used_symbol = int(hist_by_symbol.get(symbol, 0)) + int(selected_symbol_counts.get(symbol, 0))
             if used_symbol >= allowed:
-                drop_counts["symbol_concentration"] += 1
-                dropped.append(
-                    {
-                        "candidate_id": str(token.get("_candidate_id", "") or ""),
-                        "symbol": str(token.get("symbol", "") or ""),
-                        "reason": "symbol_concentration",
-                        "bucket": str(row.get("bucket", "")),
-                    }
-                )
+                _record_drop(row, "symbol_concentration")
                 return False
 
             selected.append(row)
             selected_addrs.add(uniq_key)
             source_used[source] = int(source_used.get(source, 0)) + 1
             selected_symbol_counts[symbol] = int(selected_symbol_counts.get(symbol, 0)) + 1
+            selected_symbol_last_ts[symbol] = float(now_ts)
             return True
 
         core_taken = 0
@@ -1214,15 +1600,7 @@ class UniverseQualityGateController:
             if core_taken >= int(core_target):
                 break
             if provisional_cap > 0 and provisional_taken >= provisional_cap:
-                drop_counts["provisional_core_cap"] += 1
-                dropped.append(
-                    {
-                        "candidate_id": str((row.get("token") or {}).get("_candidate_id", "") or ""),
-                        "symbol": str((row.get("token") or {}).get("symbol", "") or ""),
-                        "reason": "provisional_core_cap",
-                        "bucket": "core_provisional",
-                    }
-                )
+                _record_drop(row, "provisional_core_cap", bucket="core_provisional")
                 continue
             if _try_take(row):
                 core_taken += 1
@@ -1238,32 +1616,74 @@ class UniverseQualityGateController:
         for row in (core_rows_native + core_rows_provisional + explore_pool):
             if len(selected) >= int(target_total):
                 break
-            _try_take(row)
+            _try_take(row, ignore_source_cap=bool(self.source_cap_soft_fill_enabled))
 
         if not selected and (core_rows or explore_pool):
             for row in (core_rows_native + core_rows_provisional + explore_pool):
-                token = dict(row.get("token") or {})
-                addr_norm = normalize_address(str(token.get("address", "") or ""))
-                candidate_id = str(token.get("_candidate_id", "") or "")
-                if addr_norm:
-                    uniq_key = f"addr:{addr_norm}"
-                elif candidate_id:
-                    uniq_key = f"cid:{candidate_id}"
-                else:
-                    uniq_key = f"row:{id(row)}"
+                uniq_key, source, symbol, _token = _uniq_key_for_row(row)
                 selected = [row]
                 selected_addrs = {uniq_key}
-                source = str(row.get("source", "unknown") or "unknown")
-                symbol = str(row.get("symbol", "-") or "-")
                 source_used[source] = int(source_used.get(source, 0)) + 1
                 selected_symbol_counts[symbol] = int(selected_symbol_counts.get(symbol, 0)) + 1
                 break
 
-        for row in selected:
-            sym = str(row.get("symbol", "") or "")
-            if sym:
-                self._symbol_history.append((float(now_ts), sym))
-                self._symbol_last_selected_ts[sym] = float(now_ts)
+        forced_cooldown_probe = False
+        if not selected and cooldown_rows:
+            # Anti-stall fallback: when everything is cooldown, keep one probe row alive.
+            for row in cooldown_rows:
+                uniq_key, source, symbol, _token = _uniq_key_for_row(row)
+                row2 = dict(row)
+                row2["is_probe"] = True
+                row2["bucket"] = "cooldown_forced"
+                selected = [row2]
+                selected_addrs = {uniq_key}
+                source_used[source] = int(source_used.get(source, 0)) + 1
+                selected_symbol_counts[symbol] = int(selected_symbol_counts.get(symbol, 0)) + 1
+                selected_symbol_last_ts[symbol] = float(now_ts)
+                forced_cooldown_probe = True
+                break
+
+        has_core_selected = any(str((row or {}).get("bucket", "") or "").strip().lower() in core_buckets for row in selected)
+        if (not has_core_selected) and (core_target > 0) and (core_rows_native or core_rows_provisional or core_fallback_rows):
+            for row in (core_rows_native + core_rows_provisional + core_fallback_rows):
+                uniq_key, source, symbol, _token = _uniq_key_for_row(row)
+                if uniq_key in selected_addrs:
+                    continue
+                if len(selected) >= int(target_total):
+                    replace_idx: int | None = None
+                    replace_priority = 0.0
+                    for idx, selected_row in enumerate(selected):
+                        bucket = str((selected_row or {}).get("bucket", "") or "").strip().lower()
+                        if bucket in core_buckets:
+                            continue
+                        pr = float((selected_row or {}).get("priority", 0.0) or 0.0)
+                        if replace_idx is None or pr < replace_priority:
+                            replace_idx = idx
+                            replace_priority = pr
+                    if replace_idx is None:
+                        break
+                    replaced_row = selected.pop(replace_idx)
+                    replaced_key, replaced_source, replaced_symbol, _ = _uniq_key_for_row(replaced_row)
+                    selected_addrs.discard(replaced_key)
+                    source_used[replaced_source] = max(0, int(source_used.get(replaced_source, 0)) - 1)
+                    if source_used[replaced_source] <= 0:
+                        source_used.pop(replaced_source, None)
+                    selected_symbol_counts[replaced_symbol] = max(0, int(selected_symbol_counts.get(replaced_symbol, 0)) - 1)
+                    if selected_symbol_counts[replaced_symbol] <= 0:
+                        selected_symbol_counts.pop(replaced_symbol, None)
+                selected.append(row)
+                selected_addrs.add(uniq_key)
+                source_used[source] = int(source_used.get(source, 0)) + 1
+                selected_symbol_counts[symbol] = int(selected_symbol_counts.get(symbol, 0)) + 1
+                drop_counts["core_rescue"] += 1
+                break
+
+        if not bool(self.symbol_concentration_use_open_history):
+            for row in selected:
+                sym = str(row.get("symbol", "") or "")
+                if sym:
+                    self._symbol_history.append((float(now_ts), sym))
+                    self._symbol_last_selected_ts[sym] = float(now_ts)
 
         tagged: list[tuple[dict[str, Any], dict[str, Any]]] = []
         core_out = 0
@@ -1356,6 +1776,7 @@ class UniverseQualityGateController:
             "source_share_out": source_share_out,
             "drop_counts": dict(drop_counts),
             "dropped": dropped,
+            "forced_cooldown_probe_out": 1 if forced_cooldown_probe else 0,
             "core_share_out": round((float(core_out) / float(max(1, total_out))), 6),
             "explore_share_out": round((float(explore_out) / float(max(1, total_out))), 6),
             "max_symbol_share_out": round(float(max_symbol_share), 6),
@@ -2492,6 +2913,10 @@ class RuntimeKpiLoop:
         self.enabled = bool(getattr(config, "V2_KPI_LOOP_ENABLED", False))
         self.interval_seconds = max(60, int(getattr(config, "V2_KPI_LOOP_INTERVAL_SECONDS", 300) or 300))
         self.window_cycles = max(3, int(getattr(config, "V2_KPI_LOOP_WINDOW_CYCLES", 20) or 20))
+        raw_policy_mode = str(getattr(config, "V2_KPI_POLICY_MODE", "normal") or "normal").strip().lower()
+        if raw_policy_mode not in {"normal", "lock_zero_open"}:
+            raw_policy_mode = "normal"
+        self.policy_mode = raw_policy_mode
         self.edge_low_relax_trigger = _clamp(
             float(getattr(config, "V2_KPI_EDGE_LOW_RELAX_TRIGGER", 0.70) or 0.70),
             0.0,
@@ -2709,6 +3134,11 @@ class RuntimeKpiLoop:
         cand_total = int(sum(int(row.get("candidates", 0) or 0) for row in rows))
         opened_total = int(sum(int(row.get("opened", 0) or 0) for row in rows))
         open_rate = (float(opened_total) / float(cand_total)) if cand_total > 0 else 0.0
+        zero_open_lock = (
+            self.policy_mode == "lock_zero_open"
+            and cand_total > 0
+            and opened_total <= 0
+        )
         policy_bad = sum(1 for row in rows if str(row.get("policy_state", "UNKNOWN")) != "OK")
         policy_block_share = float(policy_bad) / float(max(1, len(rows)))
 
@@ -2762,7 +3192,7 @@ class RuntimeKpiLoop:
                 exp_win_rate >= float(self.explore_failsafe_recovery_winrate_min)
                 and exp_avg_pnl >= float(self.explore_failsafe_recovery_avg_pnl_min)
             )
-            if (not explore_failsafe_active) and degrade:
+            if (not explore_failsafe_active) and degrade and (not zero_open_lock):
                 explore_floor = max(0.0, float(self.explore_failsafe_min_share))
                 explore_share_next = max(explore_floor, float(explore_share_now) - float(self.explore_failsafe_shrink_step))
                 self._explore_failsafe_until_ts = now_ts + float(self.explore_failsafe_cooldown_seconds)
@@ -2770,6 +3200,8 @@ class RuntimeKpiLoop:
                 explore_failsafe_shrunk = abs(explore_share_next - explore_share_now) >= 0.0001
                 if explore_failsafe_shrunk:
                     action_parts.append("explore_failsafe_shrink")
+            elif (not explore_failsafe_active) and degrade and zero_open_lock:
+                action_parts.append("explore_failsafe_lock_zero_open")
             elif recover and float(explore_share_now) < float(self._explore_share_baseline):
                 recovery_cap = min(float(self.explore_share_max), float(self._explore_share_baseline))
                 explore_share_next = min(recovery_cap, float(explore_share_now) + float(self.explore_failsafe_recovery_step))
@@ -2785,14 +3217,16 @@ class RuntimeKpiLoop:
             relax_until_next = now_ts + float(cooldown)
             if relax_until_next > float(relax_until_now):
                 setattr(config, "V2_RUNTIME_EDGE_RELAX_UNTIL_TS", float(relax_until_next))
-        if bool(self.quality_rebalance_enabled) and hard_edge_regime:
+        quality_rebalance_blocked_by_zero_open = bool(
+            self.quality_rebalance_enabled and hard_edge_regime and zero_open_lock
+        )
+        if bool(self.quality_rebalance_enabled) and hard_edge_regime and (not zero_open_lock):
             if self.quality_rebalance_max_buys_step > 0:
                 max_buys_next = max(1, max_buys_now - int(self.quality_rebalance_max_buys_step))
             if self.quality_rebalance_topn_step > 0:
                 top_n_next = max(1, top_n_now - int(self.quality_rebalance_topn_step))
             explore_share_next = max(0.05, explore_share_now - float(self.quality_rebalance_explore_step))
             novelty_share_next = max(0.10, novelty_share_now - float(self.quality_rebalance_novelty_step))
-            setattr(config, "V2_QUALITY_SOURCE_BUDGET_ENABLED", True)
             action_parts.append("quality_rebalance")
         elif low_flow:
             if self.max_buys_boost_step > 0:
@@ -2802,6 +3236,8 @@ class RuntimeKpiLoop:
             if (not explore_failsafe_active) and (not explore_failsafe_shrunk):
                 explore_share_next = min(float(self.explore_share_max), explore_share_now + float(self.explore_share_step))
             action_parts.append("throughput_boost")
+        if quality_rebalance_blocked_by_zero_open:
+            action_parts.append("quality_rebalance_lock_zero_open")
         if unique_symbols < int(self.unique_symbols_min):
             novelty_share_next = min(float(self.novelty_share_max), novelty_share_now + float(self.novelty_share_step))
             action_parts.append("diversity_boost")
@@ -2827,7 +3263,8 @@ class RuntimeKpiLoop:
         logger.warning(
             (
                 "V2_KPI_LOOP action=%s open_rate=%.3f edge_low_share=%.3f policy_share=%.3f "
-                "unique_symbols=%s max_buys=%s->%s top_n=%s->%s explore_share=%.2f->%.2f novelty_share=%.2f->%.2f "
+                "unique_symbols=%s policy_mode=%s zero_open_lock=%s "
+                "max_buys=%s->%s top_n=%s->%s explore_share=%.2f->%.2f novelty_share=%.2f->%.2f "
                 "explore_failsafe(active=%s until=%.0f count=%s wr=%.3f loss=%.3f avg=$%.4f)"
             ),
             action,
@@ -2835,6 +3272,8 @@ class RuntimeKpiLoop:
             edge_low_share,
             policy_block_share,
             unique_symbols,
+            self.policy_mode,
+            bool(zero_open_lock),
             max_buys_now,
             max_buys_next,
             top_n_now,
@@ -2857,6 +3296,8 @@ class RuntimeKpiLoop:
             "edge_low_share": round(edge_low_share, 6),
             "policy_block_share": round(policy_block_share, 6),
             "unique_symbols": int(unique_symbols),
+            "policy_mode": str(self.policy_mode),
+            "zero_open_lock": bool(zero_open_lock),
             "max_buys_prev": int(max_buys_now),
             "max_buys_next": int(max_buys_next),
             "top_n_prev": int(top_n_now),

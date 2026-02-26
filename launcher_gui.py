@@ -23,6 +23,7 @@ from monitor.gui_engine_control import (
     start_bot as engine_start_bot,
     stop_bot as engine_stop_bot,
 )
+from utils.state_file import StateFileLockError, write_json_atomic_locked
 
 try:
     import msvcrt  # Windows-only, used for a robust single-instance file lock.
@@ -36,10 +37,10 @@ except Exception:  # pragma: no cover
     Web3 = None  # type: ignore[assignment]
 
 def _fix_mojibake(text: str) -> str:
-    """Fix UTF-8 bytes that were mistakenly decoded as latin-1 (common Ð...Ñ... mojibake)."""
+    """Fix UTF-8 bytes that were mistakenly decoded as latin-1 (common Ã...Ã‘... mojibake)."""
     if not isinstance(text, str):
         return str(text)
-    if "Ð" not in text and "Ñ" not in text:
+    if "Ã" not in text and "Ã‘" not in text:
         return text
     try:
         return text.encode("latin1").decode("utf-8")
@@ -80,9 +81,18 @@ try:
     GUI_UI_TICK_MS = max(120, int(os.getenv("GUI_UI_TICK_MS", "150")))
 except Exception:
     GUI_UI_TICK_MS = 150
+try:
+    STATE_FILE_LOCK_TIMEOUT_SECONDS = max(0.1, float(os.getenv("STATE_FILE_LOCK_TIMEOUT_SECONDS", "2.0")))
+except Exception:
+    STATE_FILE_LOCK_TIMEOUT_SECONDS = 2.0
+try:
+    STATE_FILE_LOCK_RETRY_SECONDS = max(0.01, float(os.getenv("STATE_FILE_LOCK_RETRY_SECONDS", "0.05")))
+except Exception:
+    STATE_FILE_LOCK_RETRY_SECONDS = 0.05
 UI_FONT_MAIN = "Bahnschrift"
 UI_FONT_MONO = "Cascadia Mono"
 GUI_STATS_EXCLUDED_SYMBOLS_DEFAULT = "ZORA"
+MATRIX_META_CACHE_TTL_SECONDS = 0.5
 ENGINE_CONTEXT = EngineContext(
     project_root=PROJECT_ROOT,
     python_path=PYTHON_PATH,
@@ -91,6 +101,7 @@ ENGINE_CONTEXT = EngineContext(
     out_log=OUT_LOG,
     err_log=ERR_LOG,
 )
+_MATRIX_META_CACHE: dict[str, object] = {"ts": 0.0, "mtime": 0.0, "payload": {}}
 
 EVENT_KEYS = {
     "BUY": ("Paper BUY", "#67e8f9"),
@@ -153,51 +164,51 @@ AUTO_POLICY_RE = re.compile(
 AUTO_TRADE_SKIP_RE = re.compile(r"AutoTrade skip token=\S+ reason=(?P<reason>[a-zA-Z0-9_:-]+)")
 
 SETTINGS_FIELDS_RAW = [
-    ("PERSONAL_MODE", "Личный режим"),
+    ("PERSONAL_MODE", "Ð›Ð¸Ñ‡Ð½Ñ‹Ð¹ Ñ€ÐµÐ¶Ð¸Ð¼"),
     ("PERSONAL_TELEGRAM_ID", "Telegram ID"),
-    ("MIN_TOKEN_SCORE", "Мин. скор"),
-    ("AUTO_FILTER_ENABLED", "Автофильтр"),
-    ("AUTO_TRADE_ENABLED", "Автотрейд"),
-    ("AUTO_TRADE_PAPER", "Бумажный режим"),
-    ("AUTO_TRADE_ENTRY_MODE", "Режим входа"),
-    ("AUTO_TRADE_TOP_N", "Топ N"),
-    ("AUTONOMOUS_CONTROL_ENABLED", "Автономный контроллер"),
-    ("AUTONOMOUS_CONTROL_MODE", "Режим автономного контроллера"),
-    ("AUTONOMOUS_CONTROL_INTERVAL_SECONDS", "Окно автоконтроля (сек)"),
-    ("AUTONOMOUS_CONTROL_MIN_WINDOW_CYCLES", "Мин. циклов в окне"),
-    ("AUTONOMOUS_CONTROL_TARGET_CANDIDATES_MIN", "Цель cand min"),
-    ("AUTONOMOUS_CONTROL_TARGET_CANDIDATES_HIGH", "Цель cand high"),
-    ("AUTONOMOUS_CONTROL_TARGET_OPENED_MIN", "Цель opened/cycle"),
-    ("AUTONOMOUS_CONTROL_NEG_REALIZED_TRIGGER_USD", "Порог лосса окна $"),
-    ("AUTONOMOUS_CONTROL_POS_REALIZED_TRIGGER_USD", "Порог профита окна $"),
-    ("AUTONOMOUS_CONTROL_MAX_OPEN_TRADES_MIN", "Граница open trades min"),
-    ("AUTONOMOUS_CONTROL_MAX_OPEN_TRADES_MAX", "Граница open trades max"),
-    ("AUTONOMOUS_CONTROL_TOP_N_MIN", "Граница top N min"),
-    ("AUTONOMOUS_CONTROL_TOP_N_MAX", "Граница top N max"),
-    ("AUTONOMOUS_CONTROL_MAX_BUYS_PER_HOUR_MIN", "Граница buys/hour min"),
-    ("AUTONOMOUS_CONTROL_MAX_BUYS_PER_HOUR_MAX", "Граница buys/hour max"),
-    ("WALLET_BALANCE_USD", "Бумажный кошелек $"),
-    ("PAPER_TRADE_SIZE_USD", "Базовый размер сделки $"),
-    ("PAPER_TRADE_SIZE_MIN_USD", "Мин. размер сделки $"),
-    ("PAPER_TRADE_SIZE_MAX_USD", "Макс. размер сделки $"),
-    ("PAPER_MAX_HOLD_SECONDS", "Макс. удержание (сек)"),
-    ("DYNAMIC_HOLD_ENABLED", "Динамический холд"),
-    ("HOLD_MIN_SECONDS", "Холд мин (сек)"),
-    ("HOLD_MAX_SECONDS", "Холд макс (сек)"),
-    ("MAX_OPEN_TRADES", "Макс. открытых сделок"),
-    ("CLOSED_TRADES_MAX_AGE_DAYS", "Хранить закрытые (дней)"),
-    ("PAPER_REALISM_ENABLED", "Реалистичный режим"),
+    ("MIN_TOKEN_SCORE", "ÐœÐ¸Ð½. ÑÐºÐ¾Ñ€"),
+    ("AUTO_FILTER_ENABLED", "ÐÐ²Ñ‚Ð¾Ñ„Ð¸Ð»ÑŒÑ‚Ñ€"),
+    ("AUTO_TRADE_ENABLED", "ÐÐ²Ñ‚Ð¾Ñ‚Ñ€ÐµÐ¹Ð´"),
+    ("AUTO_TRADE_PAPER", "Ð‘ÑƒÐ¼Ð°Ð¶Ð½Ñ‹Ð¹ Ñ€ÐµÐ¶Ð¸Ð¼"),
+    ("AUTO_TRADE_ENTRY_MODE", "Ð ÐµÐ¶Ð¸Ð¼ Ð²Ñ…Ð¾Ð´Ð°"),
+    ("AUTO_TRADE_TOP_N", "Ð¢Ð¾Ð¿ N"),
+    ("AUTONOMOUS_CONTROL_ENABLED", "ÐÐ²Ñ‚Ð¾Ð½Ð¾Ð¼Ð½Ñ‹Ð¹ ÐºÐ¾Ð½Ñ‚Ñ€Ð¾Ð»Ð»ÐµÑ€"),
+    ("AUTONOMOUS_CONTROL_MODE", "Ð ÐµÐ¶Ð¸Ð¼ Ð°Ð²Ñ‚Ð¾Ð½Ð¾Ð¼Ð½Ð¾Ð³Ð¾ ÐºÐ¾Ð½Ñ‚Ñ€Ð¾Ð»Ð»ÐµÑ€Ð°"),
+    ("AUTONOMOUS_CONTROL_INTERVAL_SECONDS", "ÐžÐºÐ½Ð¾ Ð°Ð²Ñ‚Ð¾ÐºÐ¾Ð½Ñ‚Ñ€Ð¾Ð»Ñ (ÑÐµÐº)"),
+    ("AUTONOMOUS_CONTROL_MIN_WINDOW_CYCLES", "ÐœÐ¸Ð½. Ñ†Ð¸ÐºÐ»Ð¾Ð² Ð² Ð¾ÐºÐ½Ðµ"),
+    ("AUTONOMOUS_CONTROL_TARGET_CANDIDATES_MIN", "Ð¦ÐµÐ»ÑŒ cand min"),
+    ("AUTONOMOUS_CONTROL_TARGET_CANDIDATES_HIGH", "Ð¦ÐµÐ»ÑŒ cand high"),
+    ("AUTONOMOUS_CONTROL_TARGET_OPENED_MIN", "Ð¦ÐµÐ»ÑŒ opened/cycle"),
+    ("AUTONOMOUS_CONTROL_NEG_REALIZED_TRIGGER_USD", "ÐŸÐ¾Ñ€Ð¾Ð³ Ð»Ð¾ÑÑÐ° Ð¾ÐºÐ½Ð° $"),
+    ("AUTONOMOUS_CONTROL_POS_REALIZED_TRIGGER_USD", "ÐŸÐ¾Ñ€Ð¾Ð³ Ð¿Ñ€Ð¾Ñ„Ð¸Ñ‚Ð° Ð¾ÐºÐ½Ð° $"),
+    ("AUTONOMOUS_CONTROL_MAX_OPEN_TRADES_MIN", "Ð“Ñ€Ð°Ð½Ð¸Ñ†Ð° open trades min"),
+    ("AUTONOMOUS_CONTROL_MAX_OPEN_TRADES_MAX", "Ð“Ñ€Ð°Ð½Ð¸Ñ†Ð° open trades max"),
+    ("AUTONOMOUS_CONTROL_TOP_N_MIN", "Ð“Ñ€Ð°Ð½Ð¸Ñ†Ð° top N min"),
+    ("AUTONOMOUS_CONTROL_TOP_N_MAX", "Ð“Ñ€Ð°Ð½Ð¸Ñ†Ð° top N max"),
+    ("AUTONOMOUS_CONTROL_MAX_BUYS_PER_HOUR_MIN", "Ð“Ñ€Ð°Ð½Ð¸Ñ†Ð° buys/hour min"),
+    ("AUTONOMOUS_CONTROL_MAX_BUYS_PER_HOUR_MAX", "Ð“Ñ€Ð°Ð½Ð¸Ñ†Ð° buys/hour max"),
+    ("WALLET_BALANCE_USD", "Ð‘ÑƒÐ¼Ð°Ð¶Ð½Ñ‹Ð¹ ÐºÐ¾ÑˆÐµÐ»ÐµÐº $"),
+    ("PAPER_TRADE_SIZE_USD", "Ð‘Ð°Ð·Ð¾Ð²Ñ‹Ð¹ Ñ€Ð°Ð·Ð¼ÐµÑ€ ÑÐ´ÐµÐ»ÐºÐ¸ $"),
+    ("PAPER_TRADE_SIZE_MIN_USD", "ÐœÐ¸Ð½. Ñ€Ð°Ð·Ð¼ÐµÑ€ ÑÐ´ÐµÐ»ÐºÐ¸ $"),
+    ("PAPER_TRADE_SIZE_MAX_USD", "ÐœÐ°ÐºÑ. Ñ€Ð°Ð·Ð¼ÐµÑ€ ÑÐ´ÐµÐ»ÐºÐ¸ $"),
+    ("PAPER_MAX_HOLD_SECONDS", "ÐœÐ°ÐºÑ. ÑƒÐ´ÐµÑ€Ð¶Ð°Ð½Ð¸Ðµ (ÑÐµÐº)"),
+    ("DYNAMIC_HOLD_ENABLED", "Ð”Ð¸Ð½Ð°Ð¼Ð¸Ñ‡ÐµÑÐºÐ¸Ð¹ Ñ…Ð¾Ð»Ð´"),
+    ("HOLD_MIN_SECONDS", "Ð¥Ð¾Ð»Ð´ Ð¼Ð¸Ð½ (ÑÐµÐº)"),
+    ("HOLD_MAX_SECONDS", "Ð¥Ð¾Ð»Ð´ Ð¼Ð°ÐºÑ (ÑÐµÐº)"),
+    ("MAX_OPEN_TRADES", "ÐœÐ°ÐºÑ. Ð¾Ñ‚ÐºÑ€Ñ‹Ñ‚Ñ‹Ñ… ÑÐ´ÐµÐ»Ð¾Ðº"),
+    ("CLOSED_TRADES_MAX_AGE_DAYS", "Ð¥Ñ€Ð°Ð½Ð¸Ñ‚ÑŒ Ð·Ð°ÐºÑ€Ñ‹Ñ‚Ñ‹Ðµ (Ð´Ð½ÐµÐ¹)"),
+    ("PAPER_REALISM_ENABLED", "Ð ÐµÐ°Ð»Ð¸ÑÑ‚Ð¸Ñ‡Ð½Ñ‹Ð¹ Ñ€ÐµÐ¶Ð¸Ð¼"),
     ("PAPER_REALISM_CAP_ENABLED", "Realism cap"),
     ("PAPER_REALISM_MAX_GAIN_PERCENT", "Realism max gain %"),
     ("PAPER_REALISM_MAX_LOSS_PERCENT", "Realism max loss %"),
-    ("PAPER_GAS_PER_TX_USD", "Газ за tx $"),
-    ("PAPER_SWAP_FEE_BPS", "Комиссия свапа (bps)"),
-    ("PAPER_BASE_SLIPPAGE_BPS", "Базовый slippage (bps)"),
-    ("DYNAMIC_POSITION_SIZING_ENABLED", "Динамический размер"),
-    ("EDGE_FILTER_ENABLED", "Фильтр edge"),
-    ("MIN_EXPECTED_EDGE_PERCENT", "Мин. ожидаемый edge %"),
-    ("PROFIT_TARGET_PERCENT", "Тейк-профит %"),
-    ("STOP_LOSS_PERCENT", "Стоп-лосс %"),
+    ("PAPER_GAS_PER_TX_USD", "Ð“Ð°Ð· Ð·Ð° tx $"),
+    ("PAPER_SWAP_FEE_BPS", "ÐšÐ¾Ð¼Ð¸ÑÑÐ¸Ñ ÑÐ²Ð°Ð¿Ð° (bps)"),
+    ("PAPER_BASE_SLIPPAGE_BPS", "Ð‘Ð°Ð·Ð¾Ð²Ñ‹Ð¹ slippage (bps)"),
+    ("DYNAMIC_POSITION_SIZING_ENABLED", "Ð”Ð¸Ð½Ð°Ð¼Ð¸Ñ‡ÐµÑÐºÐ¸Ð¹ Ñ€Ð°Ð·Ð¼ÐµÑ€"),
+    ("EDGE_FILTER_ENABLED", "Ð¤Ð¸Ð»ÑŒÑ‚Ñ€ edge"),
+    ("MIN_EXPECTED_EDGE_PERCENT", "ÐœÐ¸Ð½. Ð¾Ð¶Ð¸Ð´Ð°ÐµÐ¼Ñ‹Ð¹ edge %"),
+    ("PROFIT_TARGET_PERCENT", "Ð¢ÐµÐ¹Ðº-Ð¿Ñ€Ð¾Ñ„Ð¸Ñ‚ %"),
+    ("STOP_LOSS_PERCENT", "Ð¡Ñ‚Ð¾Ð¿-Ð»Ð¾ÑÑ %"),
     ("SAFE_TEST_MODE", "Safe test mode"),
     ("SAFE_MIN_LIQUIDITY_USD", "Safe min liquidity $"),
     ("SAFE_MIN_VOLUME_5M_USD", "Safe min volume 5m $"),
@@ -214,8 +225,8 @@ SETTINGS_FIELDS_RAW = [
     ("LOSS_STREAK_COOLDOWN_SECONDS", "Loss cooldown (sec)"),
     ("DEX_BOOSTS_SOURCE_ENABLED", "Dex boosts source"),
     ("DEX_BOOSTS_MAX_TOKENS", "Dex boosts max tokens"),
-    ("DEX_SEARCH_QUERIES", "Поиск Dex (через запятую)"),
-    ("GECKO_NEW_POOLS_PAGES", "Страниц Gecko"),
+    ("DEX_SEARCH_QUERIES", "ÐŸÐ¾Ð¸ÑÐº Dex (Ñ‡ÐµÑ€ÐµÐ· Ð·Ð°Ð¿ÑÑ‚ÑƒÑŽ)"),
+    ("GECKO_NEW_POOLS_PAGES", "Ð¡Ñ‚Ñ€Ð°Ð½Ð¸Ñ† Gecko"),
     ("WETH_PRICE_FALLBACK_USD", "WETH fallback $"),
     ("STAIR_STEP_ENABLED", "Step protection"),
     ("STAIR_STEP_START_BALANCE_USD", "Step start floor $"),
@@ -641,7 +652,7 @@ def truncate_file(path: str) -> None:
 def read_json(path: str) -> dict:
     if not os.path.exists(path):
         return {}
-    for _ in range(3):
+    for attempt in range(8):
         try:
             # Accept files with or without UTF-8 BOM (PowerShell often writes BOM by default).
             with open(path, "r", encoding="utf-8-sig") as f:
@@ -651,7 +662,11 @@ def read_json(path: str) -> dict:
             return {}
         except json.JSONDecodeError:
             # State can be read mid-write; retry briefly before falling back.
-            time.sleep(0.05)
+            time.sleep(0.03 + (attempt * 0.02))
+            continue
+        except OSError:
+            # Windows can raise sharing violations briefly while writer replaces file.
+            time.sleep(0.03 + (attempt * 0.02))
             continue
         except Exception:
             return {}
@@ -659,7 +674,26 @@ def read_json(path: str) -> dict:
 
 
 def read_matrix_meta() -> dict:
-    return read_json(MATRIX_ACTIVE_FILE)
+    now = time.time()
+    try:
+        mtime = float(os.path.getmtime(MATRIX_ACTIVE_FILE))
+    except Exception:
+        mtime = 0.0
+    cache_payload = _MATRIX_META_CACHE.get("payload")
+    cache_ts = float(_MATRIX_META_CACHE.get("ts", 0.0) or 0.0)
+    cache_mtime = float(_MATRIX_META_CACHE.get("mtime", 0.0) or 0.0)
+    if isinstance(cache_payload, dict):
+        if mtime > 0.0 and cache_mtime == mtime and (now - cache_ts) <= MATRIX_META_CACHE_TTL_SECONDS:
+            return cache_payload
+    payload = read_json(MATRIX_ACTIVE_FILE)
+    if isinstance(payload, dict) and payload:
+        _MATRIX_META_CACHE["payload"] = payload
+        _MATRIX_META_CACHE["mtime"] = mtime
+        _MATRIX_META_CACHE["ts"] = now
+        return payload
+    if isinstance(cache_payload, dict) and cache_payload:
+        return cache_payload
+    return {}
 
 
 def matrix_alive_count() -> int:
@@ -772,12 +806,24 @@ def _collect_matrix_runtime_sections(items: list[dict], max_lines_each: int = 12
             continue
         abs_dir = log_dir if os.path.isabs(log_dir) else os.path.join(PROJECT_ROOT, log_dir)
         block: list[str] = []
+        seen_line_keys: set[str] = set()
+
+        def _append_unique(lines: list[str]) -> None:
+            for raw_line in lines:
+                line = str(raw_line or "")
+                key = line.strip()
+                if not key:
+                    continue
+                if key in seen_line_keys:
+                    continue
+                seen_line_keys.add(key)
+                block.append(line)
 
         latest = latest_session_log(abs_dir)
         if latest:
             label = os.path.basename(latest)
             block.append(f"--- session: {label} ---")
-            block.extend(compact_runtime_lines(read_tail(latest, max_lines_each))[-max_lines_each:])
+            _append_unique(compact_runtime_lines(read_tail(latest, max_lines_each))[-max_lines_each:])
 
         for name in ("app.log", "out.log"):
             p = os.path.join(abs_dir, name)
@@ -789,7 +835,7 @@ def _collect_matrix_runtime_sections(items: list[dict], max_lines_each: int = 12
             except Exception:
                 continue
             block.append(f"--- {name} ---")
-            block.extend(compact_runtime_lines(read_tail(p, max_lines_each))[-max_lines_each:])
+            _append_unique(compact_runtime_lines(read_tail(p, max_lines_each))[-max_lines_each:])
 
         cand_lines = _format_matrix_candidate_tail(abs_dir, inst_id, max_rows=80)
         if cand_lines:
@@ -1037,6 +1083,7 @@ class App(tk.Tk):
         self._matrix_user_overrides_map: dict[str, str] = {}
         self.positions_source_var = tk.StringVar(value="single")
         self.positions_source_map: dict[str, str] = {"single": PAPER_STATE_FILE}
+        self._state_cache: dict[str, dict] = {}
         self.refresh_meta_var = tk.StringVar(value="Refresh: --")
         self.header_limits_var = tk.StringVar(value="Limits: --")
         self.header_health_var = tk.StringVar(value="Health: --")
@@ -1241,8 +1288,8 @@ class App(tk.Tk):
     def _build_signals_tab(self) -> None:
         top = ttk.Frame(self.signals_tab, style="Card.TFrame")
         top.pack(fill=tk.X, pady=(0, 10))
-        self.signals_summary_var = tk.StringVar(value="Входящих сигналов пока нет.")
-        ttk.Label(top, text="Входящие сигналы", font=("Segoe UI Semibold", 12)).pack(anchor="w")
+        self.signals_summary_var = tk.StringVar(value="Ð’Ñ…Ð¾Ð´ÑÑ‰Ð¸Ñ… ÑÐ¸Ð³Ð½Ð°Ð»Ð¾Ð² Ð¿Ð¾ÐºÐ° Ð½ÐµÑ‚.")
+        ttk.Label(top, text="Ð’Ñ…Ð¾Ð´ÑÑ‰Ð¸Ðµ ÑÐ¸Ð³Ð½Ð°Ð»Ñ‹", font=("Segoe UI Semibold", 12)).pack(anchor="w")
         ttk.Label(top, textvariable=self.signals_summary_var, foreground="#93c5fd").pack(anchor="w", pady=(4, 0))
         self.signals_diag_var = tk.StringVar(value="Signal check: not started.")
         ttk.Label(top, textvariable=self.signals_diag_var, foreground="#a7f3d0").pack(anchor="w", pady=(2, 0))
@@ -1260,11 +1307,11 @@ class App(tk.Tk):
             height=18,
         )
         for col, title, width in (
-            ("time", "Время", 110),
-            ("symbol", "Символ", 90),
+            ("time", "Ð’Ñ€ÐµÐ¼Ñ", 110),
+            ("symbol", "Ð¡Ð¸Ð¼Ð²Ð¾Ð»", 90),
             ("score", "Score", 80),
-            ("recommendation", "Рекомендация", 120),
-            ("risk", "Риск", 90),
+            ("recommendation", "Ð ÐµÐºÐ¾Ð¼ÐµÐ½Ð´Ð°Ñ†Ð¸Ñ", 120),
+            ("risk", "Ð Ð¸ÑÐº", 90),
             ("liquidity", "Liquidity $", 120),
             ("volume", "Volume 5m $", 120),
             ("change", "Change 5m %", 110),
@@ -1810,7 +1857,7 @@ class App(tk.Tk):
         ttk.Button(grid, text="Refresh wallet", command=self._refresh_wallet).grid(row=6, column=2, sticky="w", padx=8, pady=(10, 2))
         ttk.Label(
             grid,
-            text="Critical actions moved to tab: Аварийный",
+            text="Critical actions moved to tab: ÐÐ²Ð°Ñ€Ð¸Ð¹Ð½Ñ‹Ð¹",
             foreground="#fca5a5",
             font=("Segoe UI", 10),
         ).grid(row=7, column=0, columnspan=3, sticky="w", pady=(12, 2))
@@ -1818,7 +1865,7 @@ class App(tk.Tk):
     def _build_emergency_tab(self) -> None:
         top = ttk.Frame(self.emergency_tab, style="Card.TFrame")
         top.pack(fill=tk.X, pady=(0, 10))
-        ttk.Label(top, text="Аварийный блок управления", font=("Segoe UI Semibold", 12)).pack(anchor="w")
+        ttk.Label(top, text="ÐÐ²Ð°Ñ€Ð¸Ð¹Ð½Ñ‹Ð¹ Ð±Ð»Ð¾Ðº ÑƒÐ¿Ñ€Ð°Ð²Ð»ÐµÐ½Ð¸Ñ", font=("Segoe UI Semibold", 12)).pack(anchor="w")
         self.emergency_summary_var = tk.StringVar(
             value="KILL_SWITCH: OFF | CRITICAL_AUTO_RESET: 0 | live_failed: 0 | errors: 0"
         )
@@ -1826,12 +1873,12 @@ class App(tk.Tk):
 
         actions = ttk.Frame(top, style="Card.TFrame")
         actions.pack(anchor="w", pady=(8, 0))
-        ttk.Button(actions, text="Включить KILL SWITCH", command=self.on_enable_kill_switch).pack(side=tk.LEFT)
-        ttk.Button(actions, text="Выключить KILL SWITCH", command=self.on_disable_kill_switch).pack(side=tk.LEFT, padx=8)
-        ttk.Button(actions, text="Критический сброс", command=self.on_critical_reset).pack(side=tk.LEFT, padx=8)
+        ttk.Button(actions, text="Ð’ÐºÐ»ÑŽÑ‡Ð¸Ñ‚ÑŒ KILL SWITCH", command=self.on_enable_kill_switch).pack(side=tk.LEFT)
+        ttk.Button(actions, text="Ð’Ñ‹ÐºÐ»ÑŽÑ‡Ð¸Ñ‚ÑŒ KILL SWITCH", command=self.on_disable_kill_switch).pack(side=tk.LEFT, padx=8)
+        ttk.Button(actions, text="ÐšÑ€Ð¸Ñ‚Ð¸Ñ‡ÐµÑÐºÐ¸Ð¹ ÑÐ±Ñ€Ð¾Ñ", command=self.on_critical_reset).pack(side=tk.LEFT, padx=8)
         ttk.Button(actions, text="Signal Check", command=self.on_signal_check).pack(side=tk.LEFT, padx=8)
-        ttk.Button(actions, text="Очистить логи", command=self.on_clear_logs).pack(side=tk.LEFT, padx=8)
-        ttk.Button(actions, text="Очистить GUI", command=self.on_clear_gui).pack(side=tk.LEFT, padx=8)
+        ttk.Button(actions, text="ÐžÑ‡Ð¸ÑÑ‚Ð¸Ñ‚ÑŒ Ð»Ð¾Ð³Ð¸", command=self.on_clear_logs).pack(side=tk.LEFT, padx=8)
+        ttk.Button(actions, text="ÐžÑ‡Ð¸ÑÑ‚Ð¸Ñ‚ÑŒ GUI", command=self.on_clear_gui).pack(side=tk.LEFT, padx=8)
 
         self.critical_text = tk.Text(
             self.emergency_tab,
@@ -1870,8 +1917,8 @@ class App(tk.Tk):
     def _build_positions_tab(self) -> None:
         top = ttk.Frame(self.positions_tab, style="Card.TFrame")
         top.pack(fill=tk.X, pady=(0, 10))
-        self.pos_summary_var = tk.StringVar(value="Пока нет данных по сделкам.")
-        self.positions_title_var = tk.StringVar(value="Монитор сделок")
+        self.pos_summary_var = tk.StringVar(value="ÐŸÐ¾ÐºÐ° Ð½ÐµÑ‚ Ð´Ð°Ð½Ð½Ñ‹Ñ… Ð¿Ð¾ ÑÐ´ÐµÐ»ÐºÐ°Ð¼.")
+        self.positions_title_var = tk.StringVar(value="ÐœÐ¾Ð½Ð¸Ñ‚Ð¾Ñ€ ÑÐ´ÐµÐ»Ð¾Ðº")
         ttk.Label(top, textvariable=self.positions_title_var, font=("Segoe UI Semibold", 12)).pack(anchor="w")
         ttk.Label(top, textvariable=self.pos_summary_var, foreground="#93c5fd").pack(anchor="w", pady=(4, 0))
         self.untracked_summary_var = tk.StringVar(value="")
@@ -1901,7 +1948,7 @@ class App(tk.Tk):
             ttk.Label(card, textvariable=var, style="KPIValue.TLabel").pack(anchor="w", pady=(3, 0))
         actions = ttk.Frame(top, style="Card.TFrame")
         actions.pack(anchor="w", pady=(8, 0))
-        ttk.Label(actions, text="Источник:").pack(side=tk.LEFT)
+        ttk.Label(actions, text="Ð˜ÑÑ‚Ð¾Ñ‡Ð½Ð¸Ðº:").pack(side=tk.LEFT)
         self.positions_source_combo = ttk.Combobox(
             actions,
             width=22,
@@ -1911,14 +1958,14 @@ class App(tk.Tk):
         )
         self.positions_source_combo.pack(side=tk.LEFT, padx=(6, 10))
         self.positions_source_combo.bind("<<ComboboxSelected>>", lambda _e: self.refresh())
-        ttk.Button(actions, text="Удалить старые закрытые", command=self.on_prune_closed_trades).pack(side=tk.LEFT)
-        ttk.Button(actions, text="Очистить все закрытые", command=self.on_clear_closed_trades).pack(side=tk.LEFT, padx=8)
+        ttk.Button(actions, text="Ð£Ð´Ð°Ð»Ð¸Ñ‚ÑŒ ÑÑ‚Ð°Ñ€Ñ‹Ðµ Ð·Ð°ÐºÑ€Ñ‹Ñ‚Ñ‹Ðµ", command=self.on_prune_closed_trades).pack(side=tk.LEFT)
+        ttk.Button(actions, text="ÐžÑ‡Ð¸ÑÑ‚Ð¸Ñ‚ÑŒ Ð²ÑÐµ Ð·Ð°ÐºÑ€Ñ‹Ñ‚Ñ‹Ðµ", command=self.on_clear_closed_trades).pack(side=tk.LEFT, padx=8)
         idle = ttk.Frame(top, style="Card.TFrame")
         idle.pack(fill=tk.X, pady=(8, 0))
-        ttk.Label(idle, text="Причины простоя (15м)", font=("Segoe UI Semibold", 11)).pack(anchor="w")
+        ttk.Label(idle, text="ÐŸÑ€Ð¸Ñ‡Ð¸Ð½Ñ‹ Ð¿Ñ€Ð¾ÑÑ‚Ð¾Ñ (15Ð¼)", font=("Segoe UI Semibold", 11)).pack(anchor="w")
         self.idle_reasons_var = tk.StringVar(value="--")
         ttk.Label(idle, textvariable=self.idle_reasons_var, foreground="#fcd34d").pack(anchor="w", pady=(4, 0))
-        ttk.Label(idle, text="Блок после pass (live 15м)", font=("Segoe UI Semibold", 10)).pack(anchor="w", pady=(6, 0))
+        ttk.Label(idle, text="Ð‘Ð»Ð¾Ðº Ð¿Ð¾ÑÐ»Ðµ pass (live 15Ð¼)", font=("Segoe UI Semibold", 10)).pack(anchor="w", pady=(6, 0))
         self.live_block_reasons_var = tk.StringVar(value="--")
         ttk.Label(idle, textvariable=self.live_block_reasons_var, foreground="#fda4af").pack(anchor="w", pady=(2, 0))
 
@@ -1930,7 +1977,7 @@ class App(tk.Tk):
 
         left = ttk.Frame(panels, style="Card.TFrame")
         left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-        ttk.Label(left, text="Открытые позиции", font=("Segoe UI Semibold", 11)).pack(anchor="w", pady=(0, 6))
+        ttk.Label(left, text="ÐžÑ‚ÐºÑ€Ñ‹Ñ‚Ñ‹Ðµ Ð¿Ð¾Ð·Ð¸Ñ†Ð¸Ð¸", font=("Segoe UI Semibold", 11)).pack(anchor="w", pady=(0, 6))
         self.open_tree = ttk.Treeview(
             left,
             columns=("symbol", "entry", "size", "score", "opened", "pnl_pct", "pnl_usd", "pnl_hour", "peak_pct", "ttl"),
@@ -1938,12 +1985,12 @@ class App(tk.Tk):
             height=14,
         )
         for col, title, width in (
-            ("symbol", "Символ", 90),
-            ("entry", "Вход $", 120),
-            ("size", "Размер $", 90),
-            ("score", "Скор", 80),
+            ("symbol", "Ð¡Ð¸Ð¼Ð²Ð¾Ð»", 90),
+            ("entry", "Ð’Ñ…Ð¾Ð´ $", 120),
+            ("size", "Ð Ð°Ð·Ð¼ÐµÑ€ $", 90),
+            ("score", "Ð¡ÐºÐ¾Ñ€", 80),
             ("opened", "Opened", 130),
-            ("ttl", "Осталось (сек)", 120),
+            ("ttl", "ÐžÑÑ‚Ð°Ð»Ð¾ÑÑŒ (ÑÐµÐº)", 120),
         ):
             self.open_tree.heading(col, text=title)
             self.open_tree.column(col, width=width, anchor="center")
@@ -1972,7 +2019,7 @@ class App(tk.Tk):
 
         right = ttk.Frame(panels, style="Card.TFrame")
         right.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
-        ttk.Label(right, text="Закрытые позиции", font=("Segoe UI Semibold", 11)).pack(anchor="w", pady=(0, 6))
+        ttk.Label(right, text="Ð—Ð°ÐºÑ€Ñ‹Ñ‚Ñ‹Ðµ Ð¿Ð¾Ð·Ð¸Ñ†Ð¸Ð¸", font=("Segoe UI Semibold", 11)).pack(anchor="w", pady=(0, 6))
         self.closed_tree = ttk.Treeview(
             right,
             columns=("symbol", "reason", "opened", "closed", "pnl_pct", "pnl_usd"),
@@ -1980,8 +2027,8 @@ class App(tk.Tk):
             height=14,
         )
         for col, title, width in (
-            ("symbol", "Символ", 110),
-            ("reason", "Выход", 90),
+            ("symbol", "Ð¡Ð¸Ð¼Ð²Ð¾Ð»", 110),
+            ("reason", "Ð’Ñ‹Ñ…Ð¾Ð´", 90),
             ("opened", "Opened", 130),
             ("closed", "Closed", 130),
             ("pnl_pct", "PnL %", 90),
@@ -2086,8 +2133,17 @@ class App(tk.Tk):
 
     def _apply_preset_map(self, preset: dict[str, str]) -> None:
         tuned, balance, profile = self._adapt_preset_by_balance(preset)
+        normalized = dict(tuned)
+        legacy_max_trades = str(normalized.get("MAX_TRADES_PER_HOUR", "") or "").strip()
+        max_buys = str(normalized.get("MAX_BUYS_PER_HOUR", "") or "").strip()
+        if legacy_max_trades and not max_buys:
+            max_buys = legacy_max_trades
+            normalized["MAX_BUYS_PER_HOUR"] = max_buys
+        if max_buys:
+            # Keep legacy key aligned for fallback code paths.
+            normalized["MAX_TRADES_PER_HOUR"] = max_buys
         extra_env_values: dict[str, str] = {}
-        for key, value in tuned.items():
+        for key, value in normalized.items():
             if key in self.env_vars:
                 self.env_vars[key].set(value)
             else:
@@ -2112,7 +2168,7 @@ class App(tk.Tk):
                 "AUTO_FILTER_ENABLED": "true",
                 "AUTO_TRADE_ENTRY_MODE": "single",
                 "AUTO_TRADE_TOP_N": "1",
-                "MAX_TRADES_PER_HOUR": "2",
+                "MAX_BUYS_PER_HOUR": "2",
                 "MAX_BUY_AMOUNT": "0.00020",
                 "MIN_TOKEN_SCORE": "82",
                 "SAFE_TEST_MODE": "true",
@@ -2156,7 +2212,7 @@ class App(tk.Tk):
                 "AUTO_FILTER_ENABLED": "true",
                 "AUTO_TRADE_ENTRY_MODE": "top_n",
                 "AUTO_TRADE_TOP_N": "2",
-                "MAX_TRADES_PER_HOUR": "4",
+                "MAX_BUYS_PER_HOUR": "4",
                 "MAX_BUY_AMOUNT": "0.00030",
                 "MIN_TOKEN_SCORE": "75",
                 "SAFE_TEST_MODE": "true",
@@ -2200,7 +2256,7 @@ class App(tk.Tk):
                 "AUTO_FILTER_ENABLED": "false",
                 "AUTO_TRADE_ENTRY_MODE": "all",
                 "AUTO_TRADE_TOP_N": "10",
-                "MAX_TRADES_PER_HOUR": "8",
+                "MAX_BUYS_PER_HOUR": "8",
                 "MAX_BUY_AMOUNT": "0.00050",
                 "MIN_TOKEN_SCORE": "65",
                 "SAFE_TEST_MODE": "false",
@@ -2240,7 +2296,7 @@ class App(tk.Tk):
                 "AUTO_FILTER_ENABLED": "false",
                 "AUTO_TRADE_ENTRY_MODE": "single",
                 "AUTO_TRADE_TOP_N": "3",
-                "MAX_TRADES_PER_HOUR": "4",
+                "MAX_BUYS_PER_HOUR": "4",
                 "MAX_BUY_AMOUNT": "0.00035",
                 "MIN_TOKEN_SCORE": "65",
                 "SAFE_TEST_MODE": "false",
@@ -2296,7 +2352,7 @@ class App(tk.Tk):
                 "AUTONOMOUS_CONTROL_TOP_N_MAX": "8",
                 "AUTONOMOUS_CONTROL_MAX_BUYS_PER_HOUR_MIN": "12",
                 "AUTONOMOUS_CONTROL_MAX_BUYS_PER_HOUR_MAX": "36",
-                "MAX_TRADES_PER_HOUR": "6",
+                "MAX_BUYS_PER_HOUR": "6",
                 "MAX_BUY_AMOUNT": "0.00025",
                 "MIN_TOKEN_SCORE": "70",
                 "SAFE_TEST_MODE": "true",
@@ -2365,7 +2421,7 @@ class App(tk.Tk):
                 "AUTONOMOUS_CONTROL_TOP_N_MAX": "10",
                 "AUTONOMOUS_CONTROL_MAX_BUYS_PER_HOUR_MIN": "12",
                 "AUTONOMOUS_CONTROL_MAX_BUYS_PER_HOUR_MAX": "48",
-                "MAX_TRADES_PER_HOUR": "5",
+                "MAX_BUYS_PER_HOUR": "5",
                 "MAX_BUY_AMOUNT": "0.00035",
                 "MIN_TOKEN_SCORE": "72",
                 "SAFE_TEST_MODE": "true",
@@ -2421,7 +2477,7 @@ class App(tk.Tk):
                 "AUTO_FILTER_ENABLED": "true",
                 "AUTO_TRADE_ENTRY_MODE": "top_n",
                 "AUTO_TRADE_TOP_N": "2",
-                "MAX_TRADES_PER_HOUR": "0",
+                "MAX_BUYS_PER_HOUR": "0",
                 "MAX_OPEN_TRADES": "2",
                 "MAX_BUY_AMOUNT": "0.00020",
                 "MIN_TOKEN_SCORE": "70",
@@ -2515,7 +2571,7 @@ class App(tk.Tk):
             "AUTO_TRADE_ENTRY_MODE": "single",
             "AUTO_TRADE_TOP_N": "1",
             "MAX_OPEN_TRADES": "1",
-            "MAX_TRADES_PER_HOUR": "3",
+            "MAX_BUYS_PER_HOUR": "3",
             "MIN_TOKEN_SCORE": "80",
             "SAFE_TEST_MODE": "true",
             "SAFE_MIN_LIQUIDITY_USD": "100000",
@@ -2590,7 +2646,7 @@ class App(tk.Tk):
             "AUTO_TRADE_ENTRY_MODE": "single",
             "AUTO_TRADE_TOP_N": "1",
             "MAX_OPEN_TRADES": "1",
-            "MAX_TRADES_PER_HOUR": "3",
+            "MAX_BUYS_PER_HOUR": "3",
             "MIN_TOKEN_SCORE": "75",
             "SAFE_TEST_MODE": "true",
             "SAFE_REQUIRE_CONTRACT_SAFE": "true",
@@ -2666,9 +2722,9 @@ class App(tk.Tk):
         try:
             save_runtime_env_map(values)
         except Exception as exc:
-            messagebox.showerror("Ошибка сохранения", str(exc))
+            messagebox.showerror("ÐžÑˆÐ¸Ð±ÐºÐ° ÑÐ¾Ñ…Ñ€Ð°Ð½ÐµÐ½Ð¸Ñ", str(exc))
             return
-        messagebox.showinfo("Готово", ".env успешно обновлен.")
+        messagebox.showinfo("Ð“Ð¾Ñ‚Ð¾Ð²Ð¾", ".env ÑƒÑÐ¿ÐµÑˆÐ½Ð¾ Ð¾Ð±Ð½Ð¾Ð²Ð»ÐµÐ½.")
 
     def _save_restart(self) -> None:
         self._save_settings()
@@ -2846,8 +2902,19 @@ class App(tk.Tk):
                 env_abs = env_file if os.path.isabs(env_file) else os.path.join(PROJECT_ROOT, env_file)
                 env_map = read_env_map_from(env_abs)
                 if env_map:
+                    if (
+                        str(env_map.get("MAX_BUYS_PER_HOUR", "") or "").strip() == ""
+                        and str(env_map.get("MAX_TRADES_PER_HOUR", "") or "").strip() != ""
+                    ):
+                        env_map["MAX_BUYS_PER_HOUR"] = str(env_map.get("MAX_TRADES_PER_HOUR", "") or "").strip()
                     return env_map
-        return read_runtime_env_map()
+        env_map = read_runtime_env_map()
+        if (
+            str(env_map.get("MAX_BUYS_PER_HOUR", "") or "").strip() == ""
+            and str(env_map.get("MAX_TRADES_PER_HOUR", "") or "").strip() != ""
+        ):
+            env_map["MAX_BUYS_PER_HOUR"] = str(env_map.get("MAX_TRADES_PER_HOUR", "") or "").strip()
+        return env_map
 
     def _selected_signals_file(self) -> tuple[str, str]:
         item = self._selected_matrix_item()
@@ -2991,8 +3058,132 @@ class App(tk.Tk):
             out.append((float(ts), "BUY", msg))
         return out[-max_rows:]
 
+    def _recent_positions_from_trade_decisions(self, max_rows: int = 1200) -> tuple[list[dict], list[dict]]:
+        path = self._resolve_trade_decisions_log_path()
+        if not os.path.exists(path):
+            return [], []
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            return [], []
+
+        cache = getattr(self, "_trade_positions_cache", None)
+        if (
+            isinstance(cache, dict)
+            and cache.get("path") == path
+            and float(cache.get("mtime", -1.0)) == float(mtime)
+        ):
+            return list(cache.get("open", []) or []), list(cache.get("closed", []) or [])
+
+        rows = read_jsonl_tail(path, max_rows)
+        if not rows:
+            self._trade_positions_cache = {"path": path, "mtime": float(mtime), "open": [], "closed": []}
+            return [], []
+
+        def _row_iso_ts(row: dict) -> str:
+            text = str(row.get("timestamp", "") or "").strip()
+            if text:
+                return text
+            ts = _parse_ts(row.get("ts"))
+            if ts is None:
+                return ""
+            return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+        open_map: dict[str, dict] = {}
+        closed_rows: list[dict] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            stage = str(row.get("decision_stage", "") or "").strip().lower()
+            if stage not in {"trade_open", "trade_close"}:
+                continue
+
+            candidate_id = str(row.get("candidate_id", "") or "").strip()
+            token_address = str(row.get("token_address", "") or "").strip()
+            symbol = str(row.get("symbol", "N/A") or "N/A").strip() or "N/A"
+            key = candidate_id or token_address or f"{symbol}|{_row_iso_ts(row)}"
+
+            if stage == "trade_open":
+                open_map[key] = {
+                    "token_address": token_address,
+                    "symbol": symbol,
+                    "score": int(self._safe_float(row.get("score", 0), 0.0)),
+                    "entry_price_usd": self._safe_float(row.get("entry_price_usd", 0.0), 0.0),
+                    "current_price_usd": self._safe_float(row.get("entry_price_usd", 0.0), 0.0),
+                    "position_size_usd": self._safe_float(row.get("position_size_usd", 0.0), 0.0),
+                    "pnl_percent": 0.0,
+                    "pnl_usd": 0.0,
+                    "opened_at": _row_iso_ts(row),
+                    "max_hold_seconds": int(self._safe_float(row.get("max_hold_seconds", 180), 180.0)),
+                }
+                continue
+
+            # trade_close
+            open_row = open_map.pop(key, None)
+            opened_at = ""
+            if isinstance(open_row, dict):
+                opened_at = str(open_row.get("opened_at", "") or "")
+            if not opened_at:
+                opened_at = str(row.get("opened_at", "") or "")
+            closed_rows.append(
+                {
+                    "candidate_id": candidate_id,
+                    "token_address": token_address,
+                    "symbol": symbol,
+                    "close_reason": str(row.get("reason", "") or "").strip(),
+                    "reason": str(row.get("reason", "") or "").strip(),
+                    "pnl_percent": self._safe_float(row.get("pnl_percent", 0.0), 0.0),
+                    "pnl_usd": self._safe_float(row.get("pnl_usd", 0.0), 0.0),
+                    "opened_at": opened_at,
+                    "closed_at": _row_iso_ts(row),
+                }
+            )
+
+        open_rows = list(open_map.values())
+        self._trade_positions_cache = {
+            "path": path,
+            "mtime": float(mtime),
+            "open": open_rows,
+            "closed": closed_rows,
+        }
+        return open_rows, closed_rows
+
+    def _profile_stop_activity_events(self, max_rows: int = 80) -> list[tuple[float, str, str]]:
+        _src, alerts_path = self._selected_signals_file()
+        rows = read_jsonl_tail(alerts_path, max_rows * 8)
+        out: list[tuple[float, str, str]] = []
+        for row in rows:
+            event_type = str(row.get("event_type", "") or "").strip().upper()
+            symbol = str(row.get("symbol", "") or "").strip().upper()
+            if event_type not in {"PROFILE_AUTOSTOP", "CHAMPION_GUARD_AUTOSTOP"} and symbol not in {
+                "PROFILE_STOPPED",
+                "PROFILE_AUTOSTOP",
+            }:
+                continue
+            ts = _parse_ts(row.get("ts", row.get("timestamp")))
+            if ts is None:
+                ts = time.time()
+            breakdown = row.get("breakdown", {})
+            if not isinstance(breakdown, dict):
+                breakdown = {}
+            tag = str(
+                breakdown.get("event_tag")
+                or row.get("tag")
+                or ("[AUTOSTOP][PROFILE_STOPPED]" if event_type == "PROFILE_AUTOSTOP" else "[AUTOSTOP][CHAMPION_GUARD]")
+            ).strip()
+            run_tag = str(breakdown.get("run_tag") or row.get("run_tag") or "-").strip()
+            reason = str(breakdown.get("reason") or row.get("reason") or "-").strip()
+            ts_text = datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+            msg = f"[{ts_text}] {tag} profile={run_tag} reason={reason}"
+            out.append((float(ts), "WARNING", msg))
+        return out[-max_rows:]
+
     def _activity_feed_events(self, app_lines: list[str]) -> list[tuple[str, str]]:
-        events = self._market_mode_activity_events(max_rows=160) + self._trade_activity_events(max_rows=240)
+        events = (
+            self._market_mode_activity_events(max_rows=160)
+            + self._trade_activity_events(max_rows=240)
+            + self._profile_stop_activity_events(max_rows=80)
+        )
         if not events:
             return parse_activity(app_lines)
         events.sort(key=lambda x: x[0])
@@ -3205,10 +3396,12 @@ class App(tk.Tk):
             except Exception:
                 max_val = 0
             if max_val <= 0:
-                return f"{used}/∞"
+                return f"{used}/âˆž"
             return f"{used}/{max_val}"
 
-        max_buys = str(env_map.get("MAX_BUYS_PER_HOUR", "0") or "0")
+        max_buys = str(
+            env_map.get("MAX_BUYS_PER_HOUR", env_map.get("MAX_TRADES_PER_HOUR", "0")) or "0"
+        )
         max_tx_day = str(env_map.get("MAX_TX_PER_DAY", "0") or "0")
         max_open = str(env_map.get("MAX_OPEN_TRADES", "0") or "0")
 
@@ -3537,12 +3730,18 @@ class App(tk.Tk):
     def _refresh_positions(self, app_lines: list[str]) -> None:
         state_file = self._selected_positions_state_file()
         state = read_json(state_file)
+        if state:
+            self._state_cache[state_file] = state
+        elif os.path.exists(state_file):
+            cached = self._state_cache.get(state_file)
+            if isinstance(cached, dict) and cached:
+                state = cached
         src = str(self.positions_source_var.get() or "single")
         excluded_symbols = self._stats_excluded_symbols()
         if hasattr(self, "positions_title_var"):
             env_map = self._runtime_env_map()
             mode = str(env_map.get(WALLET_MODE_KEY, "paper") or "paper").strip().lower()
-            prefix = "Монитор live-сделок" if mode == "live" else "Монитор бумажных сделок"
+            prefix = "ÐœÐ¾Ð½Ð¸Ñ‚Ð¾Ñ€ live-ÑÐ´ÐµÐ»Ð¾Ðº" if mode == "live" else "ÐœÐ¾Ð½Ð¸Ñ‚Ð¾Ñ€ Ð±ÑƒÐ¼Ð°Ð¶Ð½Ñ‹Ñ… ÑÐ´ÐµÐ»Ð¾Ðº"
             suffix = "" if src == "single" else f" [{src}]"
             self.positions_title_var.set(f"{prefix}{suffix}")
         if state:
@@ -3700,6 +3899,42 @@ class App(tk.Tk):
             closed_rows = []
         else:
             closed_rows = [row for row in closed_rows if isinstance(row, dict)]
+
+        fallback_open_rows, fallback_closed_rows = self._recent_positions_from_trade_decisions(max_rows=1400)
+        if not open_rows and fallback_open_rows:
+            open_rows = [row for row in fallback_open_rows if isinstance(row, dict)]
+
+        def _norm_close_ts(value: object) -> str:
+            dt = self._parse_iso_ts(value)
+            if dt is None:
+                return str(value or "").strip()
+            return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+
+        def _closed_row_identity(row: dict) -> str:
+            # Keep dedup key stable across state/fallback sources:
+            # source-specific reason/pnl formatting can differ for the same close event.
+            position_id_k = str((row or {}).get("position_id", "") or "").strip()
+            candidate_id_k = str((row or {}).get("candidate_id", "") or "").strip()
+            token_k = str((row or {}).get("token_address", "") or "").strip().lower()
+            opened_k = _norm_close_ts((row or {}).get("opened_at", ""))
+            closed_k = _norm_close_ts((row or {}).get("closed_at", ""))
+            if position_id_k:
+                return f"pid:{position_id_k}"
+            if candidate_id_k:
+                return f"cid:{candidate_id_k}"
+            if token_k and opened_k and closed_k:
+                return f"tok:{token_k}|opened:{opened_k}|closed:{closed_k}"
+            if token_k and opened_k:
+                return f"tok:{token_k}|opened:{opened_k}"
+            symbol_k = str((row or {}).get("symbol", "") or "").strip().upper()
+            return f"fallback:{token_k}|{symbol_k}|{opened_k}|{closed_k}"
+
+        merged_closed = [row for row in fallback_closed_rows if isinstance(row, dict)]
+        merged_closed.extend(closed_rows)
+        dedup_closed: dict[str, dict] = {}
+        for row in merged_closed:
+            dedup_closed[_closed_row_identity(row)] = row
+        closed_rows = list(dedup_closed.values())
         raw_untracked = state.get("recovery_untracked", {}) or {}
         untracked_map: dict[str, int] = {}
         if isinstance(raw_untracked, dict):
@@ -3736,6 +3971,23 @@ class App(tk.Tk):
                 for row in closed_rows
                 if str((row or {}).get("symbol", "") or "").strip().upper() not in excluded_symbols
             ]
+
+        try:
+            open_rows.sort(
+                key=lambda row: (
+                    self._parse_iso_ts((row or {}).get("opened_at")) or datetime.fromtimestamp(0, tz=timezone.utc)
+                ).timestamp()
+            )
+        except Exception:
+            pass
+        try:
+            closed_rows.sort(
+                key=lambda row: (
+                    self._parse_iso_ts((row or {}).get("closed_at")) or datetime.fromtimestamp(0, tz=timezone.utc)
+                ).timestamp()
+            )
+        except Exception:
+            pass
 
         now = datetime.now(timezone.utc)
         cutoff_1h_ts = now.timestamp() - 3600.0
@@ -3873,7 +4125,7 @@ class App(tk.Tk):
                 f"{pnl_pct_v:+.2f}",
                 f"{pnl_usd_v:+.2f}",
             )
-            key = f"{closed_at_raw}|{symbol}|{reason}|{pnl_pct_v:.6f}|{pnl_usd_v:.6f}"
+            key = _closed_row_identity(row)
             iid = self._stable_iid("closed", key)
             if pnl_usd_v > breakeven_eps:
                 closed_tag = "closed_pos"
@@ -4035,20 +4287,20 @@ class App(tk.Tk):
     def on_apply_wallet_mode(self) -> None:
         mode = str(self.wallet_mode_var.get()).strip().lower()
         if mode not in {"paper", "live"}:
-            messagebox.showerror("Ошибка", "Режим кошелька должен быть paper или live.")
+            messagebox.showerror("ÐžÑˆÐ¸Ð±ÐºÐ°", "Ð ÐµÐ¶Ð¸Ð¼ ÐºÐ¾ÑˆÐµÐ»ÑŒÐºÐ° Ð´Ð¾Ð»Ð¶ÐµÐ½ Ð±Ñ‹Ñ‚ÑŒ paper Ð¸Ð»Ð¸ live.")
             return
         save_runtime_env_map({WALLET_MODE_KEY: mode})
         self._refresh_wallet()
         if mode == "live":
             messagebox.showinfo(
                 "Live mode",
-                "Внимание: live execution пока не подключен. Сейчас это режим отображения баланса.",
+                "Ð’Ð½Ð¸Ð¼Ð°Ð½Ð¸Ðµ: live execution Ð¿Ð¾ÐºÐ° Ð½Ðµ Ð¿Ð¾Ð´ÐºÐ»ÑŽÑ‡ÐµÐ½. Ð¡ÐµÐ¹Ñ‡Ð°Ñ ÑÑ‚Ð¾ Ñ€ÐµÐ¶Ð¸Ð¼ Ð¾Ñ‚Ð¾Ð±Ñ€Ð°Ð¶ÐµÐ½Ð¸Ñ Ð±Ð°Ð»Ð°Ð½ÑÐ°.",
             )
 
     def on_apply_stair_mode(self) -> None:
         mode = str(self.stair_enabled_var.get()).strip().lower()
         if mode not in {"true", "false"}:
-            messagebox.showerror("Ошибка", "Step protection должен быть true или false.")
+            messagebox.showerror("ÐžÑˆÐ¸Ð±ÐºÐ°", "Step protection Ð´Ð¾Ð»Ð¶ÐµÐ½ Ð±Ñ‹Ñ‚ÑŒ true Ð¸Ð»Ð¸ false.")
             return
         save_runtime_env_map({STAIR_STEP_ENABLED_KEY: mode})
         if STAIR_STEP_ENABLED_KEY in self.env_vars:
@@ -4060,13 +4312,13 @@ class App(tk.Tk):
             start_floor = float(str(self.stair_start_var.get()).strip())
             step_size = float(str(self.stair_size_var.get()).strip())
         except ValueError:
-            messagebox.showerror("Ошибка", "Step start/size должны быть числами.")
+            messagebox.showerror("ÐžÑˆÐ¸Ð±ÐºÐ°", "Step start/size Ð´Ð¾Ð»Ð¶Ð½Ñ‹ Ð±Ñ‹Ñ‚ÑŒ Ñ‡Ð¸ÑÐ»Ð°Ð¼Ð¸.")
             return
         if start_floor < 0:
-            messagebox.showerror("Ошибка", "Step start floor не может быть отрицательным.")
+            messagebox.showerror("ÐžÑˆÐ¸Ð±ÐºÐ°", "Step start floor Ð½Ðµ Ð¼Ð¾Ð¶ÐµÑ‚ Ð±Ñ‹Ñ‚ÑŒ Ð¾Ñ‚Ñ€Ð¸Ñ†Ð°Ñ‚ÐµÐ»ÑŒÐ½Ñ‹Ð¼.")
             return
         if step_size <= 0:
-            messagebox.showerror("Ошибка", "Step size должен быть больше 0.")
+            messagebox.showerror("ÐžÑˆÐ¸Ð±ÐºÐ°", "Step size Ð´Ð¾Ð»Ð¶ÐµÐ½ Ð±Ñ‹Ñ‚ÑŒ Ð±Ð¾Ð»ÑŒÑˆÐµ 0.")
             return
         save_runtime_env_map(
             {
@@ -4084,10 +4336,10 @@ class App(tk.Tk):
         try:
             val = float(self.live_balance_var.get().strip())
         except ValueError:
-            messagebox.showerror("Ошибка", "Live balance должен быть числом.")
+            messagebox.showerror("ÐžÑˆÐ¸Ð±ÐºÐ°", "Live balance Ð´Ð¾Ð»Ð¶ÐµÐ½ Ð±Ñ‹Ñ‚ÑŒ Ñ‡Ð¸ÑÐ»Ð¾Ð¼.")
             return
         if val < 0:
-            messagebox.showerror("Ошибка", "Live balance не может быть отрицательным.")
+            messagebox.showerror("ÐžÑˆÐ¸Ð±ÐºÐ°", "Live balance Ð½Ðµ Ð¼Ð¾Ð¶ÐµÑ‚ Ð±Ñ‹Ñ‚ÑŒ Ð¾Ñ‚Ñ€Ð¸Ñ†Ð°Ñ‚ÐµÐ»ÑŒÐ½Ñ‹Ð¼.")
             return
         save_runtime_env_map({LIVE_WALLET_BALANCE_KEY: f"{val:.2f}"})
         self._refresh_wallet()
@@ -4100,10 +4352,10 @@ class App(tk.Tk):
         try:
             val = float(self.paper_balance_set_var.get().strip())
         except ValueError:
-            messagebox.showerror("Ошибка", "Paper balance должен быть числом.")
+            messagebox.showerror("ÐžÑˆÐ¸Ð±ÐºÐ°", "Paper balance Ð´Ð¾Ð»Ð¶ÐµÐ½ Ð±Ñ‹Ñ‚ÑŒ Ñ‡Ð¸ÑÐ»Ð¾Ð¼.")
             return
         if val < 0:
-            messagebox.showerror("Ошибка", "Paper balance не может быть отрицательным.")
+            messagebox.showerror("ÐžÑˆÐ¸Ð±ÐºÐ°", "Paper balance Ð½Ðµ Ð¼Ð¾Ð¶ÐµÑ‚ Ð±Ñ‹Ñ‚ÑŒ Ð¾Ñ‚Ñ€Ð¸Ñ†Ð°Ñ‚ÐµÐ»ÑŒÐ½Ñ‹Ð¼.")
             return
 
         state_file = self._runtime_state_file()
@@ -4132,8 +4384,25 @@ class App(tk.Tk):
         state["day_realized_pnl_usd"] = 0.0
         state["stair_floor_usd"] = 0.0
         state["stair_peak_balance_usd"] = float(val)
-        with open(state_file, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
+        try:
+            write_json_atomic_locked(
+                state_file,
+                state,
+                timeout_seconds=STATE_FILE_LOCK_TIMEOUT_SECONDS,
+                poll_seconds=STATE_FILE_LOCK_RETRY_SECONDS,
+                encoding="utf-8",
+                ensure_ascii=False,
+                indent=2,
+            )
+        except StateFileLockError:
+            messagebox.showerror(
+                "Error",
+                "State file is busy (locked by another process). Retry in a moment.",
+            )
+            return
+        except OSError as exc:
+            messagebox.showerror("Error", f"Failed to save state: {exc}")
+            return
         save_runtime_env_map({"WALLET_BALANCE_USD": f"{val:.2f}"})
         if "WALLET_BALANCE_USD" in self.env_vars:
             self.env_vars["WALLET_BALANCE_USD"].set(f"{val:.2f}")
@@ -4141,8 +4410,8 @@ class App(tk.Tk):
 
     def on_critical_reset(self) -> None:
         if not messagebox.askyesno(
-            "Критический сброс",
-            "Сбросить paper-состояние полностью? Открытые и закрытые сделки будут удалены.",
+            "ÐšÑ€Ð¸Ñ‚Ð¸Ñ‡ÐµÑÐºÐ¸Ð¹ ÑÐ±Ñ€Ð¾Ñ",
+            "Ð¡Ð±Ñ€Ð¾ÑÐ¸Ñ‚ÑŒ paper-ÑÐ¾ÑÑ‚Ð¾ÑÐ½Ð¸Ðµ Ð¿Ð¾Ð»Ð½Ð¾ÑÑ‚ÑŒÑŽ? ÐžÑ‚ÐºÑ€Ñ‹Ñ‚Ñ‹Ðµ Ð¸ Ð·Ð°ÐºÑ€Ñ‹Ñ‚Ñ‹Ðµ ÑÐ´ÐµÐ»ÐºÐ¸ Ð±ÑƒÐ´ÑƒÑ‚ ÑƒÐ´Ð°Ð»ÐµÐ½Ñ‹.",
         ):
             return
 
@@ -4150,7 +4419,7 @@ class App(tk.Tk):
         if pid and is_running(pid):
             ok, msg = stop_bot()
             if not ok:
-                messagebox.showerror("Ошибка", f"Не удалось остановить бота перед сбросом: {msg}")
+                messagebox.showerror("ÐžÑˆÐ¸Ð±ÐºÐ°", f"ÐÐµ ÑƒÐ´Ð°Ð»Ð¾ÑÑŒ Ð¾ÑÑ‚Ð°Ð½Ð¾Ð²Ð¸Ñ‚ÑŒ Ð±Ð¾Ñ‚Ð° Ð¿ÐµÑ€ÐµÐ´ ÑÐ±Ñ€Ð¾ÑÐ¾Ð¼: {msg}")
                 return
 
         env_map = read_runtime_env_map()
@@ -4175,14 +4444,31 @@ class App(tk.Tk):
         }
         state_file = self._runtime_state_file()
         os.makedirs(os.path.dirname(state_file), exist_ok=True)
-        with open(state_file, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
+        try:
+            write_json_atomic_locked(
+                state_file,
+                state,
+                timeout_seconds=STATE_FILE_LOCK_TIMEOUT_SECONDS,
+                poll_seconds=STATE_FILE_LOCK_RETRY_SECONDS,
+                encoding="utf-8",
+                ensure_ascii=False,
+                indent=2,
+            )
+        except StateFileLockError:
+            messagebox.showerror(
+                "Error",
+                "State file is busy (locked by another process). Retry in a moment.",
+            )
+            return
+        except OSError as exc:
+            messagebox.showerror("Error", f"Failed to save state: {exc}")
+            return
         save_runtime_env_map({"WALLET_BALANCE_USD": f"{balance:.2f}"})
         if "WALLET_BALANCE_USD" in self.env_vars:
             self.env_vars["WALLET_BALANCE_USD"].set(f"{balance:.2f}")
         self._refresh_wallet()
         self._refresh_positions([])
-        messagebox.showinfo("Готово", f"Paper-состояние сброшено. Текущий баланс: ${balance:.2f}")
+        messagebox.showinfo("Ð“Ð¾Ñ‚Ð¾Ð²Ð¾", f"Paper-ÑÐ¾ÑÑ‚Ð¾ÑÐ½Ð¸Ðµ ÑÐ±Ñ€Ð¾ÑˆÐµÐ½Ð¾. Ð¢ÐµÐºÑƒÑ‰Ð¸Ð¹ Ð±Ð°Ð»Ð°Ð½Ñ: ${balance:.2f}")
 
     def auto_refresh(self) -> None:
         try:
@@ -4200,23 +4486,23 @@ class App(tk.Tk):
         # Avoid mixing single run with matrix mode.
         ok, msg = start_bot()
         if not ok:
-            messagebox.showerror("Ошибка запуска", msg)
+            messagebox.showerror("ÐžÑˆÐ¸Ð±ÐºÐ° Ð·Ð°Ð¿ÑƒÑÐºÐ°", msg)
         self.refresh()
 
     def on_stop(self) -> None:
         ok, msg = stop_bot()
         m_ok, m_msg = run_powershell_script(MATRIX_STOPPER, ["-HardKill"])
         if not ok:
-            messagebox.showerror("Ошибка остановки", msg)
+            messagebox.showerror("ÐžÑˆÐ¸Ð±ÐºÐ° Ð¾ÑÑ‚Ð°Ð½Ð¾Ð²ÐºÐ¸", msg)
         elif not m_ok:
-            messagebox.showerror("Ошибка остановки Matrix", m_msg)
+            messagebox.showerror("ÐžÑˆÐ¸Ð±ÐºÐ° Ð¾ÑÑ‚Ð°Ð½Ð¾Ð²ÐºÐ¸ Matrix", m_msg)
         self.refresh()
 
     def on_restart(self) -> None:
         stop_bot()
         ok, msg = start_bot()
         if not ok:
-            messagebox.showerror("Ошибка рестарта", msg)
+            messagebox.showerror("ÐžÑˆÐ¸Ð±ÐºÐ° Ñ€ÐµÑÑ‚Ð°Ñ€Ñ‚Ð°", msg)
         self.refresh()
 
     def on_matrix_start(self) -> None:
@@ -4233,9 +4519,11 @@ class App(tk.Tk):
         self.hint_var.set(f"Matrix start in progress ({count})...{profile_hint}")
 
         def _matrix_start_worker() -> tuple[bool, str]:
-            args = ["-Count", count, "-Run"]
+            args = ["-Run"]
             if profile_ids:
                 args.extend(["-ProfileIds", ",".join(profile_ids)])
+            else:
+                args = ["-Count", count, "-Run"]
             ok, msg = run_powershell_script(
                 MATRIX_LAUNCHER,
                 args,
@@ -4247,7 +4535,7 @@ class App(tk.Tk):
             txt = str(msg or "").lower()
             if "timed out" in txt:
                 alive = matrix_alive_count()
-                target = int(count)
+                target = len(profile_ids) if profile_ids else int(count)
                 if alive >= target:
                     return True, f"Matrix started (timeout fallback). Alive: {alive}/{target}"
             return False, msg
@@ -4321,10 +4609,10 @@ class App(tk.Tk):
         try:
             self._load_settings()
         except Exception as exc:
-            messagebox.showerror("Ошибка", f"Не удалось перечитать .env: {exc}")
+            messagebox.showerror("ÐžÑˆÐ¸Ð±ÐºÐ°", f"ÐÐµ ÑƒÐ´Ð°Ð»Ð¾ÑÑŒ Ð¿ÐµÑ€ÐµÑ‡Ð¸Ñ‚Ð°Ñ‚ÑŒ .env: {exc}")
             return
         self.refresh()
-        messagebox.showinfo("Готово", "Настройки перечитаны из .env.")
+        messagebox.showinfo("Ð“Ð¾Ñ‚Ð¾Ð²Ð¾", "ÐÐ°ÑÑ‚Ñ€Ð¾Ð¹ÐºÐ¸ Ð¿ÐµÑ€ÐµÑ‡Ð¸Ñ‚Ð°Ð½Ñ‹ Ð¸Ð· .env.")
 
     def on_clear_logs(self) -> None:
         paths = {APP_LOG, OUT_LOG, ERR_LOG}
@@ -4360,9 +4648,9 @@ class App(tk.Tk):
             except Exception:
                 pass
         if hasattr(self, "pos_summary_var"):
-            self.pos_summary_var.set("Очистка выполнена.")
+            self.pos_summary_var.set("ÐžÑ‡Ð¸ÑÑ‚ÐºÐ° Ð²Ñ‹Ð¿Ð¾Ð»Ð½ÐµÐ½Ð°.")
         if hasattr(self, "hint_var"):
-            self.hint_var.set("GUI очищен: логи/сигналы/таблицы. KILL SWITCH не тронут.")
+            self.hint_var.set("GUI Ð¾Ñ‡Ð¸Ñ‰ÐµÐ½: Ð»Ð¾Ð³Ð¸/ÑÐ¸Ð³Ð½Ð°Ð»Ñ‹/Ñ‚Ð°Ð±Ð»Ð¸Ñ†Ñ‹. KILL SWITCH Ð½Ðµ Ñ‚Ñ€Ð¾Ð½ÑƒÑ‚.")
 
     def on_clear_signals(self) -> None:
         src_label, signals_file = self._selected_signals_file()
@@ -4464,7 +4752,7 @@ class App(tk.Tk):
             remove_all=False,
             state_file=self._selected_positions_state_file(),
         )
-        messagebox.showinfo("Готово", f"Удалено закрытых сделок: {removed}")
+        messagebox.showinfo("Ð“Ð¾Ñ‚Ð¾Ð²Ð¾", f"Ð£Ð´Ð°Ð»ÐµÐ½Ð¾ Ð·Ð°ÐºÑ€Ñ‹Ñ‚Ñ‹Ñ… ÑÐ´ÐµÐ»Ð¾Ðº: {removed}")
         self.refresh()
 
     def on_clear_closed_trades(self) -> None:
@@ -4473,7 +4761,7 @@ class App(tk.Tk):
             remove_all=True,
             state_file=self._selected_positions_state_file(),
         )
-        messagebox.showinfo("Готово", f"Удалено закрытых сделок: {removed}")
+        messagebox.showinfo("Ð“Ð¾Ñ‚Ð¾Ð²Ð¾", f"Ð£Ð´Ð°Ð»ÐµÐ½Ð¾ Ð·Ð°ÐºÑ€Ñ‹Ñ‚Ñ‹Ñ… ÑÐ´ÐµÐ»Ð¾Ðº: {removed}")
         self.refresh()
 
     @staticmethod
@@ -4516,8 +4804,25 @@ class App(tk.Tk):
                     kept.append(row)
             state["closed_positions"] = kept
 
-        with open(state_file, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
+        try:
+            write_json_atomic_locked(
+                state_file,
+                state,
+                timeout_seconds=STATE_FILE_LOCK_TIMEOUT_SECONDS,
+                poll_seconds=STATE_FILE_LOCK_RETRY_SECONDS,
+                encoding="utf-8",
+                ensure_ascii=False,
+                indent=2,
+            )
+        except StateFileLockError:
+            messagebox.showerror(
+                "Error",
+                "State file is busy (locked by another process). Retry in a moment.",
+            )
+            return 0
+        except OSError as exc:
+            messagebox.showerror("Error", f"Failed to save state: {exc}")
+            return 0
         return max(0, before - len(state.get("closed_positions", [])))
 
 

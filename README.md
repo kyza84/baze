@@ -1,4 +1,4 @@
-﻿# Base Bot Control Stack
+# Base Bot Control Stack
 
 Local-first trading stack for Base with paper/matrix calibration and controlled live execution.
 
@@ -33,6 +33,13 @@ Recommended flow:
 2. Matrix A/B run.
 3. Promote winner with parity.
 4. Live only after precheck passes.
+
+## State File Safety
+- `PAPER_STATE_FILE` writes use inter-process lock file (`<state>.lock`) and atomic replace.
+- GUI state reset/prune actions use the same lock+atomic path as runtime state persistence.
+- Lock tuning env keys:
+  - `STATE_FILE_LOCK_TIMEOUT_SECONDS` (default `2.0`)
+  - `STATE_FILE_LOCK_RETRY_SECONDS` (default `0.05`)
 
 ## GUI (Current)
 - Top bar is simplified to core controls:
@@ -70,10 +77,28 @@ Summary:
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\matrix_paper_summary.ps1
 ```
 
+Window rank report (includes `blocked_by_safe_source`, `blocked_by_watchlist_guard`, `blocked_by_safety_budget` per profile/window):
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\matrix_window_rank.ps1 -LookbackHours 4 -MinClosed 10
+```
+
 Promote winner to live parity:
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\matrix_promote_live.ps1 -ProfileId <profile_id>
 ```
+Apply live switch (flat book required, guarded by confirm phrase):
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\matrix_promote_live.ps1 -ProfileId <profile_id> -Apply -Confirm CONFIRM_LIVE_SWITCH
+```
+Canary apply (limited risk budget):
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\matrix_promote_live.ps1 -ProfileId <profile_id> -Canary -CanaryMaxOpenTrades 1 -CanaryMaxBuysPerHour 8 -CanaryTopN 8 -CanarySizeMaxUsd 0.45 -CanaryTtlMinutes 90 -Apply -Confirm CONFIRM_LIVE_SWITCH
+```
+Rollback latest live switch snapshot:
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\matrix_promote_live.ps1 -Rollback -Confirm CONFIRM_LIVE_ROLLBACK
+```
+Switch snapshots are written to `data/live/switches/live_switch_*.json`.
 
 Profile catalog (built-in + user + recent winners):
 ```powershell
@@ -86,9 +111,32 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\matrix_user_presets.ps
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\matrix_user_presets.ps1 create --name u_mx30_safe --base mx30_guarded_balanced --set MAX_OPEN_TRADES=5
 ```
 
+Runtime tuner (matrix sidecar, pre-live calibration window):
+```powershell
+python tools\matrix_runtime_tuner.py once --profile-id u_station_ab_diag_flow_peoff --mode conveyor --dry-run
+python tools\matrix_runtime_tuner.py run --profile-id u_station_ab_diag_flow_peoff --mode conveyor --duration-minutes 60 --interval-seconds 120
+python tools\matrix_runtime_tuner.py replay --profile-id u_station_ab_diag_flow_peoff --limit 240
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\matrix_runtime_tuner.ps1 -Command run -ProfileId u_station_ab_diag_flow_peoff -Mode conveyor -DurationMinutes 60 -IntervalSeconds 120
+```
+Runtime tuner decision log (`logs/matrix/<profile>/runtime_tuner.jsonl`) now includes telemetry v2:
+`funnel_15m`, `top_reasons_15m`, `exec_health_15m`, `exit_mix_60m`,
+plus `config_hash_before/config_hash_after`, `commit_hash`, and `run_tag`.
+
+Runtime tuner controls now include:
+- policy phase mode: `--policy-phase auto|expand|hold|tighten`,
+- target corridor knobs: `--target-trades-per-hour`, `--target-pnl-per-hour-usd`,
+- degradation rollback after streak (`--rollback-degrade-streak`) to last stable mutable snapshot,
+- forensic fields: `blacklist_forensics_15m`, `tuner_effective`, `pending_runtime_diff_keys`,
+- blocked/capped action visibility: `blocked_actions`, `delta_capped_actions`.
+
+Safety guard lock:
+- scam/safety keys are protected in safe tuning contract and excluded from tuner mutation path.
+- examples: `ENTRY_FAIL_CLOSED_ON_SAFETY_GAP`, `ENTRY_ALLOWED_SAFETY_SOURCES`, `PAPER_WATCHLIST_STRICT_GUARD_ENABLED`.
+
 Full operator guide:
 - `docs/MATRIX_PRESET_MANUAL.md`
 - `docs/SAFE_TUNING_AGENT_PROTOCOL.md`
+- `docs/MATRIX_RUNTIME_TUNER.md`
 
 ## Live Precheck
 No trading actions, only readiness checks:
@@ -142,7 +190,19 @@ Covered areas:
 - dual-entry quotas,
 - rolling-edge bounds,
 - fail-closed behavior in auto-trader,
-- market-mode and policy hysteresis.
+- market-mode and policy hysteresis,
+- state-file lock exclusivity + atomic persistence.
+
+## Encoding Hygiene
+Audit tracked text files for UTF-8 BOM prefixes:
+```powershell
+python tools/check_utf8_bom.py
+```
+
+Auto-fix BOM prefixes:
+```powershell
+python tools/check_utf8_bom.py --fix
+```
 
 ## Repo Hygiene
 Runtime data and secrets are intentionally excluded from git:

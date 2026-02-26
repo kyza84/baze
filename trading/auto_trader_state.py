@@ -11,12 +11,45 @@ from typing import Any
 
 import config
 from utils.addressing import normalize_address
+from utils.state_file import (
+    E_JSON_CORRUPT,
+    E_STATE_IO,
+    E_STATE_LOCKED,
+    StateFileLockError,
+    read_json_locked,
+    write_json_atomic_locked,
+)
 
 logger = logging.getLogger(__name__)
 
 
+def _state_lock_params(trader: Any) -> tuple[float, float]:
+    timeout = max(
+        0.1,
+        float(
+            getattr(
+                trader,
+                "state_lock_timeout_seconds",
+                getattr(config, "STATE_FILE_LOCK_TIMEOUT_SECONDS", 2.0),
+            )
+            or 2.0
+        ),
+    )
+    retry = max(
+        0.01,
+        float(
+            getattr(
+                trader,
+                "state_lock_retry_seconds",
+                getattr(config, "STATE_FILE_LOCK_RETRY_SECONDS", 0.05),
+            )
+            or 0.05
+        ),
+    )
+    return timeout, retry
+
+
 def save_state(trader: Any) -> None:
-    tmp_path = ""
     try:
         trader._prune_closed_positions()
         payload = {
@@ -68,31 +101,51 @@ def save_state(trader: Any) -> None:
         }
         state_dir = os.path.dirname(trader.state_file) or "."
         os.makedirs(state_dir, exist_ok=True)
-        tmp_path = f"{trader.state_file}.tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-            f.flush()
-            try:
-                os.fsync(f.fileno())
-            except Exception:
-                pass
-        os.replace(tmp_path, trader.state_file)
+        lock_timeout, lock_retry = _state_lock_params(trader)
+        write_json_atomic_locked(
+            trader.state_file,
+            payload,
+            timeout_seconds=lock_timeout,
+            poll_seconds=lock_retry,
+            encoding="utf-8",
+            ensure_ascii=False,
+            indent=2,
+        )
         trader._last_state_flush_ts = time.time()
-    except Exception as exc:
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
-        logger.warning("AutoTrade state save failed: %s", exc)
+    except StateFileLockError as exc:
+        logger.error(
+            "AUTOTRADE_STATE_SAVE_FAILED code=%s state_file=%s detail=%s",
+            E_STATE_LOCKED,
+            trader.state_file,
+            exc,
+        )
+    except (OSError, TypeError, ValueError, OverflowError) as exc:
+        logger.exception(
+            "AUTOTRADE_STATE_SAVE_FAILED code=%s state_file=%s err=%s",
+            E_STATE_IO,
+            trader.state_file,
+            exc,
+        )
 
 
 def load_state(trader: Any) -> None:
     if not os.path.exists(trader.state_file):
         return
     try:
-        with open(trader.state_file, "r", encoding="utf-8-sig") as f:
-            payload = json.load(f)
+        lock_timeout, lock_retry = _state_lock_params(trader)
+        payload = read_json_locked(
+            trader.state_file,
+            timeout_seconds=lock_timeout,
+            poll_seconds=lock_retry,
+            encoding="utf-8-sig",
+        )
+        if not isinstance(payload, dict):
+            logger.error(
+                "AUTOTRADE_STATE_LOAD_FAILED code=%s state_file=%s detail=payload_not_object",
+                E_STATE_IO,
+                trader.state_file,
+            )
+            return
         trader.initial_balance_usd = float(payload.get("initial_balance_usd", trader.initial_balance_usd))
         trader.paper_balance_usd = float(payload.get("paper_balance_usd", trader.paper_balance_usd))
         trader.realized_pnl_usd = float(payload.get("realized_pnl_usd", 0.0))
@@ -249,5 +302,26 @@ def load_state(trader: Any) -> None:
             len(trader.closed_positions),
             trader.paper_balance_usd,
         )
-    except Exception as exc:
-        logger.warning("AutoTrade state load failed: %s", exc)
+    except FileNotFoundError:
+        return
+    except StateFileLockError as exc:
+        logger.error(
+            "AUTOTRADE_STATE_LOAD_FAILED code=%s state_file=%s detail=%s",
+            E_STATE_LOCKED,
+            trader.state_file,
+            exc,
+        )
+    except json.JSONDecodeError as exc:
+        logger.exception(
+            "AUTOTRADE_STATE_LOAD_FAILED code=%s state_file=%s err=%s",
+            E_JSON_CORRUPT,
+            trader.state_file,
+            exc,
+        )
+    except (OSError, TypeError, ValueError, KeyError, AttributeError, OverflowError) as exc:
+        logger.exception(
+            "AUTOTRADE_STATE_LOAD_FAILED code=%s state_file=%s err=%s",
+            E_STATE_IO,
+            trader.state_file,
+            exc,
+        )

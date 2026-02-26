@@ -37,6 +37,7 @@ from trading.v2_runtime import (
     RollingEdgeGovernor,
     RuntimeKpiLoop,
     SafetyBudgetController,
+    SourceQosController,
     UnifiedCalibrator,
     UniverseFlowController,
     UniverseQualityGateController,
@@ -300,6 +301,28 @@ def _format_top_filter_reasons(filter_fail_reasons: dict[str, int], limit: int =
     return ",".join(f"{k}:{int(v)}" for k, v in rows[: max(1, int(limit))])
 
 
+def _source_name_key(raw: Any) -> str:
+    return str(raw or "unknown").strip().lower() or "unknown"
+
+
+def _count_sources(tokens: list[dict[str, Any]] | None) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for token in (tokens or []):
+        if not isinstance(token, dict):
+            continue
+        key = _source_name_key(token.get("source", "unknown"))
+        out[key] = int(out.get(key, 0)) + 1
+    return out
+
+
+def _count_candidate_sources(candidates: list[tuple[dict[str, Any], dict[str, Any]]] | None) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for token_data, _ in (candidates or []):
+        key = _source_name_key((token_data or {}).get("source", "unknown"))
+        out[key] = int(out.get(key, 0)) + 1
+    return out
+
+
 def _belongs_to_candidate_shard(address: str) -> bool:
     mod = max(1, int(getattr(config, "CANDIDATE_SHARD_MOD", 1) or 1))
     slot = int(getattr(config, "CANDIDATE_SHARD_SLOT", 0) or 0)
@@ -322,6 +345,30 @@ def _format_top_counts(counts: dict[str, int], limit: int = 4) -> str:
         return "none"
     rows = sorted(counts.items(), key=lambda kv: int(kv[1]), reverse=True)
     return ",".join(f"{k}:{int(v)}" for k, v in rows[: max(1, int(limit))])
+
+
+def _format_source_qos_brief(meta: dict[str, Any], snapshot: dict[str, Any]) -> str:
+    in_total = int((meta or {}).get("in_total", 0) or 0)
+    out_total = int((meta or {}).get("out_total", in_total) or in_total)
+    drop_counts_raw = dict((meta or {}).get("drop_counts", {}) or {})
+    drop_counts: dict[str, int] = {}
+    for key, value in drop_counts_raw.items():
+        try:
+            cnt = int(value)
+        except Exception:
+            continue
+        if cnt > 0:
+            drop_counts[str(key)] = cnt
+    active_cooldowns = len(dict((snapshot or {}).get("active_cooldowns", {}) or {}))
+    dropped_total = max(0, in_total - out_total)
+    return (
+        f"enabled={1 if bool((meta or {}).get('enabled', False)) else 0}"
+        f"/in={in_total}"
+        f"/out={out_total}"
+        f"/dropped={dropped_total}"
+        f"/active_cd={active_cooldowns}"
+        f"/drops={_format_top_counts(drop_counts, limit=3)}"
+    )
 
 
 def _candidate_quality_features(token: dict, score_data: dict) -> dict[str, object]:
@@ -1653,6 +1700,13 @@ class ProfileAutoStopController:
             getattr(config, "PROFILE_AUTOSTOP_MAX_DRAWDOWN_FROM_PEAK_USD", 0.18) or 0.18
         )
         self.min_fail_signals = int(getattr(config, "PROFILE_AUTOSTOP_MIN_FAIL_SIGNALS", 2) or 2)
+        self.window_minutes = int(getattr(config, "PROFILE_AUTOSTOP_WINDOW_MINUTES", 60) or 60)
+        self.window_min_closed = int(getattr(config, "PROFILE_AUTOSTOP_WINDOW_MIN_CLOSED_TRADES", 10) or 10)
+        self.min_pnl_per_hour_usd = float(getattr(config, "PROFILE_AUTOSTOP_MIN_PNL_PER_HOUR_USD", 0.0) or 0.0)
+        self.max_sl_sum_window_usd = float(getattr(config, "PROFILE_AUTOSTOP_MAX_SL_SUM_WINDOW_USD", -999.0) or -999.0)
+        self.event_tag = str(
+            getattr(config, "PROFILE_AUTOSTOP_EVENT_TAG", "[AUTOSTOP][PROFILE_STOPPED]") or "[AUTOSTOP][PROFILE_STOPPED]"
+        ).strip()
         self.started_ts = time.time()
         self.next_eval_ts = self.started_ts + max(30, int(self.interval_seconds))
         self.peak_realized_pnl_usd = 0.0
@@ -1681,6 +1735,12 @@ class ProfileAutoStopController:
         avg_pnl_per_trade = (realized / float(closed)) if closed > 0 else 0.0
         loss_share = (float(losses) / float(closed)) if closed > 0 else 0.0
         drawdown_from_peak = float(realized - float(self.peak_realized_pnl_usd))
+        window_closed = int(auto_stats.get("autostop_window_closed", 0) or 0)
+        window_pnl_per_hour = float(auto_stats.get("autostop_window_pnl_per_hour_usd", 0.0) or 0.0)
+        window_loss_share = float(auto_stats.get("autostop_window_loss_share", 0.0) or 0.0)
+        window_sl_sum = float(auto_stats.get("autostop_window_sl_sum_usd", 0.0) or 0.0)
+        window_avg_pnl = float(auto_stats.get("autostop_window_avg_pnl_per_trade_usd", 0.0) or 0.0)
+        window_realized = float(auto_stats.get("autostop_window_realized_pnl_usd", 0.0) or 0.0)
 
         fail_reasons: list[str] = []
         if realized < float(self.min_realized_pnl_usd):
@@ -1697,6 +1757,22 @@ class ProfileAutoStopController:
             fail_reasons.append(
                 f"drawdown_from_peak {drawdown_from_peak:.4f} <= -{abs(float(self.max_drawdown_from_peak_usd)):.4f}"
             )
+        if (
+            window_closed >= int(self.window_min_closed)
+            and float(self.min_pnl_per_hour_usd) > 0.0
+            and window_pnl_per_hour < float(self.min_pnl_per_hour_usd)
+        ):
+            fail_reasons.append(
+                f"pnl_per_hour {window_pnl_per_hour:.4f} < {float(self.min_pnl_per_hour_usd):.4f}"
+            )
+        if (
+            window_closed >= int(self.window_min_closed)
+            and float(self.max_sl_sum_window_usd) > -999.0
+            and window_sl_sum < float(self.max_sl_sum_window_usd)
+        ):
+            fail_reasons.append(
+                f"sl_sum_window {window_sl_sum:.4f} < {float(self.max_sl_sum_window_usd):.4f}"
+            )
 
         if len(fail_reasons) < int(self.min_fail_signals):
             return False, None
@@ -1705,9 +1781,14 @@ class ProfileAutoStopController:
         summary = (
             f"profile={RUN_TAG} runtime={runtime_seconds}s closed={closed} wins={wins} losses={losses} "
             f"realized={realized:.4f} avg={avg_pnl_per_trade:.5f} loss_share={loss_share:.3f} "
-            f"drawdown_from_peak={drawdown_from_peak:.4f} fail_signals={len(fail_reasons)}"
+            f"drawdown_from_peak={drawdown_from_peak:.4f} "
+            f"window({int(self.window_minutes)}m): closed={window_closed} pnl={window_realized:.4f} "
+            f"pnl_h={window_pnl_per_hour:.4f} avg={window_avg_pnl:.5f} loss_share={window_loss_share:.3f} sl_sum={window_sl_sum:.4f} "
+            f"fail_signals={len(fail_reasons)}"
         )
         reason_text = "; ".join(fail_reasons)
+        event_tag = str(self.event_tag or "[AUTOSTOP][PROFILE_STOPPED]").strip()
+        tagged_reason = f"{event_tag} {reason_text}".strip()
         try:
             stop_file = _graceful_stop_file_path()
             os.makedirs(os.path.dirname(stop_file) or ".", exist_ok=True)
@@ -1718,7 +1799,7 @@ class ProfileAutoStopController:
                             "ts": now_ts,
                             "run_tag": RUN_TAG,
                             "event": "PROFILE_AUTOSTOP",
-                            "reason": reason_text,
+                            "reason": tagged_reason,
                             "summary": summary,
                         },
                         ensure_ascii=False,
@@ -1730,16 +1811,24 @@ class ProfileAutoStopController:
 
         event = {
             "event_type": "PROFILE_AUTOSTOP",
-            "symbol": "PROFILE_AUTOSTOP",
+            "symbol": "PROFILE_STOPPED",
             "score": 0,
             "recommendation": "STOP",
             "risk_level": "WARNING",
-            "name": f"{RUN_TAG} stopped",
+            "name": f"{event_tag} {RUN_TAG} stopped",
             "breakdown": {
                 "run_tag": RUN_TAG,
-                "reason": reason_text,
+                "reason": tagged_reason,
                 "summary": summary,
                 "fail_reasons": fail_reasons,
+                "event_tag": event_tag,
+                "window_minutes": int(self.window_minutes),
+                "window_closed": int(window_closed),
+                "window_realized_pnl_usd": float(window_realized),
+                "window_pnl_per_hour_usd": float(window_pnl_per_hour),
+                "window_avg_pnl_per_trade_usd": float(window_avg_pnl),
+                "window_loss_share": float(window_loss_share),
+                "window_sl_sum_usd": float(window_sl_sum),
             },
             "address": "",
             "liquidity": 0.0,
@@ -2031,6 +2120,19 @@ async def run_local_loop() -> None:
         closed=int(adaptive_init_stats.get("closed", 0) or 0),
         realized_usd=float(adaptive_init_stats.get("realized_pnl_usd", 0.0) or 0.0),
     )
+    v2_source_qos = SourceQosController()
+    if (
+        bool(getattr(config, "V2_SOURCE_QOS_FORCE_DUAL_ENTRY", True))
+        and not bool(getattr(config, "V2_ENTRY_DUAL_CHANNEL_ENABLED", False))
+    ):
+        setattr(config, "V2_ENTRY_DUAL_CHANNEL_ENABLED", True)
+        if float(getattr(config, "V2_ENTRY_EXPLORE_MAX_SHARE", 0.0) or 0.0) <= 0.0:
+            setattr(config, "V2_ENTRY_EXPLORE_MAX_SHARE", 0.18)
+        logger.warning(
+            "V2_SOURCE_QOS forced dual-entry lanes enabled=%s explore_share=%.2f",
+            bool(getattr(config, "V2_ENTRY_DUAL_CHANNEL_ENABLED", False)),
+            float(getattr(config, "V2_ENTRY_EXPLORE_MAX_SHARE", 0.0) or 0.0),
+        )
     recent_candidate_counts: deque[int] = deque(
         maxlen=max(3, int(getattr(config, "MARKET_REGIME_WINDOW_CYCLES", 12) or 12))
     )
@@ -2110,6 +2212,30 @@ async def run_local_loop() -> None:
                             before_universe,
                             len(tokens),
                         )
+                tokens_seen_total = len(tokens or [])
+                seen_by_source = _count_sources(tokens)
+                passed_by_source: dict[str, int] = {}
+                planned_by_source: dict[str, int] = {}
+                source_qos_meta: dict[str, Any] = {
+                    "enabled": bool(getattr(config, "V2_SOURCE_QOS_ENABLED", True)),
+                    "in_total": tokens_seen_total,
+                    "out_total": tokens_seen_total,
+                    "drop_counts": {},
+                }
+                source_qos_dropped: list[dict[str, Any]] = []
+                source_flow_cycle: dict[str, dict[str, Any]] = {}
+                source_qos_event: dict[str, Any] | None = None
+                source_qos_snapshot: dict[str, Any] = {}
+                if tokens:
+                    tokens, source_qos_dropped, source_qos_meta = v2_source_qos.filter_tokens(tokens or [])
+                    if int(source_qos_meta.get("in_total", 0) or 0) != int(source_qos_meta.get("out_total", 0) or 0):
+                        logger.info(
+                            "V2_SOURCE_QOS_FILTER in=%s out=%s drops=%s caps=%s",
+                            int(source_qos_meta.get("in_total", 0) or 0),
+                            int(source_qos_meta.get("out_total", 0) or 0),
+                            dict(source_qos_meta.get("drop_counts", {}) or {}),
+                            dict(source_qos_meta.get("source_caps_effective", {}) or {}),
+                        )
 
                 high_quality = 0
                 alerts_sent = 0
@@ -2128,7 +2254,7 @@ async def run_local_loop() -> None:
                         heavy_seen_until.pop(a, None)
                         heavy_last_liquidity.pop(a, None)
                         heavy_last_volume_5m.pop(a, None)
-                if tokens:
+                if tokens or source_qos_dropped:
                     cycle_filter_fails: dict[str, int] = {}
                     mode_profile = _market_mode_entry_profile(market_regime_current)
                     regime_score_delta = int(mode_profile.get("score_delta", 0) or 0)
@@ -2189,6 +2315,21 @@ async def run_local_loop() -> None:
                                 "FILTER_FAIL token=%s reason=%s",
                                 token.get("symbol", "N/A"),
                                 reason,
+                            )
+
+                    if source_qos_dropped:
+                        for drop_idx, drop_row in enumerate(source_qos_dropped):
+                            row = dict(drop_row or {})
+                            token_drop = dict(row.get("token") or {})
+                            if not token_drop:
+                                continue
+                            if not str(token_drop.get("_candidate_id", "") or "").strip():
+                                drop_addr = normalize_address(token_drop.get("address", ""))
+                                token_drop["_candidate_id"] = f"{RUN_TAG}:{cycle_index}:qos:{drop_idx}:{drop_addr or 'noaddr'}"
+                            _filter_fail(
+                                str(row.get("reason", "source_qos_drop") or "source_qos_drop"),
+                                token_drop,
+                                str(row.get("extra", "") or ""),
                             )
 
                     for token_idx, token in enumerate(tokens):
@@ -2263,7 +2404,12 @@ async def run_local_loop() -> None:
                                 continue
 
                         # Heavy safety-check dedup: avoid re-checking same token address too often.
-                        heavy_ttl = int(getattr(config, "HEAVY_CHECK_DEDUP_TTL_SECONDS", 900) or 900)
+                        heavy_ttl_raw = getattr(config, "HEAVY_CHECK_DEDUP_TTL_SECONDS", 900)
+                        try:
+                            heavy_ttl = int(heavy_ttl_raw)
+                        except Exception:
+                            heavy_ttl = 900
+                        heavy_ttl = max(0, heavy_ttl)
                         if heavy_ttl > 0 and token_address:
                             now_mono = time.monotonic()
                             until = float(heavy_seen_until.get(token_address, 0.0) or 0.0)
@@ -2314,6 +2460,29 @@ async def run_local_loop() -> None:
                         token["is_contract_safe"] = bool((safety or {}).get("is_safe", False))
 
                         if config.SAFE_TEST_MODE:
+                            if bool(getattr(config, "ENTRY_FAIL_CLOSED_ON_SAFETY_GAP", True)):
+                                safety_source = str((safety or {}).get("source", "") or "").strip().lower()
+                                allowed_sources = set(getattr(config, "ENTRY_ALLOWED_SAFETY_SOURCES", ["goplus"]) or ["goplus"])
+                                if (not safety_source) or (safety_source not in allowed_sources):
+                                    _filter_fail("safe_source", token, f"source={safety_source or 'missing'}")
+                                    continue
+                                fail_reason = str((safety or {}).get("fail_reason", "") or "").strip()
+                                if fail_reason:
+                                    is_transient_source = safety_source in {"transient_fallback", "cache_transient"}
+                                    transient_mode = bool(getattr(config, "TOKEN_SAFETY_TRANSIENT_DEGRADED_ENABLED", True))
+                                    if (not is_transient_source) or (not transient_mode):
+                                        _filter_fail("safe_fail_reason", token, fail_reason)
+                                        continue
+                            if bool(getattr(config, "ENTRY_BLOCK_RISKY_CONTRACT_FLAGS", True)):
+                                risky_flags = [
+                                    str(x).strip().lower()
+                                    for x in ((safety or {}).get("risky_flags") or [])
+                                    if str(x).strip()
+                                ]
+                                hard_flags = set(getattr(config, "ENTRY_HARD_RISKY_FLAG_CODES", []) or [])
+                                if any(flag in hard_flags for flag in risky_flags):
+                                    _filter_fail("safe_risky_flags", token, ",".join(risky_flags))
+                                    continue
                             if config.SAFE_REQUIRE_CONTRACT_SAFE and not bool(token.get("is_contract_safe", False)):
                                 _filter_fail("safe_contract", token)
                                 continue
@@ -2334,6 +2503,41 @@ async def run_local_loop() -> None:
                         token["_regime_partial_tp_sell_mult"] = float(regime_partial_tp_sell_mult)
                         token["_regime_name"] = str(market_regime_current)
                         token["_entry_tier"] = str(entry_tier)
+                        source_name = str(token.get("source", "") or "").strip().lower()
+                        if (
+                            bool(getattr(config, "AUTO_TRADE_PAPER", False))
+                            and source_name.startswith("watchlist")
+                            and not bool(getattr(config, "PAPER_ALLOW_WATCHLIST_SOURCE", False))
+                        ):
+                            strict_guard_enabled = bool(getattr(config, "PAPER_WATCHLIST_STRICT_GUARD_ENABLED", True))
+                            if not strict_guard_enabled:
+                                _filter_fail("source_disabled", token, "source=watchlist paper_mode")
+                                continue
+                            watch_score = int(score_data.get("score", 0) or 0)
+                            watch_liq = float(token.get("liquidity") or 0.0)
+                            watch_vol = float(token.get("volume_5m") or 0.0)
+                            watch_abs_chg = abs(float(token.get("price_change_5m") or 0.0))
+                            min_score = int(getattr(config, "PAPER_WATCHLIST_MIN_SCORE", 90) or 90)
+                            min_liq = float(getattr(config, "PAPER_WATCHLIST_MIN_LIQUIDITY_USD", 150000.0) or 150000.0)
+                            min_vol = float(getattr(config, "PAPER_WATCHLIST_MIN_VOLUME_5M_USD", 500.0) or 500.0)
+                            min_abs_chg = float(getattr(config, "PAPER_WATCHLIST_MIN_ABS_CHANGE_5M", 0.30) or 0.30)
+                            if (
+                                watch_score < min_score
+                                or watch_liq < min_liq
+                                or watch_vol < min_vol
+                                or watch_abs_chg < min_abs_chg
+                            ):
+                                _filter_fail(
+                                    "watchlist_strict_guard",
+                                    token,
+                                    (
+                                        f"score={watch_score}/{min_score} "
+                                        f"liq={watch_liq:.0f}/{min_liq:.0f} "
+                                        f"vol5m={watch_vol:.0f}/{min_vol:.0f} "
+                                        f"abs5m={watch_abs_chg:.2f}/{min_abs_chg:.2f}"
+                                    ),
+                                )
+                                continue
                         if entry_tier == "B":
                             soft_selected_cycle += 1
 
@@ -2381,8 +2585,10 @@ async def run_local_loop() -> None:
                             pass
                         else:
                             alerts_sent += await local_alerter.send_alert(token, score_data, safety=safety)
+                    passed_by_source = _count_candidate_sources(trade_candidates)
                 else:
                     cycle_filter_fails = {}
+                    passed_by_source = {}
 
                 dex_stats_all = dex_monitor.runtime_stats(reset=True)
                 gecko_ingest_stats = dict(dex_stats_all.get("gecko_ingest", {}) or {})
@@ -2595,6 +2801,7 @@ async def run_local_loop() -> None:
                 market_regime_prev = market_regime_current
 
                 opened_trades = 0
+                planned_by_source = _count_candidate_sources(candidates_routed)
                 if candidates_routed:
                     opened_trades = await auto_trader.plan_batch(candidates_routed)
 
@@ -2630,6 +2837,7 @@ async def run_local_loop() -> None:
                 await auto_trader.process_open_positions(bot=None)
                 auto_stats = auto_trader.get_stats()
                 skip_reasons_cycle = auto_trader.pop_skip_reason_counts_window()
+                source_flow_cycle = auto_trader.pop_source_flow_window()
                 candidate_count_cycle = len(candidates_quality)
                 adaptive_filters.record_cycle(
                     candidates=candidate_count_cycle,
@@ -2652,7 +2860,7 @@ async def run_local_loop() -> None:
                     market_regime=market_regime_current,
                 )
                 mini_analyzer.record(
-                    scanned=len(tokens or []),
+                    scanned=int(tokens_seen_total),
                     candidates=candidate_count_cycle,
                     opened=opened_trades,
                     filter_fails_cycle=cycle_filter_fails,
@@ -2660,6 +2868,13 @@ async def run_local_loop() -> None:
                     policy_state=policy_state,
                     market_regime=market_regime_current,
                 )
+                source_qos_event = v2_source_qos.record_cycle(
+                    seen_by_source=seen_by_source,
+                    passed_by_source=passed_by_source,
+                    planned_by_source=planned_by_source,
+                    source_flow=source_flow_cycle,
+                )
+                source_qos_snapshot = v2_source_qos.snapshot()
                 v2_rolling_edge.record_cycle(
                     candidates=candidate_count_cycle,
                     opened=opened_trades,
@@ -2687,6 +2902,20 @@ async def run_local_loop() -> None:
                     market_regime=market_regime_current,
                     auto_stats=auto_stats,
                 )
+                if isinstance(source_qos_event, dict):
+                    try:
+                        await local_alerter.send_event(
+                            {
+                                "event_type": "V2_SOURCE_QOS_APPLIED",
+                                "symbol": "V2_SOURCE_QOS",
+                                "recommendation": "INFO",
+                                "risk_level": "INFO",
+                                "name": f"{RUN_TAG} source qos updated",
+                                "breakdown": source_qos_event,
+                            }
+                        )
+                    except Exception:
+                        logger.exception("V2_SOURCE_QOS event write failed")
                 kpi_event = v2_kpi_loop.maybe_apply(auto_trader=auto_trader)
                 if isinstance(kpi_event, dict):
                     try:
@@ -2735,10 +2964,13 @@ async def run_local_loop() -> None:
                 stop_now, stop_event = profile_autostop.maybe_stop(auto_stats=auto_stats)
                 if stop_now:
                     reason = ""
+                    stop_tag = ""
                     if isinstance(stop_event, dict):
                         reason = str((stop_event.get("breakdown") or {}).get("reason", ""))
+                        stop_tag = str((stop_event.get("breakdown") or {}).get("event_tag", ""))
                     logger.error(
-                        "PROFILE_AUTOSTOP_TRIGGERED run_tag=%s reason=%s",
+                        "PROFILE_AUTOSTOP_TRIGGERED tag=%s run_tag=%s reason=%s",
+                        stop_tag or "[AUTOSTOP][PROFILE_STOPPED]",
                         RUN_TAG,
                         reason,
                     )
@@ -2793,9 +3025,9 @@ async def run_local_loop() -> None:
                         "Quality out/core/explore/probe: %s/%s/%s/%s | Opened: %s | "
                         "Mode: local | Source: %s | Policy: raw=%s/effective=%s(%s) | Regime: %s(%s) | "
                         "Safety: checked=%s fail_closed=%s reasons=%s | FiltersTop(session): %s | Dedup: heavy_skip=%s override=%s | "
-                        "V2Budget: %s/%s | Ingest: %s | Sources: %s | Tasks: %s | RSS: %.1fMB | CycleAvg: %.2fs"
+                        "V2Budget: %s/%s | SourceQoS: %s | Ingest: %s | Sources: %s | Tasks: %s | RSS: %.1fMB | CycleAvg: %.2fs"
                     ),
-                    len(tokens or []),
+                    int(tokens_seen_total),
                     high_quality,
                     alerts_sent,
                     len(trade_candidates),
@@ -2818,6 +3050,7 @@ async def run_local_loop() -> None:
                     heavy_dedup_override,
                     int(v2_budget_snapshot.get("used_total", 0) or 0),
                     int(v2_budget_snapshot.get("max_total", 0) or 0),
+                    _format_source_qos_brief(source_qos_meta, source_qos_snapshot),
                     _format_ingest_stats_brief(gecko_ingest_stats),
                     _format_source_stats_brief(source_stats),
                     active_tasks,

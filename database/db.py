@@ -1,4 +1,4 @@
-﻿"""Database helpers and CRUD operations."""
+"""Database helpers and CRUD operations."""
 
 from datetime import datetime
 from typing import Optional

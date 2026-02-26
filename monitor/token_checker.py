@@ -116,6 +116,7 @@ class TokenChecker:
     @staticmethod
     def _fallback_assessment(token_address: str, liquidity: float | None = None) -> dict[str, Any]:
         warnings: list[str] = []
+        risky_flags: list[str] = []
         risk_level = "MEDIUM"
         is_safe = True
 
@@ -123,12 +124,14 @@ class TokenChecker:
             risk_level = "HIGH"
             is_safe = False
             warnings.append("Low liquidity")
+            risky_flags.append("low_liquidity")
 
         top_10_holders = 85 if (liquidity is not None and liquidity < 15000) else 70
         if top_10_holders > 80:
             risk_level = "HIGH"
             is_safe = False
             warnings.append("Concentrated ownership")
+            risky_flags.append("concentrated_ownership")
 
         return {
             "token_address": token_address,
@@ -136,6 +139,8 @@ class TokenChecker:
             "risk_level": risk_level,
             "warnings": warnings,
             "warning_flags": len(warnings),
+            "risky_flags": risky_flags,
+            "has_risky_flags": bool(risky_flags),
             "source": "fallback",
         }
 
@@ -176,6 +181,8 @@ class TokenChecker:
                 "risk_level": "HIGH",
                 "warnings": [f"Safety API unavailable (fail-closed): {fail_key}"],
                 "warning_flags": 1,
+                "risky_flags": ["safety_api_unavailable"],
+                "has_risky_flags": True,
                 "source": "fail_closed",
                 "fail_reason": fail_key,
             }
@@ -189,6 +196,9 @@ class TokenChecker:
     async def _check_with_goplus(self, token_address: str) -> tuple[dict[str, Any] | None, str | None]:
         if not token_address:
             return None, "empty_token_address"
+        if not str(GOPLUS_ACCESS_TOKEN or "").strip():
+            # No paid token configured: avoid pointless upstream calls; use transient flow.
+            return None, "api_code_4029"
 
         headers = {}
         if GOPLUS_ACCESS_TOKEN:
@@ -238,6 +248,7 @@ class TokenChecker:
             return None, "no_token_entry"
 
         warnings: list[str] = []
+        risky_flags: list[str] = []
         risk_points = 0
 
         def _flag(name: str, points: int = 1) -> None:
@@ -245,29 +256,33 @@ class TokenChecker:
             warnings.append(name)
             risk_points += points
 
+        def _risky(code: str, name: str, points: int = 1) -> None:
+            risky_flags.append(str(code))
+            _flag(name, points)
+
         if result.get("is_mintable") in ("1", 1, True):
-            _flag("Mint is enabled", 1)
+            _risky("mint", "Mint is enabled", 1)
 
         if result.get("is_freezeable") in ("1", 1, True):
-            _flag("Freeze authority enabled", 1)
+            _risky("freeze", "Freeze authority enabled", 1)
 
         if result.get("is_blacklisted") in ("1", 1, True):
-            _flag("Blacklist flag present", 2)
+            _risky("blacklist", "Blacklist flag present", 2)
 
         if result.get("is_open_source") in ("0", 0, False):
             _flag("Contract not open source", 1)
 
         if result.get("can_take_back_ownership") in ("1", 1, True):
-            _flag("Ownership can be reclaimed", 2)
+            _risky("owner_takeback", "Ownership can be reclaimed", 2)
 
         if result.get("owner_change_balance") in ("1", 1, True):
-            _flag("Owner can change balances", 2)
+            _risky("owner_change_balance", "Owner can change balances", 2)
 
         if result.get("trading_cooldown") in ("1", 1, True):
-            _flag("Trading cooldown enabled", 1)
+            _risky("trading_cooldown", "Trading cooldown enabled", 1)
 
         if result.get("is_proxy") in ("1", 1, True):
-            _flag("Proxy contract", 1)
+            _risky("proxy", "Proxy contract", 1)
 
         try:
             buy_tax = float(result.get("buy_tax") or 0)
@@ -303,5 +318,16 @@ class TokenChecker:
             "risk_level": risk_level,
             "warnings": warnings,
             "warning_flags": len(warnings),
+            "risky_flags": risky_flags,
+            "has_risky_flags": bool(risky_flags),
+            "safety_flags": {
+                "is_mintable": bool(result.get("is_mintable") in ("1", 1, True)),
+                "is_freezeable": bool(result.get("is_freezeable") in ("1", 1, True)),
+                "is_blacklisted": bool(result.get("is_blacklisted") in ("1", 1, True)),
+                "can_take_back_ownership": bool(result.get("can_take_back_ownership") in ("1", 1, True)),
+                "owner_change_balance": bool(result.get("owner_change_balance") in ("1", 1, True)),
+                "trading_cooldown": bool(result.get("trading_cooldown") in ("1", 1, True)),
+                "is_proxy": bool(result.get("is_proxy") in ("1", 1, True)),
+            },
             "source": "goplus",
         }, None

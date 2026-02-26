@@ -5,6 +5,15 @@ param(
   [string]$WindowControls = 'off',
   [int]$MinClosed = 10,
   [string]$Confirm = "",
+  [switch]$Canary,
+  [int]$CanaryMaxOpenTrades = 1,
+  [int]$CanaryMaxBuysPerHour = 8,
+  [int]$CanaryTopN = 8,
+  [double]$CanarySizeMaxUsd = 0.45,
+  [int]$CanaryTtlMinutes = 90,
+  [switch]$AllowOpenPositions,
+  [switch]$Rollback,
+  [string]$SwitchSnapshot = "",
   [switch]$AllowDrift,
   [switch]$Apply
 )
@@ -25,6 +34,23 @@ if ($ProfileId -and $ProfileId.Trim().Length -gt 0) {
 $args += @('--lookback-hours', [string]$LookbackHours, '--min-closed', [string]$MinClosed, '--window-controls', $WindowControls)
 if ($AllowDrift) {
   $args += '--allow-drift'
+}
+if ($Canary) {
+  $args += '--canary'
+  $args += @('--canary-max-open-trades', [string]$CanaryMaxOpenTrades)
+  $args += @('--canary-max-buys-per-hour', [string]$CanaryMaxBuysPerHour)
+  $args += @('--canary-top-n', [string]$CanaryTopN)
+  $args += @('--canary-size-max-usd', [string]$CanarySizeMaxUsd)
+  $args += @('--canary-ttl-minutes', [string]$CanaryTtlMinutes)
+}
+if ($AllowOpenPositions) {
+  $args += '--allow-open-positions'
+}
+if ($Rollback) {
+  $args += '--rollback'
+}
+if ($SwitchSnapshot -and $SwitchSnapshot.Trim().Length -gt 0) {
+  $args += @('--switch-snapshot', $SwitchSnapshot.Trim())
 }
 if ($Confirm -and $Confirm.Trim().Length -gt 0) {
   $args += @('--confirm', $Confirm.Trim())

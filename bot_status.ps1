@@ -1,4 +1,4 @@
-﻿$ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $PidFile = Join-Path $ProjectRoot 'bot.pid'
 $OutLog = Join-Path $ProjectRoot 'logs\bot.out.log'
 $ErrLog = Join-Path $ProjectRoot 'logs\bot.err.log'

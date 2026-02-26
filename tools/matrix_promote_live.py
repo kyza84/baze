@@ -6,9 +6,11 @@ import argparse
 import json
 import os
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 LIVE_APPLY_CONFIRM_PHRASE = "CONFIRM_LIVE_SWITCH"
+LIVE_ROLLBACK_CONFIRM_PHRASE = "CONFIRM_LIVE_ROLLBACK"
 _ALLOWED_PROMOTION_DIFF_KEYS = {
     "BOT_INSTANCE_ID",
     "RUN_TAG",
@@ -21,7 +23,21 @@ _ALLOWED_PROMOTION_DIFF_KEYS = {
     "CANDIDATE_DECISIONS_LOG_FILE",
     "AUTONOMOUS_CONTROL_DECISIONS_LOG_FILE",
     "PAPER_STATE_FILE",
+    "MAX_OPEN_TRADES",
+    "MAX_BUYS_PER_HOUR",
+    "AUTO_TRADE_TOP_N",
+    "PAPER_TRADE_SIZE_MAX_USD",
+    "PAPER_TRADE_SIZE_MIN_USD",
+    "LIVE_CANARY_ENABLED",
+    "LIVE_CANARY_UNTIL_TS",
 }
+_SWITCHED_ENV_KEYS = (
+    "BOT_ENV_FILE",
+    "WALLET_MODE",
+    "AUTO_TRADE_ENABLED",
+    "AUTO_TRADE_PAPER",
+    "PAPER_RESET_ON_START",
+)
 
 
 def _safe_float(value: Any, default: float) -> float:
@@ -139,6 +155,85 @@ def _load_active_items(root: str) -> list[dict[str, str]]:
         if state_file and not os.path.isabs(state_file):
             state_file = os.path.join(root, state_file)
         out.append({"id": rid, "env_file": env_file, "state_file": state_file})
+    return out
+
+
+def _profile_open_positions(root: str, profile_id: str) -> int | None:
+    for row in _load_active_items(root):
+        if str(row.get("id", "")).strip() != str(profile_id).strip():
+            continue
+        state_file = str(row.get("state_file", "") or "").strip()
+        if not state_file:
+            return None
+        payload = _read_json(state_file)
+        open_rows = payload.get("open_positions") or []
+        if not isinstance(open_rows, list):
+            return 0
+        return int(len([x for x in open_rows if isinstance(x, dict)]))
+    return None
+
+
+def _switch_dir(root: str) -> str:
+    path = os.path.join(root, "data", "live", "switches")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _write_switch_snapshot(
+    *,
+    root: str,
+    profile_id: str,
+    source_env: str,
+    target_env: str,
+    canary: bool,
+    previous_dotenv: dict[str, str],
+    next_dotenv: dict[str, str],
+) -> str:
+    snap = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "profile_id": profile_id,
+        "source_env": source_env,
+        "target_env": target_env,
+        "canary": bool(canary),
+        "previous_env": {k: str(previous_dotenv.get(k, "")) for k in _SWITCHED_ENV_KEYS},
+        "next_env": {k: str(next_dotenv.get(k, "")) for k in _SWITCHED_ENV_KEYS},
+    }
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(_switch_dir(root), f"live_switch_{stamp}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(snap, f, ensure_ascii=False, indent=2)
+    return path
+
+
+def _latest_switch_snapshot(root: str) -> str:
+    base = Path(_switch_dir(root))
+    files = sorted(base.glob("live_switch_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return str(files[0]) if files else ""
+
+
+def _build_canary_overrides(
+    *,
+    target_map: dict[str, str],
+    max_open_trades: int,
+    max_buys_per_hour: int,
+    top_n: int,
+    size_max_usd: float,
+    ttl_minutes: int,
+) -> dict[str, str]:
+    out = dict(target_map)
+    current_open = _safe_int(out.get("MAX_OPEN_TRADES"), max_open_trades)
+    current_buys = _safe_int(out.get("MAX_BUYS_PER_HOUR"), max_buys_per_hour)
+    current_topn = _safe_int(out.get("AUTO_TRADE_TOP_N"), top_n)
+    current_size_max = _safe_float(out.get("PAPER_TRADE_SIZE_MAX_USD"), size_max_usd)
+    out["MAX_OPEN_TRADES"] = str(max(1, min(current_open, max_open_trades)))
+    out["MAX_BUYS_PER_HOUR"] = str(max(1, min(current_buys, max_buys_per_hour)))
+    out["AUTO_TRADE_TOP_N"] = str(max(1, min(current_topn, top_n)))
+    bounded_max = max(0.05, min(current_size_max, float(size_max_usd)))
+    out["PAPER_TRADE_SIZE_MAX_USD"] = f"{bounded_max:.2f}"
+    cur_min = _safe_float(out.get("PAPER_TRADE_SIZE_MIN_USD"), 0.20)
+    out["PAPER_TRADE_SIZE_MIN_USD"] = f"{max(0.05, min(cur_min, bounded_max)):.2f}"
+    out["LIVE_CANARY_ENABLED"] = "true"
+    out["LIVE_CANARY_UNTIL_TS"] = str(int(datetime.now(tz=timezone.utc).timestamp()) + int(max(1, ttl_minutes) * 60))
     return out
 
 
@@ -413,17 +508,74 @@ def main() -> int:
     parser.add_argument(
         "--confirm",
         default="",
-        help=f"Required with --apply. Must equal: {LIVE_APPLY_CONFIRM_PHRASE}",
+        help=(
+            f"Required for guarded actions. --apply expects {LIVE_APPLY_CONFIRM_PHRASE}; "
+            f"--rollback expects {LIVE_ROLLBACK_CONFIRM_PHRASE}."
+        ),
     )
     parser.add_argument(
         "--apply",
         action="store_true",
         help="Apply BOT_ENV_FILE + mode flags into .env for next bot start",
     )
+    parser.add_argument(
+        "--canary",
+        action="store_true",
+        help="Build canary-limited live env and apply it (requires --apply).",
+    )
+    parser.add_argument("--canary-max-open-trades", type=int, default=1)
+    parser.add_argument("--canary-max-buys-per-hour", type=int, default=8)
+    parser.add_argument("--canary-top-n", type=int, default=8)
+    parser.add_argument("--canary-size-max-usd", type=float, default=0.45)
+    parser.add_argument("--canary-ttl-minutes", type=int, default=90)
+    parser.add_argument(
+        "--allow-open-positions",
+        action="store_true",
+        help="Bypass open position guard when applying live switch.",
+    )
+    parser.add_argument(
+        "--rollback",
+        action="store_true",
+        help="Rollback .env switch keys from latest saved live switch snapshot.",
+    )
+    parser.add_argument("--switch-snapshot", default="", help="Optional snapshot file for --rollback.")
     args = parser.parse_args()
 
     root = os.path.abspath(args.root)
     requested_profile = args.profile_id.strip()
+    if args.rollback:
+        if args.apply or args.canary:
+            print("ROLLBACK_BLOCKED do not combine --rollback with --apply/--canary.")
+            return 2
+        if args.confirm.strip() != LIVE_ROLLBACK_CONFIRM_PHRASE:
+            print("ROLLBACK_BLOCKED invalid --confirm phrase.")
+            print("Re-run with: --rollback --confirm CONFIRM_LIVE_ROLLBACK")
+            return 2
+        snapshot = str(args.switch_snapshot or "").strip() or _latest_switch_snapshot(root)
+        if not snapshot or not os.path.exists(snapshot):
+            print("ROLLBACK_BLOCKED no live switch snapshot found.")
+            return 2
+        payload = _read_json(snapshot)
+        previous_env = payload.get("previous_env")
+        if not isinstance(previous_env, dict):
+            print(f"ROLLBACK_BLOCKED snapshot has no previous_env: {snapshot}")
+            return 2
+        dot_env = os.path.join(root, ".env")
+        env_order, env_map = _load_env(dot_env)
+        for key in _SWITCHED_ENV_KEYS:
+            if key in previous_env:
+                env_map[key] = str(previous_env.get(key, ""))
+        _write_env(dot_env, env_order, env_map)
+        print(f"ROLLBACK_APPLIED {dot_env}")
+        print(f"ROLLBACK_SNAPSHOT {snapshot}")
+        for key in _SWITCHED_ENV_KEYS:
+            print(f"RESTORED {key}={env_map.get(key, '')}")
+        print(f"STAMP {datetime.now().isoformat(timespec='seconds')}")
+        return 0
+
+    if args.canary and not args.apply:
+        print("LIVE_CANARY_BLOCKED --canary requires --apply.")
+        return 2
     if args.apply and not requested_profile:
         print("LIVE_APPLY_BLOCKED profile id is required when using --apply.")
         print("Example: --profile-id mx3_flow_compound --apply --confirm CONFIRM_LIVE_SWITCH")
@@ -446,6 +598,15 @@ def main() -> int:
     if not source_map:
         raise RuntimeError(f"Source env is empty/unreadable: {source_env_path}")
 
+    if args.apply and not bool(args.allow_open_positions):
+        open_positions = _profile_open_positions(root, profile_id)
+        if open_positions is not None and int(open_positions) > 0:
+            print(
+                f"LIVE_APPLY_BLOCKED profile={profile_id} has open_positions={open_positions}. "
+                "Wait for flat book or pass --allow-open-positions."
+            )
+            return 4
+
     target_map = dict(source_map)
     target_map.update(_build_live_overrides(source_map, profile_id))
     runtime_controls = _window_controls(
@@ -457,6 +618,15 @@ def main() -> int:
     )
     if runtime_controls:
         target_map.update(runtime_controls)
+    if args.canary:
+        target_map = _build_canary_overrides(
+            target_map=target_map,
+            max_open_trades=max(1, int(args.canary_max_open_trades)),
+            max_buys_per_hour=max(1, int(args.canary_max_buys_per_hour)),
+            top_n=max(1, int(args.canary_top_n)),
+            size_max_usd=max(0.05, float(args.canary_size_max_usd)),
+            ttl_minutes=max(1, int(args.canary_ttl_minutes)),
+        )
 
     diffs = _diff_env(source_map, target_map)
     unexpected = [d for d in diffs if d[0] not in _ALLOWED_PROMOTION_DIFF_KEYS]
@@ -467,7 +637,8 @@ def main() -> int:
         print("Re-run with --allow-drift to bypass, or disable drift sources (e.g. --window-controls off).")
         return 3
 
-    target_env = os.path.join(root, "data", "matrix", "env", f"live_from_{profile_id}.env")
+    env_prefix = "live_canary_from_" if args.canary else "live_from_"
+    target_env = os.path.join(root, "data", "matrix", "env", f"{env_prefix}{profile_id}.env")
     _write_env(target_env, order, target_map)
 
     print(f"SOURCE_PROFILE {profile_id}")
@@ -483,10 +654,14 @@ def main() -> int:
     if unexpected:
         print(f"UNEXPECTED_DIFFS {len(unexpected)}")
     print(f"LIVE_ENV {target_env}")
+    if args.canary:
+        print("CANARY_MODE true")
+        print(f"CANARY_LIMITS max_open={args.canary_max_open_trades} max_buys_per_hour={args.canary_max_buys_per_hour} top_n={args.canary_top_n} size_max_usd={float(args.canary_size_max_usd):.2f} ttl_minutes={int(args.canary_ttl_minutes)}")
 
     if args.apply:
         dot_env = os.path.join(root, ".env")
         env_order, env_map = _load_env(dot_env)
+        previous_dotenv = dict(env_map)
         rel_target = os.path.relpath(target_env, root).replace("\\", "/")
         env_map["BOT_ENV_FILE"] = rel_target
         env_map["WALLET_MODE"] = "live"
@@ -494,8 +669,18 @@ def main() -> int:
         env_map["AUTO_TRADE_PAPER"] = "false"
         env_map["PAPER_RESET_ON_START"] = "false"
         _write_env(dot_env, env_order, env_map)
+        snapshot_path = _write_switch_snapshot(
+            root=root,
+            profile_id=profile_id,
+            source_env=source_env_path,
+            target_env=target_env,
+            canary=bool(args.canary),
+            previous_dotenv=previous_dotenv,
+            next_dotenv=env_map,
+        )
         print(f"APPLIED_TO_DOTENV {dot_env}")
         print(f"BOT_ENV_FILE={rel_target}")
+        print(f"LIVE_SWITCH_SNAPSHOT {snapshot_path}")
     else:
         print("DRY_RUN only. Use --apply to update .env.")
 

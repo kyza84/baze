@@ -10,6 +10,7 @@ from typing import Any
 BOOL_TRUE = {"1", "true", "yes", "on"}
 BOOL_FALSE = {"0", "false", "no", "off"}
 SYMBOL_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+SLUG_RE = re.compile(r"^[A-Za-z0-9._:+-]+$")
 
 
 def _root() -> Path:
@@ -54,6 +55,45 @@ def _check_csv_symbol_list(value: Any, max_items: int) -> None:
             raise ValueError(f"invalid symbol '{sym}'")
 
 
+def _check_csv_slug_list(value: Any, max_items: int) -> None:
+    text = str(value or "").strip()
+    if not text:
+        return
+    parts = [p.strip().lower() for p in text.split(",") if p.strip()]
+    if len(parts) > max_items:
+        raise ValueError(f"too many items (max={max_items})")
+    for item in parts:
+        if not SLUG_RE.match(item):
+            raise ValueError(f"invalid slug '{item}'")
+
+
+def _check_source_cap_map(value: Any, max_items: int, min_value: int, max_value: int) -> None:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError("must not be empty")
+    parts = [p.strip() for p in text.split(",") if p.strip()]
+    if len(parts) > max_items:
+        raise ValueError(f"too many pairs (max={max_items})")
+    seen: set[str] = set()
+    for chunk in parts:
+        if ":" not in chunk:
+            raise ValueError(f"invalid pair '{chunk}' (expected key:value)")
+        raw_key, raw_val = chunk.split(":", 1)
+        key = raw_key.strip().lower()
+        if not key:
+            raise ValueError("empty source key")
+        if key in seen:
+            raise ValueError(f"duplicate source key '{key}'")
+        if not SLUG_RE.match(key):
+            raise ValueError(f"invalid source key '{key}'")
+        seen.add(key)
+        val = _to_int(raw_val)
+        if val < min_value:
+            raise ValueError(f"source cap '{key}' below min {min_value}")
+        if val > max_value:
+            raise ValueError(f"source cap '{key}' above max {max_value}")
+
+
 def _validate_scalar(name: str, value: Any, spec: dict[str, Any]) -> str | None:
     kind = str(spec.get("type", "")).strip()
     try:
@@ -86,6 +126,21 @@ def _validate_scalar(name: str, value: Any, spec: dict[str, Any]) -> str | None:
         if kind == "csv_symbol_list":
             max_items = int(spec.get("max_items", 50) or 50)
             _check_csv_symbol_list(value, max_items=max_items)
+            return None
+        if kind == "csv_slug_list":
+            max_items = int(spec.get("max_items", 50) or 50)
+            _check_csv_slug_list(value, max_items=max_items)
+            return None
+        if kind == "source_cap_map":
+            max_items = int(spec.get("max_items", 16) or 16)
+            min_value = int(spec.get("min_value", 1) or 1)
+            max_value = int(spec.get("max_value", 999) or 999)
+            _check_source_cap_map(
+                value,
+                max_items=max_items,
+                min_value=min_value,
+                max_value=max_value,
+            )
             return None
         return f"{name}: unsupported spec type '{kind}'"
     except ValueError as exc:

@@ -1,4 +1,4 @@
-﻿"""Keyboards for bot navigation."""
+"""Keyboards for bot navigation."""
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 

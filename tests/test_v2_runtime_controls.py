@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -10,6 +11,7 @@ from trading.v2_runtime import (
     PolicyEntryRouter,
     RollingEdgeGovernor,
     RuntimeKpiLoop,
+    SourceQosController,
     UniverseQualityGateController,
 )
 
@@ -134,6 +136,81 @@ class DualEntryTests(ConfigPatchMixin, unittest.TestCase):
         out, meta = dual.allocate(candidates=[_cand(1, "A", 90), _cand(2, "B", 80), _cand(3, "B", 70)], market_mode="RED")
         self.assertEqual(int(meta.get("explore_out", 0) or 0), 0)
         self.assertTrue(all(str(row[0].get("_entry_channel", "")) == "core" for row in out))
+
+
+class SourceQosTests(ConfigPatchMixin, unittest.TestCase):
+    def test_filter_enforces_topk_and_symbol_cap(self) -> None:
+        self.patch_cfg(
+            V2_SOURCE_QOS_ENABLED=True,
+            V2_SOURCE_QOS_TOPK_ENABLED=True,
+            V2_SOURCE_QOS_TOPK_PER_CYCLE=3,
+            V2_SOURCE_QOS_MAX_PER_SYMBOL_PER_CYCLE=1,
+            V2_SOURCE_QOS_SOURCE_CAPS="onchain:4,watchlist:4",
+        )
+        qos = SourceQosController()
+        tokens = [
+            {"symbol": "AAA", "source": "onchain", "liquidity": 100_000, "volume_5m": 8_000, "price_change_5m": 2.5},
+            {"symbol": "AAA", "source": "onchain", "liquidity": 90_000, "volume_5m": 7_500, "price_change_5m": 2.0},
+            {"symbol": "BBB", "source": "onchain", "liquidity": 80_000, "volume_5m": 7_000, "price_change_5m": 1.8},
+            {"symbol": "CCC", "source": "watchlist", "liquidity": 75_000, "volume_5m": 6_800, "price_change_5m": 1.5},
+            {"symbol": "DDD", "source": "watchlist", "liquidity": 70_000, "volume_5m": 6_500, "price_change_5m": 1.2},
+        ]
+        accepted, dropped, meta = qos.filter_tokens(tokens)
+        self.assertEqual(int(meta.get("in_total", 0) or 0), 5)
+        self.assertEqual(int(meta.get("out_total", 0) or 0), 3)
+        self.assertEqual(len(accepted), 3)
+        self.assertEqual(len(dropped), 2)
+        symbols = [str(row.get("symbol", "")).upper() for row in accepted]
+        self.assertEqual(len(symbols), len(set(symbols)))
+
+    def test_single_source_mode_applies_cap_floor(self) -> None:
+        self.patch_cfg(
+            V2_SOURCE_QOS_ENABLED=True,
+            V2_SOURCE_QOS_TOPK_ENABLED=False,
+            V2_SOURCE_QOS_MAX_PER_SYMBOL_PER_CYCLE=1,
+            V2_SOURCE_QOS_SOURCE_CAPS="watchlist:1",
+        )
+        qos = SourceQosController()
+        tokens = [
+            {"symbol": f"S{i}", "source": "watchlist", "liquidity": 40_000 + i, "volume_5m": 6_000 + i, "price_change_5m": 1.2}
+            for i in range(6)
+        ]
+        accepted, _dropped, meta = qos.filter_tokens(tokens)
+        self.assertTrue(bool(meta.get("single_source_mode")))
+        self.assertGreaterEqual(int((meta.get("single_source_cap_floor", {}) or {}).get("watchlist", 0) or 0), 3)
+        self.assertGreaterEqual(len(accepted), 3)
+
+    def test_record_cycle_can_trigger_source_cooldown(self) -> None:
+        self.patch_cfg(
+            V2_SOURCE_QOS_ENABLED=True,
+            V2_SOURCE_QOS_WINDOW_CYCLES=3,
+            V2_SOURCE_QOS_MIN_EVAL_CYCLES=3,
+            V2_SOURCE_QOS_MIN_SEEN_PER_WINDOW=30,
+            V2_SOURCE_QOS_MIN_PLAN_PER_WINDOW=6,
+            V2_SOURCE_QOS_MIN_PASS_RATE=0.20,
+            V2_SOURCE_QOS_MIN_EV_POSITIVE_RATE=0.50,
+            V2_SOURCE_QOS_MIN_OPEN_RATE=0.40,
+            V2_SOURCE_QOS_REQUIRED_FAIL_SIGNALS=2,
+            V2_SOURCE_QOS_COOLDOWN_SECONDS=600,
+            V2_SOURCE_QOS_SOURCE_CAPS="onchain:10",
+        )
+        qos = SourceQosController()
+        event = None
+        for _ in range(3):
+            event = qos.record_cycle(
+                seen_by_source={"onchain": 20},
+                passed_by_source={"onchain": 1},
+                planned_by_source={"onchain": 5},
+                source_flow={"onchain": {"plan_attempts": 5, "opens": 0, "ev_net_low_skips": 5, "ev_positive": 0}},
+            )
+        self.assertIsNotNone(event)
+        cooled = [str(x.get("source", "")) for x in list((event or {}).get("cooled_sources", []) or [])]
+        self.assertIn("onchain", cooled)
+        accepted, dropped, _ = qos.filter_tokens(
+            [{"symbol": "AAA", "source": "onchain", "liquidity": 50_000, "volume_5m": 5_000, "price_change_5m": 1.0}]
+        )
+        self.assertEqual(len(accepted), 0)
+        self.assertEqual(str((dropped[0] if dropped else {}).get("reason", "")), "source_qos_cooldown")
 
 
 class RollingEdgeTests(ConfigPatchMixin, unittest.TestCase):
@@ -339,6 +416,78 @@ class KpiLoopTests(ConfigPatchMixin, unittest.TestCase):
         self.assertLess(int(getattr(config, "AUTO_TRADE_TOP_N")), 20)
         self.assertLess(float(getattr(config, "V2_ENTRY_EXPLORE_MAX_SHARE")), 0.42)
 
+    def test_quality_rebalance_respects_source_budget_toggle(self) -> None:
+        self.patch_cfg(
+            V2_KPI_LOOP_ENABLED=True,
+            V2_KPI_QUALITY_REBALANCE_ENABLED=True,
+            V2_KPI_LOOP_WINDOW_CYCLES=3,
+            V2_KPI_LOOP_INTERVAL_SECONDS=60,
+            V2_KPI_EDGE_LOW_HARD_TRIGGER=0.75,
+            V2_KPI_QUALITY_REBALANCE_EXPLORE_STEP=0.05,
+            V2_KPI_QUALITY_REBALANCE_NOVELTY_STEP=0.04,
+            V2_KPI_QUALITY_REBALANCE_TOPN_STEP=1,
+            V2_KPI_QUALITY_REBALANCE_MAX_BUYS_STEP=4,
+            MAX_BUYS_PER_HOUR=70,
+            AUTO_TRADE_TOP_N=20,
+            V2_ENTRY_EXPLORE_MAX_SHARE=0.42,
+            V2_UNIVERSE_NOVELTY_MIN_SHARE=0.48,
+            V2_QUALITY_SOURCE_BUDGET_ENABLED=False,
+        )
+        loop = RuntimeKpiLoop()
+        loop._next_eval_ts = 0.0
+        for _ in range(3):
+            loop.record_cycle(
+                candidates=100,
+                opened=2,
+                policy_state="OK",
+                symbols=["ONE", "TWO"],
+                skip_reasons_cycle={"edge_low": 80, "negative_edge": 10},
+            )
+        payload = loop.maybe_apply()
+        self.assertIsNotNone(payload)
+        self.assertIn("quality_rebalance", str(payload.get("action", "")))
+        self.assertFalse(bool(getattr(config, "V2_QUALITY_SOURCE_BUDGET_ENABLED")))
+
+    def test_policy_lock_zero_open_blocks_quality_tighten(self) -> None:
+        self.patch_cfg(
+            V2_KPI_LOOP_ENABLED=True,
+            V2_KPI_POLICY_MODE="lock_zero_open",
+            V2_KPI_QUALITY_REBALANCE_ENABLED=True,
+            V2_KPI_LOOP_WINDOW_CYCLES=3,
+            V2_KPI_LOOP_INTERVAL_SECONDS=60,
+            V2_KPI_EDGE_LOW_HARD_TRIGGER=0.75,
+            V2_KPI_OPEN_RATE_LOW_TRIGGER=0.05,
+            V2_KPI_EDGE_LOW_RELAX_TRIGGER=0.60,
+            V2_KPI_QUALITY_REBALANCE_EXPLORE_STEP=0.05,
+            V2_KPI_QUALITY_REBALANCE_NOVELTY_STEP=0.04,
+            V2_KPI_QUALITY_REBALANCE_TOPN_STEP=2,
+            V2_KPI_QUALITY_REBALANCE_MAX_BUYS_STEP=8,
+            V2_KPI_MAX_BUYS_BOOST_STEP=4,
+            V2_KPI_TOPN_BOOST_STEP=2,
+            V2_KPI_MAX_BUYS_CAP=90,
+            V2_KPI_TOPN_CAP=30,
+            MAX_BUYS_PER_HOUR=70,
+            AUTO_TRADE_TOP_N=20,
+            V2_ENTRY_EXPLORE_MAX_SHARE=0.42,
+            V2_UNIVERSE_NOVELTY_MIN_SHARE=0.48,
+        )
+        loop = RuntimeKpiLoop()
+        loop._next_eval_ts = 0.0
+        for _ in range(3):
+            loop.record_cycle(
+                candidates=120,
+                opened=0,
+                policy_state="OK",
+                symbols=["ONE", "TWO"],
+                skip_reasons_cycle={"edge_low": 90, "negative_edge": 20},
+            )
+        payload = loop.maybe_apply()
+        self.assertIsNotNone(payload)
+        self.assertIn("quality_rebalance_lock_zero_open", str(payload.get("action", "")))
+        self.assertGreaterEqual(int(getattr(config, "MAX_BUYS_PER_HOUR")), 70)
+        self.assertGreaterEqual(int(getattr(config, "AUTO_TRADE_TOP_N")), 20)
+        self.assertGreaterEqual(float(getattr(config, "V2_ENTRY_EXPLORE_MAX_SHARE")), 0.42)
+
     def test_explore_failsafe_shrinks_share_on_bad_explore_window(self) -> None:
         class _ExplorePos:
             def __init__(self, pnl_usd: float) -> None:
@@ -506,6 +655,47 @@ class QualityGateTests(ConfigPatchMixin, unittest.TestCase):
         self.assertGreaterEqual(int(meta.get("core_out", 0) or 0), 1)
         self.assertGreaterEqual(int(meta.get("explore_out", 0) or 0), 1)
         self.assertGreater(int(meta.get("drop_counts", {}).get("cooldown_bucket", 0) or 0), 0)
+
+    def test_quality_gate_forces_single_cooldown_probe_when_empty(self) -> None:
+        self.patch_cfg(
+            V2_QUALITY_GATE_ENABLED=True,
+            V2_QUALITY_REFRESH_SECONDS=60,
+            V2_QUALITY_WINDOW_SECONDS=3600,
+            V2_QUALITY_MIN_SYMBOL_TRADES=3,
+            V2_QUALITY_MIN_CLUSTER_TRADES=3,
+            V2_QUALITY_MIN_AVG_PNL_USD=0.0,
+            V2_QUALITY_MAX_LOSS_SHARE=0.60,
+            V2_QUALITY_BAD_AVG_PNL_USD=-0.0005,
+            V2_QUALITY_BAD_LOSS_SHARE=0.65,
+            V2_QUALITY_EXPLORE_MAX_SHARE=0.0,
+            V2_QUALITY_EXPLORE_MIN_ABS=0,
+            V2_QUALITY_COOLDOWN_PROBE_PROBABILITY=0.0,
+            V2_QUALITY_SOURCE_BUDGET_ENABLED=False,
+            V2_QUALITY_SYMBOL_MAX_SHARE=1.0,
+        )
+        q = UniverseQualityGateController()
+        now = datetime.now(timezone.utc)
+        closed = [
+            _ClosedRichPos(
+                symbol="BAD",
+                token_cluster_key="s1|l1|v1|m1|r1",
+                pnl_usd=-0.01,
+                candidate_id=f"cid_bad_{i}",
+                closed_at=now,
+            )
+            for i in range(4)
+        ]
+        trader = type("T", (), {"closed_positions": closed})()
+        rows = [
+            (
+                {"_candidate_id": "bad_probe", "symbol": "BAD", "source": "watchlist", "liquidity": 18000, "volume_5m": 4200},
+                {"score": 80},
+            )
+        ]
+        out, meta = q.filter_candidates(candidates=rows, auto_trader=trader, market_mode="YELLOW")
+        self.assertEqual(len(out), 1)
+        self.assertEqual(str((out[0][0] or {}).get("_quality_bucket", "")), "cooldown_forced")
+        self.assertEqual(int(meta.get("forced_cooldown_probe_out", 0) or 0), 1)
 
     def test_quality_gate_limits_symbol_concentration(self) -> None:
         self.patch_cfg(
@@ -722,6 +912,112 @@ class QualityGateTests(ConfigPatchMixin, unittest.TestCase):
         self.assertIn("GOODSRC", out_syms)
         self.assertNotIn("BADSRC", out_syms)
         self.assertGreater(int(meta.get("drop_counts", {}).get("source_ev_cooldown", 0) or 0), 0)
+
+    def test_quality_gate_source_cap_soft_fill_reaches_target(self) -> None:
+        self.patch_cfg(
+            V2_QUALITY_GATE_ENABLED=True,
+            V2_QUALITY_REFRESH_SECONDS=60,
+            V2_QUALITY_WINDOW_SECONDS=3600,
+            V2_QUALITY_MIN_SYMBOL_TRADES=99,
+            V2_QUALITY_MIN_CLUSTER_TRADES=99,
+            V2_QUALITY_EXPLORE_MAX_SHARE=1.0,
+            V2_QUALITY_EXPLORE_MIN_ABS=0,
+            V2_QUALITY_COOLDOWN_PROBE_PROBABILITY=0.0,
+            V2_QUALITY_SYMBOL_MAX_SHARE=1.0,
+            V2_QUALITY_SOURCE_BUDGET_ENABLED=True,
+            V2_QUALITY_SOURCE_MIN_TRADES=99,
+            V2_QUALITY_SOURCE_MAX_SHARE=0.34,
+            V2_QUALITY_SOURCE_CAP_SOFT_FILL_ENABLED=True,
+        )
+        q = UniverseQualityGateController()
+        trader = type("T", (), {"closed_positions": [], "_recent_open_symbols": []})()
+        rows = [
+            (
+                {
+                    "_candidate_id": f"cid_{i}",
+                    "symbol": f"S{i}",
+                    "source": "watchlist",
+                    "liquidity": 30000 + i,
+                    "volume_5m": 5000 + i,
+                },
+                {"score": 85 - i},
+            )
+            for i in range(5)
+        ]
+        out, _meta = q.filter_candidates(candidates=rows, auto_trader=trader, market_mode="YELLOW")
+        self.assertEqual(len(out), 5)
+
+    def test_quality_gate_drop_counts_are_deduped_per_candidate_reason(self) -> None:
+        self.patch_cfg(
+            V2_QUALITY_GATE_ENABLED=True,
+            V2_QUALITY_REFRESH_SECONDS=60,
+            V2_QUALITY_WINDOW_SECONDS=3600,
+            V2_QUALITY_MIN_SYMBOL_TRADES=99,
+            V2_QUALITY_MIN_CLUSTER_TRADES=99,
+            V2_QUALITY_EXPLORE_MAX_SHARE=1.0,
+            V2_QUALITY_EXPLORE_MIN_ABS=0,
+            V2_QUALITY_COOLDOWN_PROBE_PROBABILITY=0.0,
+            V2_QUALITY_SYMBOL_MAX_SHARE=1.0,
+            V2_QUALITY_SOURCE_BUDGET_ENABLED=True,
+            V2_QUALITY_SOURCE_MIN_TRADES=99,
+            V2_QUALITY_SOURCE_MAX_SHARE=0.34,
+            V2_QUALITY_SOURCE_CAP_SOFT_FILL_ENABLED=False,
+        )
+        q = UniverseQualityGateController()
+        trader = type("T", (), {"closed_positions": [], "_recent_open_symbols": []})()
+        rows = [
+            (
+                {
+                    "_candidate_id": f"cid_{i}",
+                    "symbol": f"S{i}",
+                    "source": "watchlist",
+                    "liquidity": 22000 + i,
+                    "volume_5m": 4200 + i,
+                },
+                {"score": 82 - i},
+            )
+            for i in range(3)
+        ]
+        out, meta = q.filter_candidates(candidates=rows, auto_trader=trader, market_mode="YELLOW")
+        self.assertEqual(len(out), 2)
+        self.assertEqual(int(meta.get("drop_counts", {}).get("source_budget", 0) or 0), 1)
+        dropped_source_budget = [
+            row
+            for row in list(meta.get("dropped", []) or [])
+            if str((row or {}).get("reason", "")) == "source_budget"
+        ]
+        self.assertEqual(len(dropped_source_budget), 1)
+
+    def test_quality_gate_uses_open_history_without_mutating_selected_history(self) -> None:
+        self.patch_cfg(
+            V2_QUALITY_GATE_ENABLED=True,
+            V2_QUALITY_REFRESH_SECONDS=60,
+            V2_QUALITY_WINDOW_SECONDS=3600,
+            V2_QUALITY_MIN_SYMBOL_TRADES=99,
+            V2_QUALITY_MIN_CLUSTER_TRADES=99,
+            V2_QUALITY_EXPLORE_MAX_SHARE=1.0,
+            V2_QUALITY_EXPLORE_MIN_ABS=0,
+            V2_QUALITY_COOLDOWN_PROBE_PROBABILITY=0.0,
+            V2_QUALITY_SOURCE_BUDGET_ENABLED=False,
+            V2_QUALITY_SYMBOL_MAX_SHARE=1.0,
+            V2_QUALITY_SYMBOL_CONCENTRATION_USE_OPEN_HISTORY=True,
+        )
+        q = UniverseQualityGateController()
+        trader = type("T", (), {"closed_positions": [], "_recent_open_symbols": [(time.time(), "AAA")]})()
+        rows = [
+            (
+                {
+                    "_candidate_id": "cid_a",
+                    "symbol": "AAA",
+                    "source": "onchain",
+                    "liquidity": 40000,
+                    "volume_5m": 6000,
+                },
+                {"score": 88},
+            )
+        ]
+        q.filter_candidates(candidates=rows, auto_trader=trader, market_mode="GREEN")
+        self.assertEqual(len(q._symbol_history), 0)
 
 
 if __name__ == "__main__":
