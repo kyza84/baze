@@ -6,6 +6,7 @@ param(
   [string]$PolicyPhase = 'auto',
   [int]$WindowMinutes = 12,
   [int]$RestartCooldownSeconds = 180,
+  [int]$RestartMaxPerHour = 6,
   [int]$DurationMinutes = 600,
   [int]$IntervalSeconds = 120,
   [double]$TargetTradesPerHour = 12.0,
@@ -27,6 +28,7 @@ param(
   [double]$HoldHysteresisOpenRate = 0.07,
   [double]$HoldHysteresisTradesPerHour = 6.0,
   [string]$TargetPolicyFile = '',
+  [switch]$AllowZeroCooldown,
   [switch]$DryRun
 )
 
@@ -50,6 +52,7 @@ $cmdArgs = @(
   '-PolicyPhase', $PolicyPhase,
   '-WindowMinutes', [string]$WindowMinutes,
   '-RestartCooldownSeconds', [string]$RestartCooldownSeconds,
+  '-RestartMaxPerHour', [string]$RestartMaxPerHour,
   '-DurationMinutes', [string]$DurationMinutes,
   '-IntervalSeconds', [string]$IntervalSeconds,
   '-TargetTradesPerHour', [string]$TargetTradesPerHour,
@@ -77,6 +80,9 @@ if ($TargetPolicyFile -and $TargetPolicyFile.Trim().Length -gt 0) {
 }
 if ($DryRun) {
   $cmdArgs += '-DryRun'
+}
+if ($AllowZeroCooldown) {
+  $cmdArgs += '-AllowZeroCooldown'
 }
 
 Write-Host "[runtime_tuner] opening visible window..." -ForegroundColor Cyan

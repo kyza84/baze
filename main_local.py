@@ -130,6 +130,49 @@ def _graceful_stop_requested() -> bool:
         return False
 
 
+def _read_graceful_stop_meta() -> dict[str, str]:
+    path = _graceful_stop_file_path()
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            raw = str(f.read() or "").strip()
+    except Exception:
+        return {}
+    if not raw:
+        return {}
+
+    def _to_text(value: Any) -> str:
+        return str(value or "").strip()
+
+    try:
+        payload = json.loads(raw)
+        if isinstance(payload, dict):
+            source = _to_text(payload.get("source")) or _to_text(payload.get("event")) or "unknown"
+            reason = _to_text(payload.get("reason")) or "unknown"
+            actor = _to_text(payload.get("actor")) or "unknown"
+            ts = _to_text(payload.get("timestamp")) or _to_text(payload.get("ts"))
+            return {
+                "source": source,
+                "reason": reason,
+                "actor": actor,
+                "timestamp": ts,
+                "raw": "",
+            }
+    except Exception:
+        pass
+
+    first = raw.splitlines()[0].strip() if raw else ""
+    tokens = first.split(maxsplit=1) if first else []
+    legacy_ts = tokens[0] if len(tokens) >= 1 else ""
+    legacy_reason = tokens[1] if len(tokens) >= 2 else (first or "legacy_signal")
+    return {
+        "source": "legacy_signal_file",
+        "reason": legacy_reason or "legacy_signal",
+        "actor": "unknown",
+        "timestamp": legacy_ts,
+        "raw": first[:180],
+    }
+
+
 def _clear_graceful_stop_flag() -> None:
     try:
         path = _graceful_stop_file_path()
@@ -2575,7 +2618,20 @@ async def run_local_loop() -> None:
                     _RUNTIME_TUNER_PATCH_STATE["last_error"] = hot_detail
                     logger.warning("RUNTIME_TUNER_HOT_APPLY run_tag=%s %s", RUN_TAG, hot_detail)
             if _graceful_stop_requested():
-                logger.warning("GRACEFUL_STOP requested path=%s", _graceful_stop_file_path())
+                stop_path = _graceful_stop_file_path()
+                stop_meta = _read_graceful_stop_meta()
+                if stop_meta:
+                    logger.warning(
+                        "GRACEFUL_STOP requested path=%s source=%s reason=%s actor=%s ts=%s raw=%s",
+                        stop_path,
+                        str(stop_meta.get("source", "unknown") or "unknown"),
+                        str(stop_meta.get("reason", "unknown") or "unknown"),
+                        str(stop_meta.get("actor", "unknown") or "unknown"),
+                        str(stop_meta.get("timestamp", "") or ""),
+                        str(stop_meta.get("raw", "") or ""),
+                    )
+                else:
+                    logger.warning("GRACEFUL_STOP requested path=%s", stop_path)
                 break
             cycle_started = time.perf_counter()
             try:

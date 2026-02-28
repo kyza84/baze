@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import errno
 import tempfile
 import time
 from contextlib import contextmanager
@@ -22,6 +23,9 @@ except Exception:  # pragma: no cover - platform specific
 E_STATE_LOCKED = "E_STATE_LOCKED"
 E_JSON_CORRUPT = "E_JSON_CORRUPT"
 E_STATE_IO = "E_STATE_IO"
+
+_TRANSIENT_REPLACE_WINERRORS = {5, 32, 33}
+_TRANSIENT_REPLACE_ERRNOS = {errno.EACCES, errno.EBUSY, errno.EPERM}
 
 
 class StateFileLockError(RuntimeError):
@@ -141,7 +145,19 @@ def atomic_write_json(
                 os.fsync(f.fileno())
             except OSError:
                 pass
-        os.replace(tmp_path, abs_path)
+        replace_retries = max(0, int(os.getenv("STATE_ATOMIC_REPLACE_RETRIES", "8") or 8))
+        replace_base_delay = max(0.01, float(os.getenv("STATE_ATOMIC_REPLACE_BASE_DELAY_SECONDS", "0.03") or 0.03))
+        for attempt in range(replace_retries + 1):
+            try:
+                os.replace(tmp_path, abs_path)
+                break
+            except OSError as exc:
+                winerror = int(getattr(exc, "winerror", 0) or 0)
+                err_no = int(getattr(exc, "errno", 0) or 0)
+                transient = (winerror in _TRANSIENT_REPLACE_WINERRORS) or (err_no in _TRANSIENT_REPLACE_ERRNOS)
+                if (not transient) or attempt >= replace_retries:
+                    raise
+                time.sleep(replace_base_delay * (1.5**attempt))
     except Exception:
         try:
             os.remove(tmp_path)

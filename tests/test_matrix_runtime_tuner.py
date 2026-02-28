@@ -580,6 +580,35 @@ class MatrixRuntimeTunerTests(unittest.TestCase):
         self.assertIn("MAX_TOKEN_COOLDOWN_SECONDS", by_key)
         self.assertLess(int(by_key["MAX_TOKEN_COOLDOWN_SECONDS"].new_value), 120)
 
+    def test_relax_cooldown_respects_mode_floor_when_zero_not_allowed(self) -> None:
+        metrics = mrt.WindowMetrics(
+            selected_from_batch=40,
+            opened_from_batch=0,
+            autotrade_skip_reasons=Counter({"cooldown": 20}),
+        )
+        overrides = {
+            "MAX_TOKEN_COOLDOWN_SECONDS": "10",
+        }
+        actions = mrt._build_actions(
+            metrics=metrics,
+            overrides=overrides,
+            mode=mrt.MODE_SPECS["conveyor"],
+            allow_zero_cooldown=False,
+        )
+        for action in actions:
+            if str(action.key) == "MAX_TOKEN_COOLDOWN_SECONDS":
+                self.assertGreaterEqual(int(action.new_value), 10)
+
+    def test_adaptive_bounds_only_drop_cooldown_floor_when_explicitly_allowed(self) -> None:
+        metrics = mrt.WindowMetrics(
+            selected_from_batch=40,
+            opened_from_batch=0,
+        )
+        bounds_default = mrt._adaptive_bounds(metrics, mrt.MODE_SPECS["conveyor"], allow_zero_cooldown=False)
+        bounds_zero = mrt._adaptive_bounds(metrics, mrt.MODE_SPECS["conveyor"], allow_zero_cooldown=True)
+        self.assertEqual(int(bounds_default.cooldown_floor), 10)
+        self.assertEqual(int(bounds_zero.cooldown_floor), 0)
+
     def test_min_trade_relax_updates_a_core_min_trade_floor(self) -> None:
         metrics = mrt.WindowMetrics(
             selected_from_batch=40,
@@ -1332,6 +1361,38 @@ class MatrixRuntimeTunerTests(unittest.TestCase):
             )
             with mock.patch.object(mrt, "_pid_is_running", return_value=True):
                 self.assertTrue(mrt._profile_running(root, "u1"))
+
+    def test_prune_restart_history_keeps_recent_sorted_values(self) -> None:
+        now_ts = 10000.0
+        history = [9800.0, 5000.0, 9990.0, 12000.0, 9950.0]
+        pruned = mrt._prune_restart_history(history, now_ts=now_ts, window_seconds=3600.0)
+        self.assertEqual(pruned, [9800.0, 9950.0, 9990.0])
+
+    def test_restart_gate_blocks_when_budget_exhausted(self) -> None:
+        now_ts = 10000.0
+        history = [9800.0, 9900.0, 9950.0]
+        can_restart, cooldown_left, budget_left = mrt._restart_gate(
+            now_ts=now_ts,
+            history=history,
+            restart_cooldown_seconds=10,
+            restart_max_per_hour=3,
+        )
+        self.assertFalse(can_restart)
+        self.assertEqual(int(budget_left), 0)
+        self.assertEqual(float(cooldown_left), 0.0)
+
+    def test_restart_gate_blocks_on_cooldown(self) -> None:
+        now_ts = 10000.0
+        history = [9995.0]
+        can_restart, cooldown_left, budget_left = mrt._restart_gate(
+            now_ts=now_ts,
+            history=history,
+            restart_cooldown_seconds=30,
+            restart_max_per_hour=6,
+        )
+        self.assertFalse(can_restart)
+        self.assertGreater(float(cooldown_left), 0.0)
+        self.assertGreaterEqual(int(budget_left), 1)
 
 
 if __name__ == "__main__":

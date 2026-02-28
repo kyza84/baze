@@ -1,70 +1,125 @@
-# Base Bot Control Stack
+﻿# Base Bot Control Stack (baze)
 
-Local-first trading stack for Base with paper/matrix calibration and controlled live execution.
+Local-first trading stack for Base chain with paper calibration (Matrix), runtime autotuning, and guarded promotion to live.
 
-## What Is Included
-- Market + on-chain ingestion pipeline.
-- Multi-layer safety and policy gating.
-- Paper and live auto-trader.
-- Matrix A/B runs with profile isolation.
-- Runtime adaptive controllers (policy router, dual entry, rolling edge, KPI loop).
-- Desktop GUI control center.
+## Repository Goal
+- Keep one shared decision pipeline for paper/matrix/live.
+- Tune throughput without breaking safety invariants.
+- Preserve forensic traceability for every candidate/decision/trade.
 
-## Core Modules
-- `main_local.py`: runtime loop, market mode detection, candidate routing, orchestration.
-- `trading/auto_trader.py`: entry/exit decisions, risk caps, cooldowns, persistence.
-- `trading/runtime_policy.py`: extracted data-policy + market-mode helpers.
-- `trading/auto_trader_state.py`: extracted state save/load logic.
-- `monitor/local_alerter.py`: local alert writer (schema-stamped JSONL).
-- `monitor/gui_engine_control.py`: extracted GUI engine process control.
-- `launcher_gui.py`: UI shell, matrix control, logs, wallet/trades monitoring.
+## Project Architecture (File-Level)
 
-## Runtime Modes
-- Paper:
-  - `AUTO_TRADE_ENABLED=true`
-  - `AUTO_TRADE_PAPER=true`
-- Live:
-  - `AUTO_TRADE_ENABLED=true`
-  - `AUTO_TRADE_PAPER=false`
-  - valid `LIVE_*` credentials and RPC keys.
+### Entry Points
+- `main_local.py`
+  - Core runtime loop.
+  - Candidate ingestion, filter/precheck pipeline, planner and execution calls.
+  - Writes candidate/trade logs and heartbeat.
+- `launcher_gui.py`
+  - Desktop control center for single and matrix operations.
+  - Reads active matrix status, live tails, trade tables.
+- `tools/matrix_paper_launcher.ps1`
+  - Matrix runner for one or many profiles.
+  - Builds runtime env files and starts `main_local.py` workers.
+- `tools/matrix_paper_stop.ps1`
+  - Graceful/forced matrix shutdown.
+- `tools/matrix_watchdog.py`
+  - Watches matrix workers, stale heartbeat handling, status reconciliation.
 
-Recommended flow:
-1. Paper validation.
-2. Matrix A/B run.
-3. Promote winner with parity.
-4. Live only after precheck passes.
+### Trading Core
+- `trading/auto_trader.py`
+  - Entry/exit orchestration.
+  - Risk caps, position lifecycle, blacklist/cooldown integration.
+- `trading/live_executor.py`
+  - Live transaction execution primitives and receipts path.
+- `trading/auto_trader_state.py`
+  - Position/account state serialization and recovery helpers.
+- `trading/runtime_policy.py`
+  - Policy state transitions and mode gating helpers.
+- `trading/v2_runtime.py`
+  - Quality/source controls and runtime knobs for candidate funnel shaping.
 
-## State File Safety
-- `PAPER_STATE_FILE` writes use inter-process lock file (`<state>.lock`) and atomic replace.
-- GUI state reset/prune actions use the same lock+atomic path as runtime state persistence.
-- Lock tuning env keys:
-  - `STATE_FILE_LOCK_TIMEOUT_SECONDS` (default `2.0`)
-  - `STATE_FILE_LOCK_RETRY_SECONDS` (default `0.05`)
+### Runtime Tuner
+- `tools/matrix_runtime_tuner.py`
+  - Matrix sidecar tuner.
+  - Reads recent telemetry, computes actions, applies safe mutable overrides.
+  - Supports `once`, `run`, `replay`, dry-run and active mode.
+- `tools/matrix_runtime_tuner.ps1`
+  - PowerShell wrapper for starting/stopping tuner.
+- `tools/matrix_runtime_tuner_open.ps1`
+  - Tuner console helper.
 
-## GUI (Current)
-- Top bar is simplified to core controls:
-  - `Start`, `Stop`, `Matrix Start/Stop/Summary`, `Save`, `Restart`, `Clear Logs`, `Refresh`.
-- New tab `Matrix Presets`:
-  - catalog of built-in + user presets + recent winners,
-  - create/update/delete user presets,
-  - select presets for next `Matrix Start` directly from GUI.
-- Settings tab is curated (critical runtime keys only), not legacy full `.env` dump.
-- Activity feed focuses on:
-  - market mode changes (`MARKET_MODE_CHANGE`),
-  - opened trades (`trade_decisions.jsonl`, `decision_stage=trade_open`).
-- Raw runtime panel still shows compact full logs.
+### Config + Guardrails
+- `config.py`
+  - Runtime env parsing and defaults.
+- `tools/matrix_safe_tuning_contract.json`
+  - Mutable allow-list and bounds for preset/runtime tuning.
+- `tools/matrix_preset_guard.py`
+  - Validation of user presets against contract.
+- `tools/matrix_user_presets.py`
+  - Create/clone/list/delete profile presets.
 
-## Matrix Commands
+### State + IO Safety
+- `utils/state_file.py`
+  - Locked state read/write (file lock + atomic replace).
+  - Shared by runtime state persistence and GUI maintenance actions.
+
+### Observability
+- `utils/log_contracts.py`
+  - Schema fields for candidate/trade/alert records.
+- `monitor/local_alerter.py`
+  - Local alert emission.
+- Main runtime logs location:
+  - `logs/matrix/<profile_id>/...`
+
+## Runtime Pipeline (Shared Logic)
+1. Build candidate set from sources.
+2. Apply safety/policy/quality filters.
+3. Plan trade (`plan_trade` stage, EV/edge checks).
+4. Execute (paper or live executor).
+5. Postprocess state + trade lifecycle logs.
+
+Paper/matrix/live differences are isolated at executor and environment level; decision stages are shared.
+
+## Matrix + Autotuner Operating Model
+- Matrix profile(s) run through launcher.
+- Watchdog keeps status and stale-worker recovery.
+- Runtime tuner reads rolling windows and proposes/applies bounded config deltas.
+- Sensitive anti-scam/safety keys are contract-locked and excluded from tuner mutation.
+
+## Directory Map
+- `tools/` automation scripts (matrix launcher/stop/summary/tuner/preset guard).
+- `trading/` trading engine modules.
+- `monitor/` alerting and GUI support modules.
+- `utils/` shared infra (state locks, log contracts, helpers).
+- `tests/` unit/integration tests.
+- `data/` runtime/generated data (ignored by default).
+- `logs/` runtime logs (ignored by default; selected files tracked for diagnostics).
+- `docs/` operator manuals and architecture notes.
+
+## 48h Diagnostic Logs Included In This Update
+Included for handoff/analysis window:
+- Profile: `u_station_ab_night_autotune_v2`
+- Path: `logs/matrix/u_station_ab_night_autotune_v2/`
+- Contents committed:
+  - rolling runtime logs (`app.log*`, `out.log*`)
+  - decision streams (`candidates.jsonl`, `trade_decisions.jsonl`, `local_alerts.jsonl`)
+  - tuner telemetry (`runtime_tuner.jsonl`, state/lock/overrides)
+  - session logs from the last 48 hours (`sessions/main_local_*.log`)
+
+## Key Run Files
+- Active matrix status: `data/matrix/runs/active_matrix.json`
+- Profile env files: `data/matrix/env/<profile>.env`
+- User presets: `data/matrix/user_presets/*.json`
+
+## Common Commands
 Run matrix:
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File tools\matrix_paper_launcher.ps1 -Count 2 -Run
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\matrix_paper_launcher.ps1 -Run -Count 2
 ```
-Note:
-- launcher now also starts `tools\matrix_watchdog.py` (stale-heartbeat auto-restart).
 
-Run selected profiles (built-in or user presets):
+Run single profile:
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File tools\matrix_paper_launcher.ps1 -Run -Count 2 -ProfileIds mx30_guarded_balanced,mx31_guarded_aggressive
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\matrix_paper_launcher.ps1 -Run -ProfileIds u_station_ab_night_autotune_v2
 ```
 
 Stop matrix:
@@ -72,143 +127,28 @@ Stop matrix:
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\matrix_paper_stop.ps1 -HardKill
 ```
 
-Summary:
+Run runtime tuner:
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File tools\matrix_paper_summary.ps1
+python tools\matrix_runtime_tuner.py run --profile-id u_station_ab_night_autotune_v2 --mode conveyor --duration-minutes 60 --interval-seconds 120
 ```
 
-Window rank report (includes `blocked_by_safe_source`, `blocked_by_watchlist_guard`, `blocked_by_safety_budget` per profile/window):
+Run tuner dry-run:
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File tools\matrix_window_rank.ps1 -LookbackHours 4 -MinClosed 10
+python tools\matrix_runtime_tuner.py run --profile-id u_station_ab_night_autotune_v2 --mode conveyor --duration-minutes 60 --interval-seconds 120 --dry-run
 ```
 
-Promote winner to live parity:
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File tools\matrix_promote_live.ps1 -ProfileId <profile_id>
-```
-Apply live switch (flat book required, guarded by confirm phrase):
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File tools\matrix_promote_live.ps1 -ProfileId <profile_id> -Apply -Confirm CONFIRM_LIVE_SWITCH
-```
-Canary apply (limited risk budget):
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File tools\matrix_promote_live.ps1 -ProfileId <profile_id> -Canary -CanaryMaxOpenTrades 1 -CanaryMaxBuysPerHour 8 -CanaryTopN 8 -CanarySizeMaxUsd 0.45 -CanaryTtlMinutes 90 -Apply -Confirm CONFIRM_LIVE_SWITCH
-```
-Rollback latest live switch snapshot:
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File tools\matrix_promote_live.ps1 -Rollback -Confirm CONFIRM_LIVE_ROLLBACK
-```
-Switch snapshots are written to `data/live/switches/live_switch_*.json`.
-
-Profile catalog (built-in + user + recent winners):
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File tools\matrix_profile_catalog.ps1
-```
-
-User preset manager:
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File tools\matrix_user_presets.ps1 list
-powershell -NoProfile -ExecutionPolicy Bypass -File tools\matrix_user_presets.ps1 create --name u_mx30_safe --base mx30_guarded_balanced --set MAX_OPEN_TRADES=5
-```
-
-Runtime tuner (matrix sidecar, pre-live calibration window):
-```powershell
-python tools\matrix_runtime_tuner.py once --profile-id u_station_ab_diag_flow_peoff --mode conveyor --dry-run
-python tools\matrix_runtime_tuner.py run --profile-id u_station_ab_diag_flow_peoff --mode conveyor --duration-minutes 60 --interval-seconds 120
-python tools\matrix_runtime_tuner.py replay --profile-id u_station_ab_diag_flow_peoff --limit 240
-powershell -NoProfile -ExecutionPolicy Bypass -File tools\matrix_runtime_tuner.ps1 -Command run -ProfileId u_station_ab_diag_flow_peoff -Mode conveyor -DurationMinutes 60 -IntervalSeconds 120
-```
-Runtime tuner decision log (`logs/matrix/<profile>/runtime_tuner.jsonl`) now includes telemetry v2:
-`funnel_15m`, `top_reasons_15m`, `exec_health_15m`, `exit_mix_60m`,
-plus `config_hash_before/config_hash_after`, `commit_hash`, and `run_tag`.
-
-Runtime tuner controls now include:
-- policy phase mode: `--policy-phase auto|expand|hold|tighten`,
-- target corridor knobs: `--target-trades-per-hour`, `--target-pnl-per-hour-usd`,
-- degradation rollback after streak (`--rollback-degrade-streak`) to last stable mutable snapshot,
-- forensic fields: `blacklist_forensics_15m`, `tuner_effective`, `pending_runtime_diff_keys`,
-- blocked/capped action visibility: `blocked_actions`, `delta_capped_actions`.
-
-Safety guard lock:
-- scam/safety keys are protected in safe tuning contract and excluded from tuner mutation path.
-- examples: `ENTRY_FAIL_CLOSED_ON_SAFETY_GAP`, `ENTRY_ALLOWED_SAFETY_SOURCES`, `PAPER_WATCHLIST_STRICT_GUARD_ENABLED`.
-
-Full operator guide:
-- `docs/MATRIX_PRESET_MANUAL.md`
-- `docs/SAFE_TUNING_AGENT_PROTOCOL.md`
-- `docs/MATRIX_RUNTIME_TUNER.md`
-
-## Live Precheck
-No trading actions, only readiness checks:
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File tools\live_precheck.ps1
-```
-
-Python entry:
-```powershell
-python tools\preflight_live_check.py --env-file .env --json-out data\live_precheck_report.json
-```
-
-## Unified Dataset Sync
-Incremental deduplicated dataset into SQLite:
-```powershell
-python tools\unified_dataset_sync.py --root .
-```
-
-Continuous sync loop:
-```powershell
-python tools\unified_dataset_sync.py --root . --follow --loop-seconds 45
-```
-
-Output:
-- `data/unified_dataset/unified.db`
-- `data/unified_dataset/sync_state.json`
-
-## Log Contracts (Schema Versioned)
-Writers now stamp shared contract fields:
-- `schema_version`
-- `schema_name`
-- `event_type`
-- `ts`, `timestamp`
-- `run_tag` (when available)
-
-Schemas:
-- `candidate_decision.v1` (`logs/**/candidates.jsonl`)
-- `trade_decision.v1` (`logs/**/trade_decisions.jsonl`)
-- `local_alert.v1` (`logs/**/local_alerts.jsonl`)
-
-Implementation: `utils/log_contracts.py`.
-
-## Tests
-Run mini integration tests:
+Run tests:
 ```powershell
 python -m unittest discover -s tests -p "test_*.py" -v
 ```
 
-Covered areas:
-- policy router (`limited/block`, hard-block, legacy behavior),
-- dual-entry quotas,
-- rolling-edge bounds,
-- fail-closed behavior in auto-trader,
-- market-mode and policy hysteresis,
-- state-file lock exclusivity + atomic persistence.
+## Documentation Index
+- `docs/ARCHITECTURE.md` - detailed architecture and ownership map.
+- `docs/MATRIX_RUNTIME_TUNER.md` - tuner behavior and controls.
+- `docs/MATRIX_PRESET_MANUAL.md` - preset operations.
+- `docs/SAFE_TUNING_AGENT_PROTOCOL.md` - safe tuning process.
+- `NEXT_CHAT_CONTEXT.md` - current working state for next session.
 
-## Encoding Hygiene
-Audit tracked text files for UTF-8 BOM prefixes:
-```powershell
-python tools/check_utf8_bom.py
-```
-
-Auto-fix BOM prefixes:
-```powershell
-python tools/check_utf8_bom.py --fix
-```
-
-## Repo Hygiene
-Runtime data and secrets are intentionally excluded from git:
-- `.env`,
-- `logs/`,
-- `data/`,
-- local states/snapshots.
-
-This keeps the repository safe while preserving code-level reproducibility.
+## Notes
+- `.gitignore` excludes runtime `logs/` and `data/`; files already tracked historically can still be updated and committed.
+- For fresh log snapshots under ignored trees, use `git add -f` explicitly.

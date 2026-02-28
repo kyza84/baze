@@ -256,6 +256,7 @@ class RuntimeState:
     effective_target_stable_ticks: int = 0
     effective_target_fail_ticks: int = 0
     effective_target_last_reason: str = ""
+    restart_history_ts: list[float] = field(default_factory=list)
 
 
 
@@ -671,6 +672,14 @@ def _load_runtime_state(root: Path, profile_id: str) -> RuntimeState:
     stable_map: dict[str, str] = {}
     if isinstance(stable_raw, dict):
         stable_map = {str(k): str(v) for k, v in stable_raw.items()}
+    restart_history_raw = payload.get("restart_history_ts", [])
+    restart_history: list[float] = []
+    if isinstance(restart_history_raw, list):
+        for item in restart_history_raw:
+            try:
+                restart_history.append(float(item))
+            except Exception:
+                continue
     return RuntimeState(
         degrade_streak=int(payload.get("degrade_streak", 0) or 0),
         stable_hash=str(payload.get("stable_hash", "") or ""),
@@ -685,6 +694,7 @@ def _load_runtime_state(root: Path, profile_id: str) -> RuntimeState:
         effective_target_stable_ticks=int(payload.get("effective_target_stable_ticks", 0) or 0),
         effective_target_fail_ticks=int(payload.get("effective_target_fail_ticks", 0) or 0),
         effective_target_last_reason=str(payload.get("effective_target_last_reason", "") or ""),
+        restart_history_ts=restart_history,
     )
 
 
@@ -705,9 +715,55 @@ def _save_runtime_state(root: Path, profile_id: str, state: RuntimeState) -> Non
         "effective_target_stable_ticks": int(max(0, state.effective_target_stable_ticks)),
         "effective_target_fail_ticks": int(max(0, state.effective_target_fail_ticks)),
         "effective_target_last_reason": str(state.effective_target_last_reason or ""),
+        "restart_history_ts": [
+            float(x)
+            for x in (state.restart_history_ts or [])
+            if isinstance(x, (int, float)) and float(x) > 0.0
+        ][-96:],
         "updated_at": _now_iso(),
     }
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _prune_restart_history(
+    history: list[float],
+    *,
+    now_ts: float,
+    window_seconds: float = 3600.0,
+    max_points: int = 96,
+) -> list[float]:
+    cutoff = float(now_ts) - float(max(1.0, window_seconds))
+    out: list[float] = []
+    for item in history or []:
+        try:
+            ts = float(item)
+        except Exception:
+            continue
+        if ts <= 0.0 or ts < cutoff or ts > (float(now_ts) + 30.0):
+            continue
+        out.append(ts)
+    out.sort()
+    if len(out) > int(max(1, max_points)):
+        out = out[-int(max(1, max_points)) :]
+    return out
+
+
+def _restart_gate(
+    *,
+    now_ts: float,
+    history: list[float],
+    restart_cooldown_seconds: int,
+    restart_max_per_hour: int,
+) -> tuple[bool, float, int]:
+    max_per_hour = max(1, int(restart_max_per_hour))
+    cooldown = float(max(0, int(restart_cooldown_seconds)))
+    last_ts = float(history[-1]) if history else 0.0
+    cooldown_left = 0.0
+    if last_ts > 0.0 and cooldown > 0.0:
+        cooldown_left = max(0.0, cooldown - (float(now_ts) - last_ts))
+    budget_left = max(0, max_per_hour - len(history))
+    can_restart = bool(budget_left > 0 and cooldown_left <= 0.0)
+    return can_restart, float(cooldown_left), int(budget_left)
 
 
 def _latest_session_log(root: Path, profile_id: str) -> Path | None:
@@ -1823,6 +1879,7 @@ def _action_family(action: Action) -> str:
         "ev_net_low_gate",
         "ev_net_low_probe_tolerance",
         "cooldown_left",
+        "cooldown_dominant_flow_expand",
         "min_trade_size",
         "low_throughput_expand_topn",
         "dedup_pressure",
@@ -2410,7 +2467,12 @@ def _is_low_throughput(metrics: WindowMetrics) -> bool:
     return False
 
 
-def _adaptive_bounds(metrics: WindowMetrics, mode: ModeSpec) -> AdaptiveBounds:
+def _adaptive_bounds(
+    metrics: WindowMetrics,
+    mode: ModeSpec,
+    *,
+    allow_zero_cooldown: bool = False,
+) -> AdaptiveBounds:
     bounds = AdaptiveBounds(
         strict_floor=int(mode.strict_floor),
         soft_floor=int(mode.soft_floor),
@@ -2432,7 +2494,10 @@ def _adaptive_bounds(metrics: WindowMetrics, mode: ModeSpec) -> AdaptiveBounds:
         bounds.volume_floor = max(5.0, float(mode.volume_floor) - 3.0)
         bounds.edge_floor = max(0.05, float(mode.edge_floor) - 0.15)
         bounds.edge_usd_floor = max(0.0005, float(mode.edge_usd_floor) - 0.0015)
-        bounds.cooldown_floor = max(0, int(mode.cooldown_floor) - 10)
+        if bool(allow_zero_cooldown):
+            bounds.cooldown_floor = max(0, int(mode.cooldown_floor) - 10)
+        else:
+            bounds.cooldown_floor = max(0, int(mode.cooldown_floor))
     risk_stress = (
         int(metrics.total_closed) >= 10
         and (
@@ -2595,8 +2660,15 @@ def _build_actions(
     overrides: dict[str, str],
     mode: ModeSpec,
     telemetry: dict[str, Any] | None = None,
+    allow_zero_cooldown: bool = False,
 ) -> list[Action]:
-    actions, _, _ = _build_action_plan(metrics=metrics, overrides=overrides, mode=mode, telemetry=telemetry)
+    actions, _, _ = _build_action_plan(
+        metrics=metrics,
+        overrides=overrides,
+        mode=mode,
+        telemetry=telemetry,
+        allow_zero_cooldown=allow_zero_cooldown,
+    )
     return actions
 
 
@@ -2608,12 +2680,13 @@ def _build_action_plan(
     telemetry: dict[str, Any] | None = None,
     runtime_state: RuntimeState | None = None,
     now_ts: float | None = None,
+    allow_zero_cooldown: bool = False,
 ) -> tuple[list[Action], list[str], dict[str, Any]]:
     staged = dict(overrides)
     actions: list[Action] = []
     trace: list[str] = []
     rule_hits: Counter[str] = Counter()
-    bounds = _adaptive_bounds(metrics, mode)
+    bounds = _adaptive_bounds(metrics, mode, allow_zero_cooldown=allow_zero_cooldown)
     tick_ts = float(now_ts) if now_ts is not None else float(time.time())
 
     strict = _get_int(staged, "MARKET_MODE_STRICT_SCORE", 60)
@@ -2700,8 +2773,11 @@ def _build_action_plan(
     # Flow guardrails: prevent tuner from self-choking entry funnel on weak windows.
     flow_watchlist_share_floor = 0.08 if low_throughput else 0.02
     flow_watchlist_share_ceiling = 0.60
-    flow_non_watchlist_ceiling = 2 if low_throughput else 6
-    flow_per_symbol_cap_floor = 2 if low_throughput else 1
+    flow_non_watchlist_ceiling = 3 if low_throughput else 6
+    cooldown_dominant_early = bool(
+        low_throughput and cooldown_hits >= max(12, int(metrics.selected_from_batch) // 2)
+    )
+    flow_per_symbol_cap_floor = 1
     flow_qos_watchlist_cap_floor = 8 if low_throughput else 2
     flow_universe_watchlist_cap_floor = 4 if low_throughput else 2
     source_qos_cap_hits = int(metrics.filter_fail_reasons.get("source_qos_cap", 0))
@@ -3561,10 +3637,18 @@ def _build_action_plan(
                     "ev_net_low_probe_tolerance",
                 )
         if cooldown_hits > 0:
-            cooldown = _clamp_int(cooldown - 15, bounds.cooldown_floor, bounds.cooldown_ceiling)
-            rule_hits["relax_cooldown"] += 1
-            trace.append(f"relax_cooldown hits={cooldown_hits}")
-            _apply_action(staged, actions, "MAX_TOKEN_COOLDOWN_SECONDS", _to_int_str(cooldown), "cooldown_left")
+            next_cooldown = _clamp_int(cooldown - 15, bounds.cooldown_floor, bounds.cooldown_ceiling)
+            if next_cooldown < cooldown:
+                cooldown = next_cooldown
+                rule_hits["relax_cooldown"] += 1
+                trace.append(f"relax_cooldown hits={cooldown_hits}")
+                _apply_action(staged, actions, "MAX_TOKEN_COOLDOWN_SECONDS", _to_int_str(cooldown), "cooldown_left")
+            else:
+                rule_hits["cooldown_floor_reached"] += 1
+                trace.append(
+                    "cooldown_floor_reached "
+                    f"hits={cooldown_hits} current={cooldown} floor={bounds.cooldown_floor}"
+                )
         if min_trade_hits > 0:
             trade_min_gate = _clamp_float(trade_min_gate - 0.05, 0.1, 2.0)
             trade_min_paper = _clamp_float(trade_min_paper - 0.05, 0.1, 2.0)
@@ -3585,6 +3669,61 @@ def _build_action_plan(
             rule_hits["low_throughput_expand_topn"] += 1
             trace.append(f"low_throughput_expand_topn open_rate={open_rate:.3f} top_n={top_n}")
             _apply_action(staged, actions, "AUTO_TRADE_TOP_N", _to_int_str(top_n), "low_throughput_expand_topn")
+
+    cooldown_dominant_flow = (
+        low_throughput
+        and cooldown_hits >= max(18, int(metrics.selected_from_batch) // 2)
+        and cooldown_hits >= max(8, ev_low_hits + edge_low_hits)
+    )
+    if cooldown_dominant_flow:
+        rule_hits["cooldown_dominant_flow_expand"] += 1
+        trace.append(
+            "cooldown_dominant_flow_expand "
+            f"cooldown_hits={cooldown_hits} ev_low={ev_low_hits} edge_low={edge_low_hits} "
+            f"selected={metrics.selected_from_batch}"
+        )
+        top_n = _clamp_int(top_n + 4, 8, 80)
+        novelty_share = _clamp_float(novelty_share + 0.04, 0.05, 0.90)
+        symbol_share_cap = _clamp_float(symbol_share_cap - 0.02, 0.08, 0.50)
+        plan_watchlist_share = _clamp_float(plan_watchlist_share + 0.04, flow_watchlist_share_floor, 0.35)
+        plan_single_source_share = _clamp_float(plan_single_source_share - 0.04, 0.20, 1.0)
+        per_symbol_cycle_cap = _clamp_int(per_symbol_cycle_cap - 1, flow_per_symbol_cap_floor, 20)
+        _apply_action(staged, actions, "AUTO_TRADE_TOP_N", _to_int_str(top_n), "cooldown_dominant_flow_expand topn")
+        _apply_action(
+            staged,
+            actions,
+            "V2_UNIVERSE_NOVELTY_MIN_SHARE",
+            _to_float_str(novelty_share),
+            "cooldown_dominant_flow_expand novelty",
+        )
+        _apply_action(
+            staged,
+            actions,
+            "SYMBOL_CONCENTRATION_MAX_SHARE",
+            _to_float_str(symbol_share_cap),
+            "cooldown_dominant_flow_expand symbol_share",
+        )
+        _apply_action(
+            staged,
+            actions,
+            "PLAN_MAX_WATCHLIST_SHARE",
+            _to_float_str(plan_watchlist_share),
+            "cooldown_dominant_flow_expand watchlist_share",
+        )
+        _apply_action(
+            staged,
+            actions,
+            "PLAN_MAX_SINGLE_SOURCE_SHARE",
+            _to_float_str(plan_single_source_share),
+            "cooldown_dominant_flow_expand single_source_share",
+        )
+        _apply_action(
+            staged,
+            actions,
+            "V2_SOURCE_QOS_MAX_PER_SYMBOL_PER_CYCLE",
+            _to_int_str(per_symbol_cycle_cap),
+            "cooldown_dominant_flow_expand symbol_cap",
+        )
 
     dedup_dominant = heavy_dedup_hits >= max(
         6,
@@ -4291,7 +4430,15 @@ def _request_profile_graceful_stop(root: Path, profile_id: str) -> tuple[bool, s
         return False, "graceful_stop_path_missing"
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(f"{_now_iso()} runtime_tuner_restart\n", encoding="utf-8")
+        payload = {
+            "ts": float(time.time()),
+            "timestamp": _now_iso(),
+            "source": "runtime_tuner",
+            "reason": "runtime_tuner_restart",
+            "actor": "matrix_runtime_tuner.py",
+            "profile_id": str(profile_id),
+        }
+        path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         return True, f"graceful_stop_requested:{path}"
     except Exception as exc:
         return False, f"graceful_stop_write_failed:{exc}"
@@ -4587,6 +4734,8 @@ def _tick(
     window_minutes: int,
     dry_run: bool,
     restart_cooldown_seconds: int,
+    restart_max_per_hour: int,
+    allow_zero_cooldown: bool,
     last_restart_ts: float,
 ) -> tuple[dict[str, Any], float]:
     session = _latest_session_log(root, profile_id)
@@ -4613,6 +4762,44 @@ def _tick(
     protected_keys = {str(x).strip() for x in (contract.get("protected_keys") or []) if str(x).strip()}
     state = _load_runtime_state(root, profile_id)
     tick_now_ts = float(time.time())
+    restart_history = _prune_restart_history(
+        list(state.restart_history_ts or []),
+        now_ts=tick_now_ts,
+        window_seconds=3600.0,
+    )
+    if float(last_restart_ts or 0.0) > 0.0:
+        restart_history.append(float(last_restart_ts))
+        restart_history = _prune_restart_history(
+            restart_history,
+            now_ts=tick_now_ts,
+            window_seconds=3600.0,
+        )
+    state.restart_history_ts = list(restart_history)
+
+    def _can_restart(now_ts: float) -> tuple[bool, float, int]:
+        nonlocal restart_history
+        restart_history = _prune_restart_history(
+            restart_history,
+            now_ts=now_ts,
+            window_seconds=3600.0,
+        )
+        return _restart_gate(
+            now_ts=now_ts,
+            history=restart_history,
+            restart_cooldown_seconds=restart_cooldown_seconds,
+            restart_max_per_hour=restart_max_per_hour,
+        )
+
+    def _record_restart(now_ts: float) -> None:
+        nonlocal restart_history, last_restart_ts
+        restart_history.append(float(now_ts))
+        restart_history = _prune_restart_history(
+            restart_history,
+            now_ts=now_ts,
+            window_seconds=3600.0,
+        )
+        state.restart_history_ts = list(restart_history)
+        last_restart_ts = float(now_ts)
     runtime_subset = _active_override_subset(root, profile_id, TUNER_RUNTIME_FALLBACK_KEYS)
     for key, value in runtime_subset.items():
         if key not in overrides or str(overrides.get(key, "")).strip() == "":
@@ -4650,6 +4837,7 @@ def _tick(
         telemetry=telemetry_before,
         runtime_state=state,
         now_ts=tick_now_ts,
+        allow_zero_cooldown=bool(allow_zero_cooldown),
     )
     if warmup_guard_active:
         actions = []
@@ -4716,6 +4904,23 @@ def _tick(
     staged_overrides: dict[str, str] = {str(k): str(v) for k, v in overrides.items()}
     for action in actions:
         staged_overrides[action.key] = action.new_value
+    cooldown_floor = int(max(0, int(mode.cooldown_floor)))
+    if not bool(allow_zero_cooldown):
+        cooldown_now = _get_int(staged_overrides, "MAX_TOKEN_COOLDOWN_SECONDS", cooldown_floor)
+        if cooldown_now < cooldown_floor:
+            old_value = str(staged_overrides.get("MAX_TOKEN_COOLDOWN_SECONDS", str(cooldown_now)))
+            new_value = _to_int_str(cooldown_floor)
+            staged_overrides["MAX_TOKEN_COOLDOWN_SECONDS"] = new_value
+            if old_value.strip() != new_value:
+                actions.append(
+                    Action(
+                        key="MAX_TOKEN_COOLDOWN_SECONDS",
+                        old_value=old_value,
+                        new_value=new_value,
+                        reason="cooldown_floor_guard",
+                    )
+                )
+                decision_trace.append(f"cooldown_floor_guard {old_value}->{new_value}")
     issues: list[str] = []
     restarted = False
     restart_tail = ""
@@ -4759,11 +4964,12 @@ def _tick(
 
                 if changed_restart_required_keys:
                     now_ts = time.time()
+                    restart_allowed, restart_cooldown_left, restart_budget_left = _can_restart(now_ts)
                     can_restart = (
                         (not warmup_guard_active)
                         and (
                             metrics.open_positions <= 0
-                            and (now_ts - float(last_restart_ts)) >= float(max(0, restart_cooldown_seconds))
+                            and restart_allowed
                         )
                     )
                     if can_restart:
@@ -4771,9 +4977,15 @@ def _tick(
                         restarted = ok and _profile_running(root, profile_id)
                         apply_state = "written_restarted" if restarted else "written_restart_failed"
                         if restarted:
-                            last_restart_ts = now_ts
+                            _record_restart(now_ts)
                     else:
                         apply_state = "written_restart_deferred"
+                        decision_trace.append(
+                            "restart_deferred "
+                            f"cooldown_left={round(float(restart_cooldown_left), 2)} "
+                            f"restart_budget_left={int(restart_budget_left)} "
+                            f"open_positions={int(metrics.open_positions)} warmup={bool(warmup_guard_active)}"
+                        )
                 elif runtime_patch_sync_ok:
                     apply_state = "written_hot_applied"
     elif not dry_run:
@@ -4811,11 +5023,12 @@ def _tick(
             )
         if pending_restart_diff_keys:
             now_ts = time.time()
+            restart_allowed, restart_cooldown_left, restart_budget_left = _can_restart(now_ts)
             can_restart = (
                 (not warmup_guard_active)
                 and (
                     metrics.open_positions <= 0
-                    and (now_ts - float(last_restart_ts)) >= float(max(0, restart_cooldown_seconds))
+                    and restart_allowed
                 )
             )
             if can_restart:
@@ -4823,7 +5036,7 @@ def _tick(
                 restarted = ok and _profile_running(root, profile_id)
                 apply_state = "restart_applied" if restarted else "restart_failed"
                 if restarted:
-                    last_restart_ts = now_ts
+                    _record_restart(now_ts)
                     decision_trace.append(
                         f"pending_restart_applied diff_keys={len(pending_restart_diff_keys)}"
                     )
@@ -4832,21 +5045,23 @@ def _tick(
                     apply_state = "restart_pending_deferred"
                 decision_trace.append(
                     "pending_restart_deferred "
-                    f"diff_keys={len(pending_restart_diff_keys)} open_positions={metrics.open_positions}"
+                    f"diff_keys={len(pending_restart_diff_keys)} "
+                    f"open_positions={metrics.open_positions} "
+                    f"cooldown_left={round(float(restart_cooldown_left), 2)} "
+                    f"restart_budget_left={int(restart_budget_left)} "
+                    f"warmup={bool(warmup_guard_active)}"
                 )
     if not dry_run and metrics.open_positions <= 0:
         alive = _profile_running(root, profile_id)
         hb_recent = _heartbeat_recent(root, profile_id, max_age_seconds=90.0)
         if (not alive) and (not hb_recent):
             now_ts = time.time()
-            can_restart = (
-                (now_ts - float(last_restart_ts)) >= float(max(0, restart_cooldown_seconds))
-            )
+            can_restart, restart_cooldown_left, restart_budget_left = _can_restart(now_ts)
             if can_restart:
                 ok, restart_tail = _run_dead_profile_recovery(root, profile_id)
                 restarted = ok and _profile_running(root, profile_id)
                 if restarted:
-                    last_restart_ts = now_ts
+                    _record_restart(now_ts)
                     if apply_state == "noop":
                         apply_state = "restart_applied_dead_profile"
                 else:
@@ -4857,7 +5072,9 @@ def _tick(
                     apply_state = "restart_dead_profile_deferred"
             decision_trace.append(
                 "dead_profile_recovery "
-                f"alive={alive} hb_recent={hb_recent} can_restart={can_restart}"
+                f"alive={alive} hb_recent={hb_recent} can_restart={can_restart} "
+                f"cooldown_left={round(float(restart_cooldown_left), 2)} "
+                f"restart_budget_left={int(restart_budget_left)}"
             )
 
     if not dry_run and restarted:
@@ -4891,6 +5108,15 @@ def _tick(
     telemetry_v2["pending_restart_diff_keys"] = [str(x) for x in pending_restart_diff_keys[:64]]
     telemetry_v2["pending_hot_apply_diff_keys"] = [str(x) for x in pending_hot_apply_diff_keys[:64]]
     telemetry_v2["changed_restart_required_keys"] = [str(x) for x in changed_restart_required_keys[:64]]
+    restart_guard_ok, restart_cooldown_left_now, restart_budget_left_now = _can_restart(float(time.time()))
+    telemetry_v2["restart_guard"] = {
+        "allowed_now": bool(restart_guard_ok),
+        "cooldown_left_seconds": round(float(restart_cooldown_left_now), 3),
+        "restart_budget_left_hour": int(restart_budget_left_now),
+        "restart_history_len_hour": int(len(restart_history)),
+        "restart_cooldown_seconds": int(max(0, restart_cooldown_seconds)),
+        "restart_max_per_hour": int(max(1, restart_max_per_hour)),
+    }
     telemetry_v2["runtime_patch_sync_ok"] = bool(runtime_patch_sync_ok)
     if runtime_patch_sync_detail:
         telemetry_v2["runtime_patch_sync_detail"] = str(runtime_patch_sync_detail)
@@ -4953,6 +5179,7 @@ def _tick(
             if str(k) in TUNER_MUTABLE_KEYS and str(k) not in TUNER_EPHEMERAL_KEYS
         }
         state.stable_hash = _overrides_hash(state.stable_overrides)
+    state.restart_history_ts = list(restart_history)
     _save_runtime_state(root, profile_id, state)
 
     if policy_decision.reasons:
@@ -5121,6 +5348,8 @@ def cmd_once(args: argparse.Namespace) -> int:
             window_minutes=args.window_minutes,
             dry_run=bool(args.dry_run),
             restart_cooldown_seconds=args.restart_cooldown_seconds,
+            restart_max_per_hour=args.restart_max_per_hour,
+            allow_zero_cooldown=bool(args.allow_zero_cooldown),
             last_restart_ts=0.0,
         )
         _print_tick(report)
@@ -5156,6 +5385,8 @@ def cmd_run(args: argparse.Namespace) -> int:
                 window_minutes=args.window_minutes,
                 dry_run=bool(args.dry_run),
                 restart_cooldown_seconds=args.restart_cooldown_seconds,
+                restart_max_per_hour=args.restart_max_per_hour,
+                allow_zero_cooldown=bool(args.allow_zero_cooldown),
                 last_restart_ts=last_restart_ts,
             )
             _print_tick(report)
@@ -5207,6 +5438,17 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--policy-phase", choices=STATE_MACHINE_CHOICES, default="auto")
         sp.add_argument("--window-minutes", type=int, default=12, help="Metrics lookback window.")
         sp.add_argument("--restart-cooldown-seconds", type=int, default=180, help="Min seconds between restarts.")
+        sp.add_argument(
+            "--restart-max-per-hour",
+            type=int,
+            default=6,
+            help="Hard cap for restarts in rolling 1h window.",
+        )
+        sp.add_argument(
+            "--allow-zero-cooldown",
+            action="store_true",
+            help="Allow MAX_TOKEN_COOLDOWN_SECONDS=0 (disabled by default for anti-churn safety).",
+        )
         sp.add_argument("--target-policy-file", default="", help="Optional JSON file with target policy overrides.")
         sp.add_argument("--target-trades-per-hour", type=float, default=12.0)
         sp.add_argument("--target-pnl-per-hour-usd", type=float, default=0.05)

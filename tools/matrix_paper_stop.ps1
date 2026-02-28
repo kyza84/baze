@@ -7,6 +7,7 @@ $root = Resolve-Path (Join-Path $PSScriptRoot '..')
 Set-Location $root
 
 $metaPath = Join-Path $root 'data\matrix\runs\active_matrix.json'
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
 function Test-MainLocalProcess {
   param(
@@ -37,7 +38,18 @@ if (Test-Path $metaPath) {
 foreach ($item in $items) {
   $graceful = Join-Path $root ($item.graceful_stop_file)
   New-Item -ItemType Directory -Force -Path (Split-Path -Parent $graceful) | Out-Null
-  New-Item -ItemType File -Force -Path $graceful | Out-Null
+  $payload = [ordered]@{
+    ts = [double]([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())
+    timestamp = (Get-Date).ToUniversalTime().ToString('o')
+    source = 'matrix_paper_stop.ps1'
+    reason = $(if ($HardKill) { 'operator_stop_hard' } else { 'operator_stop' })
+    actor = [string]$env:USERNAME
+    host = [string]$env:COMPUTERNAME
+    profile_id = [string]($item.id)
+    hard_kill = [bool]$HardKill
+  }
+  $json = $payload | ConvertTo-Json -Depth 6 -Compress
+  [System.IO.File]::WriteAllText($graceful, $json, $utf8NoBom)
 }
 
 Start-Sleep -Seconds 8
@@ -116,6 +128,5 @@ $meta = [ordered]@{
   items = $updatedItems
 }
 $metaJson = $meta | ConvertTo-Json -Depth 8
-$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $metaPath) | Out-Null
 [System.IO.File]::WriteAllText($metaPath, $metaJson, $utf8NoBom)

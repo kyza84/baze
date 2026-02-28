@@ -1,0 +1,430 @@
+[14:38:11 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=expand state=written_hot_applied
+  flow15 scanned=0 candidates=0 selected=0 opened=0 open_positions=0 closed_total=0
+  diversity15 buy_total=0 unique_buy=0 top_symbol= top_share=0.0
+  target_tph effective=4.0 requested=12.0
+  actions
+  - MAX_TOKEN_COOLDOWN_SECONDS: 0 -> 10 (cooldown_floor_guard)
+  telemetry15 raw=57 src=57 pre=44 thr=7 q=7 exec=0 buy=0
+  top_plan_skip edge_low count=2
+  decision warmup_guard session_age=35.8s lines=7 scanned=0
+[14:40:18 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=expand state=restart_applied_dead_profile
+  flow15 scanned=0 candidates=0 selected=0 opened=0 open_positions=0 closed_total=0
+  diversity15 buy_total=0 unique_buy=0 top_symbol= top_share=0.0
+  target_tph effective=4.0 requested=12.0
+  telemetry15 raw=57 src=57 pre=44 thr=7 q=7 exec=0 buy=0
+  top_plan_skip edge_low count=2
+  decision warmup_guard session_age=162.1s lines=7 scanned=0
+[14:42:23 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=expand state=written_hot_applied
+  flow15 scanned=108 candidates=64 selected=33 opened=1 open_positions=1 closed_total=198
+  diversity15 buy_total=1 unique_buy=1 top_symbol=cbBTC top_share=1.0
+  target_tph effective=4.0 requested=12.0
+  actions
+  - SEEN_TOKEN_TTL: 1800 -> 900 (feed_starvation seen_token_ttl)
+  - WATCHLIST_REFRESH_SECONDS: 960 -> 840 (feed_starvation watch_refresh)
+  telemetry15 raw=169 src=169 pre=118 thr=75 q=75 exec=0 buy=1
+  top_plan_skip edge_low count=23
+  decision feed_starvation raw15=163 pre15=114 buy15=1 open_rate=0.030
+[14:44:27 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=expand state=written_hot_applied
+  flow15 scanned=172 candidates=100 selected=58 opened=1 open_positions=0 closed_total=199
+  diversity15 buy_total=1 unique_buy=1 top_symbol=cbBTC top_share=1.0
+  target_tph effective=4.0 requested=12.0
+  actions
+  - SEEN_TOKEN_TTL: 900 -> 300 (feed_starvation seen_token_ttl)
+  - WATCHLIST_REFRESH_SECONDS: 840 -> 720 (feed_starvation watch_refresh)
+  - MAX_TOKEN_COOLDOWN_SECONDS: 10 -> 0 (cooldown_left)
+  - MAX_TOKEN_COOLDOWN_SECONDS: 0 -> 10 (cooldown_floor_guard)
+  telemetry15 raw=227 src=227 pre=157 thr=107 q=107 exec=0 buy=1
+  top_plan_skip edge_low count=31
+  decision feed_starvation raw15=227 pre15=157 buy15=1 open_rate=0.017
+[14:46:32 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=expand state=written_hot_applied
+  flow15 scanned=223 candidates=132 selected=82 opened=1 open_positions=0 closed_total=199
+  diversity15 buy_total=1 unique_buy=1 top_symbol=cbBTC top_share=1.0
+  target_tph effective=4.0 requested=12.0
+  actions
+  - MAX_TOKEN_COOLDOWN_SECONDS: 10 -> 0 (cooldown_left)
+  - MAX_TOKEN_COOLDOWN_SECONDS: 0 -> 10 (cooldown_floor_guard)
+  telemetry15 raw=278 src=278 pre=191 thr=139 q=139 exec=0 buy=1
+  top_plan_skip edge_low count=39
+  decision relax_score_min hits=14
+[14:48:36 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=expand state=written_hot_applied
+  flow15 scanned=275 candidates=164 selected=106 opened=1 open_positions=0 closed_total=199
+  diversity15 buy_total=1 unique_buy=1 top_symbol=cbBTC top_share=1.0
+  target_tph effective=4.0 requested=12.0
+  actions
+  - MAX_TOKEN_COOLDOWN_SECONDS: 10 -> 0 (cooldown_left)
+  - MAX_TOKEN_COOLDOWN_SECONDS: 0 -> 10 (cooldown_floor_guard)
+  telemetry15 raw=336 src=336 pre=228 thr=175 q=175 exec=0 buy=1
+  top_plan_skip edge_low count=48
+  decision relax_score_min hits=15
+[14:50:41 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=expand state=written_hot_applied
+  flow15 scanned=336 candidates=200 selected=133 opened=1 open_positions=0 closed_total=199
+  diversity15 buy_total=1 unique_buy=1 top_symbol=cbBTC top_share=1.0
+  target_tph effective=4.0 requested=12.0
+  actions
+  - MAX_TOKEN_COOLDOWN_SECONDS: 10 -> 0 (cooldown_left)
+  - MAX_TOKEN_COOLDOWN_SECONDS: 0 -> 10 (cooldown_floor_guard)
+  telemetry15 raw=391 src=391 pre=263 thr=207 q=207 exec=0 buy=1
+  top_plan_skip edge_low count=56
+  decision relax_score_min hits=18
+[14:52:46 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=expand state=written_hot_applied
+  flow15 scanned=348 candidates=210 selected=144 opened=0 open_positions=0 closed_total=199
+  diversity15 buy_total=0 unique_buy=0 top_symbol= top_share=0.0
+  target_tph effective=4.0 requested=12.0
+  actions
+  - MAX_TOKEN_COOLDOWN_SECONDS: 10 -> 0 (cooldown_left)
+  - MAX_TOKEN_COOLDOWN_SECONDS: 0 -> 10 (cooldown_floor_guard)
+  telemetry15 raw=388 src=388 pre=256 thr=230 q=230 exec=0 buy=1
+  top_plan_skip edge_low count=62
+  decision edge_deadlock_recovery edge_hits=104 selected=144 roll_usd=0.0005 cal_usd=0.0005 vol_min=5.0
+[14:54:50 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=expand state=written_hot_applied
+  flow15 scanned=306 candidates=182 selected=134 opened=0 open_positions=0 closed_total=199
+  diversity15 buy_total=0 unique_buy=0 top_symbol= top_share=0.0
+  target_tph effective=4.0 requested=12.0
+  actions
+  - MAX_TOKEN_COOLDOWN_SECONDS: 10 -> 0 (cooldown_left)
+  - MAX_TOKEN_COOLDOWN_SECONDS: 0 -> 10 (cooldown_floor_guard)
+  telemetry15 raw=427 src=427 pre=284 thr=254 q=254 exec=0 buy=1
+  top_plan_skip edge_low count=70
+  decision edge_deadlock_recovery edge_hits=86 selected=134 roll_usd=0.0005 cal_usd=0.0005 vol_min=5.0
+[14:56:54 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=expand state=written_hot_applied
+  flow15 scanned=284 candidates=174 selected=126 opened=0 open_positions=0 closed_total=199
+  diversity15 buy_total=0 unique_buy=0 top_symbol= top_share=0.0
+  target_tph effective=4.0 requested=12.0
+  actions
+  - MAX_TOKEN_COOLDOWN_SECONDS: 10 -> 0 (cooldown_left)
+  - MAX_TOKEN_COOLDOWN_SECONDS: 0 -> 10 (cooldown_floor_guard)
+  telemetry15 raw=361 src=361 pre=244 thr=218 q=218 exec=0 buy=0
+  top_plan_skip edge_low count=60
+  decision edge_deadlock_recovery edge_hits=78 selected=126 roll_usd=0.0005 cal_usd=0.0005 vol_min=5.0
+[14:58:59 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=expand state=written_hot_applied
+  flow15 scanned=259 candidates=162 selected=112 opened=1 open_positions=1 closed_total=199
+  diversity15 buy_total=1 unique_buy=1 top_symbol=cbBTC top_share=1.0
+  target_tph effective=4.0 requested=12.0
+  actions
+  - MAX_TOKEN_COOLDOWN_SECONDS: 10 -> 0 (cooldown_left)
+  - MAX_TOKEN_COOLDOWN_SECONDS: 0 -> 10 (cooldown_floor_guard)
+  telemetry15 raw=341 src=341 pre=232 thr=213 q=213 exec=0 buy=1
+  top_plan_skip edge_low count=60
+  decision relax_score_min hits=15
+[15:01:03 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=expand state=written_hot_applied
+  flow15 scanned=251 candidates=157 selected=98 opened=1 open_positions=1 closed_total=199
+  diversity15 buy_total=1 unique_buy=1 top_symbol=cbBTC top_share=1.0
+  target_tph effective=4.0 requested=12.0
+  actions
+  - MAX_TOKEN_COOLDOWN_SECONDS: 10 -> 0 (cooldown_left)
+  - MAX_TOKEN_COOLDOWN_SECONDS: 0 -> 10 (cooldown_floor_guard)
+  telemetry15 raw=327 src=327 pre=226 thr=205 q=205 exec=0 buy=1
+  top_plan_skip edge_low count=60
+  decision relax_score_min hits=20
+[15:03:07 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=expand state=written_hot_applied
+  flow15 scanned=234 candidates=149 selected=90 opened=1 open_positions=0 closed_total=200
+  diversity15 buy_total=1 unique_buy=1 top_symbol=cbBTC top_share=1.0
+  target_tph effective=4.0 requested=12.0
+  actions
+  - MAX_TOKEN_COOLDOWN_SECONDS: 10 -> 0 (cooldown_left)
+  - MAX_TOKEN_COOLDOWN_SECONDS: 0 -> 10 (cooldown_floor_guard)
+  telemetry15 raw=314 src=314 pre=220 thr=197 q=197 exec=0 buy=1
+  top_plan_skip edge_low count=60
+  decision relax_score_min hits=20
+[15:05:11 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=expand state=written_hot_applied
+  flow15 scanned=222 candidates=144 selected=85 opened=1 open_positions=0 closed_total=200
+  diversity15 buy_total=1 unique_buy=1 top_symbol=cbBTC top_share=1.0
+  target_tph effective=4.0 requested=12.0
+  actions
+  - MAX_TOKEN_COOLDOWN_SECONDS: 10 -> 0 (cooldown_left)
+  - MAX_TOKEN_COOLDOWN_SECONDS: 0 -> 10 (cooldown_floor_guard)
+  telemetry15 raw=293 src=293 pre=210 thr=185 q=185 exec=0 buy=1
+  top_plan_skip edge_low count=56
+  decision relax_score_min hits=18
+[15:07:15 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=expand state=written_hot_applied
+  flow15 scanned=216 candidates=141 selected=83 opened=1 open_positions=0 closed_total=200
+  diversity15 buy_total=1 unique_buy=1 top_symbol=cbBTC top_share=1.0
+  target_tph effective=4.0 requested=12.0
+  actions
+  - MAX_TOKEN_COOLDOWN_SECONDS: 10 -> 0 (cooldown_left)
+  - MAX_TOKEN_COOLDOWN_SECONDS: 0 -> 10 (cooldown_floor_guard)
+  telemetry15 raw=272 src=272 pre=201 thr=177 q=177 exec=0 buy=1
+  top_plan_skip edge_low count=48
+  decision relax_score_min hits=19
+[15:09:20 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=expand state=written_hot_applied
+  flow15 scanned=219 candidates=141 selected=83 opened=1 open_positions=0 closed_total=200
+  diversity15 buy_total=1 unique_buy=1 top_symbol=cbBTC top_share=1.0
+  target_tph effective=4.0 requested=12.0
+  actions
+  - MAX_TOKEN_COOLDOWN_SECONDS: 10 -> 0 (cooldown_left)
+  - MAX_TOKEN_COOLDOWN_SECONDS: 0 -> 10 (cooldown_floor_guard)
+  telemetry15 raw=277 src=277 pre=206 thr=180 q=180 exec=0 buy=1
+  top_plan_skip cooldown count=48
+  decision relax_score_min hits=22
+[15:11:24 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=expand state=written_hot_applied
+  flow15 scanned=227 candidates=144 selected=90 opened=0 open_positions=0 closed_total=200
+  diversity15 buy_total=0 unique_buy=0 top_symbol= top_share=0.0
+  target_tph effective=4.0 requested=12.0
+  actions
+  - MAX_TOKEN_COOLDOWN_SECONDS: 10 -> 0 (cooldown_left)
+  - MAX_TOKEN_COOLDOWN_SECONDS: 0 -> 10 (cooldown_floor_guard)
+  telemetry15 raw=277 src=277 pre=207 thr=180 q=180 exec=0 buy=1
+  top_plan_skip cooldown count=48
+  decision edge_deadlock_recovery edge_hits=48 selected=90 roll_usd=0.0005 cal_usd=0.0005 vol_min=5.0
+[15:13:28 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=expand state=written_hot_applied
+  flow15 scanned=229 candidates=144 selected=96 opened=0 open_positions=0 closed_total=200
+  diversity15 buy_total=0 unique_buy=0 top_symbol= top_share=0.0
+  target_tph effective=4.0 requested=12.0
+  actions
+  - MAX_TOKEN_COOLDOWN_SECONDS: 10 -> 0 (cooldown_left)
+  - MAX_TOKEN_COOLDOWN_SECONDS: 0 -> 10 (cooldown_floor_guard)
+  telemetry15 raw=280 src=280 pre=209 thr=177 q=177 exec=0 buy=0
+  top_plan_skip cooldown count=50
+  decision edge_deadlock_recovery edge_hits=48 selected=96 roll_usd=0.0005 cal_usd=0.0005 vol_min=5.0
+[15:15:32 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=expand state=written_hot_applied
+  flow15 scanned=228 candidates=144 selected=96 opened=0 open_positions=0 closed_total=200
+  diversity15 buy_total=0 unique_buy=0 top_symbol= top_share=0.0
+  target_tph effective=4.0 requested=12.0
+  actions
+  - MAX_TOKEN_COOLDOWN_SECONDS: 10 -> 0 (cooldown_left)
+  - MAX_TOKEN_COOLDOWN_SECONDS: 0 -> 10 (cooldown_floor_guard)
+  telemetry15 raw=283 src=283 pre=210 thr=177 q=177 exec=0 buy=0
+  top_plan_skip cooldown count=58
+  decision edge_deadlock_recovery edge_hits=48 selected=96 roll_usd=0.0005 cal_usd=0.0005 vol_min=5.0
+[15:17:37 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=expand state=written_hot_applied
+  flow15 scanned=220 candidates=141 selected=94 opened=0 open_positions=0 closed_total=200
+  diversity15 buy_total=0 unique_buy=0 top_symbol= top_share=0.0
+  target_tph effective=4.0 requested=12.0
+  actions
+  - MAX_TOKEN_COOLDOWN_SECONDS: 10 -> 0 (cooldown_left)
+  - MAX_TOKEN_COOLDOWN_SECONDS: 0 -> 10 (cooldown_floor_guard)
+  telemetry15 raw=278 src=278 pre=208 thr=177 q=177 exec=0 buy=0
+  top_plan_skip cooldown count=59
+  decision edge_deadlock_recovery edge_hits=47 selected=94 roll_usd=0.0005 cal_usd=0.0005 vol_min=5.0
+[15:19:41 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=expand state=written_hot_applied
+  flow15 scanned=215 candidates=141 selected=94 opened=0 open_positions=0 closed_total=200
+  diversity15 buy_total=0 unique_buy=0 top_symbol= top_share=0.0
+  target_tph effective=4.0 requested=12.0
+  actions
+  - MAX_TOKEN_COOLDOWN_SECONDS: 10 -> 0 (cooldown_left)
+  - MAX_TOKEN_COOLDOWN_SECONDS: 0 -> 10 (cooldown_floor_guard)
+  telemetry15 raw=275 src=275 pre=206 thr=180 q=180 exec=0 buy=0
+  top_plan_skip cooldown count=60
+  decision edge_deadlock_recovery edge_hits=47 selected=94 roll_usd=0.0005 cal_usd=0.0005 vol_min=5.0
+[15:21:45 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=expand state=written_hot_applied
+  flow15 scanned=222 candidates=144 selected=96 opened=0 open_positions=0 closed_total=200
+  diversity15 buy_total=0 unique_buy=0 top_symbol= top_share=0.0
+  target_tph effective=4.0 requested=12.0
+  actions
+  - MAX_TOKEN_COOLDOWN_SECONDS: 10 -> 0 (cooldown_left)
+  - MAX_TOKEN_COOLDOWN_SECONDS: 0 -> 10 (cooldown_floor_guard)
+  telemetry15 raw=281 src=281 pre=206 thr=180 q=180 exec=0 buy=0
+  top_plan_skip cooldown count=60
+  decision edge_deadlock_recovery edge_hits=48 selected=96 roll_usd=0.0005 cal_usd=0.0005 vol_min=5.0
+[15:23:49 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=expand state=written_hot_applied
+  flow15 scanned=235 candidates=144 selected=89 opened=1 open_positions=1 closed_total=200
+  diversity15 buy_total=1 unique_buy=1 top_symbol=cbBTC top_share=1.0
+  target_tph effective=4.0 requested=12.0
+  actions
+  - MAX_TOKEN_COOLDOWN_SECONDS: 10 -> 0 (cooldown_left)
+  - MAX_TOKEN_COOLDOWN_SECONDS: 0 -> 10 (cooldown_floor_guard)
+  telemetry15 raw=285 src=285 pre=202 thr=177 q=177 exec=0 buy=1
+  top_plan_skip cooldown count=51
+  decision relax_score_min hits=20
+[15:25:54 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=expand state=written_hot_applied
+  flow15 scanned=236 candidates=141 selected=79 opened=1 open_positions=1 closed_total=200
+  diversity15 buy_total=1 unique_buy=1 top_symbol=cbBTC top_share=1.0
+  target_tph effective=4.0 requested=12.0
+  actions
+  - MAX_TOKEN_COOLDOWN_SECONDS: 10 -> 0 (cooldown_left)
+  - MAX_TOKEN_COOLDOWN_SECONDS: 0 -> 10 (cooldown_floor_guard)
+  telemetry15 raw=294 src=294 pre=202 thr=177 q=177 exec=0 buy=1
+  top_plan_skip cooldown count=43
+  decision relax_score_min hits=19
+[15:27:58 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=expand state=written_hot_applied
+  flow15 scanned=244 candidates=141 selected=79 opened=1 open_positions=0 closed_total=201
+  diversity15 buy_total=1 unique_buy=1 top_symbol=cbBTC top_share=1.0
+  target_tph effective=4.0 requested=12.0
+  actions
+  - MAX_TOKEN_COOLDOWN_SECONDS: 10 -> 0 (cooldown_left)
+  - MAX_TOKEN_COOLDOWN_SECONDS: 0 -> 10 (cooldown_floor_guard)
+  telemetry15 raw=302 src=302 pre=201 thr=177 q=177 exec=0 buy=1
+  top_plan_skip edge_low count=45
+  decision relax_score_min hits=18
+[15:30:02 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=expand state=written_hot_applied
+  flow15 scanned=256 candidates=141 selected=79 opened=1 open_positions=0 closed_total=201
+  diversity15 buy_total=1 unique_buy=1 top_symbol=cbBTC top_share=1.0
+  target_tph effective=4.0 requested=12.0
+  actions
+  - MAX_TOKEN_COOLDOWN_SECONDS: 10 -> 0 (cooldown_left)
+  - MAX_TOKEN_COOLDOWN_SECONDS: 0 -> 10 (cooldown_floor_guard)
+  telemetry15 raw=306 src=306 pre=200 thr=177 q=177 exec=0 buy=1
+  top_plan_skip edge_low count=48
+  decision relax_score_min hits=21
+[15:32:06 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=expand state=written_hot_applied
+  flow15 scanned=265 candidates=141 selected=79 opened=1 open_positions=0 closed_total=201
+  diversity15 buy_total=1 unique_buy=1 top_symbol=cbBTC top_share=1.0
+  target_tph effective=4.0 requested=12.0
+  actions
+  - MAX_TOKEN_COOLDOWN_SECONDS: 10 -> 0 (cooldown_left)
+  - MAX_TOKEN_COOLDOWN_SECONDS: 0 -> 10 (cooldown_floor_guard)
+  telemetry15 raw=324 src=324 pre=207 thr=180 q=180 exec=0 buy=1
+  top_plan_skip edge_low count=46
+  decision relax_score_min hits=23
+[15:34:11 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=expand state=written_hot_applied
+  flow15 scanned=275 candidates=144 selected=81 opened=0 open_positions=0 closed_total=201
+  diversity15 buy_total=0 unique_buy=0 top_symbol= top_share=0.0
+  target_tph effective=4.0 requested=12.0
+  actions
+  - MAX_TOKEN_COOLDOWN_SECONDS: 10 -> 0 (cooldown_left)
+  - MAX_TOKEN_COOLDOWN_SECONDS: 0 -> 10 (cooldown_floor_guard)
+  telemetry15 raw=333 src=333 pre=207 thr=180 q=180 exec=0 buy=1
+  top_plan_skip cooldown count=44
+  decision edge_deadlock_recovery edge_hits=48 selected=81 roll_usd=0.0005 cal_usd=0.0005 vol_min=5.0
+[15:36:15 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=expand state=written_hot_applied
+  flow15 scanned=278 candidates=144 selected=89 opened=0 open_positions=0 closed_total=201
+  diversity15 buy_total=0 unique_buy=0 top_symbol= top_share=0.0
+  target_tph effective=4.0 requested=12.0
+  actions
+  - MAX_TOKEN_COOLDOWN_SECONDS: 10 -> 0 (cooldown_left)
+  - MAX_TOKEN_COOLDOWN_SECONDS: 0 -> 10 (cooldown_floor_guard)
+  telemetry15 raw=343 src=343 pre=209 thr=177 q=177 exec=0 buy=1
+  top_plan_skip cooldown count=43
+  decision edge_deadlock_recovery edge_hits=48 selected=89 roll_usd=0.0005 cal_usd=0.0005 vol_min=5.0
+[15:38:19 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=expand state=written_hot_applied
+  flow15 scanned=277 candidates=144 selected=96 opened=0 open_positions=0 closed_total=201
+  diversity15 buy_total=0 unique_buy=0 top_symbol= top_share=0.0
+  target_tph effective=4.0 requested=12.0
+  actions
+  - MAX_TOKEN_COOLDOWN_SECONDS: 10 -> 0 (cooldown_left)
+  - MAX_TOKEN_COOLDOWN_SECONDS: 0 -> 10 (cooldown_floor_guard)
+  telemetry15 raw=339 src=339 pre=205 thr=177 q=177 exec=0 buy=0
+  top_plan_skip cooldown count=49
+  decision edge_deadlock_recovery edge_hits=48 selected=96 roll_usd=0.0005 cal_usd=0.0005 vol_min=5.0
+[15:40:24 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=expand state=written_hot_applied
+  flow15 scanned=267 candidates=141 selected=94 opened=0 open_positions=0 closed_total=201
+  diversity15 buy_total=0 unique_buy=0 top_symbol= top_share=0.0
+  target_tph effective=4.0 requested=12.0
+  actions
+  - MAX_TOKEN_COOLDOWN_SECONDS: 10 -> 0 (cooldown_left)
+  - MAX_TOKEN_COOLDOWN_SECONDS: 0 -> 10 (cooldown_floor_guard)
+  telemetry15 raw=339 src=339 pre=204 thr=177 q=177 exec=0 buy=0
+  top_plan_skip cooldown count=57
+  decision edge_deadlock_recovery edge_hits=47 selected=94 roll_usd=0.0005 cal_usd=0.0005 vol_min=5.0
+[15:42:28 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=expand state=written_hot_applied
+  flow15 scanned=272 candidates=141 selected=88 opened=1 open_positions=1 closed_total=201
+  diversity15 buy_total=1 unique_buy=1 top_symbol=cbBTC top_share=1.0
+  target_tph effective=4.0 requested=12.0
+  actions
+  - MAX_TOKEN_COOLDOWN_SECONDS: 10 -> 0 (cooldown_left)
+  - MAX_TOKEN_COOLDOWN_SECONDS: 0 -> 10 (cooldown_floor_guard)
+  telemetry15 raw=339 src=339 pre=206 thr=177 q=177 exec=0 buy=1
+  top_plan_skip cooldown count=53
+  decision relax_score_min hits=23
+[15:44:33 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=expand state=written_hot_applied
+  flow15 scanned=274 candidates=141 selected=80 opened=1 open_positions=0 closed_total=202
+  diversity15 buy_total=1 unique_buy=1 top_symbol=cbBTC top_share=1.0
+  target_tph effective=4.0 requested=12.0
+  actions
+  - MAX_TOKEN_COOLDOWN_SECONDS: 10 -> 0 (cooldown_left)
+  - MAX_TOKEN_COOLDOWN_SECONDS: 0 -> 10 (cooldown_floor_guard)
+  telemetry15 raw=340 src=340 pre=208 thr=177 q=177 exec=0 buy=1
+  top_plan_skip ev_net_low count=55
+  decision relax_score_min hits=26
+[15:46:37 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=expand state=written_hot_applied
+  flow15 scanned=274 candidates=141 selected=72 opened=1 open_positions=0 closed_total=202
+  diversity15 buy_total=1 unique_buy=1 top_symbol=cbBTC top_share=1.0
+  target_tph effective=4.0 requested=12.0
+  actions
+  - MAX_TOKEN_COOLDOWN_SECONDS: 10 -> 0 (cooldown_left)
+  - MAX_TOKEN_COOLDOWN_SECONDS: 0 -> 10 (cooldown_floor_guard)
+  telemetry15 raw=340 src=340 pre=205 thr=177 q=177 exec=0 buy=1
+  top_plan_skip cooldown count=47
+  decision relax_score_min hits=24
+[15:48:42 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=expand state=written_hot_applied
+  flow15 scanned=258 candidates=138 selected=62 opened=1 open_positions=0 closed_total=202
+  diversity15 buy_total=1 unique_buy=1 top_symbol=cbBTC top_share=1.0
+  target_tph effective=4.0 requested=12.0
+  actions
+  - MAX_TOKEN_COOLDOWN_SECONDS: 10 -> 0 (cooldown_left)
+  - MAX_TOKEN_COOLDOWN_SECONDS: 0 -> 10 (cooldown_floor_guard)
+  telemetry15 raw=337 src=337 pre=202 thr=177 q=177 exec=0 buy=1
+  top_plan_skip cooldown count=47
+  decision relax_score_min hits=18
+[15:50:47 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=expand state=written_hot_applied
+  flow15 scanned=263 candidates=141 selected=55 opened=1 open_positions=0 closed_total=202
+  diversity15 buy_total=1 unique_buy=1 top_symbol=cbBTC top_share=1.0
+  target_tph effective=4.0 requested=12.0
+  actions
+  - MAX_TOKEN_COOLDOWN_SECONDS: 10 -> 0 (cooldown_left)
+  - MAX_TOKEN_COOLDOWN_SECONDS: 0 -> 10 (cooldown_floor_guard)
+  telemetry15 raw=334 src=334 pre=202 thr=177 q=177 exec=0 buy=1
+  top_plan_skip cooldown count=47
+  decision relax_score_min hits=19
+[15:52:52 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=expand state=written_hot_applied
+  flow15 scanned=264 candidates=141 selected=47 opened=1 open_positions=0 closed_total=202
+  diversity15 buy_total=1 unique_buy=1 top_symbol=cbBTC top_share=1.0
+  target_tph effective=4.0 requested=12.0
+  actions
+  - MAX_TOKEN_COOLDOWN_SECONDS: 10 -> 0 (cooldown_left)
+  - MAX_TOKEN_COOLDOWN_SECONDS: 0 -> 10 (cooldown_floor_guard)
+  telemetry15 raw=331 src=331 pre=202 thr=177 q=177 exec=0 buy=1
+  top_plan_skip cooldown count=47
+  decision relax_score_min hits=19
+[15:54:57 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=expand state=written_hot_applied
+  flow15 scanned=257 candidates=132 selected=52 opened=0 open_positions=0 closed_total=202
+  diversity15 buy_total=0 unique_buy=0 top_symbol= top_share=0.0
+  target_tph effective=4.0 requested=12.0
+  actions
+  - MAX_TOKEN_COOLDOWN_SECONDS: 10 -> 0 (cooldown_left)
+  - MAX_TOKEN_COOLDOWN_SECONDS: 0 -> 10 (cooldown_floor_guard)
+  telemetry15 raw=325 src=325 pre=195 thr=168 q=168 exec=0 buy=1
+  top_plan_skip cooldown count=47
+  decision relax_score_min hits=22
+[15:57:01 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=expand state=written_hot_applied
+  flow15 scanned=234 candidates=116 selected=52 opened=0 open_positions=0 closed_total=202
+  diversity15 buy_total=0 unique_buy=0 top_symbol= top_share=0.0
+  target_tph effective=4.0 requested=12.0
+  actions
+  - MAX_TOKEN_COOLDOWN_SECONDS: 10 -> 0 (cooldown_left)
+  - MAX_TOKEN_COOLDOWN_SECONDS: 0 -> 10 (cooldown_floor_guard)
+  telemetry15 raw=309 src=309 pre=179 thr=153 q=153 exec=0 buy=0
+  top_plan_skip cooldown count=52
+  decision relax_score_min hits=16
+[15:59:07 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=expand state=written_hot_applied
+  flow15 scanned=227 candidates=101 selected=53 opened=0 open_positions=0 closed_total=202
+  diversity15 buy_total=0 unique_buy=0 top_symbol= top_share=0.0
+  target_tph effective=4.0 requested=12.0
+  actions
+  - MAX_TOKEN_COOLDOWN_SECONDS: 10 -> 0 (cooldown_left)
+  - MAX_TOKEN_COOLDOWN_SECONDS: 0 -> 10 (cooldown_floor_guard)
+  telemetry15 raw=291 src=291 pre=161 thr=137 q=137 exec=0 buy=0
+  top_plan_skip cooldown count=60
+  decision relax_score_min hits=23
+[16:01:12 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=expand state=written_hot_applied
+  flow15 scanned=213 candidates=85 selected=53 opened=0 open_positions=0 closed_total=202
+  diversity15 buy_total=0 unique_buy=0 top_symbol= top_share=0.0
+  target_tph effective=4.0 requested=12.0
+  actions
+  - MAX_TOKEN_COOLDOWN_SECONDS: 10 -> 0 (cooldown_left)
+  - MAX_TOKEN_COOLDOWN_SECONDS: 0 -> 10 (cooldown_floor_guard)
+  telemetry15 raw=272 src=272 pre=144 thr=118 q=118 exec=0 buy=0
+  top_plan_skip cooldown count=59
+  decision relax_score_min hits=24
+[16:03:21 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=expand state=written_hot_applied
+  flow15 scanned=188 candidates=66 selected=52 opened=0 open_positions=0 closed_total=202
+  diversity15 buy_total=0 unique_buy=0 top_symbol= top_share=0.0
+  target_tph effective=4.0 requested=12.0
+  actions
+  - WATCHLIST_REFRESH_SECONDS: 720 -> 600 (feed_starvation watch_refresh)
+  - MAX_TOKEN_COOLDOWN_SECONDS: 10 -> 0 (cooldown_left)
+  - MAX_TOKEN_COOLDOWN_SECONDS: 0 -> 10 (cooldown_floor_guard)
+  telemetry15 raw=258 src=258 pre=129 thr=103 q=103 exec=0 buy=0
+  top_plan_skip cooldown count=60
+  decision feed_starvation raw15=258 pre15=129 buy15=0 open_rate=0.000
+[16:05:26 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=expand state=written_hot_applied
+  flow15 scanned=189 candidates=68 selected=60 opened=0 open_positions=0 closed_total=202
+  diversity15 buy_total=0 unique_buy=0 top_symbol= top_share=0.0
+  target_tph effective=4.0 requested=12.0
+  actions
+  - WATCHLIST_REFRESH_SECONDS: 600 -> 480 (feed_starvation watch_refresh)
+  - MAX_TOKEN_COOLDOWN_SECONDS: 10 -> 0 (cooldown_left)
+  - MAX_TOKEN_COOLDOWN_SECONDS: 0 -> 10 (cooldown_floor_guard)
+  telemetry15 raw=253 src=253 pre=128 thr=103 q=103 exec=0 buy=0
+  top_plan_skip cooldown count=65
+  decision feed_starvation raw15=253 pre15=128 buy15=0 open_rate=0.000

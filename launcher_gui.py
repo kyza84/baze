@@ -23,7 +23,7 @@ from monitor.gui_engine_control import (
     start_bot as engine_start_bot,
     stop_bot as engine_stop_bot,
 )
-from utils.state_file import StateFileLockError, write_json_atomic_locked
+from utils.state_file import StateFileLockError, read_json_locked, write_json_atomic_locked
 
 try:
     import msvcrt  # Windows-only, used for a robust single-instance file lock.
@@ -480,8 +480,17 @@ def _signal_graceful_stop() -> tuple[bool, str]:
     path = _resolve_graceful_stop_file()
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
+        payload = {
+            "ts": float(time.time()),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "source": "launcher_gui.py",
+            "reason": "gui_graceful_stop",
+            "actor": str(os.getenv("USERNAME", "") or "unknown"),
+            "host": str(os.getenv("COMPUTERNAME", "") or "unknown"),
+            "hard_kill": False,
+        }
         with open(path, "w", encoding="utf-8") as f:
-            f.write(f"{datetime.now(timezone.utc).isoformat()} gui_graceful_stop\n")
+            f.write(json.dumps(payload, ensure_ascii=False))
         return True, path
     except Exception as exc:
         return False, str(exc)
@@ -656,16 +665,28 @@ def truncate_file(path: str) -> None:
 def read_json(path: str) -> dict:
     if not os.path.exists(path):
         return {}
+    is_paper_state = str(os.path.basename(path)).lower().startswith("paper_state") and str(path).lower().endswith(".json")
     for attempt in range(8):
         try:
-            # Accept files with or without UTF-8 BOM (PowerShell often writes BOM by default).
-            with open(path, "r", encoding="utf-8-sig") as f:
-                payload = json.load(f)
+            if is_paper_state:
+                payload = read_json_locked(
+                    path,
+                    timeout_seconds=STATE_FILE_LOCK_TIMEOUT_SECONDS,
+                    poll_seconds=STATE_FILE_LOCK_RETRY_SECONDS,
+                    encoding="utf-8-sig",
+                )
+            else:
+                # Accept files with or without UTF-8 BOM (PowerShell often writes BOM by default).
+                with open(path, "r", encoding="utf-8-sig") as f:
+                    payload = json.load(f)
             if isinstance(payload, dict):
                 return payload
             return {}
         except json.JSONDecodeError:
             # State can be read mid-write; retry briefly before falling back.
+            time.sleep(0.03 + (attempt * 0.02))
+            continue
+        except StateFileLockError:
             time.sleep(0.03 + (attempt * 0.02))
             continue
         except OSError:

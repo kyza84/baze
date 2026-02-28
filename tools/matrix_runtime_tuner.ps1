@@ -8,6 +8,7 @@ param(
   [string]$PolicyPhase = 'auto',
   [int]$WindowMinutes = 12,
   [int]$RestartCooldownSeconds = 180,
+  [int]$RestartMaxPerHour = 6,
   [int]$DurationMinutes = 60,
   [int]$IntervalSeconds = 120,
   [int]$Limit = 240,
@@ -30,6 +31,7 @@ param(
   [int]$RollbackDegradeStreak = 3,
   [double]$HoldHysteresisOpenRate = 0.07,
   [double]$HoldHysteresisTradesPerHour = 6.0,
+  [switch]$AllowZeroCooldown,
   [switch]$DryRun,
   [switch]$Json
 )
@@ -70,6 +72,7 @@ if ($Command -eq 'replay') {
   $args += @('--policy-phase', $PolicyPhase)
   $args += @('--window-minutes', [string]$WindowMinutes)
   $args += @('--restart-cooldown-seconds', [string]$RestartCooldownSeconds)
+  $args += @('--restart-max-per-hour', [string]$RestartMaxPerHour)
   if ($TargetPolicyFile -and $TargetPolicyFile.Trim().Length -gt 0) {
     $args += @('--target-policy-file', $TargetPolicyFile.Trim())
   }
@@ -91,6 +94,9 @@ if ($Command -eq 'replay') {
   $args += @('--rollback-degrade-streak', [string]$RollbackDegradeStreak)
   $args += @('--hold-hysteresis-open-rate', [string]$HoldHysteresisOpenRate)
   $args += @('--hold-hysteresis-trades-per-hour', [string]$HoldHysteresisTradesPerHour)
+  if ($AllowZeroCooldown) {
+    $args += '--allow-zero-cooldown'
+  }
   if ($Command -eq 'run') {
     $args += @('--duration-minutes', [string]$DurationMinutes)
     $args += @('--interval-seconds', [string]$IntervalSeconds)

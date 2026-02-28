@@ -1,1 +1,1 @@
-{"run_tag": "u_station_ab_night_autotune_v2", "pid": 17828, "ts": 1772286563.9648948, "timestamp": "2026-02-28T13:49:23.964894+00:00", "stage": "shutdown", "cycle_index": 498, "open_trades": 1, "detail": ""}
+{"run_tag": "u_station_ab_night_autotune_v2", "pid": 11552, "ts": 1772300542.243628, "timestamp": "2026-02-28T17:42:22.243628+00:00", "stage": "cycle_begin", "cycle_index": 277, "open_trades": 2, "detail": ""}
