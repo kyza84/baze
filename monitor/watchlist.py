@@ -82,13 +82,22 @@ class WatchlistMonitor:
         # GeckoTerminal pools as a supplement.
         tokens: list[dict[str, Any]] = []
         seen_addr: set[str] = set()
+        strict_count = 0
 
-        for row in await self._fetch_dexscreener_watchlist():
-            addr = normalize_address(row.get("address"))
-            if not addr or addr in seen_addr:
-                continue
-            seen_addr.add(addr)
-            tokens.append(row)
+        def _add_rows(rows: list[dict[str, Any]]) -> int:
+            added = 0
+            for row in rows:
+                addr = normalize_address(row.get("address"))
+                if not addr or addr in seen_addr:
+                    continue
+                if self._is_blocked_token(address=addr, symbol=str(row.get("symbol", "") or "")):
+                    continue
+                seen_addr.add(addr)
+                tokens.append(row)
+                added += 1
+            return added
+
+        strict_count += _add_rows(await self._fetch_dexscreener_watchlist())
 
         trending_pages = int(getattr(config, "WATCHLIST_GECKO_TRENDING_PAGES", 2) or 2)
         pools_pages = int(getattr(config, "WATCHLIST_GECKO_POOLS_PAGES", 2) or 2)
@@ -101,12 +110,7 @@ class WatchlistMonitor:
             if isinstance(rows, Exception):
                 logger.warning("Watchlist trending page failed: %s", rows)
                 continue
-            for row in rows:
-                addr = normalize_address(row.get("address"))
-                if not addr or addr in seen_addr:
-                    continue
-                seen_addr.add(addr)
-                tokens.append(row)
+            strict_count += _add_rows(rows)
 
         pool_tasks = [self._fetch_gecko_pool_page(kind="pools", page=page) for page in range(1, pools_pages + 1)]
         pool_rows = await asyncio.gather(*pool_tasks, return_exceptions=True) if pool_tasks else []
@@ -114,28 +118,241 @@ class WatchlistMonitor:
             if isinstance(rows, Exception):
                 logger.warning("Watchlist pools page failed: %s", rows)
                 continue
-            for row in rows:
-                addr = normalize_address(row.get("address"))
-                if not addr or addr in seen_addr:
-                    continue
-                seen_addr.add(addr)
-                tokens.append(row)
+            strict_count += _add_rows(rows)
+
+        low_supply_min_count = max(1, int(getattr(config, "WATCHLIST_LOW_SUPPLY_MIN_COUNT", 12) or 12))
+        if len(tokens) < low_supply_min_count:
+            relax_factor = max(
+                0.05,
+                min(1.0, float(getattr(config, "WATCHLIST_LOW_SUPPLY_RELAX_FACTOR", 0.50) or 0.50)),
+            )
+            strict_min_liq = max(0.0, float(getattr(config, "WATCHLIST_MIN_LIQUIDITY_USD", 0.0) or 0.0))
+            strict_min_vol_h24 = max(0.0, float(getattr(config, "WATCHLIST_MIN_VOLUME_24H_USD", 0.0) or 0.0))
+            strict_min_vol_5m = max(0.0, float(getattr(config, "WATCHLIST_MIN_VOLUME_5M_USD", 0.0) or 0.0))
+            strict_min_pc = max(
+                0.0,
+                float(getattr(config, "WATCHLIST_MIN_PRICE_CHANGE_5M_ABS_PERCENT", 0.0) or 0.0),
+            )
+            relaxed_min_liq = strict_min_liq * relax_factor
+            relaxed_min_vol_h24 = strict_min_vol_h24 * relax_factor
+            low_supply_vol_floor = max(
+                0.0,
+                float(getattr(config, "WATCHLIST_LOW_SUPPLY_MIN_VOLUME_5M_USD", 120.0) or 120.0),
+            )
+            if strict_min_vol_5m > 0.0:
+                relaxed_min_vol_5m = max(low_supply_vol_floor, strict_min_vol_5m * relax_factor)
+            else:
+                relaxed_min_vol_5m = low_supply_vol_floor
+            relaxed_min_pc = max(
+                0.0,
+                float(
+                    getattr(
+                        config,
+                        "WATCHLIST_LOW_SUPPLY_RELAX_MIN_PRICE_CHANGE_5M_ABS_PERCENT",
+                        0.0,
+                    )
+                    or 0.0
+                ),
+            )
+            if relaxed_min_pc <= 0.0 and strict_min_pc > 0.0:
+                relaxed_min_pc = strict_min_pc * relax_factor
+            allow_non_weth_in_paper = bool(
+                getattr(config, "WATCHLIST_LOW_SUPPLY_ALLOW_NON_WETH_IN_PAPER", True)
+            ) and bool(getattr(config, "AUTO_TRADE_PAPER", False))
+            relaxed_require_weth = bool(getattr(config, "WATCHLIST_REQUIRE_WETH_QUOTE", True))
+            if allow_non_weth_in_paper:
+                relaxed_require_weth = False
+            relaxed_trending_pages = max(
+                0,
+                min(
+                    trending_pages,
+                    int(getattr(config, "WATCHLIST_LOW_SUPPLY_RELAX_TRENDING_PAGES", 1) or 1),
+                ),
+            )
+            relaxed_pools_pages = max(
+                0,
+                min(
+                    pools_pages,
+                    int(getattr(config, "WATCHLIST_LOW_SUPPLY_RELAX_POOLS_PAGES", 1) or 1),
+                ),
+            )
+            fallback_timeout_seconds = max(
+                1.0,
+                float(getattr(config, "WATCHLIST_LOW_SUPPLY_FALLBACK_TIMEOUT_SECONDS", 8.0) or 8.0),
+            )
+
+            strict_snapshot = (
+                strict_min_liq,
+                strict_min_vol_h24,
+                strict_min_vol_5m,
+                strict_min_pc,
+                bool(getattr(config, "WATCHLIST_REQUIRE_WETH_QUOTE", True)),
+            )
+            relaxed_snapshot = (
+                relaxed_min_liq,
+                relaxed_min_vol_h24,
+                relaxed_min_vol_5m,
+                relaxed_min_pc,
+                relaxed_require_weth,
+            )
+
+            if relaxed_snapshot != strict_snapshot:
+                logger.warning(
+                    "WATCHLIST low_supply fallback strict=%s final=%s min=%s relax_factor=%.2f",
+                    int(strict_count),
+                    int(len(tokens)),
+                    int(low_supply_min_count),
+                    float(relax_factor),
+                )
+                relaxed_added = 0
+                relaxed_added += _add_rows(
+                    await self._fetch_dexscreener_watchlist(
+                        min_liq=relaxed_min_liq,
+                        min_vol_h24=relaxed_min_vol_h24,
+                        require_weth_quote=relaxed_require_weth,
+                    )
+                )
+                relaxed_trending_tasks = [
+                    self._fetch_gecko_pool_page(
+                        kind="trending_pools",
+                        page=page,
+                        min_liq=relaxed_min_liq,
+                        min_vol_h24=relaxed_min_vol_h24,
+                        min_vol_5m=relaxed_min_vol_5m,
+                        min_pc=relaxed_min_pc,
+                        require_weth_quote=relaxed_require_weth,
+                    )
+                    for page in range(1, relaxed_trending_pages + 1)
+                ]
+                relaxed_pool_tasks = [
+                    self._fetch_gecko_pool_page(
+                        kind="pools",
+                        page=page,
+                        min_liq=relaxed_min_liq,
+                        min_vol_h24=relaxed_min_vol_h24,
+                        min_vol_5m=relaxed_min_vol_5m,
+                        min_pc=relaxed_min_pc,
+                        require_weth_quote=relaxed_require_weth,
+                    )
+                    for page in range(1, relaxed_pools_pages + 1)
+                ]
+                relaxed_rows: list[list[dict[str, Any]]] = []
+                relaxed_tasks = [
+                    asyncio.create_task(coro)
+                    for coro in (relaxed_trending_tasks + relaxed_pool_tasks)
+                ]
+                if relaxed_tasks:
+                    done, pending = await asyncio.wait(
+                        relaxed_tasks,
+                        timeout=fallback_timeout_seconds,
+                    )
+                    if pending:
+                        logger.warning(
+                            "WATCHLIST low_supply fallback timeout timeout=%.1fs pending=%s",
+                            float(fallback_timeout_seconds),
+                            int(len(pending)),
+                        )
+                        for task in pending:
+                            task.cancel()
+                        await asyncio.gather(*pending, return_exceptions=True)
+                    for task in done:
+                        try:
+                            rows = task.result()
+                        except Exception as exc:
+                            logger.warning("Watchlist relaxed page failed: %s", exc)
+                            continue
+                        if isinstance(rows, list):
+                            relaxed_rows.append(rows)
+                for rows in relaxed_rows:
+                    relaxed_added += _add_rows(rows)
+                if relaxed_added > 0:
+                    logger.warning(
+                        "WATCHLIST low_supply fallback added=%s final=%s",
+                        int(relaxed_added),
+                        int(len(tokens)),
+                    )
 
         # Hard cap total output; filters downstream will pick the best anyway.
+        tokens.sort(
+            key=lambda x: (
+                float(x.get("liquidity") or 0.0),
+                float(x.get("volume_5m") or 0.0),
+            ),
+            reverse=True,
+        )
         max_tokens = int(getattr(config, "WATCHLIST_MAX_TOKENS", 30) or 30)
         if max_tokens > 0:
             tokens = tokens[: max(1, max_tokens)]
         return tokens
 
-    async def _fetch_dexscreener_watchlist(self) -> list[dict[str, Any]]:
-        queries = getattr(config, "DEX_SEARCH_QUERIES", None) or [getattr(config, "DEX_SEARCH_QUERY", "base")]
-        chain_id = normalize_address(getattr(config, "CHAIN_ID", "base") or "base")
+    @staticmethod
+    def _csv_items(raw: Any) -> list[str]:
+        if raw is None:
+            return []
+        if isinstance(raw, str):
+            return [x.strip() for x in raw.split(",") if x.strip()]
+        if isinstance(raw, (list, tuple, set)):
+            return [str(x).strip() for x in raw if str(x).strip()]
+        text = str(raw).strip()
+        return [text] if text else []
+
+    @staticmethod
+    def _chain_key(raw: Any) -> str:
+        return str(raw or "").strip().lower()
+
+    @staticmethod
+    def _is_placeholder_address(address: str) -> bool:
+        addr = normalize_address(address)
+        return addr == "0x0000000000000000000000000000000000000000"
+
+    @staticmethod
+    def _is_blocked_token(*, address: str, symbol: str) -> bool:
+        addr = normalize_address(address)
+        if (not addr) or WatchlistMonitor._is_placeholder_address(addr):
+            return True
+        hard_blocked = {
+            normalize_address(x)
+            for x in WatchlistMonitor._csv_items(getattr(config, "AUTO_TRADE_HARD_BLOCKED_ADDRESSES", []) or [])
+            if str(x or "").strip()
+        }
+        if addr in hard_blocked:
+            return True
+
+        sym = str(symbol or "").strip().upper()
+        if not sym:
+            return False
+        excluded_symbols = {
+            str(x).strip().upper()
+            for x in WatchlistMonitor._csv_items(getattr(config, "AUTO_TRADE_EXCLUDED_SYMBOLS", []) or [])
+            if str(x).strip()
+        }
+        if sym in excluded_symbols:
+            return True
+        excluded_keywords = [
+            str(x).strip().upper()
+            for x in WatchlistMonitor._csv_items(getattr(config, "AUTO_TRADE_EXCLUDED_SYMBOL_KEYWORDS", []) or [])
+            if str(x).strip()
+        ]
+        return any(kw and (kw in sym) for kw in excluded_keywords)
+
+    async def _fetch_dexscreener_watchlist(
+        self,
+        *,
+        min_liq: float | None = None,
+        min_vol_h24: float | None = None,
+        require_weth_quote: bool | None = None,
+    ) -> list[dict[str, Any]]:
+        raw_queries = getattr(config, "DEX_SEARCH_QUERIES", None)
+        queries = self._csv_items(raw_queries) or [str(getattr(config, "DEX_SEARCH_QUERY", "base") or "base").strip()]
+        chain_id = self._chain_key(getattr(config, "CHAIN_ID", "base") or "base")
         weth = normalize_address(getattr(config, "WETH_ADDRESS", "") or "")
         allow = set(getattr(config, "WATCHLIST_DEX_ALLOWLIST", []) or [])
-        require_weth_quote = bool(getattr(config, "WATCHLIST_REQUIRE_WETH_QUOTE", True))
-
-        min_liq = float(getattr(config, "WATCHLIST_MIN_LIQUIDITY_USD", 200000) or 200000)
-        min_vol_h24 = float(getattr(config, "WATCHLIST_MIN_VOLUME_24H_USD", 500000) or 500000)
+        if require_weth_quote is None:
+            require_weth_quote = bool(getattr(config, "WATCHLIST_REQUIRE_WETH_QUOTE", True))
+        if min_liq is None:
+            min_liq = float(getattr(config, "WATCHLIST_MIN_LIQUIDITY_USD", 200000) or 200000)
+        if min_vol_h24 is None:
+            min_vol_h24 = float(getattr(config, "WATCHLIST_MIN_VOLUME_24H_USD", 500000) or 500000)
 
         out: list[dict[str, Any]] = []
         active_queries = [str(q or "").strip() for q in list(queries)[:20] if str(q or "").strip()]
@@ -158,7 +375,7 @@ class WatchlistMonitor:
             for pair in pairs:
                 if not isinstance(pair, dict):
                     continue
-                if normalize_address(pair.get("chainId", "")) != chain_id:
+                if chain_id and self._chain_key(pair.get("chainId", "")) != chain_id:
                     continue
                 dex_id = str(pair.get("dexId") or "").lower()
                 if allow and dex_id and (dex_id not in allow):
@@ -244,7 +461,17 @@ class WatchlistMonitor:
         out.sort(key=lambda x: float(x.get("liquidity") or 0.0), reverse=True)
         return out
 
-    async def _fetch_gecko_pool_page(self, kind: str, page: int = 1) -> list[dict[str, Any]]:
+    async def _fetch_gecko_pool_page(
+        self,
+        kind: str,
+        page: int = 1,
+        *,
+        min_liq: float | None = None,
+        min_vol_h24: float | None = None,
+        min_vol_5m: float | None = None,
+        min_pc: float | None = None,
+        require_weth_quote: bool | None = None,
+    ) -> list[dict[str, Any]]:
         network = str(getattr(config, "GECKO_NETWORK", "base") or "base").strip()
         include = "base_token,quote_token,dex"
         url = f"https://api.geckoterminal.com/api/v2/networks/{network}/{kind}?page={int(page)}&include={include}"
@@ -265,11 +492,16 @@ class WatchlistMonitor:
                 dex_map[str(item.get("id", ""))] = item.get("attributes", {}) or {}
 
         weth = normalize_address(getattr(config, "WETH_ADDRESS", "") or "")
-        require_weth_quote = bool(getattr(config, "WATCHLIST_REQUIRE_WETH_QUOTE", True))
-        min_liq = float(getattr(config, "WATCHLIST_MIN_LIQUIDITY_USD", 200000) or 200000)
-        min_vol_h24 = float(getattr(config, "WATCHLIST_MIN_VOLUME_24H_USD", 500000) or 500000)
-        min_vol_5m = float(getattr(config, "WATCHLIST_MIN_VOLUME_5M_USD", 0.0) or 0.0)
-        min_pc = float(getattr(config, "WATCHLIST_MIN_PRICE_CHANGE_5M_ABS_PERCENT", 0.0) or 0.0)
+        if require_weth_quote is None:
+            require_weth_quote = bool(getattr(config, "WATCHLIST_REQUIRE_WETH_QUOTE", True))
+        if min_liq is None:
+            min_liq = float(getattr(config, "WATCHLIST_MIN_LIQUIDITY_USD", 200000) or 200000)
+        if min_vol_h24 is None:
+            min_vol_h24 = float(getattr(config, "WATCHLIST_MIN_VOLUME_24H_USD", 500000) or 500000)
+        if min_vol_5m is None:
+            min_vol_5m = float(getattr(config, "WATCHLIST_MIN_VOLUME_5M_USD", 0.0) or 0.0)
+        if min_pc is None:
+            min_pc = float(getattr(config, "WATCHLIST_MIN_PRICE_CHANGE_5M_ABS_PERCENT", 0.0) or 0.0)
 
         out: list[dict[str, Any]] = []
         now = datetime.now(timezone.utc)

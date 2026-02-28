@@ -1,0 +1,40 @@
+2026-02-27 03:49:45,753 [INFO] [u_station_ab_night_autotune_v2] __main__: SESSION_LOG file=logs/matrix/u_station_ab_night_autotune_v2\sessions\main_local_20260227_024945_pid16624.log
+2026-02-27 03:49:45,790 [INFO] [u_station_ab_night_autotune_v2] trading.auto_trader_state: AutoTrade state loaded open=0 closed=61 balance=$7.18
+2026-02-27 03:49:45,797 [WARNING] [u_station_ab_night_autotune_v2] trading.auto_trader: DATA_POLICY mode=OK reason=init_reset_manual prev_mode=OK prev_reason=healthy | route=allow_all
+2026-02-27 03:49:45,798 [INFO] [u_station_ab_night_autotune_v2] __main__: AUTOTRADER_INIT state=ready reason=manual mode=paper
+2026-02-27 03:49:45,799 [INFO] [u_station_ab_night_autotune_v2] __main__: Local mode started (Telegram disabled).
+2026-02-27 03:49:47,865 [INFO] [u_station_ab_night_autotune_v2] __main__: WATCHLIST merged count=6
+2026-02-27 03:49:47,876 [INFO] [u_station_ab_night_autotune_v2] trading.v2_runtime: V2_UNIVERSE in=14 dedup=14 out=14 target=14 novel_target=12 novel_out=14 repeat_dropped=0 symbol_dropped=0 surge_in=4 surge_target=4 surge_out=4
+2026-02-27 03:49:47,876 [INFO] [u_station_ab_night_autotune_v2] __main__: V2_SOURCE_QOS_FILTER in=14 out=9 drops={'source_qos_symbol_cap': 1, 'source_qos_cap': 4} caps={'watchlist': 2, 'geckoterminal': 287}
+2026-02-27 03:49:47,884 [INFO] [u_station_ab_night_autotune_v2] __main__: FILTER_FAIL token=CLAW reason=source_qos_symbol_cap symbol=CLAW used=1/1
+2026-02-27 03:49:47,884 [INFO] [u_station_ab_night_autotune_v2] __main__: FILTER_FAIL token=SAIRI reason=source_qos_cap source=watchlist used=2/2
+2026-02-27 03:49:47,884 [INFO] [u_station_ab_night_autotune_v2] __main__: FILTER_FAIL token=BOTCOIN reason=source_qos_cap source=watchlist used=2/2
+2026-02-27 03:49:47,884 [INFO] [u_station_ab_night_autotune_v2] __main__: FILTER_FAIL token=VIRTUAL reason=source_qos_cap source=watchlist used=2/2
+2026-02-27 03:49:47,884 [INFO] [u_station_ab_night_autotune_v2] __main__: FILTER_FAIL token=AERO reason=source_qos_cap source=watchlist used=2/2
+2026-02-27 03:49:47,884 [INFO] [u_station_ab_night_autotune_v2] __main__: FILTER_FAIL token=DOH reason=safe_change_5m
+2026-02-27 03:49:47,884 [INFO] [u_station_ab_night_autotune_v2] __main__: FILTER_PASS token=CLAW tier=A score=90 mode=YELLOW risk=MEDIUM liq=42991 vol5m=43511
+2026-02-27 03:49:47,884 [INFO] [u_station_ab_night_autotune_v2] monitor.local_alerter: Local alert token=CLAW address=0xff8921551c2196d6a907ae90eb4bd51a1e1ba988 score=90 reco=BUY risk=MEDIUM warnings=0 liq=42991 vol5m=43511
+2026-02-27 03:49:47,884 [INFO] [u_station_ab_night_autotune_v2] __main__: FILTER_PASS token=POOPCOIN tier=A score=100 mode=YELLOW risk=MEDIUM liq=476610 vol5m=11212
+2026-02-27 03:49:47,884 [INFO] [u_station_ab_night_autotune_v2] __main__: FILTER_PASS token=LUFFY tier=A score=60 mode=YELLOW risk=MEDIUM liq=83659 vol5m=1280
+2026-02-27 03:49:47,884 [INFO] [u_station_ab_night_autotune_v2] monitor.local_alerter: Local alert token=LUFFY address=0xf987530222dc7fabee9a984308b94de8bcdb77a3 score=60 reco=HOLD risk=MEDIUM warnings=0 liq=83659 vol5m=1280
+2026-02-27 03:49:47,884 [INFO] [u_station_ab_night_autotune_v2] __main__: FILTER_FAIL token=SENT reason=safe_age
+2026-02-27 03:49:47,900 [INFO] [u_station_ab_night_autotune_v2] __main__: FILTER_PASS token=cbBTC tier=A score=100 mode=YELLOW risk=MEDIUM liq=19750460 vol5m=14231
+2026-02-27 03:49:47,900 [INFO] [u_station_ab_night_autotune_v2] __main__: FILTER_FAIL token=ToruCeoAI reason=score_min score=30 strict_min=48 soft_min=48 mode=YELLOW
+2026-02-27 03:49:47,900 [INFO] [u_station_ab_night_autotune_v2] __main__: FILTER_FAIL token=AFL reason=safe_age
+2026-02-27 03:49:47,900 [INFO] [u_station_ab_night_autotune_v2] __main__: FILTER_PASS token=CLAWIND tier=A score=60 mode=YELLOW risk=MEDIUM liq=24621 vol5m=8
+2026-02-27 03:49:47,903 [INFO] [u_station_ab_night_autotune_v2] monitor.local_alerter: Local alert token=CLAWIND address=0x53c9de5e2509b32f4100ebcf8618165d7215cba3 score=60 reco=HOLD risk=MEDIUM warnings=0 liq=24621 vol5m=8
+2026-02-27 03:49:47,903 [INFO] [u_station_ab_night_autotune_v2] trading.v2_runtime: V2_QUALITY_ROTATE symbols_core=1 symbols_cooldown=0 sources=1 top_core=JUNO:0.0126/12 top_cooldown=-
+2026-02-27 03:49:47,903 [INFO] [u_station_ab_night_autotune_v2] __main__: V2_QUALITY_GATE enabled=True regime=YELLOW in=5 out=5 core_out=1 explore_out=4 probe_out=0 quota=3 max_symbol_share=0.200 drop={'duplicate_address': 4} sources_used={'watchlist': 2, 'geckoterminal': 3}
+2026-02-27 03:49:47,903 [INFO] [u_station_ab_night_autotune_v2] __main__: V2_ENTRY_ROUTE enabled=True regime=YELLOW in=5 out=4 core_out=1 explore_out=3 quota=3 allow_explore=True
+2026-02-27 03:49:47,903 [WARNING] [u_station_ab_night_autotune_v2] trading.auto_trader: DATA_POLICY mode=OK reason=healthy | route=allow_all prev_mode=OK prev_reason=init_reset_manual
+2026-02-27 03:49:47,903 [INFO] [u_station_ab_night_autotune_v2] __main__: MARKET_REGIME mode=YELLOW reason=hysteresis_recover_wait 1/4 raw=GREEN avg_cand_recent=5.00
+2026-02-27 03:49:47,921 [INFO] [u_station_ab_night_autotune_v2] trading.auto_trader: AutoTrade adjust token=CLAW reason=min_trade_floor size=$0.07->$0.10 min=$0.10
+2026-02-27 03:49:47,921 [INFO] [u_station_ab_night_autotune_v2] trading.auto_trader: AutoTrade skip token=CLAW reason=edge_low mode=both edge=-24.19% raw=-22.40% mult=1.08 min=0.05% probe_min=0.05% edge_usd=$-0.024 min_usd=$0.000 probe_min_usd=$0.000 size=$0.10 gross=8.00% costs=30.40% pwin=0.75 probe=- budget=0/1
+2026-02-27 03:49:47,937 [INFO] [u_station_ab_night_autotune_v2] trading.auto_trader: AutoTrade adjust token=cbBTC reason=min_trade_floor size=$0.08->$0.10 min=$0.10
+2026-02-27 03:49:47,937 [INFO] [u_station_ab_night_autotune_v2] trading.auto_trader: AutoTrade skip token=cbBTC reason=ev_net_low expected_net=$-0.00678 min=$-0.00250 samples=22 conf=1.00 pwin=0.45 avg_win=$0.0043 avg_loss=$0.0168 kelly=0.000 mem=sparse trades=2<18
+2026-02-27 03:49:47,937 [INFO] [u_station_ab_night_autotune_v2] trading.auto_trader: AutoTrade skip token=POOPCOIN reason=blacklist detail=honeypot_guard:honeypot_api_status_404
+2026-02-27 03:49:47,937 [INFO] [u_station_ab_night_autotune_v2] trading.auto_trader: AutoTrade batch mode=top_n candidates=4 eligible=3 selected=3 opened=0 pe=off burst_window=0
+2026-02-27 03:49:47,937 [INFO] [u_station_ab_night_autotune_v2] __main__: FILTER_THRESHOLDS safe_volume_5m_min=$5 safe_liquidity_min=$8000 safe_age_min=240s score_min=48 edge_min=0.05% lock_floor=0.95 no_momentum_max_pnl=0.25 weakness_pnl=-2.60
+2026-02-27 03:49:47,937 [INFO] [u_station_ab_night_autotune_v2] __main__: Scanned 14 tokens | High quality: 4 | Alerts sent: 3 | Trade candidates: 5 | Quality out/core/explore/probe: 5/1/4/0 | Opened: 0 | Mode: local | Source: onchain+market | Policy: raw=OK/effective=OK(healthy | route=allow_all) | Regime: YELLOW(hysteresis_recover_wait 1/4 raw=GREEN) | Safety: checked=5 fail_closed=0 reasons=api_code_4029:5 | FiltersTop(session): source_qos_cap:4,safe_age:2,source_qos_symbol_cap:1,safe_change_5m:1 | Dedup: heavy_skip=0 override=0 | V2Budget: 5/280 | SourceQoS: enabled=1/in=14/out=9/dropped=5/active_cd=0/drops=source_qos_cap:4,source_qos_symbol_cap:1 | Ingest: q=0/oldest=0.0s/drop_old=0/dedup_skip=0/enq=8/drain=8 | Sources: dex_boosts:ok=1/fail=0/429=0/lim_wait=0/cd_wait=0/err=0.0%/avg=124ms; dexscreener:ok=12/fail=0/429=0/lim_wait=0/cd_wait=0/err=0.0%/avg=100ms; geckoterminal:ok=2/fail=0/429=0/lim_wait=0/cd_wait=0/err=0.0%/avg=164ms; watchlist_dex:ok=10/fail=0/429=0/lim_wait=0/cd_wait=0/err=0.0%/avg=96ms; watchlist_gecko:ok=6/fail=0/429=0/lim_wait=0/cd_wait=0/err=0.0%/avg=627ms | Tasks: 3 | RSS: 0.0MB | CycleAvg: 0.00s
+2026-02-27 03:49:51,945 [WARNING] [u_station_ab_night_autotune_v2] __main__: GRACEFUL_STOP requested path=D:\earnforme\solana-alert-bot\data\graceful_stop.u_station_ab_night_autotune_v2.signal
+2026-02-27 03:49:51,985 [INFO] [u_station_ab_night_autotune_v2] trading.auto_trader: AUTOTRADER_SHUTDOWN reason=main_local_shutdown open=0 closed=61

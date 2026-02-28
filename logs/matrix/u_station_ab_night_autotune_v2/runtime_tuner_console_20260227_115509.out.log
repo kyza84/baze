@@ -1,0 +1,102 @@
+[10:55:11 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=expand state=noop
+  flow15 scanned=17 candidates=6 selected=4 opened=1 open_positions=0 closed_total=0
+  diversity15 buy_total=1 unique_buy=1 top_symbol=JUNO top_share=1.0
+  target_tph effective=4.0 requested=30.0
+  telemetry15 raw=130 src=130 pre=87 thr=59 q=59 exec=0 buy=1
+  top_plan_skip disabled_or_limits count=72
+  decision warmup_guard session_age=8.9s lines=49 scanned=17
+[10:57:13 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=expand state=restart_applied_dead_profile
+  flow15 scanned=17 candidates=6 selected=4 opened=1 open_positions=0 closed_total=0
+  diversity15 buy_total=1 unique_buy=1 top_symbol=JUNO top_share=1.0
+  target_tph effective=4.0 requested=30.0
+  telemetry15 raw=119 src=119 pre=78 thr=53 q=53 exec=0 buy=1
+  top_plan_skip disabled_or_limits count=66
+  decision warmup_guard session_age=130.9s lines=49 scanned=17
+[10:59:14 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=tighten state=noop
+  flow15 scanned=106 candidates=71 selected=46 opened=0 open_positions=0 closed_total=91
+  diversity15 buy_total=0 unique_buy=0 top_symbol= top_share=0.0
+  target_tph effective=4.0 requested=30.0
+  telemetry15 raw=178 src=178 pre=110 thr=90 q=90 exec=0 buy=1
+  top_plan_skip disabled_or_limits count=63
+  decision feed_starvation raw15=178 pre15=110 buy15=1 open_rate=0.000
+  blocked_actions=3
+[11:01:16 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=tighten state=restart_applied_dead_profile
+  flow15 scanned=106 candidates=71 selected=46 opened=0 open_positions=0 closed_total=91
+  diversity15 buy_total=0 unique_buy=0 top_symbol= top_share=0.0
+  target_tph effective=4.0 requested=30.0
+  telemetry15 raw=168 src=168 pre=102 thr=85 q=85 exec=0 buy=1
+  top_plan_skip disabled_or_limits count=45
+  decision feed_starvation raw15=168 pre15=102 buy15=1 open_rate=0.000
+  blocked_actions=3
+[11:03:18 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=tighten state=written_restart_deferred
+  flow15 scanned=70 candidates=47 selected=13 opened=2 open_positions=1 closed_total=92
+  diversity15 buy_total=2 unique_buy=2 top_symbol=BNKR top_share=0.5
+  target_tph effective=4.0 requested=30.0
+  actions
+  - PAPER_WATCHLIST_MIN_VOLUME_5M_USD: 10 -> 80 (auto_rollback_degradation)
+  - PLAN_MAX_WATCHLIST_SHARE: 0.14 -> 0.08 (auto_rollback_degradation)
+  - SEEN_TOKEN_TTL: 300 -> 2100 (auto_rollback_degradation)
+  - TOKEN_AGE_MAX: 21600 -> 20400 (auto_rollback_degradation)
+  - V2_SOURCE_QOS_SOURCE_CAPS: onchain:432,onchain+market:428,dexscreener:400,geckoterminal:395,watchlist:56,dex_boosts:140 -> onchain:372,onchain+market:368,dexscreener:340,geckoterminal:335,watchlist:2,dex_boosts:140 (auto_rollback_degradation)
+  - WATCHLIST_MIN_LIQUIDITY_USD: 5000 -> 55000 (auto_rollback_degradation)
+  - WATCHLIST_MIN_VOLUME_24H_USD: 10000 -> 160000 (auto_rollback_degradation)
+  - WATCHLIST_REFRESH_SECONDS: 60 -> 360 (auto_rollback_degradation)
+  telemetry15 raw=209 src=209 pre=134 thr=114 q=114 exec=0 buy=3
+  top_plan_skip disabled_or_limits count=31
+  decision rollback_triggered degrade_streak=3
+  delta_capped=7
+[11:05:19 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=tighten state=written_restart_deferred
+  flow15 scanned=127 candidates=88 selected=39 opened=3 open_positions=1 closed_total=93
+  diversity15 buy_total=3 unique_buy=3 top_symbol=BNKR top_share=0.333333
+  target_tph effective=4.0 requested=30.0
+  actions
+  - PLAN_MAX_WATCHLIST_SHARE: 0.08 -> 0.02 (auto_rollback_degradation)
+  - SEEN_TOKEN_TTL: 2100 -> 3900 (auto_rollback_degradation)
+  - TOKEN_AGE_MAX: 20400 -> 19200 (auto_rollback_degradation)
+  - V2_SOURCE_QOS_SOURCE_CAPS: onchain:372,onchain+market:368,dexscreener:340,geckoterminal:335,watchlist:2,dex_boosts:140 -> onchain:324,onchain+market:320,dexscreener:292,geckoterminal:287,watchlist:2,dex_boosts:140 (auto_rollback_degradation)
+  - WATCHLIST_MIN_LIQUIDITY_USD: 55000 -> 80000 (auto_rollback_degradation)
+  - WATCHLIST_MIN_VOLUME_24H_USD: 160000 -> 260000 (auto_rollback_degradation)
+  - WATCHLIST_REFRESH_SECONDS: 360 -> 660 (auto_rollback_degradation)
+  telemetry15 raw=242 src=242 pre=162 thr=138 q=138 exec=0 buy=4
+  top_plan_skip ev_net_low count=45
+  decision rollback_triggered degrade_streak=4
+  delta_capped=3
+[11:07:21 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=tighten state=written_restart_deferred
+  flow15 scanned=194 candidates=152 selected=61 opened=3 open_positions=1 closed_total=93
+  diversity15 buy_total=3 unique_buy=3 top_symbol=BNKR top_share=0.333333
+  target_tph effective=4.0 requested=30.0
+  actions
+  - SEEN_TOKEN_TTL: 3900 -> 5700 (auto_rollback_degradation)
+  - TOKEN_AGE_MAX: 19200 -> 18000 (auto_rollback_degradation)
+  - WATCHLIST_REFRESH_SECONDS: 660 -> 960 (auto_rollback_degradation)
+  telemetry15 raw=285 src=285 pre=223 thr=201 q=201 exec=0 buy=4
+  top_plan_skip ev_net_low count=68
+  decision rollback_triggered degrade_streak=5
+  blocked_actions=1
+  delta_capped=3
+[11:09:22 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=tighten state=written_restart_deferred
+  flow15 scanned=194 candidates=152 selected=62 opened=3 open_positions=1 closed_total=93
+  diversity15 buy_total=3 unique_buy=3 top_symbol=BNKR top_share=0.333333
+  target_tph effective=4.0 requested=30.0
+  actions
+  - SEEN_TOKEN_TTL: 5700 -> 7500 (auto_rollback_degradation)
+  - TOKEN_AGE_MAX: 18000 -> 16800 (auto_rollback_degradation)
+  - WATCHLIST_REFRESH_SECONDS: 960 -> 1260 (auto_rollback_degradation)
+  telemetry15 raw=275 src=275 pre=215 thr=200 q=200 exec=0 buy=4
+  top_plan_skip ev_net_low count=68
+  decision rollback_triggered degrade_streak=6
+  blocked_actions=1
+  delta_capped=3
+[11:11:24 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=tighten state=written_restarted
+  flow15 scanned=52 candidates=41 selected=24 opened=1 open_positions=0 closed_total=0
+  diversity15 buy_total=1 unique_buy=1 top_symbol=JUNO top_share=1.0
+  target_tph effective=4.0 requested=30.0
+  actions
+  - SEEN_TOKEN_TTL: 7500 -> 9300 (auto_rollback_degradation)
+  - TOKEN_AGE_MAX: 16800 -> 15600 (auto_rollback_degradation)
+  - WATCHLIST_REFRESH_SECONDS: 1260 -> 1560 (auto_rollback_degradation)
+  telemetry15 raw=289 src=289 pre=228 thr=218 q=218 exec=0 buy=4
+  top_plan_skip ev_net_low count=71
+  decision rollback_triggered degrade_streak=7
+  blocked_actions=3
+  delta_capped=3

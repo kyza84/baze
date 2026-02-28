@@ -45,6 +45,95 @@ class WatchlistMonitorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(rows), 1)
         self.assertGreaterEqual(int(rows[0].get("age_seconds") or 0), fallback_age)
 
+    async def test_refresh_skips_excluded_and_hard_blocked_tokens(self) -> None:
+        monitor = WatchlistMonitor()
+
+        async def fake_fetch_dex(**kwargs) -> list[dict]:  # noqa: ARG001
+            return [
+                {
+                    "symbol": "NOOK",
+                    "address": "0x1111111111111111111111111111111111111111",
+                    "liquidity": 300000.0,
+                    "volume_5m": 2500.0,
+                    "source": "watchlist",
+                },
+                {
+                    "symbol": "OKX",
+                    "address": "0x2222222222222222222222222222222222222222",
+                    "liquidity": 350000.0,
+                    "volume_5m": 3200.0,
+                    "source": "watchlist",
+                },
+                {
+                    "symbol": "HARD",
+                    "address": "0x3333333333333333333333333333333333333333",
+                    "liquidity": 450000.0,
+                    "volume_5m": 5000.0,
+                    "source": "watchlist",
+                },
+            ]
+
+        async def fake_fetch_gecko_page(kind: str, page: int = 1, **kwargs) -> list[dict]:  # noqa: ARG001
+            return []
+
+        monitor._fetch_dexscreener_watchlist = fake_fetch_dex  # type: ignore[assignment]
+        monitor._fetch_gecko_pool_page = fake_fetch_gecko_page  # type: ignore[assignment]
+        with patch.object(config, "AUTO_TRADE_EXCLUDED_SYMBOLS", ["NOOK"]), patch.object(
+            config, "AUTO_TRADE_EXCLUDED_SYMBOL_KEYWORDS", []
+        ), patch.object(
+            config, "AUTO_TRADE_HARD_BLOCKED_ADDRESSES", ["0x3333333333333333333333333333333333333333"]
+        ), patch.object(
+            config, "WATCHLIST_GECKO_TRENDING_PAGES", 1
+        ), patch.object(
+            config, "WATCHLIST_GECKO_POOLS_PAGES", 0
+        ):
+            rows = await monitor._refresh()
+
+        await monitor.close()
+        symbols = {str(x.get("symbol", "")).upper() for x in rows}
+        self.assertEqual(symbols, {"OKX"})
+
+    async def test_refresh_skips_excluded_when_symbol_list_is_csv_string(self) -> None:
+        monitor = WatchlistMonitor()
+
+        async def fake_fetch_dex(**kwargs) -> list[dict]:  # noqa: ARG001
+            return [
+                {
+                    "symbol": "NOOK",
+                    "address": "0x1111111111111111111111111111111111111111",
+                    "liquidity": 300000.0,
+                    "volume_5m": 2500.0,
+                    "source": "watchlist",
+                },
+                {
+                    "symbol": "OKX",
+                    "address": "0x2222222222222222222222222222222222222222",
+                    "liquidity": 350000.0,
+                    "volume_5m": 3200.0,
+                    "source": "watchlist",
+                },
+            ]
+
+        async def fake_fetch_gecko_page(kind: str, page: int = 1, **kwargs) -> list[dict]:  # noqa: ARG001
+            return []
+
+        monitor._fetch_dexscreener_watchlist = fake_fetch_dex  # type: ignore[assignment]
+        monitor._fetch_gecko_pool_page = fake_fetch_gecko_page  # type: ignore[assignment]
+        with patch.object(config, "AUTO_TRADE_EXCLUDED_SYMBOLS", "NOOK,FELIX"), patch.object(
+            config, "AUTO_TRADE_EXCLUDED_SYMBOL_KEYWORDS", ""
+        ), patch.object(
+            config, "AUTO_TRADE_HARD_BLOCKED_ADDRESSES", ""
+        ), patch.object(
+            config, "WATCHLIST_GECKO_TRENDING_PAGES", 1
+        ), patch.object(
+            config, "WATCHLIST_GECKO_POOLS_PAGES", 0
+        ):
+            rows = await monitor._refresh()
+
+        await monitor.close()
+        symbols = {str(x.get("symbol", "")).upper() for x in rows}
+        self.assertEqual(symbols, {"OKX"})
+
 
 if __name__ == "__main__":
     unittest.main()

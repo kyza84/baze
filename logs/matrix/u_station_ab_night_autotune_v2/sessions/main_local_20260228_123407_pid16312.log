@@ -1,0 +1,7 @@
+2026-02-28 13:34:07,249 [INFO] [u_station_ab_night_autotune_v2] __main__: SESSION_LOG file=logs/matrix/u_station_ab_night_autotune_v2\sessions\main_local_20260228_123407_pid16312.log
+2026-02-28 13:34:07,278 [INFO] [u_station_ab_night_autotune_v2] trading.auto_trader_state: AutoTrade state loaded open=0 closed=194 balance=$7.73
+2026-02-28 13:34:07,289 [WARNING] [u_station_ab_night_autotune_v2] trading.auto_trader: DATA_POLICY mode=OK reason=init_reset_manual prev_mode=OK prev_reason=healthy | route=allow_all
+2026-02-28 13:34:07,290 [INFO] [u_station_ab_night_autotune_v2] __main__: AUTOTRADER_INIT state=ready reason=manual mode=paper
+2026-02-28 13:34:07,292 [INFO] [u_station_ab_night_autotune_v2] __main__: Local mode started (Telegram disabled).
+2026-02-28 13:34:07,405 [WARNING] [u_station_ab_night_autotune_v2] __main__: RUNTIME_TUNER_CONTROL active run_tag=u_station_ab_night_autotune_v2: local adaptive controllers locked (kpi/calibration/rolling/orchestrator).
+2026-02-28 13:34:07,406 [WARNING] [u_station_ab_night_autotune_v2] __main__: RUNTIME_TUNER_HOT_APPLY run_tag=u_station_ab_night_autotune_v2 keys=2 details=AUTO_TRADE_TOP_N,PAPER_TRADE_SIZE_MAX_USD

@@ -1,6 +1,7 @@
 """Application configuration."""
 
 import os
+from pathlib import Path
 from typing import Dict, Tuple
 
 from dotenv import load_dotenv
@@ -19,10 +20,17 @@ def _load_dotenv_safe(dotenv_path: str | None = None, *, override: bool = False)
 _load_dotenv_safe()
 _BOT_ENV_FILE = os.getenv("BOT_ENV_FILE", "").strip()
 if _BOT_ENV_FILE:
+    _bot_env_path = Path(_BOT_ENV_FILE).expanduser()
+    if not _bot_env_path.is_absolute():
+        _bot_env_path = (Path.cwd() / _bot_env_path).resolve()
+    if not _bot_env_path.exists():
+        raise FileNotFoundError(f"BOT_ENV_FILE does not exist: {_bot_env_path}")
+    if not _bot_env_path.is_file():
+        raise IsADirectoryError(f"BOT_ENV_FILE is not a file: {_bot_env_path}")
     try:
-        _load_dotenv_safe(_BOT_ENV_FILE, override=True)
-    except Exception:
-        pass
+        _load_dotenv_safe(str(_bot_env_path), override=True)
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise RuntimeError(f"Failed to load BOT_ENV_FILE '{_bot_env_path}': {exc}") from exc
 
 
 def _parse_source_rate_limits(raw: str) -> Dict[str, Tuple[int, float]]:
@@ -209,6 +217,35 @@ WATCHLIST_REQUIRE_WETH_QUOTE = os.getenv("WATCHLIST_REQUIRE_WETH_QUOTE", "true")
     "y",
     "on",
 )
+WATCHLIST_LOW_SUPPLY_MIN_COUNT = max(1, int(os.getenv("WATCHLIST_LOW_SUPPLY_MIN_COUNT", "12")))
+WATCHLIST_LOW_SUPPLY_RELAX_FACTOR = max(
+    0.05,
+    min(1.0, float(os.getenv("WATCHLIST_LOW_SUPPLY_RELAX_FACTOR", "0.50"))),
+)
+WATCHLIST_LOW_SUPPLY_MIN_VOLUME_5M_USD = max(
+    0.0,
+    float(os.getenv("WATCHLIST_LOW_SUPPLY_MIN_VOLUME_5M_USD", "120")),
+)
+WATCHLIST_LOW_SUPPLY_RELAX_MIN_PRICE_CHANGE_5M_ABS_PERCENT = max(
+    0.0,
+    float(os.getenv("WATCHLIST_LOW_SUPPLY_RELAX_MIN_PRICE_CHANGE_5M_ABS_PERCENT", "0.0")),
+)
+WATCHLIST_LOW_SUPPLY_ALLOW_NON_WETH_IN_PAPER = os.getenv(
+    "WATCHLIST_LOW_SUPPLY_ALLOW_NON_WETH_IN_PAPER",
+    "true",
+).strip().lower() in ("1", "true", "yes", "y", "on")
+WATCHLIST_LOW_SUPPLY_RELAX_TRENDING_PAGES = max(
+    0,
+    int(os.getenv("WATCHLIST_LOW_SUPPLY_RELAX_TRENDING_PAGES", "1")),
+)
+WATCHLIST_LOW_SUPPLY_RELAX_POOLS_PAGES = max(
+    0,
+    int(os.getenv("WATCHLIST_LOW_SUPPLY_RELAX_POOLS_PAGES", "1")),
+)
+WATCHLIST_LOW_SUPPLY_FALLBACK_TIMEOUT_SECONDS = max(
+    1.0,
+    float(os.getenv("WATCHLIST_LOW_SUPPLY_FALLBACK_TIMEOUT_SECONDS", "8.0")),
+)
 WATCHLIST_ALERTS_ENABLED = os.getenv("WATCHLIST_ALERTS_ENABLED", "false").strip().lower() in (
     "1",
     "true",
@@ -336,6 +373,22 @@ MARKET_MODE_RED_PARTIAL_TP_SELL_MULT = max(0.2, float(os.getenv("MARKET_MODE_RED
 ADAPTIVE_FILTERS_ENABLED = os.getenv("ADAPTIVE_FILTERS_ENABLED", "false").lower() == "true"
 ADAPTIVE_FILTERS_MODE = os.getenv("ADAPTIVE_FILTERS_MODE", "dry_run").strip().lower()  # off | dry_run | apply
 ADAPTIVE_FILTERS_PAPER_ONLY = os.getenv("ADAPTIVE_FILTERS_PAPER_ONLY", "true").lower() == "true"
+RUNTIME_TUNER_LOCK_LOCAL_CONTROLLERS = os.getenv(
+    "RUNTIME_TUNER_LOCK_LOCAL_CONTROLLERS",
+    "true",
+).strip().lower() in ("1", "true", "yes", "y", "on")
+RUNTIME_TUNER_LOCK_CHECK_INTERVAL_SECONDS = max(
+    1,
+    int(os.getenv("RUNTIME_TUNER_LOCK_CHECK_INTERVAL_SECONDS", "3")),
+)
+RUNTIME_TUNER_PRUNE_STALE_LOCK = os.getenv(
+    "RUNTIME_TUNER_PRUNE_STALE_LOCK",
+    "true",
+).strip().lower() in ("1", "true", "yes", "y", "on")
+RUNTIME_TUNER_STALE_LOCK_SECONDS = max(
+    10,
+    int(os.getenv("RUNTIME_TUNER_STALE_LOCK_SECONDS", "120")),
+)
 ADAPTIVE_FILTERS_INTERVAL_SECONDS = max(60, int(os.getenv("ADAPTIVE_FILTERS_INTERVAL_SECONDS", "900")))
 ADAPTIVE_FILTERS_MIN_WINDOW_CYCLES = max(1, int(os.getenv("ADAPTIVE_FILTERS_MIN_WINDOW_CYCLES", "5")))
 ADAPTIVE_FILTERS_COOLDOWN_WINDOWS = max(0, int(os.getenv("ADAPTIVE_FILTERS_COOLDOWN_WINDOWS", "1")))
@@ -1624,6 +1677,8 @@ HONEYPOT_API_CACHE_TTL_SECONDS = max(60, int(os.getenv("HONEYPOT_API_CACHE_TTL_S
 HONEYPOT_API_FAIL_CLOSED = os.getenv("HONEYPOT_API_FAIL_CLOSED", "true").lower() == "true"
 # Also apply honeypot guard for paper/matrix mode to keep simulation close to live safety.
 HONEYPOT_GUARD_IN_PAPER = os.getenv("HONEYPOT_GUARD_IN_PAPER", "true").lower() == "true"
+# When false, transient honeypot API failures (status/timeouts) only trigger cooldown, not persistent blacklist.
+HONEYPOT_TRANSIENT_TO_BLACKLIST = os.getenv("HONEYPOT_TRANSIENT_TO_BLACKLIST", "false").lower() == "true"
 HONEYPOT_MAX_BUY_TAX_PERCENT = float(os.getenv("HONEYPOT_MAX_BUY_TAX_PERCENT", "10"))
 HONEYPOT_MAX_SELL_TAX_PERCENT = float(os.getenv("HONEYPOT_MAX_SELL_TAX_PERCENT", "10"))
 
@@ -1725,6 +1780,10 @@ AUTOTRADE_BLACKLIST_FILE = os.getenv(
     os.path.join("data", "autotrade_blacklist.json"),
 )
 AUTOTRADE_BLACKLIST_TTL_SECONDS = max(300, int(os.getenv("AUTOTRADE_BLACKLIST_TTL_SECONDS", "86400")))
+AUTOTRADE_BLACKLIST_UNKNOWN_TTL_SECONDS = max(
+    300,
+    int(os.getenv("AUTOTRADE_BLACKLIST_UNKNOWN_TTL_SECONDS", "900")),
+)
 AUTOTRADE_BLACKLIST_TRANSIENT_SAFETY_TTL_SECONDS = max(
     300,
     int(os.getenv("AUTOTRADE_BLACKLIST_TRANSIENT_SAFETY_TTL_SECONDS", "900")),
@@ -1737,6 +1796,26 @@ AUTOTRADE_BLACKLIST_PAPER_HARD_ONLY = os.getenv("AUTOTRADE_BLACKLIST_PAPER_HARD_
 # - top_n: open best N eligible candidates per scan cycle
 AUTO_TRADE_ENTRY_MODE = os.getenv("AUTO_TRADE_ENTRY_MODE", "single").lower()
 AUTO_TRADE_TOP_N = int(os.getenv("AUTO_TRADE_TOP_N", "10"))
+# Plan batch diversity controls (applied in AutoTrader._rebalance_plan_batch_sources).
+PLAN_MAX_SINGLE_SOURCE_SHARE = max(
+    0.20,
+    min(1.00, float(os.getenv("PLAN_MAX_SINGLE_SOURCE_SHARE", "0.50"))),
+)
+PLAN_MAX_WATCHLIST_SHARE = max(
+    0.00,
+    min(1.00, float(os.getenv("PLAN_MAX_WATCHLIST_SHARE", "0.30"))),
+)
+PLAN_MIN_NON_WATCHLIST_PER_BATCH = max(0, int(os.getenv("PLAN_MIN_NON_WATCHLIST_PER_BATCH", "1")))
+# Optional hard guard at plan stage: enforce non-watchlist quota in rolling open window.
+PLAN_NON_WATCHLIST_QUOTA_ENABLED = os.getenv("PLAN_NON_WATCHLIST_QUOTA_ENABLED", "true").lower() == "true"
+PLAN_NON_WATCHLIST_QUOTA_WINDOW_SECONDS = max(
+    300,
+    int(os.getenv("PLAN_NON_WATCHLIST_QUOTA_WINDOW_SECONDS", "900")),
+)
+PLAN_NON_WATCHLIST_QUOTA_MIN_OPENS = max(
+    2,
+    int(os.getenv("PLAN_NON_WATCHLIST_QUOTA_MIN_OPENS", "4")),
+)
 # MAX_OPEN_TRADES:
 # - 0 means unlimited open positions
 MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "1"))
@@ -2039,6 +2118,11 @@ EXTREME_SL_SYMBOL_COOLDOWN_SECONDS = max(
     int(os.getenv("EXTREME_SL_SYMBOL_COOLDOWN_SECONDS", "5400")),
 )
 CORE_BLOCK_L1_FOR_CORE_ENABLED = os.getenv("CORE_BLOCK_L1_FOR_CORE_ENABLED", "true").lower() == "true"
+CORE_BLOCK_L1_FALLBACK_TO_EXPLORE = os.getenv("CORE_BLOCK_L1_FALLBACK_TO_EXPLORE", "true").lower() == "true"
+CORE_L1_FALLBACK_SIZE_MULT = max(0.10, float(os.getenv("CORE_L1_FALLBACK_SIZE_MULT", "0.65")))
+CORE_L1_FALLBACK_HOLD_MULT = max(0.20, float(os.getenv("CORE_L1_FALLBACK_HOLD_MULT", "0.75")))
+CORE_L1_FALLBACK_EDGE_USD_MULT = max(1.00, float(os.getenv("CORE_L1_FALLBACK_EDGE_USD_MULT", "1.25")))
+CORE_L1_FALLBACK_EDGE_PERCENT_MULT = max(1.00, float(os.getenv("CORE_L1_FALLBACK_EDGE_PERCENT_MULT", "1.20")))
 SYMBOL_EV_GUARD_ENABLED = os.getenv("SYMBOL_EV_GUARD_ENABLED", "true").lower() == "true"
 SYMBOL_EV_WINDOW_MINUTES = max(10, int(os.getenv("SYMBOL_EV_WINDOW_MINUTES", "120")))
 SYMBOL_EV_MIN_TRADES = max(1, int(os.getenv("SYMBOL_EV_MIN_TRADES", "3")))
@@ -2067,6 +2151,20 @@ SYMBOL_CONCENTRATION_MAX_SHARE = max(
 SYMBOL_CONCENTRATION_TIER_A_SHARE_MULT = max(
     1.0,
     float(os.getenv("SYMBOL_CONCENTRATION_TIER_A_SHARE_MULT", "1.15")),
+)
+# Hard anti-repeat block for 15m rolling opens (separate from concentration guard and anti-choke bypasses).
+TOP1_OPEN_SHARE_15M_GUARD_ENABLED = os.getenv("TOP1_OPEN_SHARE_15M_GUARD_ENABLED", "true").lower() == "true"
+TOP1_OPEN_SHARE_15M_WINDOW_SECONDS = max(
+    300,
+    int(os.getenv("TOP1_OPEN_SHARE_15M_WINDOW_SECONDS", "900")),
+)
+TOP1_OPEN_SHARE_15M_MIN_OPENS = max(
+    2,
+    int(os.getenv("TOP1_OPEN_SHARE_15M_MIN_OPENS", "4")),
+)
+TOP1_OPEN_SHARE_15M_MAX_SHARE = max(
+    0.20,
+    min(1.0, float(os.getenv("TOP1_OPEN_SHARE_15M_MAX_SHARE", "0.72"))),
 )
 
 # EV-core (entry/sizing/exit) controls.

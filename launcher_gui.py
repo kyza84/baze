@@ -37,15 +37,19 @@ except Exception:  # pragma: no cover
     Web3 = None  # type: ignore[assignment]
 
 def _fix_mojibake(text: str) -> str:
-    """Fix UTF-8 bytes that were mistakenly decoded as latin-1 (common Ã...Ã‘... mojibake)."""
+    """Fix common UTF-8 mojibake variants (e.g. Ã..., Ð..., Ñ...)."""
     if not isinstance(text, str):
         return str(text)
-    if "Ã" not in text and "Ã‘" not in text:
+    if not any(marker in text for marker in ("Ã", "Ð", "Ñ")):
         return text
-    try:
-        return text.encode("latin1").decode("utf-8")
-    except Exception:
-        return text
+    for source_encoding in ("latin1", "cp1252"):
+        try:
+            fixed = text.encode(source_encoding).decode("utf-8")
+        except Exception:
+            continue
+        if fixed != text and re.search(r"[А-Яа-яЁё]", fixed):
+            return fixed
+    return text
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 PYTHON_PATH = os.path.join(PROJECT_ROOT, ".venv", "Scripts", "python.exe")
@@ -4835,3 +4839,4 @@ if __name__ == "__main__":
             App().mainloop()
         finally:
             gui_lock.release()
+

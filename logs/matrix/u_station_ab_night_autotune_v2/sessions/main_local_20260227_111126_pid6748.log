@@ -1,0 +1,5 @@
+2026-02-27 12:11:26,362 [INFO] [u_station_ab_night_autotune_v2] __main__: SESSION_LOG file=logs/matrix/u_station_ab_night_autotune_v2\sessions\main_local_20260227_111126_pid6748.log
+2026-02-27 12:11:26,379 [INFO] [u_station_ab_night_autotune_v2] trading.auto_trader_state: AutoTrade state loaded open=1 closed=94 balance=$6.89
+2026-02-27 12:11:26,379 [WARNING] [u_station_ab_night_autotune_v2] trading.auto_trader: DATA_POLICY mode=OK reason=init_reset_manual prev_mode=OK prev_reason=healthy | route=allow_all
+2026-02-27 12:11:26,394 [INFO] [u_station_ab_night_autotune_v2] __main__: AUTOTRADER_INIT state=ready reason=manual mode=paper
+2026-02-27 12:11:26,394 [INFO] [u_station_ab_night_autotune_v2] __main__: Local mode started (Telegram disabled).

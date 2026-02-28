@@ -33,6 +33,28 @@
       "sensitivity": "high",
       "importance": "flow"
     },
+    "MAX_TX_PER_DAY": {
+      "type": "int",
+      "min": 0,
+      "max": 5000,
+      "sensitivity": "high",
+      "importance": "flow"
+    },
+    "ANTI_CHOKE_ALLOW_SYMBOL_COOLDOWN_BYPASS": {
+      "type": "bool",
+      "sensitivity": "high",
+      "importance": "diversification"
+    },
+    "ANTI_CHOKE_ALLOW_SYMBOL_FATIGUE_BYPASS": {
+      "type": "bool",
+      "sensitivity": "high",
+      "importance": "diversification"
+    },
+    "ANTI_CHOKE_ALLOW_SYMBOL_STRICT_BYPASS": {
+      "type": "bool",
+      "sensitivity": "high",
+      "importance": "diversification"
+    },
     "MIN_TOKEN_SCORE": {
       "type": "int",
       "min": 15,
@@ -66,6 +88,44 @@
       "min": 0.0005,
       "max": 0.05,
       "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "V2_ROLLING_EDGE_MIN_USD": {
+      "type": "float",
+      "min": 0.0005,
+      "max": 0.05,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "V2_ROLLING_EDGE_MIN_PERCENT": {
+      "type": "float",
+      "min": 0.05,
+      "max": 3.0,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "V2_CALIBRATION_ENABLED": {
+      "type": "bool",
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "V2_CALIBRATION_NO_TIGHTEN_DURING_RELAX_WINDOW": {
+      "type": "bool",
+      "sensitivity": "medium",
+      "importance": "routing"
+    },
+    "V2_CALIBRATION_EDGE_USD_MIN": {
+      "type": "float",
+      "min": 0.0005,
+      "max": 0.05,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "V2_CALIBRATION_VOLUME_MIN": {
+      "type": "float",
+      "min": 5.0,
+      "max": 450.0,
+      "sensitivity": "medium",
       "importance": "entry_quality"
     },
     "EV_FIRST_ENTRY_MIN_NET_USD": {
@@ -109,6 +169,20 @@
       "max": 3600,
       "sensitivity": "high",
       "importance": "entry_quality"
+    },
+    "TOKEN_AGE_MAX": {
+      "type": "int",
+      "min": 1800,
+      "max": 21600,
+      "sensitivity": "medium",
+      "importance": "source_quality"
+    },
+    "SEEN_TOKEN_TTL": {
+      "type": "int",
+      "min": 300,
+      "max": 21600,
+      "sensitivity": "medium",
+      "importance": "source_quality"
     },
     "PAPER_TRADE_SIZE_MIN_USD": {
       "type": "float",

@@ -9,6 +9,7 @@ import hashlib
 import json
 import logging
 import os
+import subprocess
 import time
 from collections import deque
 from datetime import datetime, timezone
@@ -57,6 +58,32 @@ WINDOWS_MUTEX_NAME = (
 )
 PID_FILE = os.path.join(PROJECT_ROOT, "bot.pid")
 HEARTBEAT_FILE = os.path.join(LOG_DIR, "heartbeat.json")
+_RUNTIME_TUNER_LOCK_STATE: dict[str, float | int | bool] = {
+    "checked_at": 0.0,
+    "active": False,
+    "pid": 0,
+}
+_RUNTIME_TUNER_PATCH_STATE: dict[str, Any] = {
+    "checked_mtime": 0.0,
+    "applied_hash": "",
+    "last_error": "",
+    "applied_keys": [],
+}
+_RUNTIME_TUNER_RELOAD_PREFIX_MAP: dict[str, str] = {
+    "V2_UNIVERSE_": "universe",
+    "V2_SOURCE_QOS_": "source_qos",
+    "V2_QUALITY_": "quality_gate",
+    "V2_SAFETY_BUDGET_": "safety_budget",
+    "V2_CALIBRATION_": "calibrator",
+    "V2_ROLLING_EDGE_": "rolling_edge",
+    "V2_ANTI_SELF_TIGHTEN_": "rolling_edge",
+    "V2_ENTRY_": "dual_entry",
+    "V2_POLICY_": "policy_router",
+    "V2_KPI_": "kpi_loop",
+}
+_RUNTIME_TUNER_RELOAD_EXACT_MAP: dict[str, str] = {
+    "PROFIT_ENGINE_ENABLED": "kpi_loop",
+}
 
 
 def _should_manage_single_pid_file() -> bool:
@@ -132,6 +159,255 @@ def _write_heartbeat(*, stage: str, cycle_index: int, open_trades: int = 0, deta
     except Exception:
         # Heartbeat must never break runtime loop.
         pass
+
+
+def _pid_is_alive(pid: int) -> bool:
+    pid = int(pid or 0)
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            creationflags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            probe = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+                creationflags=creationflags,
+            )
+            line = str(probe.stdout or "").strip().lower()
+            if not line or "no tasks are running" in line:
+                return False
+            return (str(pid) in line) and ("python.exe" in line)
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+
+def _runtime_tuner_lock_file(run_tag: str) -> str:
+    safe_tag = str(run_tag or "").strip()
+    if not safe_tag:
+        return ""
+    return os.path.join(PROJECT_ROOT, "logs", "matrix", safe_tag, "runtime_tuner.lock.json")
+
+
+def _runtime_tuner_patch_file(run_tag: str) -> str:
+    safe_tag = str(run_tag or "").strip()
+    if not safe_tag:
+        return ""
+    return os.path.join(PROJECT_ROOT, "logs", "matrix", safe_tag, "runtime_tuner_runtime_overrides.json")
+
+
+def _runtime_tuner_applied_keys() -> list[str]:
+    raw = _RUNTIME_TUNER_PATCH_STATE.get("applied_keys", [])
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    for item in raw:
+        key = str(item or "").strip().upper()
+        if key:
+            out.append(key)
+    return out
+
+
+def _runtime_tuner_reload_targets(applied_keys: list[str]) -> set[str]:
+    targets: set[str] = set()
+    for key in applied_keys:
+        normalized = str(key or "").strip().upper()
+        if not normalized:
+            continue
+        exact = _RUNTIME_TUNER_RELOAD_EXACT_MAP.get(normalized)
+        if exact:
+            targets.add(exact)
+        for prefix, target in _RUNTIME_TUNER_RELOAD_PREFIX_MAP.items():
+            if normalized.startswith(prefix):
+                targets.add(target)
+                break
+    return targets
+
+
+def _enforce_source_qos_dual_entry_guard() -> None:
+    if (
+        bool(getattr(config, "V2_SOURCE_QOS_FORCE_DUAL_ENTRY", True))
+        and not bool(getattr(config, "V2_ENTRY_DUAL_CHANNEL_ENABLED", False))
+    ):
+        setattr(config, "V2_ENTRY_DUAL_CHANNEL_ENABLED", True)
+        if float(getattr(config, "V2_ENTRY_EXPLORE_MAX_SHARE", 0.0) or 0.0) <= 0.0:
+            setattr(config, "V2_ENTRY_EXPLORE_MAX_SHARE", 0.18)
+        logger.warning(
+            "V2_SOURCE_QOS forced dual-entry lanes enabled=%s explore_share=%.2f",
+            bool(getattr(config, "V2_ENTRY_DUAL_CHANNEL_ENABLED", False)),
+            float(getattr(config, "V2_ENTRY_EXPLORE_MAX_SHARE", 0.0) or 0.0),
+        )
+
+
+def _coerce_runtime_override_value(*, key: str, raw: Any) -> Any:
+    text = str(raw).strip() if raw is not None else ""
+    current = getattr(config, key, None)
+
+    if isinstance(current, bool):
+        low = text.lower()
+        if low in {"1", "true", "yes", "on"}:
+            return True
+        if low in {"0", "false", "no", "off"}:
+            return False
+        return bool(current)
+    if isinstance(current, int) and not isinstance(current, bool):
+        try:
+            return int(round(float(text)))
+        except Exception:
+            return int(current)
+    if isinstance(current, float):
+        try:
+            return float(text)
+        except Exception:
+            return float(current)
+    if isinstance(current, (list, tuple, set)):
+        if isinstance(raw, (list, tuple, set)):
+            parts = [str(x).strip() for x in raw if str(x).strip()]
+        else:
+            parts = [p.strip() for p in text.split(",") if p.strip()]
+        if isinstance(current, tuple):
+            return tuple(parts)
+        if isinstance(current, set):
+            return set(parts)
+        return parts
+    if isinstance(current, str):
+        return text
+
+    # Fallback for unknown attribute types.
+    low = text.lower()
+    if low in {"true", "false"}:
+        return low == "true"
+    try:
+        if "." in text:
+            return float(text)
+        return int(text)
+    except Exception:
+        return text
+
+
+def _runtime_tuner_apply_runtime_overrides(*, run_tag: str) -> tuple[bool, int, str]:
+    if not bool(getattr(config, "RUNTIME_TUNER_HOT_APPLY_ENABLED", True)):
+        _RUNTIME_TUNER_PATCH_STATE["applied_keys"] = []
+        return False, 0, "disabled"
+    patch_path = _runtime_tuner_patch_file(run_tag)
+    if not patch_path or not os.path.exists(patch_path):
+        _RUNTIME_TUNER_PATCH_STATE["applied_keys"] = []
+        return False, 0, "missing"
+
+    try:
+        mtime = float(os.path.getmtime(patch_path))
+    except Exception as exc:
+        _RUNTIME_TUNER_PATCH_STATE["applied_keys"] = []
+        return False, 0, f"error:stat_failed:{exc}"
+
+    checked_mtime = float(_RUNTIME_TUNER_PATCH_STATE.get("checked_mtime", 0.0) or 0.0)
+    if mtime <= checked_mtime:
+        _RUNTIME_TUNER_PATCH_STATE["applied_keys"] = []
+        return False, 0, "unchanged"
+
+    try:
+        with open(patch_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception as exc:
+        _RUNTIME_TUNER_PATCH_STATE["applied_keys"] = []
+        return False, 0, f"error:read_failed:{exc}"
+
+    overrides_raw = payload.get("overrides", {}) if isinstance(payload, dict) else {}
+    if not isinstance(overrides_raw, dict):
+        _RUNTIME_TUNER_PATCH_STATE["applied_keys"] = []
+        return False, 0, "error:invalid_payload"
+
+    normalized = {str(k): str(v) for k, v in overrides_raw.items()}
+    payload_hash = hashlib.sha256(
+        json.dumps(normalized, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()[:16]
+    if payload_hash == str(_RUNTIME_TUNER_PATCH_STATE.get("applied_hash", "") or ""):
+        _RUNTIME_TUNER_PATCH_STATE["checked_mtime"] = mtime
+        _RUNTIME_TUNER_PATCH_STATE["applied_keys"] = []
+        return False, 0, "unchanged_hash"
+
+    applied_keys: list[str] = []
+    skipped_unknown = 0
+    for key in sorted(normalized.keys()):
+        if not key or (not hasattr(config, key)):
+            skipped_unknown += 1
+            continue
+        current = getattr(config, key)
+        value = _coerce_runtime_override_value(key=key, raw=normalized[key])
+        if current == value:
+            continue
+        setattr(config, key, value)
+        applied_keys.append(key)
+
+    _RUNTIME_TUNER_PATCH_STATE["checked_mtime"] = mtime
+    _RUNTIME_TUNER_PATCH_STATE["applied_hash"] = payload_hash
+    _RUNTIME_TUNER_PATCH_STATE["last_error"] = ""
+    _RUNTIME_TUNER_PATCH_STATE["applied_keys"] = sorted(applied_keys)
+    if applied_keys:
+        detail = ",".join(applied_keys[:8])
+        if len(applied_keys) > 8:
+            detail += ",..."
+        if skipped_unknown > 0:
+            detail += f" skipped_unknown={skipped_unknown}"
+        return True, len(applied_keys), detail
+    if skipped_unknown > 0:
+        return False, 0, f"no_changes skipped_unknown={skipped_unknown}"
+    return False, 0, "no_changes"
+
+
+def _runtime_tuner_control_active(*, run_tag: str) -> bool:
+    if not bool(getattr(config, "RUNTIME_TUNER_LOCK_LOCAL_CONTROLLERS", True)):
+        return False
+
+    interval = max(1.0, float(getattr(config, "RUNTIME_TUNER_LOCK_CHECK_INTERVAL_SECONDS", 3) or 3))
+    now_ts = float(time.time())
+    last_checked = float(_RUNTIME_TUNER_LOCK_STATE.get("checked_at", 0.0) or 0.0)
+    if (now_ts - last_checked) < interval:
+        return bool(_RUNTIME_TUNER_LOCK_STATE.get("active", False))
+
+    active = False
+    pid = 0
+    lock_path = _runtime_tuner_lock_file(run_tag)
+    if lock_path and os.path.exists(lock_path):
+        try:
+            with open(lock_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            pid = int(payload.get("pid", 0) or 0)
+            active = _pid_is_alive(pid)
+            if (not active) and bool(getattr(config, "RUNTIME_TUNER_PRUNE_STALE_LOCK", True)):
+                stale_after = max(
+                    10.0,
+                    float(getattr(config, "RUNTIME_TUNER_STALE_LOCK_SECONDS", 120) or 120),
+                )
+                lock_mtime = float(os.path.getmtime(lock_path))
+                lock_age = max(0.0, now_ts - lock_mtime)
+                if lock_age >= stale_after:
+                    try:
+                        os.remove(lock_path)
+                        logger.warning(
+                            "RUNTIME_TUNER_CONTROL pruned stale lock run_tag=%s pid=%s age=%.1fs path=%s",
+                            run_tag,
+                            int(pid or 0),
+                            float(lock_age),
+                            lock_path,
+                        )
+                    except Exception:
+                        pass
+        except Exception:
+            active = False
+            pid = 0
+
+    _RUNTIME_TUNER_LOCK_STATE["checked_at"] = now_ts
+    _RUNTIME_TUNER_LOCK_STATE["active"] = bool(active)
+    _RUNTIME_TUNER_LOCK_STATE["pid"] = int(pid or 0)
+    return bool(active)
 
 
 def _rss_memory_mb() -> float:
@@ -442,18 +718,105 @@ def _apply_market_mode_hysteresis(
 
 
 def _excluded_trade_addresses() -> set[str]:
+    def _iter_values(raw: Any) -> list[str]:
+        if raw is None:
+            return []
+        if isinstance(raw, str):
+            return [x.strip() for x in raw.split(",") if x.strip()]
+        if isinstance(raw, (list, tuple, set)):
+            return [str(x).strip() for x in raw if str(x).strip()]
+        text = str(raw).strip()
+        return [text] if text else []
+
     out: set[str] = set()
     weth = normalize_address(getattr(config, "WETH_ADDRESS", ""))
     if weth:
         out.add(weth)
-    for addr in (getattr(config, "AUTO_TRADE_EXCLUDED_ADDRESSES", []) or []):
+    for addr in _iter_values(getattr(config, "AUTO_TRADE_EXCLUDED_ADDRESSES", [])):
         n = normalize_address(str(addr))
         if n:
             out.add(n)
     return out
 
 
+def _is_placeholder_trade_address(address: str) -> bool:
+    addr = normalize_address(address)
+    if not addr:
+        return True
+    return addr == "0x0000000000000000000000000000000000000000"
+
+
+def _excluded_trade_symbols() -> set[str]:
+    raw = getattr(config, "AUTO_TRADE_EXCLUDED_SYMBOLS", []) or []
+    if isinstance(raw, str):
+        items = [x.strip() for x in raw.split(",") if x.strip()]
+    elif isinstance(raw, (list, tuple, set)):
+        items = [str(x).strip() for x in raw if str(x).strip()]
+    else:
+        text = str(raw).strip()
+        items = [text] if text else []
+    return {
+        str(x).strip().upper()
+        for x in items
+        if str(x).strip()
+    }
+
+
+def _excluded_trade_symbol_keywords() -> list[str]:
+    raw = getattr(config, "AUTO_TRADE_EXCLUDED_SYMBOL_KEYWORDS", []) or []
+    if isinstance(raw, str):
+        items = [x.strip() for x in raw.split(",") if x.strip()]
+    elif isinstance(raw, (list, tuple, set)):
+        items = [str(x).strip() for x in raw if str(x).strip()]
+    else:
+        text = str(raw).strip()
+        items = [text] if text else []
+    return [
+        str(x).strip().upper()
+        for x in items
+        if str(x).strip()
+    ]
+
+
+def _excluded_symbol_reason(
+    symbol: str,
+    *,
+    excluded_symbols: set[str] | None = None,
+    excluded_keywords: list[str] | None = None,
+) -> str:
+    sym = str(symbol or "").strip().upper()
+    if not sym:
+        return ""
+    symbols = excluded_symbols if excluded_symbols is not None else _excluded_trade_symbols()
+    if sym in symbols:
+        return "excluded_symbol"
+    keywords = excluded_keywords if excluded_keywords is not None else _excluded_trade_symbol_keywords()
+    for keyword in keywords:
+        if keyword and keyword in sym:
+            return "excluded_symbol_keyword"
+    return ""
+
+
 def _merge_token_streams(*groups: list[dict]) -> list[dict]:
+    def _is_watchlist_source(token: dict) -> bool:
+        src = str((token or {}).get("source", "") or "").strip().lower()
+        return src.startswith("watchlist")
+
+    def _merge_enrichment(primary: dict, secondary: dict) -> dict:
+        # Keep the primary token identity/source, but backfill missing market fields.
+        out = dict(primary or {})
+        for key, value in (secondary or {}).items():
+            if key == "source":
+                continue
+            current = out.get(key)
+            if current in (None, "", 0, 0.0):
+                out[key] = value
+                continue
+            if isinstance(current, (int, float)) and isinstance(value, (int, float)):
+                if float(value) > float(current):
+                    out[key] = value
+        return out
+
     merged: dict[str, dict] = {}
     for group in groups:
         for token in group or []:
@@ -463,6 +826,14 @@ def _merge_token_streams(*groups: list[dict]) -> list[dict]:
             existing = merged.get(address)
             if not existing:
                 merged[address] = token
+                continue
+            existing_watch = _is_watchlist_source(existing)
+            token_watch = _is_watchlist_source(token)
+            if (not existing_watch) and token_watch:
+                merged[address] = _merge_enrichment(existing, token)
+                continue
+            if existing_watch and (not token_watch):
+                merged[address] = _merge_enrichment(token, existing)
                 continue
             existing_score = (
                 (1 if float(existing.get("liquidity") or 0) > 0 else 0)
@@ -2121,18 +2492,7 @@ async def run_local_loop() -> None:
         realized_usd=float(adaptive_init_stats.get("realized_pnl_usd", 0.0) or 0.0),
     )
     v2_source_qos = SourceQosController()
-    if (
-        bool(getattr(config, "V2_SOURCE_QOS_FORCE_DUAL_ENTRY", True))
-        and not bool(getattr(config, "V2_ENTRY_DUAL_CHANNEL_ENABLED", False))
-    ):
-        setattr(config, "V2_ENTRY_DUAL_CHANNEL_ENABLED", True)
-        if float(getattr(config, "V2_ENTRY_EXPLORE_MAX_SHARE", 0.0) or 0.0) <= 0.0:
-            setattr(config, "V2_ENTRY_EXPLORE_MAX_SHARE", 0.18)
-        logger.warning(
-            "V2_SOURCE_QOS forced dual-entry lanes enabled=%s explore_share=%.2f",
-            bool(getattr(config, "V2_ENTRY_DUAL_CHANNEL_ENABLED", False)),
-            float(getattr(config, "V2_ENTRY_EXPLORE_MAX_SHARE", 0.0) or 0.0),
-        )
+    _enforce_source_qos_dual_entry_guard()
     recent_candidate_counts: deque[int] = deque(
         maxlen=max(3, int(getattr(config, "MARKET_REGIME_WINDOW_CYCLES", 12) or 12))
     )
@@ -2141,6 +2501,7 @@ async def run_local_loop() -> None:
     market_mode_risk_streak = 0
     market_mode_recover_streak = 0
     market_regime_prev = market_regime_current
+    runtime_tuner_lock_prev: bool | None = None
     cycle_index = 0
 
     logger.info("Local mode started (Telegram disabled).")
@@ -2149,6 +2510,70 @@ async def run_local_loop() -> None:
         while True:
             cycle_index += 1
             _write_heartbeat(stage="cycle_begin", cycle_index=cycle_index, open_trades=len(auto_trader.open_positions))
+            runtime_tuner_lock_active = _runtime_tuner_control_active(run_tag=RUN_TAG)
+            if runtime_tuner_lock_prev is None or bool(runtime_tuner_lock_prev) != bool(runtime_tuner_lock_active):
+                if runtime_tuner_lock_active:
+                    logger.warning(
+                        "RUNTIME_TUNER_CONTROL active run_tag=%s: local adaptive controllers locked (kpi/calibration/rolling/orchestrator).",
+                        RUN_TAG,
+                    )
+                else:
+                    logger.warning(
+                        "RUNTIME_TUNER_CONTROL inactive run_tag=%s: local adaptive controllers unlocked.",
+                        RUN_TAG,
+                    )
+                runtime_tuner_lock_prev = bool(runtime_tuner_lock_active)
+            hot_applied, hot_count, hot_detail = _runtime_tuner_apply_runtime_overrides(run_tag=RUN_TAG)
+            if hot_applied:
+                logger.warning(
+                    "RUNTIME_TUNER_HOT_APPLY run_tag=%s keys=%s details=%s",
+                    RUN_TAG,
+                    int(hot_count),
+                    hot_detail,
+                )
+                applied_keys = _runtime_tuner_applied_keys()
+                reload_targets = _runtime_tuner_reload_targets(applied_keys)
+                reloaded: list[str] = []
+                if "universe" in reload_targets:
+                    v2_universe = UniverseFlowController()
+                    reloaded.append("universe")
+                if "source_qos" in reload_targets:
+                    v2_source_qos = SourceQosController()
+                    _enforce_source_qos_dual_entry_guard()
+                    reloaded.append("source_qos")
+                if "quality_gate" in reload_targets:
+                    v2_quality_gate = UniverseQualityGateController()
+                    reloaded.append("quality_gate")
+                if "safety_budget" in reload_targets:
+                    v2_safety_budget = SafetyBudgetController()
+                    reloaded.append("safety_budget")
+                if "calibrator" in reload_targets:
+                    v2_calibrator = UnifiedCalibrator()
+                    reloaded.append("calibrator")
+                if "policy_router" in reload_targets:
+                    v2_policy_router = PolicyEntryRouter()
+                    reloaded.append("policy_router")
+                if "dual_entry" in reload_targets:
+                    v2_dual_entry = DualEntryController()
+                    reloaded.append("dual_entry")
+                if "rolling_edge" in reload_targets:
+                    v2_rolling_edge = RollingEdgeGovernor()
+                    reloaded.append("rolling_edge")
+                if "kpi_loop" in reload_targets:
+                    v2_kpi_loop = RuntimeKpiLoop()
+                    reloaded.append("kpi_loop")
+                if reloaded:
+                    logger.warning(
+                        "RUNTIME_TUNER_HOT_APPLY_REFRESH run_tag=%s targets=%s applied_keys=%s",
+                        RUN_TAG,
+                        ",".join(sorted(reloaded)),
+                        ",".join(applied_keys[:8]) + (",..." if len(applied_keys) > 8 else ""),
+                    )
+            elif str(hot_detail).startswith("error:"):
+                last_err = str(_RUNTIME_TUNER_PATCH_STATE.get("last_error", "") or "")
+                if hot_detail != last_err:
+                    _RUNTIME_TUNER_PATCH_STATE["last_error"] = hot_detail
+                    logger.warning("RUNTIME_TUNER_HOT_APPLY run_tag=%s %s", RUN_TAG, hot_detail)
             if _graceful_stop_requested():
                 logger.warning("GRACEFUL_STOP requested path=%s", _graceful_stop_file_path())
                 break
@@ -2274,6 +2699,8 @@ async def run_local_loop() -> None:
                     soft_score_base = int(getattr(config, "MARKET_MODE_SOFT_SCORE", 70) or 70)
                     soft_score_min = max(base_score_floor, min(strict_score_min, soft_score_base + int(regime_score_delta)))
                     soft_selected_cycle = 0
+                    excluded_symbols_cycle = _excluded_trade_symbols()
+                    excluded_keywords_cycle = _excluded_trade_symbol_keywords()
 
                     def _filter_fail(reason: str, token: dict, extra: str = "") -> None:
                         key = str(reason or "unknown").strip().lower() or "unknown"
@@ -2332,10 +2759,27 @@ async def run_local_loop() -> None:
                                 str(row.get("extra", "") or ""),
                             )
 
+                    cycle_seen_addresses: set[str] = set()
                     for token_idx, token in enumerate(tokens):
                         token_address = normalize_address(token.get("address", ""))
                         candidate_id = f"{RUN_TAG}:{cycle_index}:{token_idx}:{token_address or 'noaddr'}"
                         token["_candidate_id"] = candidate_id
+                        if _is_placeholder_trade_address(token_address):
+                            _filter_fail("invalid_address", token, f"address={token_address or 'missing'}")
+                            continue
+                        if token_address in cycle_seen_addresses:
+                            _filter_fail("duplicate_address", token, "cycle_dedup")
+                            continue
+                        cycle_seen_addresses.add(token_address)
+                        blk_blocked, blk_reason = auto_trader.blacklist_status(token_address)
+                        if blk_blocked:
+                            _filter_fail("blacklist", token, str(blk_reason or "blacklisted"))
+                            continue
+                        symbol_now = str(token.get("symbol", "") or "")
+                        if auto_trader.is_hard_blocked(token_address, symbol=symbol_now):
+                            auto_trader.add_hard_blocklist_entry(token_address)
+                            _filter_fail("hard_blocklist", token, f"address={token_address}")
+                            continue
                         if token_address:
                             seen_now = time.monotonic()
                             prev_seen = float(heavy_last_seen_ts.get(token_address, 0.0) or 0.0)
@@ -2346,6 +2790,14 @@ async def run_local_loop() -> None:
                             heavy_last_seen_ts[token_address] = seen_now
                         if token_address in excluded_addresses:
                             _filter_fail("excluded_base_token", token)
+                            continue
+                        symbol_block_reason = _excluded_symbol_reason(
+                            str(token.get("symbol", "") or ""),
+                            excluded_symbols=excluded_symbols_cycle,
+                            excluded_keywords=excluded_keywords_cycle,
+                        )
+                        if symbol_block_reason:
+                            _filter_fail(symbol_block_reason, token)
                             continue
                         if not _belongs_to_candidate_shard(token_address):
                             _filter_fail("shard_skip", token)
@@ -2887,21 +3339,22 @@ async def run_local_loop() -> None:
                     symbols=candidates_symbols_cycle,
                     skip_reasons_cycle=skip_reasons_cycle,
                 )
-                adaptive_filters.maybe_adapt(
-                    policy_state=policy_state,
-                    auto_stats=auto_stats,
-                    source_stats=source_stats,
-                )
-                autonomy_controller.maybe_adapt(
-                    policy_state=policy_state,
-                    market_regime=market_regime_current,
-                    auto_stats=auto_stats,
-                )
-                strategy_orchestrator.maybe_adapt(
-                    policy_state=policy_state,
-                    market_regime=market_regime_current,
-                    auto_stats=auto_stats,
-                )
+                if not runtime_tuner_lock_active:
+                    adaptive_filters.maybe_adapt(
+                        policy_state=policy_state,
+                        auto_stats=auto_stats,
+                        source_stats=source_stats,
+                    )
+                    autonomy_controller.maybe_adapt(
+                        policy_state=policy_state,
+                        market_regime=market_regime_current,
+                        auto_stats=auto_stats,
+                    )
+                    strategy_orchestrator.maybe_adapt(
+                        policy_state=policy_state,
+                        market_regime=market_regime_current,
+                        auto_stats=auto_stats,
+                    )
                 if isinstance(source_qos_event, dict):
                     try:
                         await local_alerter.send_event(
@@ -2916,7 +3369,7 @@ async def run_local_loop() -> None:
                         )
                     except Exception:
                         logger.exception("V2_SOURCE_QOS event write failed")
-                kpi_event = v2_kpi_loop.maybe_apply(auto_trader=auto_trader)
+                kpi_event = None if runtime_tuner_lock_active else v2_kpi_loop.maybe_apply(auto_trader=auto_trader)
                 if isinstance(kpi_event, dict):
                     try:
                         await local_alerter.send_event(
@@ -2931,7 +3384,7 @@ async def run_local_loop() -> None:
                         )
                     except Exception:
                         logger.exception("V2_KPI_LOOP event write failed")
-                calibration_event = v2_calibrator.maybe_apply()
+                calibration_event = None if runtime_tuner_lock_active else v2_calibrator.maybe_apply()
                 if isinstance(calibration_event, dict):
                     try:
                         await local_alerter.send_event(
@@ -2946,7 +3399,11 @@ async def run_local_loop() -> None:
                         )
                     except Exception:
                         logger.exception("V2_CALIBRATION event write failed")
-                rolling_edge_event = v2_rolling_edge.maybe_apply(auto_trader=auto_trader, auto_stats=auto_stats)
+                rolling_edge_event = (
+                    None
+                    if runtime_tuner_lock_active
+                    else v2_rolling_edge.maybe_apply(auto_trader=auto_trader, auto_stats=auto_stats)
+                )
                 if isinstance(rolling_edge_event, dict):
                     try:
                         await local_alerter.send_event(

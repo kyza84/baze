@@ -1,0 +1,9 @@
+2026-02-27 05:30:35,727 [INFO] [u_station_ab_night_autotune_v2] __main__: SESSION_LOG file=logs/matrix/u_station_ab_night_autotune_v2\sessions\main_local_20260227_043035_pid16368.log
+2026-02-27 05:30:35,754 [INFO] [u_station_ab_night_autotune_v2] trading.auto_trader_state: AutoTrade state loaded open=2 closed=67 balance=$6.10
+2026-02-27 05:30:35,766 [WARNING] [u_station_ab_night_autotune_v2] trading.auto_trader: DATA_POLICY mode=OK reason=init_reset_manual prev_mode=OK prev_reason=healthy | route=allow_all
+2026-02-27 05:30:35,766 [INFO] [u_station_ab_night_autotune_v2] __main__: AUTOTRADER_INIT state=ready reason=manual mode=paper
+2026-02-27 05:30:35,767 [INFO] [u_station_ab_night_autotune_v2] __main__: Local mode started (Telegram disabled).
+2026-02-27 05:30:36,285 [INFO] [u_station_ab_night_autotune_v2] monitor.onchain_factory: PAIR_DETECTED source=uniswap_v2 dex=uniswap_v2 pair=0x395585f3c181b7a0d11456b6ba71926df5b97884 token0=0x17d5cf35303a097d6c8618ba59b9d4d00588798b token1=0x4200000000000000000000000000000000000006 block=42688634 factory=0x8909dc15e40173ff4699343b6eb8132c65e18ec6
+2026-02-27 05:30:36,285 [INFO] [u_station_ab_night_autotune_v2] monitor.onchain_factory: PAIR_DETECTED source=uniswap_v2 dex=uniswap_v2 pair=0x2be961355e39b2d2e8cdff1ed2874bbc1a532b3c token0=0x4200000000000000000000000000000000000006 token1=0x938f4b70b17afed8649ea30989a1a0fa01a2eb07 block=42688635 factory=0x8909dc15e40173ff4699343b6eb8132c65e18ec6
+2026-02-27 05:30:36,698 [INFO] [u_station_ab_night_autotune_v2] monitor.onchain_factory: ENRICH_RETRY token=0x938f4b70b17afed8649ea30989a1a0fa01a2eb07 pair=0x2be961355e39b2d2e8cdff1ed2874bbc1a532b3c attempt=1/2 delay=10s
+2026-02-27 05:30:36,885 [INFO] [u_station_ab_night_autotune_v2] monitor.onchain_factory: ENRICH_RETRY token=0x17d5cf35303a097d6c8618ba59b9d4d00588798b pair=0x395585f3c181b7a0d11456b6ba71926df5b97884 attempt=1/2 delay=10s

@@ -1546,11 +1546,19 @@ class UniverseQualityGateController:
             symbol = str(row.get("symbol", "-") or "-")
             return uniq_key, source, symbol, token
 
-        def _try_take(row: dict[str, Any], *, ignore_source_cap: bool = False) -> bool:
+        def _try_take(
+            row: dict[str, Any],
+            *,
+            ignore_source_cap: bool = False,
+            record_duplicate_drop: bool = True,
+        ) -> bool:
             uniq_key, source, symbol, token = _uniq_key_for_row(row)
             candidate_id = str(token.get("_candidate_id", "") or "")
             if uniq_key in selected_addrs:
-                _record_drop(row, "duplicate_address")
+                # Soft-fill pass can revisit rows that are already selected.
+                # Do not count those internal revisits as duplicate-address drops.
+                if record_duplicate_drop:
+                    _record_drop(row, "duplicate_address")
                 return False
             source_p = _clamp(_safe_float(row.get("source_entry_probability"), 1.0), 0.0, 1.0)
             if source_p < 1.0:
@@ -1616,7 +1624,11 @@ class UniverseQualityGateController:
         for row in (core_rows_native + core_rows_provisional + explore_pool):
             if len(selected) >= int(target_total):
                 break
-            _try_take(row, ignore_source_cap=bool(self.source_cap_soft_fill_enabled))
+            _try_take(
+                row,
+                ignore_source_cap=bool(self.source_cap_soft_fill_enabled),
+                record_duplicate_drop=False,
+            )
 
         if not selected and (core_rows or explore_pool):
             for row in (core_rows_native + core_rows_provisional + explore_pool):

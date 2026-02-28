@@ -43,6 +43,32 @@ class MatrixPresetGuardContractTests(unittest.TestCase):
         issues = validate_overrides({"ENTRY_A_CORE_MIN_TRADE_USD": "0.25"}, contract)
         self.assertEqual(issues, [])
 
+    def test_source_feed_window_keys_are_allowed(self) -> None:
+        contract = load_contract(ROOT)
+        issues = validate_overrides(
+            {
+                "TOKEN_AGE_MAX": "5400",
+                "SEEN_TOKEN_TTL": "3600",
+            },
+            contract,
+        )
+        self.assertEqual(issues, [])
+
+    def test_runtime_edge_floor_keys_are_allowed(self) -> None:
+        contract = load_contract(ROOT)
+        issues = validate_overrides(
+            {
+                "V2_ROLLING_EDGE_MIN_USD": "0.0010",
+                "V2_ROLLING_EDGE_MIN_PERCENT": "0.20",
+                "V2_CALIBRATION_ENABLED": "true",
+                "V2_CALIBRATION_NO_TIGHTEN_DURING_RELAX_WINDOW": "true",
+                "V2_CALIBRATION_EDGE_USD_MIN": "0.0010",
+                "V2_CALIBRATION_VOLUME_MIN": "20",
+            },
+            contract,
+        )
+        self.assertEqual(issues, [])
+
 
 if __name__ == "__main__":
     unittest.main()

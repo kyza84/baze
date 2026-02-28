@@ -988,6 +988,42 @@ class QualityGateTests(ConfigPatchMixin, unittest.TestCase):
         ]
         self.assertEqual(len(dropped_source_budget), 1)
 
+    def test_quality_gate_does_not_report_duplicate_for_soft_fill_revisit(self) -> None:
+        self.patch_cfg(
+            V2_QUALITY_GATE_ENABLED=True,
+            V2_QUALITY_REFRESH_SECONDS=60,
+            V2_QUALITY_WINDOW_SECONDS=3600,
+            V2_QUALITY_MIN_SYMBOL_TRADES=99,
+            V2_QUALITY_MIN_CLUSTER_TRADES=99,
+            V2_QUALITY_EXPLORE_MAX_SHARE=1.0,
+            V2_QUALITY_EXPLORE_MIN_ABS=0,
+            V2_QUALITY_COOLDOWN_PROBE_PROBABILITY=0.0,
+            V2_QUALITY_SOURCE_BUDGET_ENABLED=False,
+            V2_QUALITY_SOURCE_CAP_SOFT_FILL_ENABLED=True,
+            V2_QUALITY_SYMBOL_MAX_SHARE=1.0,
+            V2_QUALITY_SYMBOL_MIN_ABS_CAP=8,
+            V2_QUALITY_SYMBOL_CONCENTRATION_WINDOW_SECONDS=300,
+        )
+        q = UniverseQualityGateController()
+        trader = type("T", (), {"closed_positions": [], "_recent_open_symbols": []})()
+        rows = [
+            (
+                {
+                    "_candidate_id": f"cid_{i}",
+                    "address": f"0x{i+1:040x}",
+                    "symbol": f"S{i}",
+                    "source": "watchlist",
+                    "liquidity": 20000 + i,
+                    "volume_5m": 3000 + i,
+                },
+                {"score": 88 - i},
+            )
+            for i in range(3)
+        ]
+        out, meta = q.filter_candidates(candidates=rows, auto_trader=trader, market_mode="YELLOW")
+        self.assertEqual(len(out), 3)
+        self.assertEqual(int(meta.get("drop_counts", {}).get("duplicate_address", 0) or 0), 0)
+
     def test_quality_gate_uses_open_history_without_mutating_selected_history(self) -> None:
         self.patch_cfg(
             V2_QUALITY_GATE_ENABLED=True,

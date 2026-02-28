@@ -7,6 +7,7 @@ import unittest
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -131,6 +132,93 @@ class MatrixRuntimeTunerTests(unittest.TestCase):
         self.assertGreater(float(by_key["V2_UNIVERSE_NOVELTY_MIN_SHARE"].new_value), 0.40)
         self.assertLess(float(by_key["SYMBOL_CONCENTRATION_MAX_SHARE"].new_value), 0.35)
 
+    def test_symbol_churn_detector_flags_flat_single_symbol_loop(self) -> None:
+        rows = [
+            {"decision_stage": "trade_open", "decision": "open", "symbol": "cbBTC"},
+            {"decision_stage": "trade_open", "decision": "open", "symbol": "cbBTC"},
+            {"decision_stage": "trade_open", "decision": "open", "symbol": "cbBTC"},
+            {"decision_stage": "trade_close", "decision": "close", "symbol": "cbBTC", "reason": "NO_MOMENTUM", "pnl_usd": 0.0002},
+            {"decision_stage": "trade_close", "decision": "close", "symbol": "cbBTC", "reason": "TIMEOUT", "pnl_usd": -0.0003},
+            {"decision_stage": "trade_close", "decision": "close", "symbol": "cbBTC", "reason": "NO_MOMENTUM", "pnl_usd": 0.0001},
+        ]
+        out = mrt._symbol_churn_15m(rows)
+        self.assertTrue(bool(out.get("detected")))
+        self.assertEqual(str(out.get("symbol")), "CBBTC")
+        self.assertGreater(int(out.get("ttl_seconds", 0) or 0), 0)
+
+    def test_churn_lock_adds_excluded_symbol_and_tightens(self) -> None:
+        metrics = mrt.WindowMetrics(
+            selected_from_batch=42,
+            opened_from_batch=2,
+            buy_symbol_counts=Counter({"cbBTC": 5, "PEON": 1}),
+        )
+        overrides = {
+            "AUTO_TRADE_EXCLUDED_SYMBOLS": "ZORA",
+            "V2_UNIVERSE_NOVELTY_MIN_SHARE": "0.20",
+            "SYMBOL_CONCENTRATION_MAX_SHARE": "0.35",
+            "V2_SOURCE_QOS_MAX_PER_SYMBOL_PER_CYCLE": "4",
+            "V2_QUALITY_SYMBOL_REENTRY_MIN_SECONDS": "180",
+            "TOKEN_EV_MEMORY_MIN_TRADES": "4",
+            "TOKEN_EV_MEMORY_BAD_ENTRY_PROBABILITY": "0.72",
+            "TOKEN_EV_MEMORY_SEVERE_ENTRY_PROBABILITY": "0.42",
+            "SOURCE_ROUTER_BAD_ENTRY_PROBABILITY": "0.55",
+            "SOURCE_ROUTER_SEVERE_ENTRY_PROBABILITY": "0.35",
+        }
+        telemetry = {
+            "symbol_churn_15m": {
+                "detected": True,
+                "symbol": "cbBTC",
+                "open_share": 0.80,
+                "flat_close_share": 0.75,
+                "ttl_seconds": 1200,
+            },
+            "funnel_15m": {"raw": 300, "pre": 180, "buy": 2},
+            "top_reasons_15m": {"quality_skip": [], "plan_skip": []},
+        }
+        state = mrt.RuntimeState()
+        actions, _trace, meta = mrt._build_action_plan(
+            metrics=metrics,
+            overrides=overrides,
+            mode=mrt.MODE_SPECS["conveyor"],
+            telemetry=telemetry,
+            runtime_state=state,
+            now_ts=1000.0,
+        )
+        by_key = _actions_by_key(actions)
+        self.assertIn("AUTO_TRADE_EXCLUDED_SYMBOLS", by_key)
+        self.assertIn("CBBTC", by_key["AUTO_TRADE_EXCLUDED_SYMBOLS"].new_value)
+        self.assertIn("TOKEN_EV_MEMORY_MIN_TRADES", by_key)
+        self.assertIn("SOURCE_ROUTER_BAD_ENTRY_PROBABILITY", by_key)
+        self.assertEqual(state.churn_lock_symbol, "CBBTC")
+        self.assertGreater(float(state.churn_lock_until_ts), 1000.0)
+        churn_meta = (meta or {}).get("churn_lock", {}) or {}
+        self.assertTrue(bool(churn_meta.get("active", False)))
+
+    def test_churn_lock_releases_on_ttl_expiry(self) -> None:
+        metrics = mrt.WindowMetrics(selected_from_batch=30, opened_from_batch=0)
+        overrides = {
+            "AUTO_TRADE_EXCLUDED_SYMBOLS": "CBBTC,ZORA",
+        }
+        telemetry = {
+            "symbol_churn_15m": {"detected": False, "symbol": "", "open_share": 0.0, "flat_close_share": 0.0, "ttl_seconds": 0},
+            "funnel_15m": {"raw": 120, "pre": 70, "buy": 0},
+            "top_reasons_15m": {"quality_skip": [], "plan_skip": []},
+        }
+        state = mrt.RuntimeState(churn_lock_symbol="CBBTC", churn_lock_until_ts=900.0)
+        actions, _trace, _meta = mrt._build_action_plan(
+            metrics=metrics,
+            overrides=overrides,
+            mode=mrt.MODE_SPECS["conveyor"],
+            telemetry=telemetry,
+            runtime_state=state,
+            now_ts=1200.0,
+        )
+        by_key = _actions_by_key(actions)
+        self.assertIn("AUTO_TRADE_EXCLUDED_SYMBOLS", by_key)
+        self.assertNotIn("CBBTC", by_key["AUTO_TRADE_EXCLUDED_SYMBOLS"].new_value)
+        self.assertEqual(state.churn_lock_symbol, "")
+        self.assertEqual(float(state.churn_lock_until_ts), 0.0)
+
     def test_recover_tighten_when_over_relaxed_signals_high(self) -> None:
         metrics = mrt.WindowMetrics(
             selected_from_batch=40,
@@ -243,8 +331,8 @@ class MatrixRuntimeTunerTests(unittest.TestCase):
         by_key = _actions_by_key(actions)
         self.assertIn("V2_SOURCE_QOS_SOURCE_CAPS", by_key)
         self.assertIn("V2_UNIVERSE_SOURCE_CAPS", by_key)
-        self.assertIn("watchlist:6", by_key["V2_SOURCE_QOS_SOURCE_CAPS"].new_value)
-        self.assertIn("watchlist:6", by_key["V2_UNIVERSE_SOURCE_CAPS"].new_value)
+        self.assertIn("watchlist:8", by_key["V2_SOURCE_QOS_SOURCE_CAPS"].new_value)
+        self.assertIn("watchlist:4", by_key["V2_UNIVERSE_SOURCE_CAPS"].new_value)
 
     def test_selected_zero_still_allows_relax_when_filters_exist(self) -> None:
         metrics = mrt.WindowMetrics(
@@ -286,6 +374,197 @@ class MatrixRuntimeTunerTests(unittest.TestCase):
         self.assertIn("SOURCE_ROUTER_BAD_ENTRY_PROBABILITY", by_key)
         self.assertLess(float(by_key["PLAN_MAX_WATCHLIST_SHARE"].new_value), 0.30)
         self.assertGreater(int(by_key["PLAN_MIN_NON_WATCHLIST_PER_BATCH"].new_value), 1)
+
+    def test_source_qos_cap_choke_rebalances_caps_and_topk(self) -> None:
+        metrics = mrt.WindowMetrics(
+            selected_from_batch=120,
+            opened_from_batch=0,
+            filter_fail_reasons=Counter({"source_qos_cap": 44}),
+        )
+        overrides = {
+            "V2_SOURCE_QOS_SOURCE_CAPS": "onchain:120,onchain+market:120,dexscreener:100,geckoterminal:100,watchlist:2,dex_boosts:40",
+            "V2_SOURCE_QOS_TOPK_PER_CYCLE": "120",
+            "PLAN_MAX_WATCHLIST_SHARE": "0.02",
+        }
+        actions = mrt._build_actions(metrics=metrics, overrides=overrides, mode=mrt.MODE_SPECS["conveyor"])
+        by_key = _actions_by_key(actions)
+        self.assertIn("V2_SOURCE_QOS_SOURCE_CAPS", by_key)
+        self.assertIn("V2_SOURCE_QOS_TOPK_PER_CYCLE", by_key)
+        self.assertIn("PLAN_MAX_WATCHLIST_SHARE", by_key)
+        caps_text = by_key["V2_SOURCE_QOS_SOURCE_CAPS"].new_value
+        watch_cap = 0
+        for part in str(caps_text).split(","):
+            name, _, raw = part.partition(":")
+            if str(name).strip().lower() == "watchlist":
+                try:
+                    watch_cap = int(str(raw).strip())
+                except Exception:
+                    watch_cap = 0
+                break
+        self.assertGreaterEqual(watch_cap, 8)
+        self.assertGreater(int(by_key["V2_SOURCE_QOS_TOPK_PER_CYCLE"].new_value), 120)
+        self.assertGreater(float(by_key["PLAN_MAX_WATCHLIST_SHARE"].new_value), 0.02)
+
+    def test_coalesce_actions_keeps_last_value_and_merges_reasons(self) -> None:
+        actions = [
+            mrt.Action("AUTO_TRADE_TOP_N", "12", "16", "flow_expand"),
+            mrt.Action("AUTO_TRADE_TOP_N", "16", "18", "source_qos_cap_rebalance"),
+            mrt.Action("MARKET_MODE_STRICT_SCORE", "50", "48", "score_min_dominant"),
+            mrt.Action("AUTO_TRADE_TOP_N", "18", "20", "duplicate_choke_topn"),
+        ]
+        coalesced, collapsed = mrt._coalesce_actions(actions)
+        by_key = _actions_by_key(coalesced)
+        self.assertEqual(int(collapsed), 2)
+        self.assertIn("AUTO_TRADE_TOP_N", by_key)
+        self.assertEqual(by_key["AUTO_TRADE_TOP_N"].old_value, "12")
+        self.assertEqual(by_key["AUTO_TRADE_TOP_N"].new_value, "20")
+        self.assertIn("flow_expand", by_key["AUTO_TRADE_TOP_N"].reason)
+        self.assertIn("duplicate_choke_topn", by_key["AUTO_TRADE_TOP_N"].reason)
+
+    def test_blacklist_forensics_exposes_detail_classes(self) -> None:
+        trade_rows_15m = [
+            {
+                "decision_stage": "plan_trade",
+                "decision": "skip",
+                "reason": "blacklist",
+                "detail": "honeypot_guard:is_honeypot",
+                "token_address": "0x1",
+            },
+            {
+                "decision_stage": "plan_trade",
+                "decision": "skip",
+                "reason": "blacklist",
+                "detail": "",
+                "token_address": "0x2",
+            },
+        ]
+        out = mrt._blacklist_forensics(
+            candidate_rows_15m=[],
+            trade_rows_15m=trade_rows_15m,
+            trade_rows_60m=[],
+            metrics=None,
+        )
+        self.assertEqual(int(out.get("plan_skip_blacklist_honeypot_15m", 0)), 1)
+        self.assertEqual(int(out.get("plan_skip_blacklist_unknown_15m", 0)), 1)
+        self.assertGreater(float(out.get("plan_skip_blacklist_honeypot_share_15m", 0.0)), 0.0)
+        self.assertGreater(float(out.get("plan_skip_blacklist_unknown_share_15m", 0.0)), 0.0)
+
+    def test_edge_deadlock_recovery_relaxes_runtime_edge_floors(self) -> None:
+        metrics = mrt.WindowMetrics(
+            selected_from_batch=180,
+            opened_from_batch=0,
+            autotrade_skip_reasons=Counter(
+                {
+                    "edge_low": 120,
+                    "edge_usd_low": 14,
+                    "negative_edge": 12,
+                }
+            ),
+        )
+        overrides = {
+            "V2_ROLLING_EDGE_MIN_PERCENT": "0.35",
+            "V2_ROLLING_EDGE_MIN_USD": "0.008",
+            "V2_CALIBRATION_EDGE_USD_MIN": "0.012",
+            "V2_CALIBRATION_VOLUME_MIN": "80",
+            "V2_CALIBRATION_NO_TIGHTEN_DURING_RELAX_WINDOW": "false",
+        }
+        actions = mrt._build_actions(metrics=metrics, overrides=overrides, mode=mrt.MODE_SPECS["conveyor"])
+        by_key = _actions_by_key(actions)
+        self.assertIn("V2_ROLLING_EDGE_MIN_PERCENT", by_key)
+        self.assertIn("V2_ROLLING_EDGE_MIN_USD", by_key)
+        self.assertIn("V2_CALIBRATION_EDGE_USD_MIN", by_key)
+        self.assertIn("V2_CALIBRATION_VOLUME_MIN", by_key)
+        self.assertIn("V2_CALIBRATION_NO_TIGHTEN_DURING_RELAX_WINDOW", by_key)
+        self.assertLess(float(by_key["V2_ROLLING_EDGE_MIN_PERCENT"].new_value), 0.35)
+        self.assertLess(float(by_key["V2_ROLLING_EDGE_MIN_USD"].new_value), 0.008)
+        self.assertLess(float(by_key["V2_CALIBRATION_EDGE_USD_MIN"].new_value), 0.012)
+        self.assertLess(float(by_key["V2_CALIBRATION_VOLUME_MIN"].new_value), 80.0)
+
+    def test_excluded_symbol_rotation_adjusts_watchlist_controls(self) -> None:
+        metrics = mrt.WindowMetrics(
+            selected_from_batch=64,
+            opened_from_batch=0,
+            autotrade_skip_reasons=Counter({"excluded_symbol": 28}),
+        )
+        overrides = {
+            "PLAN_MAX_WATCHLIST_SHARE": "0.20",
+            "PLAN_MIN_NON_WATCHLIST_PER_BATCH": "2",
+            "WATCHLIST_REFRESH_SECONDS": "600",
+            "WATCHLIST_MAX_TOKENS": "20",
+        }
+        actions = mrt._build_actions(metrics=metrics, overrides=overrides, mode=mrt.MODE_SPECS["conveyor"])
+        by_key = _actions_by_key(actions)
+        self.assertIn("PLAN_MAX_WATCHLIST_SHARE", by_key)
+        self.assertIn("WATCHLIST_REFRESH_SECONDS", by_key)
+        self.assertIn("WATCHLIST_MAX_TOKENS", by_key)
+        self.assertLess(float(by_key["PLAN_MAX_WATCHLIST_SHARE"].new_value), 0.20)
+        self.assertLess(int(by_key["WATCHLIST_REFRESH_SECONDS"].new_value), 600)
+        self.assertGreater(int(by_key["WATCHLIST_MAX_TOKENS"].new_value), 20)
+
+    def test_feed_starvation_relaxes_token_age_and_seen_ttl(self) -> None:
+        metrics = mrt.WindowMetrics(
+            selected_from_batch=40,
+            opened_from_batch=0,
+        )
+        telemetry = {
+            "funnel_15m": {"raw": 120, "pre": 95, "buy": 0},
+            "top_reasons_15m": {"quality_skip": [], "plan_skip": []},
+        }
+        overrides = {
+            "TOKEN_AGE_MAX": "3600",
+            "SEEN_TOKEN_TTL": "10800",
+            "WATCHLIST_REFRESH_SECONDS": "900",
+            "WATCHLIST_MAX_TOKENS": "25",
+            "WATCHLIST_MIN_LIQUIDITY_USD": "200000",
+            "WATCHLIST_MIN_VOLUME_24H_USD": "500000",
+            "PAPER_WATCHLIST_MIN_SCORE": "85",
+            "PAPER_WATCHLIST_MIN_LIQUIDITY_USD": "150000",
+            "PAPER_WATCHLIST_MIN_VOLUME_5M_USD": "500",
+        }
+        actions, _trace, _meta = mrt._build_action_plan(
+            metrics=metrics,
+            overrides=overrides,
+            mode=mrt.MODE_SPECS["conveyor"],
+            telemetry=telemetry,
+        )
+        by_key = _actions_by_key(actions)
+        self.assertIn("TOKEN_AGE_MAX", by_key)
+        self.assertIn("SEEN_TOKEN_TTL", by_key)
+        self.assertGreater(int(by_key["TOKEN_AGE_MAX"].new_value), 3600)
+        self.assertLess(int(by_key["SEEN_TOKEN_TTL"].new_value), 10800)
+
+    def test_quality_duplicate_telemetry_triggers_duplicate_choke(self) -> None:
+        metrics = mrt.WindowMetrics(
+            selected_from_batch=120,
+            opened_from_batch=1,
+            autotrade_skip_reasons=Counter(),
+        )
+        telemetry = {
+            "funnel_15m": {"raw": 420, "pre": 360, "buy": 0},
+            "top_reasons_15m": {
+                "quality_skip": [
+                    {"reason_code": "duplicate_address", "count": 180},
+                    {"reason_code": "source_budget", "count": 40},
+                ],
+                "plan_skip": [],
+            },
+        }
+        overrides = {
+            "AUTO_TRADE_TOP_N": "30",
+            "PLAN_MAX_WATCHLIST_SHARE": "0.25",
+            "PLAN_MIN_NON_WATCHLIST_PER_BATCH": "1",
+            "PLAN_MAX_SINGLE_SOURCE_SHARE": "0.50",
+            "V2_SOURCE_QOS_SOURCE_CAPS": "onchain:300,onchain+market:300,dexscreener:260,geckoterminal:260,watchlist:140,dex_boosts:100",
+        }
+        actions, _trace, _meta = mrt._build_action_plan(
+            metrics=metrics,
+            overrides=overrides,
+            mode=mrt.MODE_SPECS["fast"],
+            telemetry=telemetry,
+        )
+        by_key = _actions_by_key(actions)
+        self.assertIn("AUTO_TRADE_TOP_N", by_key)
+        self.assertGreater(int(by_key["AUTO_TRADE_TOP_N"].new_value), 30)
 
     def test_relax_cooldown_uses_plain_cooldown_reason(self) -> None:
         metrics = mrt.WindowMetrics(
@@ -349,6 +628,22 @@ class MatrixRuntimeTunerTests(unittest.TestCase):
         self.assertIn("PROFIT_ENGINE_ENABLED", by_key)
         self.assertEqual(len(blocked), 2)
 
+    def test_filter_actions_by_phase_tighten_allows_flow_escape_signals(self) -> None:
+        actions = [
+            mrt.Action(
+                "V2_SOURCE_QOS_SOURCE_CAPS",
+                "onchain:120,onchain+market:120,dexscreener:100,geckoterminal:100,watchlist:2,dex_boosts:40",
+                "onchain:150,onchain+market:150,dexscreener:130,geckoterminal:130,watchlist:8,dex_boosts:55",
+                "source_qos_cap_rebalance caps",
+            ),
+            mrt.Action("MARKET_MODE_STRICT_SCORE", "45", "47", "recover_tighten safe_volume"),
+        ]
+        filtered, blocked = mrt._filter_actions_by_phase(actions=actions, phase="tighten")
+        by_key = _actions_by_key(filtered)
+        self.assertIn("V2_SOURCE_QOS_SOURCE_CAPS", by_key)
+        self.assertIn("MARKET_MODE_STRICT_SCORE", by_key)
+        self.assertEqual(len(blocked), 0)
+
     def test_apply_action_delta_caps_limits_large_jumps(self) -> None:
         actions = [
             mrt.Action("AUTO_TRADE_TOP_N", "20", "80", "low_throughput_expand_topn"),
@@ -376,6 +671,7 @@ class MatrixRuntimeTunerTests(unittest.TestCase):
             "blacklist_forensics_15m": {
                 "plan_skip_blacklist_15m": 25,
                 "plan_skip_blacklist_share_15m": 0.8,
+                "unique_blacklist_tokens_15m": 8,
             },
         }
         policy = mrt.TargetPolicy(max_blacklist_added_15m=10, max_blacklist_share_15m=0.5)
@@ -389,6 +685,413 @@ class MatrixRuntimeTunerTests(unittest.TestCase):
         )
         self.assertEqual(decision.phase, "tighten")
         self.assertTrue(decision.blacklist_fail)
+
+    def test_resolve_policy_phase_ignores_single_token_blacklist_storm(self) -> None:
+        metrics = mrt.WindowMetrics(selected_from_batch=40, opened_from_batch=0)
+        telemetry = {
+            "funnel_15m": {"buy": 0},
+            "exec_health_15m": {"open_rate": 0.02, "closes": 0, "winrate_closed": 0.0},
+            "exit_mix_60m": {"pnl_usd_sum": 0.0},
+            "blacklist_forensics_15m": {
+                "plan_skip_blacklist_15m": 40,
+                "plan_skip_blacklist_share_15m": 0.9,
+                "unique_blacklist_tokens_15m": 1,
+            },
+        }
+        policy = mrt.TargetPolicy(max_blacklist_added_15m=10, max_blacklist_share_15m=0.5)
+        state = mrt.RuntimeState(last_phase="expand")
+        decision = mrt._resolve_policy_phase(
+            metrics=metrics,
+            telemetry=telemetry,
+            target=policy,
+            state=state,
+            forced_phase="auto",
+        )
+        self.assertFalse(decision.blacklist_fail)
+        self.assertTrue(any("blacklist_concentrated_ignore" in r for r in decision.reasons))
+
+    def test_resolve_policy_phase_ignores_two_token_blacklist_storm(self) -> None:
+        metrics = mrt.WindowMetrics(selected_from_batch=40, opened_from_batch=0)
+        telemetry = {
+            "funnel_15m": {"buy": 0},
+            "exec_health_15m": {"open_rate": 0.02, "closes": 0, "winrate_closed": 0.0},
+            "exit_mix_60m": {"pnl_usd_sum": 0.0},
+            "blacklist_forensics_15m": {
+                "plan_skip_blacklist_15m": 100,
+                "plan_skip_blacklist_share_15m": 0.75,
+                "unique_blacklist_tokens_15m": 2,
+                "top_blacklist_tokens_15m": [
+                    {"token": "0xabc", "count": 58},
+                    {"token": "0xdef", "count": 36},
+                ],
+            },
+        }
+        policy = mrt.TargetPolicy(max_blacklist_added_15m=40, max_blacklist_share_15m=0.45)
+        state = mrt.RuntimeState(last_phase="expand")
+        decision = mrt._resolve_policy_phase(
+            metrics=metrics,
+            telemetry=telemetry,
+            target=policy,
+            state=state,
+            forced_phase="auto",
+        )
+        self.assertFalse(decision.blacklist_fail)
+        self.assertTrue(any("blacklist_concentrated_ignore" in r for r in decision.reasons))
+
+    def test_resolve_policy_phase_ignores_two_token_share_storm_even_below_added_cap(self) -> None:
+        metrics = mrt.WindowMetrics(selected_from_batch=22, opened_from_batch=1)
+        telemetry = {
+            "funnel_15m": {"buy": 1},
+            "exec_health_15m": {"open_rate": 0.05, "closes": 2, "winrate_closed": 0.5, "plan_attempts": 40},
+            "exit_mix_60m": {"pnl_usd_sum": 0.0},
+            "blacklist_forensics_15m": {
+                "plan_skip_blacklist_15m": 23,
+                "plan_skip_blacklist_share_15m": 0.575,
+                "unique_blacklist_tokens_15m": 2,
+                "top_blacklist_tokens_15m": [
+                    {"token": "0xabc", "count": 12},
+                    {"token": "0xdef", "count": 11},
+                ],
+            },
+        }
+        policy = mrt.TargetPolicy(max_blacklist_added_15m=80, max_blacklist_share_15m=0.45)
+        decision = mrt._resolve_policy_phase(
+            metrics=metrics,
+            telemetry=telemetry,
+            target=policy,
+            state=mrt.RuntimeState(last_phase="tighten"),
+            forced_phase="auto",
+            effective_target_trades_per_hour=4.0,
+        )
+        self.assertFalse(decision.blacklist_fail)
+        self.assertTrue(any("blacklist_concentrated_ignore" in r for r in decision.reasons))
+
+    def test_resolve_policy_phase_does_not_trigger_blacklist_share_on_micro_sample(self) -> None:
+        metrics = mrt.WindowMetrics(selected_from_batch=2, opened_from_batch=1)
+        telemetry = {
+            "funnel_15m": {"buy": 1},
+            "exec_health_15m": {
+                "open_rate": 1.0,
+                "plan_attempts": 1,
+                "closes": 0,
+                "winrate_closed": 0.0,
+            },
+            "exit_mix_60m": {"pnl_usd_sum": 0.0},
+            "blacklist_forensics_15m": {
+                "plan_skip_blacklist_15m": 1,
+                "plan_skip_blacklist_share_15m": 1.0,
+                "unique_blacklist_tokens_15m": 1,
+                "top_blacklist_tokens_15m": [{"token": "0xaaa", "count": 1}],
+            },
+        }
+        policy = mrt.TargetPolicy(max_blacklist_added_15m=80, max_blacklist_share_15m=0.45)
+        decision = mrt._resolve_policy_phase(
+            metrics=metrics,
+            telemetry=telemetry,
+            target=policy,
+            state=mrt.RuntimeState(last_phase="hold"),
+            forced_phase="auto",
+            effective_target_trades_per_hour=4.0,
+        )
+        self.assertFalse(decision.blacklist_fail)
+
+    def test_resolve_policy_phase_ignores_unknown_dominated_blacklist_storm(self) -> None:
+        metrics = mrt.WindowMetrics(selected_from_batch=40, opened_from_batch=0)
+        telemetry = {
+            "funnel_15m": {"buy": 0},
+            "exec_health_15m": {"open_rate": 0.02, "closes": 0, "winrate_closed": 0.0},
+            "exit_mix_60m": {"pnl_usd_sum": 0.0},
+            "blacklist_forensics_15m": {
+                "plan_skip_blacklist_15m": 28,
+                "plan_skip_blacklist_share_15m": 0.70,
+                "unique_blacklist_tokens_15m": 14,
+                "plan_skip_blacklist_unknown_share_15m": 0.89,
+                "plan_skip_blacklist_honeypot_share_15m": 0.02,
+            },
+        }
+        policy = mrt.TargetPolicy(max_blacklist_added_15m=20, max_blacklist_share_15m=0.5)
+        decision = mrt._resolve_policy_phase(
+            metrics=metrics,
+            telemetry=telemetry,
+            target=policy,
+            state=mrt.RuntimeState(last_phase="expand"),
+            forced_phase="auto",
+        )
+        self.assertFalse(decision.blacklist_fail)
+        self.assertTrue(any("blacklist_unknown_dominated_ignore" in r for r in decision.reasons))
+
+    def test_resolve_policy_phase_keeps_honeypot_dominated_blacklist_fail(self) -> None:
+        metrics = mrt.WindowMetrics(selected_from_batch=40, opened_from_batch=0)
+        telemetry = {
+            "funnel_15m": {"buy": 0},
+            "exec_health_15m": {"open_rate": 0.01, "closes": 0, "winrate_closed": 0.0},
+            "exit_mix_60m": {"pnl_usd_sum": 0.0},
+            "blacklist_forensics_15m": {
+                "plan_skip_blacklist_15m": 24,
+                "plan_skip_blacklist_share_15m": 0.72,
+                "unique_blacklist_tokens_15m": 12,
+                "plan_skip_blacklist_unknown_share_15m": 0.08,
+                "plan_skip_blacklist_honeypot_share_15m": 0.83,
+            },
+        }
+        policy = mrt.TargetPolicy(max_blacklist_added_15m=20, max_blacklist_share_15m=0.5)
+        decision = mrt._resolve_policy_phase(
+            metrics=metrics,
+            telemetry=telemetry,
+            target=policy,
+            state=mrt.RuntimeState(last_phase="expand"),
+            forced_phase="auto",
+        )
+        self.assertTrue(decision.blacklist_fail)
+        self.assertEqual(decision.phase, "tighten")
+
+    def test_resolve_policy_phase_tighten_on_pre_risk_before_closes(self) -> None:
+        metrics = mrt.WindowMetrics(selected_from_batch=42, opened_from_batch=0)
+        telemetry = {
+            "funnel_15m": {"buy": 0},
+            "exec_health_15m": {
+                "open_rate": 0.01,
+                "plan_attempts": 22,
+                "opens": 1,
+                "closes": 0,
+                "buy_fail": [{"reason_code": "buy_fail", "count": 9, "share": 0.409}],
+                "sell_fail": [],
+                "route_fail": [{"reason_code": "no_route", "count": 8, "share": 0.364}],
+            },
+            "exit_mix_60m": {"pnl_usd_sum": 0.0, "total": 0, "tail_loss_ratio": "N/A"},
+            "blacklist_forensics_15m": {
+                "plan_skip_blacklist_15m": 0,
+                "plan_skip_blacklist_share_15m": 0.0,
+            },
+        }
+        policy = mrt.TargetPolicy(
+            min_selected_15m=16,
+            pre_risk_min_plan_attempts_15m=8,
+            pre_risk_route_fail_rate_15m=0.30,
+            pre_risk_buy_fail_rate_15m=0.30,
+        )
+        decision = mrt._resolve_policy_phase(
+            metrics=metrics,
+            telemetry=telemetry,
+            target=policy,
+            state=mrt.RuntimeState(last_phase="expand"),
+            forced_phase="auto",
+            effective_target_trades_per_hour=8.0,
+        )
+        self.assertEqual(decision.phase, "tighten")
+        self.assertTrue(bool(decision.pre_risk_fail))
+        self.assertTrue(any("pre_risk_fail" in r for r in decision.reasons))
+
+    def test_resolve_policy_phase_tighten_on_tail_loss_ratio(self) -> None:
+        metrics = mrt.WindowMetrics(selected_from_batch=30, opened_from_batch=1)
+        telemetry = {
+            "funnel_15m": {"buy": 1},
+            "exec_health_15m": {"open_rate": 0.08, "closes": 8, "winrate_closed": 0.70},
+            "exit_mix_60m": {
+                "pnl_usd_sum": 0.01,
+                "total": 9,
+                "largest_loss_usd": -0.09,
+                "median_win_usd": 0.009,
+                "tail_loss_ratio": 10.0,
+            },
+            "blacklist_forensics_15m": {
+                "plan_skip_blacklist_15m": 0,
+                "plan_skip_blacklist_share_15m": 0.0,
+            },
+        }
+        policy = mrt.TargetPolicy(
+            tail_loss_min_closes_60m=6,
+            tail_loss_ratio_max=8.0,
+            min_closed_for_risk_checks=6,
+            min_winrate_closed_15m=0.35,
+        )
+        decision = mrt._resolve_policy_phase(
+            metrics=metrics,
+            telemetry=telemetry,
+            target=policy,
+            state=mrt.RuntimeState(last_phase="hold"),
+            forced_phase="auto",
+            effective_target_trades_per_hour=6.0,
+        )
+        self.assertEqual(decision.phase, "tighten")
+        self.assertTrue(bool(decision.risk_fail))
+        self.assertTrue(any("tail_loss_fail" in r for r in decision.reasons))
+
+    def test_resolve_policy_phase_unlocks_expand_when_tighten_stalls(self) -> None:
+        metrics = mrt.WindowMetrics(
+            selected_from_batch=48,
+            opened_from_batch=0,
+            open_positions=0,
+        )
+        telemetry = {
+            "funnel_15m": {"buy": 0},
+            "exec_health_15m": {"open_rate": 0.02, "closes": 12, "winrate_closed": 0.2},
+            "exit_mix_60m": {"pnl_usd_sum": -0.12},
+            "blacklist_forensics_15m": {
+                "plan_skip_blacklist_15m": 0,
+                "plan_skip_blacklist_share_15m": 0.0,
+            },
+        }
+        policy = mrt.TargetPolicy(
+            min_selected_15m=16,
+            min_closed_for_risk_checks=6,
+            min_winrate_closed_15m=0.35,
+            rollback_degrade_streak=3,
+        )
+        state = mrt.RuntimeState(last_phase="tighten", degrade_streak=4)
+        decision = mrt._resolve_policy_phase(
+            metrics=metrics,
+            telemetry=telemetry,
+            target=policy,
+            state=state,
+            forced_phase="auto",
+        )
+        self.assertEqual(decision.phase, "expand")
+        self.assertTrue(decision.risk_fail)
+        self.assertTrue(any("risk_fail_recovery_unlock" in r for r in decision.reasons))
+
+    def test_adaptive_target_bootstrap_caps_unrealistic_goal(self) -> None:
+        target = mrt.TargetPolicy(
+            target_trades_per_hour=30.0,
+            adaptive_target_enabled=True,
+            adaptive_target_floor_trades_per_hour=4.0,
+            adaptive_target_headroom_mult=1.35,
+            adaptive_target_headroom_add_trades_per_hour=2.0,
+        )
+        state = mrt.RuntimeState()
+        effective, meta = mrt._resolve_effective_target_trades_per_hour(
+            requested_tph=30.0,
+            target=target,
+            state=state,
+            throughput_est=4.0,
+        )
+        self.assertGreaterEqual(float(effective), 4.0)
+        self.assertLess(float(effective), 30.0)
+        self.assertTrue(bool(meta.get("enabled")))
+
+    def test_adaptive_target_state_steps_up_then_down(self) -> None:
+        target = mrt.TargetPolicy(
+            target_trades_per_hour=20.0,
+            adaptive_target_enabled=True,
+            adaptive_target_floor_trades_per_hour=4.0,
+            adaptive_target_step_up_trades_per_hour=2.0,
+            adaptive_target_step_down_trades_per_hour=3.0,
+            adaptive_target_stable_ticks_for_step_up=2,
+            adaptive_target_fail_ticks_for_step_down=2,
+        )
+        state = mrt.RuntimeState(effective_target_trades_per_hour=6.0)
+        stable_decision = mrt.PolicyDecision(
+            phase="hold",
+            reasons=[],
+            target_trades_per_hour_effective=6.0,
+            target_trades_per_hour_requested=20.0,
+            throughput_est_trades_h=8.0,
+            pnl_hour_usd=0.01,
+            blacklist_added_15m=0,
+            blacklist_share_15m=0.0,
+            open_rate_15m=0.12,
+            risk_fail=False,
+            flow_fail=False,
+            blacklist_fail=False,
+        )
+        stable_metrics = mrt.WindowMetrics(selected_from_batch=40, opened_from_batch=2)
+        mrt._update_effective_target_state(
+            state=state,
+            target=target,
+            decision=stable_decision,
+            metrics=stable_metrics,
+        )
+        post_up = mrt._update_effective_target_state(
+            state=state,
+            target=target,
+            decision=stable_decision,
+            metrics=stable_metrics,
+        )
+        self.assertEqual(str(post_up.get("adjustment")), "step_up")
+        self.assertGreater(float(state.effective_target_trades_per_hour), 6.0)
+
+        fail_decision = mrt.PolicyDecision(
+            phase="expand",
+            reasons=[],
+            target_trades_per_hour_effective=float(state.effective_target_trades_per_hour),
+            target_trades_per_hour_requested=20.0,
+            throughput_est_trades_h=2.0,
+            pnl_hour_usd=-0.01,
+            blacklist_added_15m=0,
+            blacklist_share_15m=0.0,
+            open_rate_15m=0.01,
+            risk_fail=False,
+            flow_fail=True,
+            blacklist_fail=False,
+        )
+        fail_metrics = mrt.WindowMetrics(selected_from_batch=50, opened_from_batch=0)
+        mrt._update_effective_target_state(
+            state=state,
+            target=target,
+            decision=fail_decision,
+            metrics=fail_metrics,
+        )
+        post_down = mrt._update_effective_target_state(
+            state=state,
+            target=target,
+            decision=fail_decision,
+            metrics=fail_metrics,
+        )
+        self.assertEqual(str(post_down.get("adjustment")), "step_down")
+        self.assertLessEqual(float(state.effective_target_trades_per_hour), float(post_up.get("effective_tph_after", 99.0)))
+
+    def test_resolve_policy_phase_uses_effective_target(self) -> None:
+        metrics = mrt.WindowMetrics(selected_from_batch=40, opened_from_batch=1)
+        telemetry = {
+            "funnel_15m": {"buy": 1},
+            "exec_health_15m": {"open_rate": 0.08, "closes": 1, "winrate_closed": 1.0},
+            "exit_mix_60m": {"pnl_usd_sum": 0.0},
+            "blacklist_forensics_15m": {
+                "plan_skip_blacklist_15m": 0,
+                "plan_skip_blacklist_share_15m": 0.0,
+            },
+        }
+        decision = mrt._resolve_policy_phase(
+            metrics=metrics,
+            telemetry=telemetry,
+            target=mrt.TargetPolicy(target_trades_per_hour=30.0),
+            state=mrt.RuntimeState(last_phase="hold"),
+            forced_phase="auto",
+            effective_target_trades_per_hour=6.0,
+        )
+        self.assertFalse(bool(decision.flow_fail))
+        self.assertAlmostEqual(float(decision.target_trades_per_hour_effective), 6.0, places=6)
+
+    def test_resolve_policy_phase_marks_diversity_fail_and_expands(self) -> None:
+        metrics = mrt.WindowMetrics(
+            selected_from_batch=28,
+            opened_from_batch=4,
+            buy_symbol_counts=Counter({"CBBTC": 4}),
+        )
+        telemetry = {
+            "funnel_15m": {"buy": 4},
+            "exec_health_15m": {"open_rate": 0.20, "closes": 0, "winrate_closed": 0.0},
+            "exit_mix_60m": {"pnl_usd_sum": 0.0},
+            "blacklist_forensics_15m": {
+                "plan_skip_blacklist_15m": 0,
+                "plan_skip_blacklist_share_15m": 0.0,
+            },
+        }
+        decision = mrt._resolve_policy_phase(
+            metrics=metrics,
+            telemetry=telemetry,
+            target=mrt.TargetPolicy(
+                diversity_min_buys_15m=4,
+                diversity_min_unique_symbols_15m=2,
+                diversity_max_top1_open_share_15m=0.72,
+            ),
+            state=mrt.RuntimeState(last_phase="hold"),
+            forced_phase="auto",
+            effective_target_trades_per_hour=8.0,
+        )
+        self.assertTrue(bool(decision.diversity_fail))
+        self.assertEqual(decision.phase, "expand")
+        self.assertTrue(any("diversity_fail" in r for r in decision.reasons))
 
     def test_collect_telemetry_v2_builds_funnel_and_reasons(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -531,6 +1234,104 @@ class MatrixRuntimeTunerTests(unittest.TestCase):
         self.assertEqual(int(summary["action_ticks"]), 1)
         self.assertTrue(any(k == "A" for k, _ in summary["top_action_keys"]))
         self.assertTrue(any(k == "rule_x" for k, _ in summary["rule_hits"]))
+
+    def test_runtime_lock_blocks_second_owner_when_pid_alive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            profile = "u_lock_test"
+            lock_path = mrt._runtime_lock_path(root, profile)
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            lock_path.write_text(
+                json.dumps(
+                    {
+                        "pid": 77777,
+                        "owner": "existing",
+                        "profile_id": profile,
+                        "started_at": "2026-01-01T00:00:00+00:00",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(mrt, "_pid_is_running", return_value=True):
+                ok, msg = mrt._acquire_runtime_lock(root, profile, "new_owner")
+            self.assertFalse(ok)
+            self.assertIn("lock busy", msg)
+
+    def test_runtime_lock_allows_replace_stale_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            profile = "u_lock_test"
+            lock_path = mrt._runtime_lock_path(root, profile)
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            lock_path.write_text(
+                json.dumps({"pid": 77777, "owner": "stale", "profile_id": profile}, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(mrt, "_pid_is_running", return_value=False):
+                ok, msg = mrt._acquire_runtime_lock(root, profile, "fresh_owner")
+            self.assertTrue(ok, msg)
+            payload = json.loads(lock_path.read_text(encoding="utf-8"))
+            self.assertEqual(str(payload.get("owner")), "fresh_owner")
+            self.assertEqual(int(payload.get("pid", 0)), int(mrt.os.getpid()))
+
+    def test_runtime_lock_release_keeps_file_for_alive_foreign_pid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            profile = "u_lock_test"
+            lock_path = mrt._runtime_lock_path(root, profile)
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            lock_path.write_text(
+                json.dumps({"pid": 77777, "owner": "active_foreign", "profile_id": profile}, ensure_ascii=False)
+                + "\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(mrt, "_pid_is_running", return_value=True):
+                mrt._release_runtime_lock(root, profile)
+            self.assertTrue(lock_path.exists())
+
+    def test_profile_running_false_when_pid_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            active = root / "data" / "matrix" / "runs" / "active_matrix.json"
+            active.parent.mkdir(parents=True, exist_ok=True)
+            active.write_text(
+                json.dumps(
+                    {
+                        "running": True,
+                        "items": [
+                            {"id": "u1", "status": "running", "pid": 12345},
+                        ],
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(mrt, "_pid_is_running", return_value=False):
+                self.assertFalse(mrt._profile_running(root, "u1"))
+
+    def test_profile_running_true_when_pid_alive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            active = root / "data" / "matrix" / "runs" / "active_matrix.json"
+            active.parent.mkdir(parents=True, exist_ok=True)
+            active.write_text(
+                json.dumps(
+                    {
+                        "running": True,
+                        "items": [
+                            {"id": "u1", "status": "running", "pid": 12345},
+                        ],
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(mrt, "_pid_is_running", return_value=True):
+                self.assertTrue(mrt._profile_running(root, "u1"))
 
 
 if __name__ == "__main__":

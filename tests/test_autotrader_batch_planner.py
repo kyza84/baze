@@ -29,6 +29,7 @@ class AutoTraderBatchPlannerTests(ConfigPatchMixin, unittest.IsolatedAsyncioTest
     def _blank_trader() -> AutoTrader:
         trader = AutoTrader.__new__(AutoTrader)
         trader.open_positions = {}
+        trader._blacklist = {}
         trader._recent_batch_open_timestamps = []
         trader._active_trade_decision_context = None
 
@@ -108,6 +109,47 @@ class AutoTraderBatchPlannerTests(ConfigPatchMixin, unittest.IsolatedAsyncioTest
         )
         trader = self._blank_trader()
         trader._token_cluster_key = lambda **kwargs: str(kwargs.get("risk_level", "MEDIUM"))  # type: ignore[method-assign]
+
+        attempted: list[str] = []
+
+        async def _plan_trade(token_data: dict, score_data: dict) -> object | None:
+            symbol = str(token_data.get("symbol", ""))
+            attempted.append(symbol)
+            if symbol == "CAND2":
+                return object()
+            return None
+
+        trader.plan_trade = _plan_trade  # type: ignore[method-assign]
+        candidates = [
+            self._candidate("CAND1", "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 100, risk_level="LOW"),
+            self._candidate("CAND2", "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 99, risk_level="MEDIUM"),
+            self._candidate("CAND3", "0xcccccccccccccccccccccccccccccccccccccccc", 98, risk_level="HIGH"),
+        ]
+
+        opened = await trader.plan_batch(candidates)
+        self.assertEqual(opened, 1)
+        self.assertGreaterEqual(len(attempted), 2)
+        self.assertEqual(attempted[:2], ["CAND1", "CAND2"])
+
+    async def test_burst_fallback_can_expand_beyond_selected_cap(self) -> None:
+        self.patch_cfg(
+            MIN_TOKEN_SCORE=0,
+            AUTO_TRADE_ENTRY_MODE="top_n",
+            AUTO_TRADE_TOP_N=6,
+            PROFIT_ENGINE_ENABLED=False,
+            BURST_GOVERNOR_ENABLED=True,
+            BURST_GOVERNOR_MAX_OPENS_PER_BATCH=1,
+            BURST_GOVERNOR_MAX_PER_SYMBOL_PER_BATCH=1,
+            BURST_GOVERNOR_MAX_PER_CLUSTER_PER_BATCH=1,
+            BURST_GOVERNOR_WINDOW_SECONDS=120,
+            BURST_GOVERNOR_MAX_OPENS_PER_WINDOW=1,
+            BURST_GOVERNOR_ATTEMPT_MULTIPLIER=3,
+        )
+        trader = self._blank_trader()
+        trader._token_cluster_key = lambda **kwargs: str(kwargs.get("risk_level", "MEDIUM"))  # type: ignore[method-assign]
+        trader._profit_engine_batch_limit = (  # type: ignore[method-assign]
+            lambda *, mode, selected_cap: (1, False, "off")
+        )
 
         attempted: list[str] = []
 

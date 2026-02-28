@@ -1,0 +1,16 @@
+{
+  "degrade_streak": 0,
+  "stable_hash": "",
+  "stable_overrides": {},
+  "last_phase": "expand",
+  "last_effective_hash": "",
+  "last_effective_at": "",
+  "churn_lock_symbol": "",
+  "churn_lock_until_ts": 0.0,
+  "churn_lock_last_reason": "",
+  "effective_target_trades_per_hour": 4.0,
+  "effective_target_stable_ticks": 0,
+  "effective_target_fail_ticks": 0,
+  "effective_target_last_reason": "hold observed=0.00 headroom=4.00 stable=0 fail=0",
+  "updated_at": "2026-02-27T16:32:13.590710+00:00"
+}

@@ -88,6 +88,30 @@ class PaperPosition:
 
 
 class AutoTrader:
+    @staticmethod
+    def _as_csv_items(raw: Any) -> list[str]:
+        if raw is None:
+            return []
+        if isinstance(raw, str):
+            return [x.strip() for x in raw.split(",") if x.strip()]
+        if isinstance(raw, (list, tuple, set)):
+            return [str(x).strip() for x in raw if str(x).strip()]
+        text = str(raw).strip()
+        return [text] if text else []
+
+    @staticmethod
+    def _as_symbol_set(raw: Any) -> set[str]:
+        return {str(x).strip().upper() for x in AutoTrader._as_csv_items(raw) if str(x).strip()}
+
+    @staticmethod
+    def _as_address_set(raw: Any) -> set[str]:
+        out: set[str] = set()
+        for item in AutoTrader._as_csv_items(raw):
+            addr = normalize_address(item)
+            if addr:
+                out.add(addr)
+        return out
+
     def __init__(self) -> None:
         self.state_file = str(
             getattr(
@@ -107,6 +131,7 @@ class AutoTrader:
         self.total_losses = 0
         self.current_loss_streak = 0
         self.token_cooldowns: dict[str, float] = {}
+        self.token_cooldown_reasons: dict[str, str] = {}
         self.token_cooldown_strikes: dict[str, int] = {}
         self.symbol_cooldowns: dict[str, float] = {}
         self.trade_open_timestamps: list[float] = []
@@ -144,6 +169,7 @@ class AutoTrader:
         self._opens_by_source_window: dict[str, int] = {}
         self._skip_reasons_by_source_window: dict[str, dict[str, int]] = {}
         self._recent_open_symbols: list[tuple[float, str]] = []
+        self._recent_open_sources: list[tuple[float, str]] = []
         self._recent_batch_open_timestamps: list[float] = []
         self._new_token_pause_until_ts = 0.0
         self._quarantine_rows: dict[str, dict[str, float | int]] = {}
@@ -229,15 +255,20 @@ class AutoTrader:
         chain = str(getattr(config, "CHAIN_ID", "") or getattr(config, "EVM_CHAIN_ID", "") or "base").strip().lower()
         return chain or "base"
 
+    @staticmethod
+    def _is_placeholder_token_address(token_address: str) -> bool:
+        addr = normalize_address(token_address)
+        return (not addr) or (addr == "0x0000000000000000000000000000000000000000")
+
     def _blacklist_key(self, token_address: str) -> str:
         addr = normalize_address(token_address)
-        if not addr:
+        if self._is_placeholder_token_address(addr):
             return ""
         return f"{self._chain_key()}:{addr}"
 
     def _blacklist_lookup_keys(self, token_address: str) -> list[str]:
         addr = normalize_address(token_address)
-        if not addr:
+        if self._is_placeholder_token_address(addr):
             return []
         keys: list[str] = [self._blacklist_key(addr), addr]
         evm_chain = str(getattr(config, "EVM_CHAIN_ID", "") or "").strip().lower()
@@ -260,15 +291,14 @@ class AutoTrader:
         addr = normalize_address(token_address)
         if not addr:
             return False
-        raw = set(getattr(config, "AUTO_TRADE_HARD_BLOCKED_ADDRESSES", []) or [])
-        blocked = {normalize_address(x) for x in raw if str(x or "").strip()}
+        blocked = self._as_address_set(getattr(config, "AUTO_TRADE_HARD_BLOCKED_ADDRESSES", []) or [])
         if addr in blocked:
             return True
         # Optional fallback by symbol if address is unavailable in a source row.
         symbol_u = str(symbol or "").strip().upper()
         if not symbol_u:
             return False
-        blocked_symbols = {str(x).strip().upper() for x in (getattr(config, "AUTO_TRADE_EXCLUDED_SYMBOLS", []) or []) if str(x).strip()}
+        blocked_symbols = self._as_symbol_set(getattr(config, "AUTO_TRADE_EXCLUDED_SYMBOLS", []) or [])
         return symbol_u in blocked_symbols
 
     def _seed_hard_blocked_addresses(self) -> None:
@@ -285,9 +315,30 @@ class AutoTrader:
         return ("safety_source_transient:" in key) or ("safety_fail_transient:" in key)
 
     @staticmethod
+    def _is_transient_honeypot_reason(reason: str) -> bool:
+        key = str(reason or "").strip().lower()
+        if key.startswith("honeypot_guard_transient:"):
+            return True
+        if not key.startswith("honeypot_guard:"):
+            return False
+        detail = key.split(":", 1)[1].strip()
+        transient_prefixes = (
+            "honeypot_api_status_",
+            "honeypot_api_error",
+            "http_",
+            "timeout",
+            "temporarily_unavailable",
+            "service_unavailable",
+            "connection_error",
+        )
+        return any(detail.startswith(prefix) for prefix in transient_prefixes)
+
+    @staticmethod
     def _blacklist_reason_is_hard_block(reason: str) -> bool:
         key = str(reason or "").strip().lower()
         if not key:
+            return False
+        if AutoTrader._is_transient_honeypot_reason(key):
             return False
         hard_prefixes = (
             "hard_blocklist:",
@@ -334,12 +385,27 @@ class AutoTrader:
                     if ":" in key_text:
                         addr = key_text.rsplit(":", 1)[-1]
                     addr = normalize_address(addr)
-                    if not addr:
+                    if self._is_placeholder_token_address(addr):
                         continue
                     key = self._blacklist_key(addr)
                     if not key:
                         continue
                     row = dict(raw_row)
+                    reason = str((row or {}).get("reason") or "").strip()
+                    # Migrate old rows: do not keep transient guard outcomes as persistent blacklist.
+                    if reason:
+                        if (
+                            (not bool(getattr(config, "ENTRY_TRANSIENT_SAFETY_TO_BLACKLIST", False)))
+                            and self._is_transient_safety_reason(reason)
+                        ):
+                            continue
+                        if (
+                            (not bool(getattr(config, "HONEYPOT_TRANSIENT_TO_BLACKLIST", False)))
+                            and self._is_transient_honeypot_reason(reason)
+                        ):
+                            continue
+                        if not str((row or {}).get("reason_class") or "").strip():
+                            row["reason_class"] = self._blacklist_reason_class(reason)
                     prev = mapped.get(key)
                     if not isinstance(prev, dict):
                         mapped[key] = row
@@ -348,13 +414,6 @@ class AutoTrader:
                     row_until = float(row.get("until_ts") or 0.0)
                     if row_until >= prev_until:
                         mapped[key] = row
-                # Transient safety failures should not create persistent hard blocks by default.
-                if not bool(getattr(config, "ENTRY_TRANSIENT_SAFETY_TO_BLACKLIST", False)):
-                    mapped = {
-                        k: v
-                        for k, v in mapped.items()
-                        if not self._is_transient_safety_reason(str((v or {}).get("reason") or ""))
-                    }
                 self._blacklist = mapped
                 self._blacklist_prune()
             else:
@@ -418,6 +477,18 @@ class AutoTrader:
             return True, reason
         return False, ""
 
+    def blacklist_status(self, token_address: str) -> tuple[bool, str]:
+        """Public read-only blacklist status for pre-pipeline filters."""
+        return self._blacklist_is_blocked(token_address)
+
+    def is_hard_blocked(self, token_address: str, *, symbol: str = "") -> bool:
+        """Public hard-block probe to keep source/filter stages aligned with plan_trade."""
+        return self._is_hard_blocked_token(token_address, symbol=symbol)
+
+    def add_hard_blocklist_entry(self, token_address: str) -> None:
+        """Persist hard blocklist hit so repeated candidates are skipped cheaply."""
+        self._blacklist_add(token_address, "hard_blocklist:config", ttl_seconds=90 * 24 * 3600)
+
     def _blacklist_add(self, token_address: str, reason: str, ttl_seconds: int | None = None) -> None:
         if not bool(getattr(config, "AUTOTRADE_BLACKLIST_ENABLED", True)):
             return
@@ -425,10 +496,12 @@ class AutoTrader:
         if not key:
             return
         now_ts = datetime.now(timezone.utc).timestamp()
+        reason_class = self._blacklist_reason_class(reason)
         ttl = int(ttl_seconds) if ttl_seconds is not None else self._blacklist_default_ttl_seconds(reason)
         ttl = max(300, ttl)
         self._blacklist[key] = {
             "reason": str(reason or "blacklisted"),
+            "reason_class": str(reason_class),
             "added_ts": now_ts,
             "until_ts": now_ts + ttl,
         }
@@ -436,10 +509,37 @@ class AutoTrader:
         self._save_blacklist()
 
     @staticmethod
+    def _blacklist_reason_class(reason: str) -> str:
+        key = str(reason or "").strip().lower()
+        if AutoTrader._is_transient_honeypot_reason(key):
+            return "unknown"
+        if key.startswith("honeypot_guard:"):
+            return "honeypot"
+        if key.startswith("hard_blocklist:"):
+            return "safety"
+        if ("safety_source_transient:" in key) or ("safety_fail_transient:" in key):
+            return "unknown"
+        if key.startswith("safety_guard:"):
+            if "unknown" in key or "fail_closed" in key or "api" in key:
+                return "unknown"
+            return "safety"
+        return "other"
+
+    @staticmethod
     def _blacklist_default_ttl_seconds(reason: str) -> int:
         """Shorten TTL for transient routing/quote failures to keep throughput healthy."""
         base_ttl = int(getattr(config, "AUTOTRADE_BLACKLIST_TTL_SECONDS", 86400) or 86400)
         key = str(reason or "").strip().lower()
+        if AutoTrader._is_transient_honeypot_reason(key):
+            tuned = int(getattr(config, "AUTOTRADE_BLACKLIST_UNKNOWN_TTL_SECONDS", 900) or 900)
+            return min(base_ttl, max(300, tuned))
+        reason_class = AutoTrader._blacklist_reason_class(key)
+        if reason_class == "unknown":
+            tuned = int(getattr(config, "AUTOTRADE_BLACKLIST_UNKNOWN_TTL_SECONDS", 900) or 900)
+            return min(base_ttl, max(300, tuned))
+        if reason_class == "honeypot":
+            tuned = int(getattr(config, "AUTOTRADE_BLACKLIST_HONEYPOT_TTL_SECONDS", 24 * 3600) or 24 * 3600)
+            return max(base_ttl, max(3600, tuned))
         if key.startswith("hard_blocklist:"):
             return max(base_ttl, 30 * 24 * 3600)
         if ("safety_source_transient:" in key) or ("safety_fail_transient:" in key):
@@ -466,7 +566,7 @@ class AutoTrader:
 
     def _apply_transient_safety_cooldown(self, token_address: str, reason: str) -> None:
         addr = normalize_address(token_address)
-        if not addr:
+        if self._is_placeholder_token_address(addr):
             return
         seconds = int(getattr(config, "ENTRY_TRANSIENT_SAFETY_COOLDOWN_SECONDS", 180) or 180)
         if seconds <= 0:
@@ -475,6 +575,7 @@ class AutoTrader:
         prev_until = float(self.token_cooldowns.get(addr, 0.0) or 0.0)
         until_ts = max(prev_until, now_ts + float(seconds))
         self.token_cooldowns[addr] = until_ts
+        self.token_cooldown_reasons[addr] = f"transient_safety:{str(reason or '').strip().lower()}"
         logger.info(
             "TRANSIENT_SAFETY_COOLDOWN token=%s reason=%s cooldown=%ss",
             addr,
@@ -895,6 +996,16 @@ class AutoTrader:
             if (now_ts - float(row[0])) <= float(win)
         ]
 
+    def _prune_source_open_window(self, window_seconds: int) -> None:
+        win = max(60, int(window_seconds))
+        now_ts = datetime.now(timezone.utc).timestamp()
+        rows = list(getattr(self, "_recent_open_sources", []) or [])
+        self._recent_open_sources = [
+            row
+            for row in rows
+            if (now_ts - float(row[0])) <= float(win)
+        ]
+
     def _record_open_symbol(self, symbol: str) -> None:
         key = self._symbol_key(symbol)
         if not key:
@@ -904,13 +1015,148 @@ class AutoTrader:
         window_seconds = max(300, int(getattr(config, "SYMBOL_CONCENTRATION_WINDOW_SECONDS", 3600) or 3600))
         self._prune_symbol_open_window(window_seconds)
 
+    def _record_open_source(self, source: str) -> None:
+        src = str(source or "unknown").strip().lower() or "unknown"
+        now_ts = datetime.now(timezone.utc).timestamp()
+        if not hasattr(self, "_recent_open_sources"):
+            self._recent_open_sources = []
+        self._recent_open_sources.append((now_ts, src))
+        window_seconds = max(300, int(getattr(config, "PLAN_NON_WATCHLIST_QUOTA_WINDOW_SECONDS", 900) or 900))
+        self._prune_source_open_window(window_seconds)
+
+    def _symbol_open_share_recent(self, *, symbol: str, window_seconds: int) -> tuple[int, int, float]:
+        key = self._symbol_key(symbol)
+        if not key:
+            return 0, 0, 0.0
+        self._prune_symbol_open_window(window_seconds)
+        total = len(self._recent_open_symbols)
+        if total <= 0:
+            return 0, 0, 0.0
+        same = sum(1 for _, s in self._recent_open_symbols if s == key)
+        share = float(same) / float(total)
+        return same, total, float(share)
+
+    def _top_symbol_share_recent(self, *, window_seconds: int) -> tuple[str, int, int, float]:
+        self._prune_symbol_open_window(window_seconds)
+        total = len(self._recent_open_symbols)
+        if total <= 0:
+            return "", 0, 0, 0.0
+        counts: dict[str, int] = {}
+        for _, symbol in self._recent_open_symbols:
+            key = self._symbol_key(symbol)
+            if not key:
+                continue
+            counts[key] = int(counts.get(key, 0)) + 1
+        if not counts:
+            return "", 0, total, 0.0
+        top_symbol, top_count = max(counts.items(), key=lambda kv: int(kv[1]))
+        share = float(top_count) / float(max(1, total))
+        return str(top_symbol), int(top_count), int(total), float(share)
+
+    def _open_source_mix_recent(self, *, window_seconds: int) -> tuple[int, int, int, float]:
+        self._prune_source_open_window(window_seconds)
+        rows = list(getattr(self, "_recent_open_sources", []) or [])
+        total = len(rows)
+        if total <= 0:
+            return 0, 0, 0, 0.0
+        watch = sum(1 for _, src in rows if self._is_watchlist_source(src))
+        non_watch = max(0, int(total) - int(watch))
+        watch_share = float(watch) / float(total)
+        return int(watch), int(non_watch), int(total), float(watch_share)
+
+    def _hard_top1_open_share_blocked(self, *, symbol: str) -> tuple[bool, str]:
+        if not bool(getattr(config, "TOP1_OPEN_SHARE_15M_GUARD_ENABLED", True)):
+            return False, ""
+        key = self._symbol_key(symbol)
+        if not key:
+            return False, ""
+        window_seconds = max(300, int(getattr(config, "TOP1_OPEN_SHARE_15M_WINDOW_SECONDS", 900) or 900))
+        min_opens = max(2, int(getattr(config, "TOP1_OPEN_SHARE_15M_MIN_OPENS", 4) or 4))
+        max_share = max(
+            0.20,
+            min(1.0, float(getattr(config, "TOP1_OPEN_SHARE_15M_MAX_SHARE", 0.72) or 0.72)),
+        )
+        same, total, current_share = self._symbol_open_share_recent(symbol=key, window_seconds=window_seconds)
+        if total < min_opens:
+            return False, ""
+        projected_share = float(same + 1) / float(total + 1)
+        if projected_share <= max_share:
+            return False, ""
+        top_symbol, top_count, _, top_share = self._top_symbol_share_recent(window_seconds=window_seconds)
+        detail = (
+            f"top1_open_share_15m symbol={key} projected_share={projected_share:.3f} "
+            f"cap={max_share:.3f} opens={same}/{total} current_share={current_share:.3f} "
+            f"top_symbol={top_symbol or '-'} top={top_count}/{total} top_share={top_share:.3f} "
+            f"window={window_seconds}s"
+        )
+        return True, detail
+
+    def _plan_non_watchlist_quota_blocked(
+        self,
+        *,
+        source_name: str,
+        batch_has_non_watchlist: bool,
+    ) -> tuple[bool, str]:
+        if not bool(getattr(config, "PLAN_NON_WATCHLIST_QUOTA_ENABLED", True)):
+            return False, ""
+        if not self._is_watchlist_source(source_name):
+            return False, ""
+        if not bool(batch_has_non_watchlist):
+            return False, ""
+        min_non_watch = max(0, int(getattr(config, "PLAN_MIN_NON_WATCHLIST_PER_BATCH", 1) or 1))
+        if min_non_watch <= 0:
+            return False, ""
+        window_seconds = max(300, int(getattr(config, "PLAN_NON_WATCHLIST_QUOTA_WINDOW_SECONDS", 900) or 900))
+        min_opens = max(2, int(getattr(config, "PLAN_NON_WATCHLIST_QUOTA_MIN_OPENS", 4) or 4))
+        watch_share_cap = max(
+            0.0,
+            min(1.0, float(getattr(config, "PLAN_MAX_WATCHLIST_SHARE", 0.30) or 0.30)),
+        )
+        watch, non_watch, total, watch_share = self._open_source_mix_recent(window_seconds=window_seconds)
+        if total < min_opens:
+            return False, ""
+        projected_watch_share = float(watch + 1) / float(total + 1)
+        non_watch_shortfall = int(non_watch) < int(min_non_watch)
+        if (not non_watch_shortfall) and projected_watch_share <= watch_share_cap:
+            return False, ""
+        detail = (
+            f"plan_non_watchlist_quota source={str(source_name or '-')} "
+            f"non_watch={non_watch}/{total} min_non_watch={min_non_watch} "
+            f"watch_share={watch_share:.3f} projected_watch_share={projected_watch_share:.3f} "
+            f"watch_share_cap={watch_share_cap:.3f} batch_has_non_watch={bool(batch_has_non_watchlist)} "
+            f"window={window_seconds}s"
+        )
+        return True, detail
+
+    def _anti_choke_symbol_dominant(self, *, symbol: str, window_seconds: int | None = None) -> tuple[bool, str]:
+        if not self._anti_choke_active():
+            return False, ""
+        win = max(
+            300,
+            int(
+                (window_seconds if window_seconds is not None else getattr(config, "SYMBOL_CONCENTRATION_WINDOW_SECONDS", 3600))
+                or 3600
+            ),
+        )
+        min_opens = max(1, int(getattr(config, "ANTI_CHOKE_BYPASS_SYMBOL_MIN_OPENS", 4) or 4))
+        share_limit = max(
+            0.05,
+            min(1.0, float(getattr(config, "ANTI_CHOKE_BYPASS_SYMBOL_SHARE_LIMIT", 0.70) or 0.70)),
+        )
+        same, total, share = self._symbol_open_share_recent(symbol=symbol, window_seconds=win)
+        if total < min_opens or share < share_limit:
+            return False, ""
+        detail = (
+            f"anti_choke_dominant_symbol symbol={self._symbol_key(symbol)} share={share:.3f} "
+            f"limit={share_limit:.3f} opens={same}/{total} window={win}s"
+        )
+        return True, detail
+
     def _symbol_concentration_blocked(self, *, symbol: str, entry_tier: str) -> tuple[bool, str]:
         if not bool(getattr(config, "SYMBOL_CONCENTRATION_GUARD_ENABLED", True)):
             return False, ""
         key = self._symbol_key(symbol)
         if not key:
-            return False, ""
-        if self._anti_choke_active():
             return False, ""
 
         window_seconds = max(300, int(getattr(config, "SYMBOL_CONCENTRATION_WINDOW_SECONDS", 3600) or 3600))
@@ -918,21 +1164,32 @@ class AutoTrader:
         max_share = max(0.01, min(1.0, float(getattr(config, "SYMBOL_CONCENTRATION_MAX_SHARE", 0.10) or 0.10)))
         tier_a_mult = max(1.0, float(getattr(config, "SYMBOL_CONCENTRATION_TIER_A_SHARE_MULT", 1.15) or 1.15))
 
-        self._prune_symbol_open_window(window_seconds)
-        total = len(self._recent_open_symbols)
+        anti_choke = self._anti_choke_active()
+        if anti_choke and bool(getattr(config, "ANTI_CHOKE_ALLOW_SYMBOL_CONCENTRATION_BYPASS", True)):
+            dominant, _detail = self._anti_choke_symbol_dominant(symbol=key, window_seconds=window_seconds)
+            if not dominant:
+                return False, ""
+
+        same, total, current_share = self._symbol_open_share_recent(symbol=key, window_seconds=window_seconds)
         if total < min_opens:
             return False, ""
-        same = sum(1 for _, s in self._recent_open_symbols if s == key)
         projected_share = float(same + 1) / float(total + 1)
 
         cap = max_share
         if str(entry_tier or "").strip().upper() == "A":
             cap = min(1.0, cap * tier_a_mult)
+        if anti_choke:
+            anti_choke_floor = max(
+                cap,
+                min(1.0, float(getattr(config, "ANTI_CHOKE_CONCENTRATION_MIN_SHARE_CAP", 0.35) or 0.35)),
+            )
+            cap = anti_choke_floor
         if projected_share <= cap:
             return False, ""
         detail = (
             f"symbol_concentration symbol={key} projected_share={projected_share:.3f} "
-            f"cap={cap:.3f} opens={same}/{total} window={window_seconds}s"
+            f"cap={cap:.3f} opens={same}/{total} current_share={current_share:.3f} "
+            f"window={window_seconds}s anti_choke={anti_choke}"
         )
         return True, detail
 
@@ -1013,6 +1270,7 @@ class AutoTrader:
             cooldown_seconds = min(cap_seconds, base + (strikes_next * step_seconds))
         if cooldown_seconds > 0:
             self.token_cooldowns[normalized] = now_ts + cooldown_seconds
+            self.token_cooldown_reasons[normalized] = f"close:{str(close_reason or '').strip().upper() or 'UNKNOWN'}"
             logger.info(
                 "TOKEN_COOLDOWN token=%s reason=%s pnl=$%.4f cooldown=%ss strikes=%s->%s dynamic=%s",
                 normalized,
@@ -1046,6 +1304,7 @@ class AutoTrader:
                 if token_block_seconds > 0:
                     prev_until = float(self.token_cooldowns.get(normalized, 0.0) or 0.0)
                     self.token_cooldowns[normalized] = max(prev_until, now_ts + float(token_block_seconds))
+                    self.token_cooldown_reasons[normalized] = "extreme_sl"
                 if symbol_block_seconds > 0:
                     self._set_symbol_cooldown(symbol, symbol_block_seconds, "extreme_sl")
                 logger.warning(
@@ -2196,6 +2455,9 @@ class AutoTrader:
     def _refresh_daily_window(self) -> None:
         now_ts = datetime.now(timezone.utc).timestamp()
         self.token_cooldowns = {k: v for k, v in self.token_cooldowns.items() if v > now_ts}
+        self.token_cooldown_reasons = {
+            k: v for k, v in self.token_cooldown_reasons.items() if k in self.token_cooldowns
+        }
         self.symbol_cooldowns = {k: v for k, v in self.symbol_cooldowns.items() if v > now_ts}
         self._prune_symbol_open_window(max(300, int(getattr(config, "SYMBOL_CONCENTRATION_WINDOW_SECONDS", 3600) or 3600)))
         self._prune_daily_tx_window()
@@ -2495,30 +2757,76 @@ class AutoTrader:
             and int(score.get("score", 0)) >= int(config.MIN_TOKEN_SCORE)
         ]
         # Do not waste planner slots on rows that cannot be opened by construction.
-        # They would fail in plan_trade with address_or_duplicate anyway.
-        prefilter_missing_addr = 0
-        prefilter_open_dup = 0
-        if eligible:
-            eligible_prefiltered: list[tuple[dict[str, Any], dict[str, Any]]] = []
-            for token, score in eligible:
+        # They would fail in plan_trade anyway (address/duplicate/blacklist/hard-blocklist).
+        def _prefilter_eligible(
+            rows: list[tuple[dict[str, Any], dict[str, Any]]],
+            *,
+            stage: str,
+        ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+            removed_missing_addr = 0
+            removed_placeholder_addr = 0
+            removed_open_duplicate = 0
+            removed_blacklist = 0
+            removed_hard_blocklist = 0
+            out: list[tuple[dict[str, Any], dict[str, Any]]] = []
+            for token, score in rows:
                 token_address = normalize_address(str((token or {}).get("address", "") or ""))
+                symbol = str((token or {}).get("symbol", "N/A") or "N/A")
                 if not token_address:
-                    prefilter_missing_addr += 1
+                    removed_missing_addr += 1
+                    self._bump_skip_reason("address_or_duplicate")
+                    continue
+                if self._is_placeholder_token_address(token_address):
+                    removed_placeholder_addr += 1
                     self._bump_skip_reason("address_or_duplicate")
                     continue
                 if token_address in self.open_positions:
-                    prefilter_open_dup += 1
+                    removed_open_duplicate += 1
                     self._bump_skip_reason("address_or_duplicate")
                     continue
-                eligible_prefiltered.append((token, score))
-            eligible = eligible_prefiltered
-            if (prefilter_missing_addr + prefilter_open_dup) > 0:
+                blocked, blk_reason = self._blacklist_is_blocked(token_address)
+                if blocked:
+                    removed_blacklist += 1
+                    self._bump_skip_reason("blacklist")
+                    logger.info(
+                        "AutoTrade skip token=%s reason=blacklist detail=%s",
+                        symbol,
+                        self._short_error_text(blk_reason),
+                    )
+                    continue
+                if self._is_hard_blocked_token(token_address, symbol=symbol):
+                    removed_hard_blocklist += 1
+                    self._bump_skip_reason("hard_blocklist")
+                    self._blacklist_add(token_address, "hard_blocklist:config", ttl_seconds=90 * 24 * 3600)
+                    logger.warning("AutoTrade skip token=%s reason=hard_blocklist address=%s", symbol, token_address)
+                    continue
+                out.append((token, score))
+
+            total_removed = (
+                removed_missing_addr
+                + removed_placeholder_addr
+                + removed_open_duplicate
+                + removed_blacklist
+                + removed_hard_blocklist
+            )
+            if total_removed > 0:
                 logger.info(
-                    "AutoTrade batch prefilter removed=%s missing_addr=%s open_duplicate=%s",
-                    prefilter_missing_addr + prefilter_open_dup,
-                    prefilter_missing_addr,
-                    prefilter_open_dup,
+                    (
+                        "AutoTrade batch %s-prefilter removed=%s missing_addr=%s "
+                        "placeholder_addr=%s open_duplicate=%s blacklist=%s hard_blocklist=%s"
+                    ),
+                    stage,
+                    total_removed,
+                    removed_missing_addr,
+                    removed_placeholder_addr,
+                    removed_open_duplicate,
+                    removed_blacklist,
+                    removed_hard_blocklist,
                 )
+            return out
+
+        if eligible:
+            eligible = _prefilter_eligible(eligible, stage="pre")
         # Underflow fallback (matrix tuning mode): if there are no BUY candidates in cycle,
         # allow HOLD candidates with a separate floor to keep exploration alive.
         if (not eligible) and bool(getattr(config, "PLAN_UNDERFLOW_ALLOW_HOLD", False)):
@@ -2537,28 +2845,7 @@ class AutoTrader:
                 )
         if eligible:
             # Fallback path can inject rows that were not part of BUY prefilter.
-            post_prefilter_missing_addr = 0
-            post_prefilter_open_dup = 0
-            eligible_post_prefilter: list[tuple[dict[str, Any], dict[str, Any]]] = []
-            for token, score in eligible:
-                token_address = normalize_address(str((token or {}).get("address", "") or ""))
-                if not token_address:
-                    post_prefilter_missing_addr += 1
-                    self._bump_skip_reason("address_or_duplicate")
-                    continue
-                if token_address in self.open_positions:
-                    post_prefilter_open_dup += 1
-                    self._bump_skip_reason("address_or_duplicate")
-                    continue
-                eligible_post_prefilter.append((token, score))
-            eligible = eligible_post_prefilter
-            if (post_prefilter_missing_addr + post_prefilter_open_dup) > 0:
-                logger.info(
-                    "AutoTrade batch post-prefilter removed=%s missing_addr=%s open_duplicate=%s",
-                    post_prefilter_missing_addr + post_prefilter_open_dup,
-                    post_prefilter_missing_addr,
-                    post_prefilter_open_dup,
-                )
+            eligible = _prefilter_eligible(eligible, stage="post")
         if not eligible:
             return 0
 
@@ -2594,6 +2881,7 @@ class AutoTrader:
             ]
         selected = selected[: max(1, int(dynamic_cap))]
         selected = self._rebalance_plan_batch_sources(selected=selected, eligible=eligible)
+        base_selected = list(selected)
 
         # Burst governor: avoid correlated packet opens in one cycle/window.
         open_budget: int | None = None
@@ -2615,11 +2903,43 @@ class AutoTrader:
                     1,
                     int(getattr(config, "BURST_GOVERNOR_ATTEMPT_MULTIPLIER", 4) or 4),
                 )
-                attempt_budget = min(len(selected), max(int(budget), int(budget) * int(attempt_mult)))
+                attempt_budget_raw = max(int(budget), int(budget) * int(attempt_mult))
+                # Fallback pool: when top-ranked picks are skipped in plan_trade (cooldown/edge),
+                # continue trying additional eligible rows in the same cycle.
+                attempt_pool = list(base_selected)
+                if attempt_budget_raw > len(attempt_pool):
+                    seen_keys: set[str] = set()
+                    for token, score in attempt_pool:
+                        token_addr = normalize_address(str((token or {}).get("address", "") or ""))
+                        candidate_id = str((token or {}).get("_candidate_id", "") or "").strip()
+                        symbol = self._symbol_key(str((token or {}).get("symbol", "") or ""))
+                        if token_addr:
+                            seen_keys.add(f"addr:{token_addr}")
+                        elif candidate_id:
+                            seen_keys.add(f"cid:{candidate_id}")
+                        else:
+                            seen_keys.add(f"sym:{symbol}|score:{int((score or {}).get('score', 0) or 0)}")
+                    for token, score in eligible:
+                        token_addr = normalize_address(str((token or {}).get("address", "") or ""))
+                        candidate_id = str((token or {}).get("_candidate_id", "") or "").strip()
+                        symbol = self._symbol_key(str((token or {}).get("symbol", "") or ""))
+                        if token_addr:
+                            row_key = f"addr:{token_addr}"
+                        elif candidate_id:
+                            row_key = f"cid:{candidate_id}"
+                        else:
+                            row_key = f"sym:{symbol}|score:{int((score or {}).get('score', 0) or 0)}"
+                        if row_key in seen_keys:
+                            continue
+                        seen_keys.add(row_key)
+                        attempt_pool.append((token, score))
+                        if len(attempt_pool) >= int(attempt_budget_raw):
+                            break
+                attempt_budget = min(len(attempt_pool), int(attempt_budget_raw))
                 picked: list[tuple[dict[str, Any], dict[str, Any]]] = []
                 sym_counts: dict[str, int] = {}
                 cluster_counts: dict[str, int] = {}
-                for token, score in selected:
+                for token, score in attempt_pool:
                     symbol = self._symbol_key(str((token or {}).get("symbol", "") or ""))
                     try:
                         cluster = self._token_cluster_key(
@@ -2649,9 +2969,17 @@ class AutoTrader:
                 selected = picked
 
         opened = 0
+        batch_has_non_watchlist = any(
+            not self._is_watchlist_source(self._token_source_key(token_data))
+            for token_data, _ in selected
+        )
         for token_data, score_data in selected:
             if open_budget is not None and opened >= int(open_budget):
                 break
+            try:
+                token_data["_plan_batch_has_non_watchlist"] = bool(batch_has_non_watchlist)
+            except Exception:
+                pass
             pos = await self.plan_trade(token_data, score_data)
             if pos:
                 opened += 1
@@ -2789,14 +3117,14 @@ class AutoTrader:
             int(self._plan_attempts_by_source_window.get(source_key_ctx, 0)) + 1
         )
         symbol_upper = symbol.strip().upper()
-        excluded_symbols = set(getattr(config, "AUTO_TRADE_EXCLUDED_SYMBOLS", []) or [])
+        excluded_symbols = self._as_symbol_set(getattr(config, "AUTO_TRADE_EXCLUDED_SYMBOLS", []) or [])
         if symbol_upper and symbol_upper in excluded_symbols:
             self._bump_skip_reason("excluded_symbol")
             logger.info("AutoTrade skip token=%s reason=excluded_symbol", symbol)
             return None
         excluded_symbol_keywords = [
             str(x or "").strip().upper()
-            for x in (getattr(config, "AUTO_TRADE_EXCLUDED_SYMBOL_KEYWORDS", []) or [])
+            for x in self._as_csv_items(getattr(config, "AUTO_TRADE_EXCLUDED_SYMBOL_KEYWORDS", []) or [])
             if str(x or "").strip()
         ]
         if symbol_upper and excluded_symbol_keywords:
@@ -2856,6 +3184,7 @@ class AutoTrader:
             entry_channel = "core"
         source_name = str(token_data.get("source", "") or "").strip().lower()
         source_is_watchlist = source_name.startswith("watchlist")
+        batch_has_non_watchlist = bool(token_data.get("_plan_batch_has_non_watchlist", False))
         if source_is_watchlist and (not self._is_live_mode()) and (not bool(getattr(config, "PAPER_ALLOW_WATCHLIST_SOURCE", False))):
             strict_guard_enabled = bool(getattr(config, "PAPER_WATCHLIST_STRICT_GUARD_ENABLED", True))
             if not strict_guard_enabled:
@@ -2891,6 +3220,23 @@ class AutoTrader:
                     min_abs_chg,
                 )
                 return None
+        hard_top1_blocked, hard_top1_detail = self._hard_top1_open_share_blocked(symbol=symbol)
+        if hard_top1_blocked:
+            self._bump_skip_reason("top1_open_share_15m")
+            logger.info("AutoTrade skip token=%s reason=top1_open_share_15m detail=%s", symbol, hard_top1_detail)
+            return None
+        non_watch_quota_blocked, non_watch_quota_detail = self._plan_non_watchlist_quota_blocked(
+            source_name=source_name,
+            batch_has_non_watchlist=batch_has_non_watchlist,
+        )
+        if non_watch_quota_blocked:
+            self._bump_skip_reason("plan_non_watchlist_quota")
+            logger.info(
+                "AutoTrade skip token=%s reason=plan_non_watchlist_quota detail=%s",
+                symbol,
+                non_watch_quota_detail,
+            )
+            return None
         concentration_blocked, concentration_detail = self._symbol_concentration_blocked(
             symbol=symbol,
             entry_tier=entry_tier,
@@ -2899,12 +3245,7 @@ class AutoTrader:
             self._bump_skip_reason("symbol_concentration")
             logger.info("AutoTrade skip token=%s reason=symbol_concentration detail=%s", symbol, concentration_detail)
             return None
-        blocked, blk_reason = self._blacklist_is_blocked(token_address)
-        if blocked:
-            self._bump_skip_reason("blacklist")
-            logger.info("AutoTrade skip token=%s reason=blacklist detail=%s", symbol, self._short_error_text(blk_reason))
-            return None
-        if not token_address or token_address in self.open_positions:
+        if self._is_placeholder_token_address(token_address) or token_address in self.open_positions:
             self._bump_skip_reason("address_or_duplicate")
             logger.info(
                 "AutoTrade skip token=%s reason=address_or_duplicate raw_address=%s normalized=%s source=%s",
@@ -2914,6 +3255,11 @@ class AutoTrader:
                 str(token_data.get("source", "-")),
             )
             return None
+        blocked, blk_reason = self._blacklist_is_blocked(token_address)
+        if blocked:
+            self._bump_skip_reason("blacklist")
+            logger.info("AutoTrade skip token=%s reason=blacklist detail=%s", symbol, self._short_error_text(blk_reason))
+            return None
         if self._is_hard_blocked_token(token_address, symbol=symbol):
             self._bump_skip_reason("hard_blocklist")
             self._blacklist_add(token_address, "hard_blocklist:config", ttl_seconds=90 * 24 * 3600)
@@ -2922,8 +3268,16 @@ class AutoTrader:
         anti_choke = self._anti_choke_active()
         cooldown_until = float(self.token_cooldowns.get(token_address, 0.0))
         now_ts = datetime.now(timezone.utc).timestamp()
+        anti_choke_dominant_symbol, anti_choke_dominant_detail = self._anti_choke_symbol_dominant(
+            symbol=symbol_upper,
+        )
         if cooldown_until > now_ts:
             cooldown_left = int(max(1, cooldown_until - now_ts))
+            cooldown_reason = str(self.token_cooldown_reasons.get(token_address, "") or "").strip().lower()
+            is_transient_safety_cooldown = cooldown_reason.startswith("transient_safety:")
+            allow_transient_bypass = bool(
+                getattr(config, "ANTI_CHOKE_ALLOW_TRANSIENT_SAFETY_COOLDOWN_BYPASS", False)
+            )
             bypass_max_seconds = max(
                 0,
                 int(getattr(config, "ANTI_CHOKE_BYPASS_TOKEN_COOLDOWN_MAX_SECONDS", 180) or 180),
@@ -2931,6 +3285,8 @@ class AutoTrader:
             allow_token_cooldown_bypass = (
                 anti_choke
                 and bool(getattr(config, "ANTI_CHOKE_ALLOW_TOKEN_COOLDOWN_BYPASS", True))
+                and (allow_transient_bypass or (not is_transient_safety_cooldown))
+                and (not anti_choke_dominant_symbol)
                 and cooldown_left <= bypass_max_seconds
             )
             if allow_token_cooldown_bypass:
@@ -2941,7 +3297,15 @@ class AutoTrader:
                 )
             else:
                 self._bump_skip_reason("cooldown")
-                logger.info("AutoTrade skip token=%s reason=cooldown_left_%ss", symbol, cooldown_left)
+                if anti_choke and anti_choke_dominant_symbol:
+                    logger.info(
+                        "AutoTrade skip token=%s reason=cooldown_left_%ss detail=%s",
+                        symbol,
+                        cooldown_left,
+                        anti_choke_dominant_detail or "anti_choke_dominant_symbol",
+                    )
+                else:
+                    logger.info("AutoTrade skip token=%s reason=cooldown_left_%ss", symbol, cooldown_left)
                 return None
         is_unverified_token = self._is_live_mode() and (not self._is_token_sell_verified(token_address))
         if is_unverified_token and float(self._new_token_pause_until_ts or 0.0) > now_ts:
@@ -2961,6 +3325,7 @@ class AutoTrader:
             allow_symbol_cooldown_bypass = (
                 anti_choke
                 and bool(getattr(config, "ANTI_CHOKE_ALLOW_SYMBOL_COOLDOWN_BYPASS", True))
+                and (not anti_choke_dominant_symbol)
                 and int(symbol_cd_left) <= int(bypass_max_seconds)
             )
             if allow_symbol_cooldown_bypass:
@@ -2971,7 +3336,15 @@ class AutoTrader:
                 )
             else:
                 self._bump_skip_reason("symbol_cooldown")
-                logger.info("AutoTrade skip token=%s reason=symbol_cooldown_left_%ss", symbol, symbol_cd_left)
+                if anti_choke and anti_choke_dominant_symbol:
+                    logger.info(
+                        "AutoTrade skip token=%s reason=symbol_cooldown_left_%ss detail=%s",
+                        symbol,
+                        symbol_cd_left,
+                        anti_choke_dominant_detail or "anti_choke_dominant_symbol",
+                    )
+                else:
+                    logger.info("AutoTrade skip token=%s reason=symbol_cooldown_left_%ss", symbol, symbol_cd_left)
                 return None
         if is_unverified_token and bool(getattr(config, "LIVE_UNVERIFIED_RISK_CAPS_ENABLED", True)):
             unverified_open = int(self._count_open_unverified_positions())
@@ -3207,14 +3580,62 @@ class AutoTrader:
             and bool(getattr(config, "CORE_BLOCK_L1_FOR_CORE_ENABLED", True))
             and "|l1|" in str(cluster_key).lower()
         ):
-            self._bump_skip_reason("core_l1_block")
-            logger.info(
-                "AutoTrade skip token=%s reason=core_l1_block cluster=%s entry_channel=%s",
-                symbol,
-                cluster_key,
-                entry_channel,
-            )
-            return None
+            if bool(getattr(config, "CORE_BLOCK_L1_FALLBACK_TO_EXPLORE", True)):
+                fallback_size_mult = max(
+                    0.10,
+                    min(1.00, _safe_float(getattr(config, "CORE_L1_FALLBACK_SIZE_MULT", 0.65), 0.65)),
+                )
+                fallback_hold_mult = max(
+                    0.20,
+                    min(1.00, _safe_float(getattr(config, "CORE_L1_FALLBACK_HOLD_MULT", 0.75), 0.75)),
+                )
+                fallback_edge_usd_mult = max(
+                    1.00,
+                    _safe_float(getattr(config, "CORE_L1_FALLBACK_EDGE_USD_MULT", 1.25), 1.25),
+                )
+                fallback_edge_pct_mult = max(
+                    1.00,
+                    _safe_float(getattr(config, "CORE_L1_FALLBACK_EDGE_PERCENT_MULT", 1.20), 1.20),
+                )
+                token_data["_entry_channel"] = "explore"
+                token_data["_entry_channel_size_mult"] = min(
+                    max(0.10, _safe_float(token_data.get("_entry_channel_size_mult"), 1.0)),
+                    float(fallback_size_mult),
+                )
+                token_data["_entry_channel_hold_mult"] = min(
+                    max(0.20, _safe_float(token_data.get("_entry_channel_hold_mult"), 1.0)),
+                    float(fallback_hold_mult),
+                )
+                token_data["_entry_channel_edge_usd_mult"] = max(
+                    1.00,
+                    _safe_float(token_data.get("_entry_channel_edge_usd_mult"), 1.0),
+                    float(fallback_edge_usd_mult),
+                )
+                token_data["_entry_channel_edge_pct_mult"] = max(
+                    1.00,
+                    _safe_float(token_data.get("_entry_channel_edge_pct_mult"), 1.0),
+                    float(fallback_edge_pct_mult),
+                )
+                if self._active_trade_decision_context is not None:
+                    self._active_trade_decision_context["core_l1_fallback"] = True
+                logger.info(
+                    "AutoTrade fallback token=%s reason=core_l1_block_to_explore cluster=%s size_mult=%.2f hold_mult=%.2f edge_mult(usd=%.2f,pct=%.2f)",
+                    symbol,
+                    cluster_key,
+                    float(token_data.get("_entry_channel_size_mult") or 1.0),
+                    float(token_data.get("_entry_channel_hold_mult") or 1.0),
+                    float(token_data.get("_entry_channel_edge_usd_mult") or 1.0),
+                    float(token_data.get("_entry_channel_edge_pct_mult") or 1.0),
+                )
+            else:
+                self._bump_skip_reason("core_l1_block")
+                logger.info(
+                    "AutoTrade skip token=%s reason=core_l1_block cluster=%s entry_channel=%s",
+                    symbol,
+                    cluster_key,
+                    entry_channel,
+                )
+                return None
         if bool(getattr(config, "ENTRY_REQUIRE_POSITIVE_CHANGE_5M", False)):
             min_change_5m = float(getattr(config, "ENTRY_MIN_PRICE_CHANGE_5M_PERCENT", 0.0) or 0.0)
             if price_change_5m <= min_change_5m:
@@ -3890,13 +4311,21 @@ class AutoTrader:
             hp_ok, hp_detail = await self._honeypot_guard_passes(token_address)
             if not hp_ok:
                 self._bump_skip_reason("honeypot_guard")
+                hp_detail_short = self._short_error_text(hp_detail)
                 logger.warning(
                     "AutoTrade skip token=%s reason=honeypot_guard detail=%s mode=%s",
                     symbol,
-                    self._short_error_text(hp_detail),
+                    hp_detail_short,
                     "live" if self._is_live_mode() else "paper",
                 )
-                self._blacklist_add(token_address, f"honeypot_guard:{self._short_error_text(hp_detail)}")
+                hp_reason = f"honeypot_guard:{hp_detail_short}"
+                if self._is_transient_honeypot_reason(hp_reason):
+                    # Fail-closed still skips the trade, but avoid poisoning paper blacklist on API-side outages.
+                    self._apply_transient_safety_cooldown(token_address, f"honeypot_guard_transient:{hp_detail_short}")
+                    if bool(getattr(config, "HONEYPOT_TRANSIENT_TO_BLACKLIST", False)):
+                        self._blacklist_add(token_address, f"honeypot_guard_transient:{hp_detail_short}")
+                else:
+                    self._blacklist_add(token_address, hp_reason)
                 return None
 
         if not self._is_live_mode():
@@ -4170,6 +4599,7 @@ class AutoTrader:
             if core_probe_applied:
                 self._record_core_probe_open()
             self._record_open_symbol(pos.symbol)
+            self._record_open_source(source_key_open)
             self._record_tx_event()
             logger.info(
                 "AUTO_BUY Live BUY token=%s address=%s mode=%s tier=%s channel=%s lane=%s spend=%.8f ETH score=%s edge=%.2f%% edge_usd=$%.3f size=$%.2f mult=%.2f(%s) hold=%ss tx=%s",
@@ -4268,6 +4698,7 @@ class AutoTrader:
         if core_probe_applied:
             self._record_core_probe_open()
         self._record_open_symbol(pos.symbol)
+        self._record_open_source(source_key_open)
         self._record_tx_event()
         self.paper_balance_usd -= position_size_usd
 
@@ -5743,6 +6174,12 @@ class AutoTrader:
             top_symbol, top_count = max(symbol_counts.items(), key=lambda item: int(item[1]))
         conc_total = len(self._recent_open_symbols)
         top_share = (float(top_count) / float(conc_total)) if conc_total > 0 else 0.0
+        top1_window = max(300, int(getattr(config, "TOP1_OPEN_SHARE_15M_WINDOW_SECONDS", 900) or 900))
+        top1_symbol, top1_count, top1_total, top1_share = self._top_symbol_share_recent(window_seconds=top1_window)
+        quota_window = max(300, int(getattr(config, "PLAN_NON_WATCHLIST_QUOTA_WINDOW_SECONDS", 900) or 900))
+        watch_opens, non_watch_opens, source_total, watch_share_recent = self._open_source_mix_recent(
+            window_seconds=quota_window,
+        )
         win_rate = (self.total_wins / self.total_closed * 100) if self.total_closed else 0.0
         unrealized_pnl = sum(pos.pnl_usd for pos in self.open_positions.values())
         equity = self.paper_balance_usd + sum(pos.position_size_usd + pos.pnl_usd for pos in self.open_positions.values())
@@ -5821,6 +6258,16 @@ class AutoTrader:
             "symbol_concentration_recent_opens": int(conc_total),
             "symbol_concentration_top_symbol": top_symbol,
             "symbol_concentration_top_share": round(float(top_share), 3),
+            "top1_open_share_15m_window_seconds": int(top1_window),
+            "top1_open_share_15m_total": int(top1_total),
+            "top1_open_share_15m_symbol": str(top1_symbol or ""),
+            "top1_open_share_15m_count": int(top1_count),
+            "top1_open_share_15m_share": round(float(top1_share), 3),
+            "source_mix_15m_window_seconds": int(quota_window),
+            "source_mix_15m_total_opens": int(source_total),
+            "source_mix_15m_watchlist_opens": int(watch_opens),
+            "source_mix_15m_non_watchlist_opens": int(non_watch_opens),
+            "source_mix_15m_watchlist_share": round(float(watch_share_recent), 3),
             "autostop_window_minutes": int(window_minutes),
             "autostop_window_closed": int(window_closed),
             "autostop_window_realized_pnl_usd": float(window_realized),
@@ -5851,10 +6298,12 @@ class AutoTrader:
         self._last_pause_detail = ""
         self._last_pause_trigger_ts = 0.0
         self.token_cooldowns.clear()
+        self.token_cooldown_reasons.clear()
         self.token_cooldown_strikes.clear()
         self.symbol_cooldowns.clear()
         self.trade_open_timestamps.clear()
         self._recent_open_symbols.clear()
+        self._recent_open_sources.clear()
         self.tx_event_timestamps.clear()
         self.price_guard_pending.clear()
         self.emergency_halt_reason = ""

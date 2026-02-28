@@ -1,0 +1,7 @@
+[03:11:25 UTC] [u_station_ab_night_autotune_v2] mode=conveyor phase=tighten state=noop
+  flow15 scanned=65 candidates=13 selected=2 opened=2 open_positions=1 closed_total=63
+  diversity15 buy_total=2 unique_buy=2 top_symbol=cbBTC top_share=0.5
+  target_tph effective=4.0 requested=30.0
+  telemetry15 raw=268 src=268 pre=214 thr=92 q=92 exec=0 buy=2
+  top_plan_skip blacklist count=50
+  decision recover_tighten_not_ready selected=2 opened=2 open_rate=1.000

@@ -1,0 +1,11 @@
+2026-02-27 16:16:14,862 [INFO] [u_station_ab_night_autotune_v2] __main__: SESSION_LOG file=logs/matrix/u_station_ab_night_autotune_v2\sessions\main_local_20260227_151614_pid12984.log
+2026-02-27 16:16:14,930 [INFO] [u_station_ab_night_autotune_v2] trading.auto_trader_state: AutoTrade state loaded open=0 closed=116 balance=$7.31
+2026-02-27 16:16:14,940 [WARNING] [u_station_ab_night_autotune_v2] trading.auto_trader: DATA_POLICY mode=OK reason=init_reset_manual prev_mode=OK prev_reason=healthy | route=allow_all
+2026-02-27 16:16:14,941 [INFO] [u_station_ab_night_autotune_v2] __main__: AUTOTRADER_INIT state=ready reason=manual mode=paper
+2026-02-27 16:16:14,943 [INFO] [u_station_ab_night_autotune_v2] __main__: Local mode started (Telegram disabled).
+2026-02-27 16:16:14,946 [WARNING] [u_station_ab_night_autotune_v2] __main__: RUNTIME_TUNER_CONTROL inactive run_tag=u_station_ab_night_autotune_v2: local adaptive controllers unlocked.
+2026-02-27 16:16:15,371 [INFO] [u_station_ab_night_autotune_v2] monitor.onchain_factory: PAIR_DETECTED source=uniswap_v2 dex=uniswap_v2 pair=0x1fcb15e19d05aaa3b3a54e7a6a3f48375b062dc4 token0=0x4200000000000000000000000000000000000006 token1=0xc0faeea8f1f84d63736a0577c554641e0cb6eb07 block=42707970 factory=0x8909dc15e40173ff4699343b6eb8132c65e18ec6
+2026-02-27 16:16:15,371 [INFO] [u_station_ab_night_autotune_v2] monitor.onchain_factory: PAIR_DETECTED source=uniswap_v2 dex=uniswap_v2 pair=0x37f709f546b926d0b4832941227a2d6021a0e881 token0=0x4200000000000000000000000000000000000006 token1=0x80dafcc39774ea462b64e4389d7569fba9368dc1 block=42707975 factory=0x8909dc15e40173ff4699343b6eb8132c65e18ec6
+2026-02-27 16:16:15,509 [INFO] [u_station_ab_night_autotune_v2] monitor.onchain_factory: PAIR_DETECTED source=uniswap_v3 dex=uniswap_v3 pair=0xb650ef0ef53d8461bfcf459a611432f1fb71f48b token0=0x4200000000000000000000000000000000000006 token1=0xfa5191fdaeaa4f835297f4313011e0269ca96595 block=42708000 factory=0x33128a8fc17869897dce68ed026d694621f6fdfd
+2026-02-27 16:16:15,934 [INFO] [u_station_ab_night_autotune_v2] monitor.onchain_factory: ENRICH_RETRY token=0xfa5191fdaeaa4f835297f4313011e0269ca96595 pair=0xb650ef0ef53d8461bfcf459a611432f1fb71f48b attempt=1/2 delay=10s
+2026-02-27 16:16:27,720 [WARNING] [u_station_ab_night_autotune_v2] monitor.watchlist: WATCHLIST low_supply fallback strict=3 final=3 min=12 relax_factor=0.50
