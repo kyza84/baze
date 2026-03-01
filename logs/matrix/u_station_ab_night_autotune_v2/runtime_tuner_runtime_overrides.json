@@ -1,5 +1,5 @@
 {
-  "ts": "2026-02-28T17:42:13.912644+00:00",
+  "ts": "2026-03-01T19:55:39.844007+00:00",
   "profile_id": "u_station_ab_night_autotune_v2",
   "overrides": {
     "AUTO_TRADE_EXCLUDED_SYMBOLS": "NOOK,FELIX",
@@ -19,8 +19,8 @@
     "PAPER_WATCHLIST_MIN_SCORE": "70",
     "PAPER_WATCHLIST_MIN_VOLUME_5M_USD": "10",
     "PLAN_MAX_SINGLE_SOURCE_SHARE": "0.2",
-    "PLAN_MAX_WATCHLIST_SHARE": "0.20",
-    "PLAN_MIN_NON_WATCHLIST_PER_BATCH": "3",
+    "PLAN_MAX_WATCHLIST_SHARE": "0.02",
+    "PLAN_MIN_NON_WATCHLIST_PER_BATCH": "6",
     "PROFIT_ENGINE_ENABLED": "false",
     "SAFE_MIN_VOLUME_5M_USD": "5",
     "SEEN_TOKEN_TTL": "300",
@@ -30,7 +30,7 @@
     "SYMBOL_CONCENTRATION_MAX_SHARE": "0.12",
     "TOKEN_AGE_MAX": "21600",
     "TOKEN_EV_MEMORY_BAD_ENTRY_PROBABILITY": "0.95",
-    "TOKEN_EV_MEMORY_MIN_TRADES": "18",
+    "TOKEN_EV_MEMORY_MIN_TRADES": "12",
     "TOKEN_EV_MEMORY_SEVERE_ENTRY_PROBABILITY": "0.9",
     "V2_CALIBRATION_EDGE_USD_MIN": "0.0005",
     "V2_CALIBRATION_ENABLED": "true",
@@ -41,14 +41,14 @@
     "V2_QUALITY_SYMBOL_REENTRY_MIN_SECONDS": "60",
     "V2_ROLLING_EDGE_MIN_PERCENT": "0.05",
     "V2_ROLLING_EDGE_MIN_USD": "0.0005",
-    "V2_SOURCE_QOS_MAX_PER_SYMBOL_PER_CYCLE": "1",
-    "V2_SOURCE_QOS_SOURCE_CAPS": "onchain:352,onchain+market:348,dexscreener:322,geckoterminal:317,watchlist:10,dex_boosts:142",
+    "V2_SOURCE_QOS_MAX_PER_SYMBOL_PER_CYCLE": "20",
+    "V2_SOURCE_QOS_SOURCE_CAPS": "onchain:536,onchain+market:536,dexscreener:600,geckoterminal:600,watchlist:8,dex_boosts:600",
     "V2_SOURCE_QOS_TOPK_PER_CYCLE": "600",
     "V2_UNIVERSE_NOVELTY_MIN_SHARE": "0.85",
-    "V2_UNIVERSE_SOURCE_CAPS": "onchain:224,onchain+market:223,dexscreener:201,geckoterminal:197,watchlist:4,dex_boosts:128",
+    "V2_UNIVERSE_SOURCE_CAPS": "onchain:250,onchain+market:250,dexscreener:225,geckoterminal:220,watchlist:4,dex_boosts:150",
     "WATCHLIST_MAX_TOKENS": "120",
     "WATCHLIST_MIN_LIQUIDITY_USD": "5000",
     "WATCHLIST_MIN_VOLUME_24H_USD": "10000",
-    "WATCHLIST_REFRESH_SECONDS": "480"
+    "WATCHLIST_REFRESH_SECONDS": "60"
   }
 }

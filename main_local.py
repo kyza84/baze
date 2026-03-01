@@ -2506,6 +2506,7 @@ async def run_local_loop() -> None:
     heavy_last_liquidity: dict[str, float] = {}
     heavy_last_volume_5m: dict[str, float] = {}
     heavy_last_seen_ts: dict[str, float] = {}
+    safe_volume_probe_state: dict[str, dict[str, float | int]] = {}
     filter_fail_reasons_session: dict[str, int] = {}
     adaptive_filters = AdaptiveFilterController()
     adaptive_init_stats = auto_trader.get_stats()
@@ -2735,6 +2736,14 @@ async def run_local_loop() -> None:
                         heavy_seen_until.pop(a, None)
                         heavy_last_liquidity.pop(a, None)
                         heavy_last_volume_5m.pop(a, None)
+                if safe_volume_probe_state:
+                    expired_probe = [
+                        a
+                        for a, row in safe_volume_probe_state.items()
+                        if float((row or {}).get("until", 0.0) or 0.0) <= now_mono
+                    ]
+                    for a in expired_probe:
+                        safe_volume_probe_state.pop(a, None)
                 if tokens or source_qos_dropped:
                     cycle_filter_fails: dict[str, int] = {}
                     mode_profile = _market_mode_entry_profile(market_regime_current)
@@ -2897,13 +2906,87 @@ async def run_local_loop() -> None:
                                 _filter_fail("safe_liquidity", token)
                                 continue
                             safe_volume_floor = float(config.SAFE_MIN_VOLUME_5M_USD) * max(0.1, float(regime_volume_mult))
-                            if float(token.get("volume_5m") or 0) < safe_volume_floor:
-                                _filter_fail(
-                                    "safe_volume",
-                                    token,
-                                    f"vol5m={float(token.get('volume_5m') or 0):.0f} min={safe_volume_floor:.0f} regime={market_regime_current}",
+                            token_volume_5m = float(token.get("volume_5m") or 0.0)
+                            if token_volume_5m < safe_volume_floor:
+                                soft_enabled = bool(getattr(config, "SAFE_VOLUME_TWO_TIER_ENABLED", False))
+                                soft_ratio = max(
+                                    0.20,
+                                    min(0.99, float(getattr(config, "SAFE_VOLUME_TWO_TIER_SOFT_RATIO", 0.80) or 0.80)),
                                 )
-                                continue
+                                soft_min_volume = float(safe_volume_floor) * float(soft_ratio)
+                                if soft_enabled and token_address and token_volume_5m >= soft_min_volume:
+                                    stable_cycles_required = max(
+                                        1,
+                                        int(getattr(config, "SAFE_VOLUME_TWO_TIER_STABLE_CYCLES", 2) or 2),
+                                    )
+                                    stability_ratio = max(
+                                        0.50,
+                                        min(
+                                            1.20,
+                                            float(
+                                                getattr(
+                                                    config,
+                                                    "SAFE_VOLUME_TWO_TIER_STABILITY_RATIO",
+                                                    0.85,
+                                                )
+                                                or 0.85
+                                            ),
+                                        ),
+                                    )
+                                    probe_ttl_seconds = max(
+                                        60,
+                                        int(getattr(config, "SAFE_VOLUME_TWO_TIER_TTL_SECONDS", 900) or 900),
+                                    )
+                                    prev_probe = dict(safe_volume_probe_state.get(token_address, {}) or {})
+                                    prev_vol = float(prev_probe.get("vol", 0.0) or 0.0)
+                                    prev_liq = float(prev_probe.get("liq", 0.0) or 0.0)
+                                    prev_hits = int(prev_probe.get("hits", 0) or 0)
+                                    token_liq_now = float(token.get("liquidity") or 0.0)
+                                    stable_volume = (prev_vol <= 0.0) or (token_volume_5m >= (prev_vol * stability_ratio))
+                                    stable_liquidity = (prev_liq <= 0.0) or (token_liq_now >= (prev_liq * stability_ratio))
+                                    probe_hits = (prev_hits + 1) if (stable_volume and stable_liquidity) else 1
+                                    safe_volume_probe_state[token_address] = {
+                                        "hits": int(probe_hits),
+                                        "vol": float(token_volume_5m),
+                                        "liq": float(token_liq_now),
+                                        "until": float(now_mono + float(probe_ttl_seconds)),
+                                    }
+                                    if probe_hits >= stable_cycles_required:
+                                        token["_safe_volume_soft_pass"] = True
+                                        token["_safe_volume_soft_detail"] = (
+                                            f"vol5m={token_volume_5m:.0f}/{safe_volume_floor:.0f} "
+                                            f"soft_min={soft_min_volume:.0f} hits={probe_hits}/{stable_cycles_required}"
+                                        )
+                                        logger.info(
+                                            "SAFE_VOLUME_SOFT_PASS token=%s vol5m=%.0f min=%.0f soft_min=%.0f hits=%s/%s mode=%s",
+                                            token.get("symbol", "N/A"),
+                                            token_volume_5m,
+                                            safe_volume_floor,
+                                            soft_min_volume,
+                                            probe_hits,
+                                            stable_cycles_required,
+                                            market_regime_current,
+                                        )
+                                    else:
+                                        _filter_fail(
+                                            "safe_volume_quarantine",
+                                            token,
+                                            (
+                                                f"vol5m={token_volume_5m:.0f} min={safe_volume_floor:.0f} "
+                                                f"soft_min={soft_min_volume:.0f} hits={probe_hits}/{stable_cycles_required} "
+                                                f"regime={market_regime_current}"
+                                            ),
+                                        )
+                                        continue
+                                else:
+                                    _filter_fail(
+                                        "safe_volume",
+                                        token,
+                                        f"vol5m={token_volume_5m:.0f} min={safe_volume_floor:.0f} regime={market_regime_current}",
+                                    )
+                                    continue
+                            elif token_address:
+                                safe_volume_probe_state.pop(token_address, None)
                             if int(token.get("age_seconds") or 0) < int(config.SAFE_MIN_AGE_SECONDS):
                                 _filter_fail("safe_age", token)
                                 continue

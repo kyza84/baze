@@ -44,6 +44,50 @@ Set-Location $root
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 
+function Disable-QuickEditMode {
+  if (-not $IsWindows) {
+    return
+  }
+  try {
+    if (-not ("Win32.ConsoleModeTools" -as [type])) {
+      Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+namespace Win32 {
+  public static class ConsoleModeTools {
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern IntPtr GetStdHandle(int nStdHandle);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern bool GetConsoleMode(IntPtr hConsoleHandle, out int lpMode);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern bool SetConsoleMode(IntPtr hConsoleHandle, int dwMode);
+  }
+}
+"@ | Out-Null
+    }
+    $STD_INPUT_HANDLE = -10
+    $ENABLE_QUICK_EDIT_MODE = 0x0040
+    $ENABLE_INSERT_MODE = 0x0020
+    $ENABLE_EXTENDED_FLAGS = 0x0080
+    $handle = [Win32.ConsoleModeTools]::GetStdHandle($STD_INPUT_HANDLE)
+    if ($handle -eq [IntPtr]::Zero -or $handle -eq [IntPtr]::op_Explicit(-1)) {
+      return
+    }
+    $mode = 0
+    if (-not [Win32.ConsoleModeTools]::GetConsoleMode($handle, [ref]$mode)) {
+      return
+    }
+    $newMode = ($mode -bor $ENABLE_EXTENDED_FLAGS)
+    $newMode = $newMode -band (-bnot $ENABLE_QUICK_EDIT_MODE)
+    $newMode = $newMode -band (-bnot $ENABLE_INSERT_MODE)
+    [Win32.ConsoleModeTools]::SetConsoleMode($handle, $newMode) | Out-Null
+  } catch {
+    # Non-fatal: tuner must continue even if console mode couldn't be changed.
+  }
+}
+
+Disable-QuickEditMode
+
 if (-not $ProfileId -or $ProfileId.Trim().Length -eq 0) {
   throw "ProfileId is required."
 }

@@ -120,6 +120,91 @@ def _heartbeat_age_seconds(root: Path, item: dict[str, Any]) -> float | None:
     return max(0.0, time.time() - hb_ts)
 
 
+def _file_age_seconds(path: Path) -> float | None:
+    if not path.exists():
+        return None
+    try:
+        mtime = float(path.stat().st_mtime)
+    except Exception:
+        return None
+    return max(0.0, time.time() - mtime)
+
+
+def _runtime_tuner_lock_pid(root: Path, item: dict[str, Any]) -> int:
+    rel_log_dir = str(item.get("log_dir", "") or "").strip()
+    if not rel_log_dir:
+        return 0
+    lock_path = root / rel_log_dir / "runtime_tuner.lock.json"
+    payload = _read_json(lock_path)
+    try:
+        return int(payload.get("pid", 0) or 0)
+    except Exception:
+        return 0
+
+
+def _runtime_tuner_log_age_seconds(root: Path, item: dict[str, Any]) -> float | None:
+    rel_log_dir = str(item.get("log_dir", "") or "").strip()
+    if not rel_log_dir:
+        return None
+    log_path = root / rel_log_dir / "runtime_tuner.jsonl"
+    return _file_age_seconds(log_path)
+
+
+def _runtime_tuner_known(root: Path, item: dict[str, Any]) -> bool:
+    rel_log_dir = str(item.get("log_dir", "") or "").strip()
+    if not rel_log_dir:
+        return False
+    log_dir = root / rel_log_dir
+    return bool((log_dir / "runtime_tuner.jsonl").exists() or (log_dir / "runtime_tuner.lock.json").exists())
+
+
+def _restart_tuner(root: Path, profile_id: str) -> tuple[bool, str, int]:
+    py = _python_path(root)
+    if not py.exists():
+        return False, f"python not found: {py}", 0
+    script = root / "tools" / "matrix_runtime_tuner.py"
+    if not script.exists():
+        return False, f"script not found: {script}", 0
+    try:
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        proc = subprocess.Popen(
+            [
+                str(py),
+                "-u",
+                str(script),
+                "run",
+                "--profile-id",
+                str(profile_id),
+                "--root",
+                str(root),
+                "--mode",
+                "conveyor",
+                "--policy-phase",
+                "auto",
+                "--window-minutes",
+                "12",
+                "--duration-minutes",
+                "600",
+                "--interval-seconds",
+                "120",
+            ],
+            cwd=str(root),
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=(subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP) if os.name == "nt" else 0,
+            close_fds=True,
+        )
+        pid = int(proc.pid or 0)
+        if pid <= 0:
+            return False, "spawn failed", 0
+        return True, "restarted", pid
+    except Exception as exc:
+        return False, str(exc), 0
+
+
 def _meta_path(root: Path) -> Path:
     return root / "data" / "matrix" / "runs" / "active_matrix.json"
 
@@ -132,7 +217,15 @@ def _events_path(root: Path) -> Path:
     return root / "data" / "matrix" / "runs" / "watchdog_events.jsonl"
 
 
-def _scan_once(root: Path, stale_seconds: int, restart_cooldown_seconds: int) -> dict[str, Any]:
+def _scan_once(
+    root: Path,
+    stale_seconds: int,
+    restart_cooldown_seconds: int,
+    *,
+    watch_tuner: bool = False,
+    tuner_stale_seconds: int = 420,
+    tuner_restart_cooldown_seconds: int = 300,
+) -> dict[str, Any]:
     meta_path = _meta_path(root)
     state_path = _state_path(root)
     meta = _read_json(meta_path)
@@ -140,6 +233,9 @@ def _scan_once(root: Path, stale_seconds: int, restart_cooldown_seconds: int) ->
     requested_run = bool(meta.get("requested_run", False))
     state = _read_json(state_path)
     last_restarts = state.get("last_restarts", {}) if isinstance(state.get("last_restarts"), dict) else {}
+    last_tuner_restarts = (
+        state.get("last_tuner_restarts", {}) if isinstance(state.get("last_tuner_restarts"), dict) else {}
+    )
     events: list[dict[str, Any]] = []
     changed = False
 
@@ -187,6 +283,41 @@ def _scan_once(root: Path, stale_seconds: int, restart_cooldown_seconds: int) ->
             else:
                 row["status"] = "restart_failed"
 
+        if watch_tuner and requested_run and _runtime_tuner_known(root, row):
+            tuner_pid = _runtime_tuner_lock_pid(root, row)
+            tuner_alive = _pid_alive(tuner_pid) if tuner_pid > 0 else False
+            tuner_age = _runtime_tuner_log_age_seconds(root, row)
+            tuner_stale = (tuner_age is None) or (float(tuner_age) >= float(tuner_stale_seconds))
+            tuner_dead = (tuner_pid > 0) and (not tuner_alive)
+            tuner_reason = ""
+            if tuner_dead:
+                tuner_reason = "tuner_pid_dead"
+            elif tuner_stale:
+                tuner_reason = "tuner_stale_jsonl"
+            if tuner_reason:
+                tuner_last_ts = float(last_tuner_restarts.get(profile_id, 0.0) or 0.0)
+                tuner_cooldown_left = float(tuner_restart_cooldown_seconds) - (now_ts - tuner_last_ts)
+                if tuner_cooldown_left <= 0.0:
+                    if tuner_pid > 0 and tuner_alive:
+                        _kill_pid(tuner_pid)
+                    ok, msg, new_pid = _restart_tuner(root, profile_id)
+                    evt = {
+                        "ts": now_ts,
+                        "timestamp": _now_iso(),
+                        "component": "runtime_tuner",
+                        "id": profile_id,
+                        "reason": tuner_reason,
+                        "tuner_log_age_sec": round(float(tuner_age or 0.0), 2),
+                        "old_pid": int(tuner_pid),
+                        "restart_ok": bool(ok),
+                        "message": msg,
+                        "new_pid": int(new_pid),
+                    }
+                    events.append(evt)
+                    _append_jsonl(_events_path(root), evt)
+                    last_tuner_restarts[profile_id] = now_ts
+                    changed = True
+
     if changed:
         alive_count = 0
         for row in items:
@@ -204,6 +335,7 @@ def _scan_once(root: Path, stale_seconds: int, restart_cooldown_seconds: int) ->
             {
                 "updated_at": _now_iso(),
                 "last_restarts": last_restarts,
+                "last_tuner_restarts": last_tuner_restarts,
                 "events_tail": (state.get("events_tail", []) if isinstance(state.get("events_tail"), list) else [])[-80:] + events,
             },
         )
@@ -220,6 +352,9 @@ def main() -> int:
     parser.add_argument("--root", default=".")
     parser.add_argument("--stale-seconds", type=int, default=180)
     parser.add_argument("--restart-cooldown-seconds", type=int, default=120)
+    parser.add_argument("--watch-tuner", action="store_true")
+    parser.add_argument("--tuner-stale-seconds", type=int, default=420)
+    parser.add_argument("--tuner-restart-cooldown-seconds", type=int, default=300)
     parser.add_argument("--loop-seconds", type=int, default=20)
     parser.add_argument("--follow", action="store_true")
     args = parser.parse_args()
@@ -231,11 +366,16 @@ def main() -> int:
                 root=root,
                 stale_seconds=max(60, int(args.stale_seconds)),
                 restart_cooldown_seconds=max(30, int(args.restart_cooldown_seconds)),
+                watch_tuner=bool(args.watch_tuner),
+                tuner_stale_seconds=max(120, int(args.tuner_stale_seconds)),
+                tuner_restart_cooldown_seconds=max(60, int(args.tuner_restart_cooldown_seconds)),
             )
             for evt in res.get("events", []) or []:
                 print(
-                    f"[WATCHDOG] id={evt.get('id')} reason={evt.get('reason')} old_pid={evt.get('old_pid')} "
-                    f"new_pid={evt.get('new_pid')} ok={evt.get('restart_ok')} age={evt.get('heartbeat_age_sec')}s"
+                    f"[WATCHDOG] component={evt.get('component', 'main_local')} id={evt.get('id')} "
+                    f"reason={evt.get('reason')} old_pid={evt.get('old_pid')} "
+                    f"new_pid={evt.get('new_pid')} ok={evt.get('restart_ok')} "
+                    f"age={evt.get('heartbeat_age_sec', evt.get('tuner_log_age_sec', 'N/A'))}s"
                 )
             time.sleep(max(10, int(args.loop_seconds)))
     else:
@@ -243,6 +383,9 @@ def main() -> int:
             root=root,
             stale_seconds=max(60, int(args.stale_seconds)),
             restart_cooldown_seconds=max(30, int(args.restart_cooldown_seconds)),
+            watch_tuner=bool(args.watch_tuner),
+            tuner_stale_seconds=max(120, int(args.tuner_stale_seconds)),
+            tuner_restart_cooldown_seconds=max(60, int(args.tuner_restart_cooldown_seconds)),
         )
         print(json.dumps(res, ensure_ascii=False, indent=2))
     return 0

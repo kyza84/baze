@@ -184,6 +184,8 @@ TIGHTEN_FLOW_ESCAPE_SIGNALS = {
     "anti_concentration",
     "low_throughput_expand_topn",
     "cooldown_dominant_flow_expand",
+    "safe_volume_soft_flow_expand",
+    "blacklist_dominator_shaping",
     "ev_net_low",
     "ev_net_low_gate",
     "ev_net_low_probe_tolerance",
@@ -196,6 +198,17 @@ HOLD_FLOW_ESCAPE_SIGNALS = {
     "feed_starvation",
     "plan_concentration",
     "source_diversity_rebalance",
+    "safe_volume_soft_flow_expand",
+    "blacklist_dominator_shaping",
+}
+ROLLBACK_SOURCE_GUARD_KEYS = {
+    # Do not rollback these keys while source concentration is still unresolved.
+    "PLAN_MAX_WATCHLIST_SHARE",
+    "PLAN_MIN_NON_WATCHLIST_PER_BATCH",
+    "PLAN_MAX_SINGLE_SOURCE_SHARE",
+    "V2_SOURCE_QOS_SOURCE_CAPS",
+    "V2_SOURCE_QOS_TOPK_PER_CYCLE",
+    "V2_SOURCE_QOS_MAX_PER_SYMBOL_PER_CYCLE",
 }
 IDLE_RELAX_SAFE_KEYS = {
     "AUTO_TRADE_TOP_N",
@@ -280,13 +293,20 @@ class PolicyDecision:
     risk_fail: bool
     flow_fail: bool
     blacklist_fail: bool
+    risk_fail_core: bool = False
+    tail_loss_fail: bool = False
     pre_risk_fail: bool = False
     diversity_fail: bool = False
+    plan_concentration_fail: bool = False
+    source_concentration_fail: bool = False
+    source_top_name_15m: str = ""
+    source_top_share_15m: float = 0.0
 
 
 @dataclass
 class RuntimeState:
     degrade_streak: int = 0
+    tail_loss_fail_streak: int = 0
     stable_hash: str = ""
     stable_overrides: dict[str, str] = field(default_factory=dict)
     last_phase: str = "expand"
@@ -728,6 +748,7 @@ def _load_runtime_state(root: Path, profile_id: str) -> RuntimeState:
                 continue
     return RuntimeState(
         degrade_streak=int(payload.get("degrade_streak", 0) or 0),
+        tail_loss_fail_streak=int(payload.get("tail_loss_fail_streak", 0) or 0),
         stable_hash=str(payload.get("stable_hash", "") or ""),
         stable_overrides=stable_map,
         last_phase=str(payload.get("last_phase", "expand") or "expand"),
@@ -752,6 +773,7 @@ def _save_runtime_state(root: Path, profile_id: str, state: RuntimeState) -> Non
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "degrade_streak": int(max(0, state.degrade_streak)),
+        "tail_loss_fail_streak": int(max(0, state.tail_loss_fail_streak)),
         "stable_hash": str(state.stable_hash or ""),
         "stable_overrides": {str(k): str(v) for k, v in (state.stable_overrides or {}).items()},
         "last_phase": str(state.last_phase or "expand"),
@@ -1089,6 +1111,40 @@ def _top_reasons_15m(candidate_rows: list[dict[str, Any]], trade_rows: list[dict
     }
 
 
+def _blacklist_filter_dominator_15m(candidate_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    symbol_hits = Counter[str]()
+    total_hits = 0
+    for row in candidate_rows:
+        stage = str(row.get("decision_stage", "") or "").strip().lower()
+        decision = str(row.get("decision", "") or "").strip().lower()
+        reason = str(row.get("reason", "") or "").strip().lower()
+        if stage != "filter_fail" or decision != "skip" or reason != "blacklist":
+            continue
+        total_hits += 1
+        symbol = str(row.get("symbol", "") or "").strip().upper() or "N/A"
+        symbol_hits[symbol] += 1
+    top_symbol = ""
+    top_count = 0
+    if symbol_hits:
+        top_symbol, top_count = symbol_hits.most_common(1)[0]
+    top_share = (float(top_count) / float(max(1, total_hits))) if total_hits > 0 else 0.0
+    return {
+        "total_hits": int(total_hits),
+        "unique_symbols": int(len(symbol_hits)),
+        "top_symbol": str(top_symbol),
+        "top_count": int(top_count),
+        "top_share": round(float(top_share), 6),
+        "top_symbols": [
+            {
+                "symbol": str(sym),
+                "count": int(cnt),
+                "share": round(float(cnt) / float(max(1, total_hits)), 6),
+            }
+            for sym, cnt in symbol_hits.most_common(8)
+        ],
+    }
+
+
 def _exec_health_15m(trade_rows: list[dict[str, Any]]) -> dict[str, Any]:
     plan_attempts = 0
     plan_skips = 0
@@ -1159,9 +1215,11 @@ def _silence_diagnostics_15m(
     post_filters_passed = int(_safe_float((funnel or {}).get("post_filters_passed", (funnel or {}).get("thr", 0)), 0.0))
     plan_attempts = int(_safe_float((funnel or {}).get("plan_attempts", (exec_health or {}).get("plan_attempts", 0)), 0.0))
     plan_skips = int(_safe_float((funnel or {}).get("plan_skips", (exec_health or {}).get("plan_skips", 0)), 0.0))
-    action_pass = max(0, int(plan_attempts - plan_skips))
+    action_pass_plan = max(0, int(plan_attempts - plan_skips))
     trade_open = int(_safe_float((funnel or {}).get("trade_open", (exec_health or {}).get("opens", 0)), 0.0))
     trade_close = int(_safe_float((funnel or {}).get("trade_close", (exec_health or {}).get("closes", 0)), 0.0))
+    # Fallback for partial observability gaps: if opens exist, action cannot be zero.
+    action_pass = max(int(action_pass_plan), int(trade_open))
     execution_events = int(max(0, trade_open + trade_close))
 
     opportunity_rate_h = float(post_filters_passed) * 4.0
@@ -1194,6 +1252,8 @@ def _silence_diagnostics_15m(
     return {
         "opportunity_count_15m": int(post_filters_passed),
         "action_count_15m": int(action_pass),
+        "action_count_plan_15m": int(action_pass_plan),
+        "action_count_fallback_open_15m": int(trade_open),
         "execution_open_count_15m": int(trade_open),
         "execution_event_count_15m": int(execution_events),
         "opportunity_rate_per_hour": round(opportunity_rate_h, 6),
@@ -2199,10 +2259,16 @@ def _resolve_policy_phase(
         blacklist_share_15m=round(float(blacklist_share), 6),
         open_rate_15m=round(float(open_rate), 6),
         risk_fail=bool(risk_fail),
+        risk_fail_core=bool(risk_fail_core),
+        tail_loss_fail=bool(tail_loss_fail),
         flow_fail=bool(flow_fail),
         blacklist_fail=bool(blacklist_fail),
         pre_risk_fail=bool(pre_risk_fail),
         diversity_fail=bool(diversity_fail),
+        plan_concentration_fail=bool(plan_concentration_fail),
+        source_concentration_fail=bool(source_concentration_fail),
+        source_top_name_15m=str(source_top_name_15m or ""),
+        source_top_share_15m=round(float(source_top_share_15m), 6),
     )
 
 
@@ -2216,6 +2282,7 @@ def _action_family(action: Action) -> str:
     expand_signals = (
         "score_min_dominant",
         "safe_volume_dominant",
+        "safe_volume_soft_flow_expand",
         "ev_net_low",
         "ev_net_low_gate",
         "ev_net_low_probe_tolerance",
@@ -2232,6 +2299,7 @@ def _action_family(action: Action) -> str:
         "quality_source_budget_choke",
         "quality_duplicate_choke",
         "excluded_symbol_rotation",
+        "blacklist_dominator_shaping",
         "feed_starvation",
         "edge_deadlock_recovery",
         "source_qos_cap_rebalance",
@@ -2667,6 +2735,7 @@ def _collect_telemetry_v2(
     exec_health_15m = _exec_health_15m(trade_rows_15m)
     source_profile_15m = _source_profile_15m(candidate_rows_15m, trade_rows_15m)
     plan_concentration_15m = _plan_symbol_concentration_15m(trade_rows_15m)
+    blacklist_filter_dominator_15m = _blacklist_filter_dominator_15m(candidate_rows_15m)
     silence_diagnostics_15m = _silence_diagnostics_15m(
         funnel=funnel_15m,
         exec_health=exec_health_15m,
@@ -2692,6 +2761,7 @@ def _collect_telemetry_v2(
         "exec_health_15m": exec_health_15m,
         "source_profile_15m": source_profile_15m,
         "plan_symbol_concentration_15m": plan_concentration_15m,
+        "blacklist_filter_dominator_15m": blacklist_filter_dominator_15m,
         "silence_diagnostics_15m": silence_diagnostics_15m,
         "ev_forensics_15m": _ev_forensics_15m(trade_rows_15m),
         "symbol_churn_15m": _symbol_churn_15m(trade_rows_15m),
@@ -3284,6 +3354,13 @@ def _build_action_plan(
     source_qos_cap_hits = int(metrics.filter_fail_reasons.get("source_qos_cap", 0))
     source_qos_symbol_cap_hits = int(metrics.filter_fail_reasons.get("source_qos_symbol_cap", 0))
     edge_pressure_hits = int(ev_low_hits + edge_low_hits + edge_usd_low_hits + negative_edge_hits)
+    filter_fail_total = 0
+    for _rk, _rv in metrics.filter_fail_reasons.items():
+        try:
+            filter_fail_total += max(0, int(_rv))
+        except Exception:
+            continue
+    safe_volume_share = float(safe_volume_hits) / float(max(1, filter_fail_total))
 
     def _reason_count(rows: list[dict[str, Any]], reason_code: str) -> int:
         target = str(reason_code or "").strip().lower()
@@ -3308,6 +3385,7 @@ def _build_action_plan(
     source_profile_15m: dict[str, Any] = {}
     plan_concentration_15m: dict[str, Any] = {}
     ev_forensics_15m: dict[str, Any] = {}
+    blacklist_dominator_15m: dict[str, Any] = {}
     if isinstance(telemetry, dict):
         top_reasons = telemetry.get("top_reasons_15m", {}) or {}
         if isinstance(top_reasons, dict):
@@ -3329,6 +3407,9 @@ def _build_action_plan(
         plan_conc_raw = telemetry.get("plan_symbol_concentration_15m", {}) or {}
         if isinstance(plan_conc_raw, dict):
             plan_concentration_15m = plan_conc_raw
+        dom_raw = telemetry.get("blacklist_filter_dominator_15m", {}) or {}
+        if isinstance(dom_raw, dict):
+            blacklist_dominator_15m = dom_raw
         ev_raw = telemetry.get("ev_forensics_15m", {}) or {}
         if isinstance(ev_raw, dict):
             ev_forensics_15m = ev_raw
@@ -3352,6 +3433,10 @@ def _build_action_plan(
     plan_top_share_15m = _safe_float((plan_concentration_15m or {}).get("plan_top_share", 0.0), 0.0)
     source_top_share_15m = _safe_float((source_profile_15m or {}).get("plan_top_source_share", 0.0), 0.0)
     source_top_name_15m = str((source_profile_15m or {}).get("plan_top_source", "") or "").strip().lower()
+    blacklist_dominator_hits = int(_safe_float((blacklist_dominator_15m or {}).get("total_hits", 0), 0.0))
+    blacklist_dominator_unique = int(_safe_float((blacklist_dominator_15m or {}).get("unique_symbols", 0), 0.0))
+    blacklist_dominator_top_symbol = str((blacklist_dominator_15m or {}).get("top_symbol", "") or "").strip().upper()
+    blacklist_dominator_top_share = _safe_float((blacklist_dominator_15m or {}).get("top_share", 0.0), 0.0)
     ev_skip_total_15m = int(_safe_float((ev_forensics_15m or {}).get("ev_skip_total", 0), 0.0))
     churn_detected = bool((churn_15m or {}).get("detected", False))
     churn_symbol = str((churn_15m or {}).get("symbol", "") or "").strip().upper()
@@ -3385,6 +3470,13 @@ def _build_action_plan(
         and source_top_name_15m not in {"", "unknown"}
         and int(metrics.opened_from_batch) <= 2
     )
+    watchlist_source_concentration = bool(
+        source_concentration_choke and str(source_top_name_15m or "").strip().lower().startswith("watchlist")
+    )
+    if watchlist_source_concentration:
+        # When plan is fully dominated by watchlist, allow deeper watchlist-share tightening.
+        flow_watchlist_share_floor = min(flow_watchlist_share_floor, 0.02)
+        flow_non_watchlist_ceiling = max(flow_non_watchlist_ceiling, 6)
 
     if plan_concentration_choke:
         rule_hits["plan_concentration_choke"] += 1
@@ -3458,14 +3550,44 @@ def _build_action_plan(
             _to_float_str(plan_single_source_share),
             "source_diversity_rebalance single_source_share",
         )
+        if watchlist_source_concentration:
+            plan_watchlist_share = _clamp_float(
+                plan_watchlist_share - 0.06,
+                flow_watchlist_share_floor,
+                flow_watchlist_share_ceiling,
+            )
+            plan_min_non_watchlist = _clamp_int(plan_min_non_watchlist + 1, 0, flow_non_watchlist_ceiling)
+            _apply_action(
+                staged,
+                actions,
+                "PLAN_MAX_WATCHLIST_SHARE",
+                _to_float_str(plan_watchlist_share),
+                "source_diversity_rebalance watchlist_share",
+            )
+            _apply_action(
+                staged,
+                actions,
+                "PLAN_MIN_NON_WATCHLIST_PER_BATCH",
+                _to_int_str(plan_min_non_watchlist),
+                "source_diversity_rebalance non_watch_min",
+            )
         if qos_caps:
             top_source_cap = int(qos_caps.get(source_top_name_15m, 0) or 0)
             if top_source_cap > 0:
-                qos_caps[source_top_name_15m] = _clamp_int(top_source_cap - 10, 1, 600)
+                drop = 16 if watchlist_source_concentration else 10
+                # Keep watchlist cap above flow floor under low-throughput windows.
+                cap_floor = 1
+                if watchlist_source_concentration and low_throughput:
+                    cap_floor = max(cap_floor, int(flow_qos_watchlist_cap_floor))
+                    drop = min(drop, 6)
+                qos_caps[source_top_name_15m] = _clamp_int(top_source_cap - drop, cap_floor, 600)
             for src_name in ("dexscreener", "geckoterminal", "watchlist", "dex_boosts"):
+                if watchlist_source_concentration and src_name == "watchlist":
+                    continue
                 prev = int(qos_caps.get(src_name, 0) or 0)
                 if prev > 0:
-                    qos_caps[src_name] = _clamp_int(prev + 4, 1, 600)
+                    bump = 6 if watchlist_source_concentration else 4
+                    qos_caps[src_name] = _clamp_int(prev + bump, 1, 600)
             _apply_action(
                 staged,
                 actions,
@@ -3971,6 +4093,74 @@ def _build_action_plan(
             "excluded_symbol_rotation max_tokens",
         )
 
+    blacklist_dominator_choke = (
+        low_throughput
+        and blacklist_dominator_hits >= max(16, int(metrics.selected_from_batch) // 4)
+        and blacklist_dominator_top_share >= 0.45
+        and blacklist_dominator_unique <= max(6, int(metrics.selected_from_batch) // 6 + 1)
+        and blacklist_dominator_top_symbol not in {"", "N/A", "UNKNOWN"}
+    )
+    if blacklist_dominator_choke:
+        rule_hits["blacklist_dominator_shaping"] += 1
+        trace.append(
+            "blacklist_dominator_shaping "
+            f"symbol={blacklist_dominator_top_symbol} hits={blacklist_dominator_hits} "
+            f"share={blacklist_dominator_top_share:.2f} unique={blacklist_dominator_unique}"
+        )
+        per_symbol_cycle_cap = _clamp_int(per_symbol_cycle_cap - 1, flow_per_symbol_cap_floor, 20)
+        source_qos_topk_per_cycle = _clamp_int(source_qos_topk_per_cycle + 18, 20, 600)
+        top_n = _clamp_int(top_n + 4, 8, 80)
+        plan_single_source_share = _clamp_float(plan_single_source_share - 0.05, 0.20, 1.0)
+        _apply_action(
+            staged,
+            actions,
+            "V2_SOURCE_QOS_MAX_PER_SYMBOL_PER_CYCLE",
+            _to_int_str(per_symbol_cycle_cap),
+            "blacklist_dominator_shaping symbol_cap",
+        )
+        _apply_action(
+            staged,
+            actions,
+            "V2_SOURCE_QOS_TOPK_PER_CYCLE",
+            _to_int_str(source_qos_topk_per_cycle),
+            "blacklist_dominator_shaping topk",
+        )
+        _apply_action(
+            staged,
+            actions,
+            "AUTO_TRADE_TOP_N",
+            _to_int_str(top_n),
+            "blacklist_dominator_shaping topn",
+        )
+        _apply_action(
+            staged,
+            actions,
+            "PLAN_MAX_SINGLE_SOURCE_SHARE",
+            _to_float_str(plan_single_source_share),
+            "blacklist_dominator_shaping single_source_share",
+        )
+        if source_top_name_15m.startswith("watchlist"):
+            plan_watchlist_share = _clamp_float(
+                plan_watchlist_share - 0.04,
+                flow_watchlist_share_floor,
+                flow_watchlist_share_ceiling,
+            )
+            plan_min_non_watchlist = _clamp_int(plan_min_non_watchlist + 1, 0, flow_non_watchlist_ceiling)
+            _apply_action(
+                staged,
+                actions,
+                "PLAN_MAX_WATCHLIST_SHARE",
+                _to_float_str(plan_watchlist_share),
+                "blacklist_dominator_shaping watchlist_share",
+            )
+            _apply_action(
+                staged,
+                actions,
+                "PLAN_MIN_NON_WATCHLIST_PER_BATCH",
+                _to_int_str(plan_min_non_watchlist),
+                "blacklist_dominator_shaping non_watch_min",
+            )
+
     feed_starvation = (
         low_throughput
         and funnel_raw_count > 0
@@ -4053,7 +4243,12 @@ def _build_action_plan(
         if qos_caps:
             watch_cap = int(qos_caps.get("watchlist", 0) or 0)
             if watch_cap > 0:
-                qos_caps["watchlist"] = _clamp_int(watch_cap + 4, 2, 600)
+                watch_floor = max(2, int(flow_qos_watchlist_cap_floor))
+                if watchlist_source_concentration:
+                    # During source-cap choke we should not tighten watchlist cap; it causes self-choke.
+                    qos_caps["watchlist"] = _clamp_int(max(watch_cap, watch_floor) + 2, watch_floor, 600)
+                else:
+                    qos_caps["watchlist"] = _clamp_int(watch_cap + 4, watch_floor, 600)
             for src in ("onchain", "onchain+market", "dexscreener", "geckoterminal"):
                 prev = int(qos_caps.get(src, 0) or 0)
                 if prev > 0:
@@ -4082,29 +4277,51 @@ def _build_action_plan(
                 _to_int_str(per_symbol_cycle_cap),
                 "source_qos_cap_rebalance symbol_cap",
             )
-        source_qos_watch_target = max(0.14, flow_watchlist_share_floor + 0.04)
-        if plan_watchlist_share < source_qos_watch_target:
+        if watchlist_source_concentration:
             plan_watchlist_share = _clamp_float(
-                plan_watchlist_share + 0.05,
+                plan_watchlist_share - 0.05,
                 flow_watchlist_share_floor,
-                1.0,
+                flow_watchlist_share_ceiling,
             )
+            plan_min_non_watchlist = _clamp_int(plan_min_non_watchlist + 1, 0, flow_non_watchlist_ceiling)
             _apply_action(
                 staged,
                 actions,
                 "PLAN_MAX_WATCHLIST_SHARE",
                 _to_float_str(plan_watchlist_share),
-                "source_qos_cap_rebalance watchlist_share",
+                "source_qos_cap_rebalance watchlist_share_guard",
             )
-        if plan_min_non_watchlist > 0:
-            plan_min_non_watchlist = _clamp_int(plan_min_non_watchlist - 1, 0, flow_non_watchlist_ceiling)
             _apply_action(
                 staged,
                 actions,
                 "PLAN_MIN_NON_WATCHLIST_PER_BATCH",
                 _to_int_str(plan_min_non_watchlist),
-                "source_qos_cap_rebalance non_watch_min",
+                "source_qos_cap_rebalance non_watch_guard",
             )
+        else:
+            source_qos_watch_target = max(0.14, flow_watchlist_share_floor + 0.04)
+            if plan_watchlist_share < source_qos_watch_target:
+                plan_watchlist_share = _clamp_float(
+                    plan_watchlist_share + 0.05,
+                    flow_watchlist_share_floor,
+                    1.0,
+                )
+                _apply_action(
+                    staged,
+                    actions,
+                    "PLAN_MAX_WATCHLIST_SHARE",
+                    _to_float_str(plan_watchlist_share),
+                    "source_qos_cap_rebalance watchlist_share",
+                )
+            if plan_min_non_watchlist > 0:
+                plan_min_non_watchlist = _clamp_int(plan_min_non_watchlist - 1, 0, flow_non_watchlist_ceiling)
+                _apply_action(
+                    staged,
+                    actions,
+                    "PLAN_MIN_NON_WATCHLIST_PER_BATCH",
+                    _to_int_str(plan_min_non_watchlist),
+                    "source_qos_cap_rebalance non_watch_min",
+                )
 
     edge_deadlock = (
         low_throughput
@@ -4224,7 +4441,14 @@ def _build_action_plan(
             "calibration_reenable",
         )
 
+    volume_soft_choke = False
     if metrics.opened_from_batch <= 0 or low_throughput:
+        volume_soft_choke = bool(
+            low_throughput
+            and int(metrics.selected_from_batch) >= 16
+            and safe_volume_hits >= max(24, int(metrics.selected_from_batch) // 3)
+            and safe_volume_share >= 0.30
+        )
         if score_min_hits > 0:
             strict = _clamp_int(strict - 2, bounds.strict_floor, bounds.strict_ceiling)
             soft = _clamp_int(soft - 2, bounds.soft_floor, bounds.soft_ceiling)
@@ -4235,10 +4459,72 @@ def _build_action_plan(
             _apply_action(staged, actions, "MARKET_MODE_STRICT_SCORE", _to_int_str(strict), "score_min_dominant")
             _apply_action(staged, actions, "MARKET_MODE_SOFT_SCORE", _to_int_str(soft), "score_min_dominant")
         if safe_volume_hits > 0:
-            min_vol = _clamp_float(min_vol - 1.0, bounds.volume_floor, bounds.volume_ceiling)
-            rule_hits["relax_safe_volume"] += 1
-            trace.append(f"relax_safe_volume hits={safe_volume_hits}")
-            _apply_action(staged, actions, "SAFE_MIN_VOLUME_5M_USD", _to_float_str(min_vol), "safe_volume_dominant")
+            if volume_soft_choke:
+                rule_hits["safe_volume_soft_flow_expand"] += 1
+                trace.append(
+                    "safe_volume_soft_flow_expand "
+                    f"hits={safe_volume_hits} share={safe_volume_share:.3f} selected={metrics.selected_from_batch}"
+                )
+                top_n = _clamp_int(top_n + 4, 8, 80)
+                novelty_share = _clamp_float(novelty_share + 0.03, 0.05, 0.90)
+                plan_single_source_share = _clamp_float(plan_single_source_share - 0.04, 0.20, 1.0)
+                source_qos_topk_per_cycle = _clamp_int(source_qos_topk_per_cycle + 18, 20, 600)
+                per_symbol_cycle_cap = _clamp_int(per_symbol_cycle_cap + 1, flow_per_symbol_cap_floor, 20)
+                _apply_action(staged, actions, "AUTO_TRADE_TOP_N", _to_int_str(top_n), "safe_volume_soft_flow_expand topn")
+                _apply_action(
+                    staged,
+                    actions,
+                    "V2_UNIVERSE_NOVELTY_MIN_SHARE",
+                    _to_float_str(novelty_share),
+                    "safe_volume_soft_flow_expand novelty",
+                )
+                _apply_action(
+                    staged,
+                    actions,
+                    "PLAN_MAX_SINGLE_SOURCE_SHARE",
+                    _to_float_str(plan_single_source_share),
+                    "safe_volume_soft_flow_expand single_source_share",
+                )
+                _apply_action(
+                    staged,
+                    actions,
+                    "V2_SOURCE_QOS_TOPK_PER_CYCLE",
+                    _to_int_str(source_qos_topk_per_cycle),
+                    "safe_volume_soft_flow_expand source_qos_topk",
+                )
+                _apply_action(
+                    staged,
+                    actions,
+                    "V2_SOURCE_QOS_MAX_PER_SYMBOL_PER_CYCLE",
+                    _to_int_str(per_symbol_cycle_cap),
+                    "safe_volume_soft_flow_expand symbol_cap",
+                )
+                if watchlist_source_concentration:
+                    plan_watchlist_share = _clamp_float(
+                        plan_watchlist_share - 0.03,
+                        flow_watchlist_share_floor,
+                        flow_watchlist_share_ceiling,
+                    )
+                    plan_min_non_watchlist = _clamp_int(plan_min_non_watchlist + 1, 0, flow_non_watchlist_ceiling)
+                    _apply_action(
+                        staged,
+                        actions,
+                        "PLAN_MAX_WATCHLIST_SHARE",
+                        _to_float_str(plan_watchlist_share),
+                        "safe_volume_soft_flow_expand watchlist_share",
+                    )
+                    _apply_action(
+                        staged,
+                        actions,
+                        "PLAN_MIN_NON_WATCHLIST_PER_BATCH",
+                        _to_int_str(plan_min_non_watchlist),
+                        "safe_volume_soft_flow_expand non_watch_min",
+                    )
+            else:
+                min_vol = _clamp_float(min_vol - 1.0, bounds.volume_floor, bounds.volume_ceiling)
+                rule_hits["relax_safe_volume"] += 1
+                trace.append(f"relax_safe_volume hits={safe_volume_hits}")
+                _apply_action(staged, actions, "SAFE_MIN_VOLUME_5M_USD", _to_float_str(min_vol), "safe_volume_dominant")
         if ev_low_hits > 0:
             min_edge_pct = _clamp_float(min_edge_pct - 0.05, bounds.edge_floor, bounds.edge_ceiling)
             min_edge_usd = _clamp_float(min_edge_usd - 0.001, bounds.edge_usd_floor, bounds.edge_usd_ceiling)
@@ -4352,10 +4638,39 @@ def _build_action_plan(
             f"cooldown_hits={cooldown_hits} ev_low={ev_low_hits} edge_low={edge_low_hits} "
             f"selected={metrics.selected_from_batch}"
         )
+        if cooldown > bounds.cooldown_floor:
+            cooldown = _clamp_int(cooldown - 10, bounds.cooldown_floor, bounds.cooldown_ceiling)
+            _apply_action(
+                staged,
+                actions,
+                "MAX_TOKEN_COOLDOWN_SECONDS",
+                _to_int_str(cooldown),
+                "cooldown_dominant_flow_expand global_cooldown",
+            )
+        if quality_symbol_reentry_min_seconds > 60:
+            quality_symbol_reentry_min_seconds = _clamp_int(
+                quality_symbol_reentry_min_seconds - 30,
+                60,
+                3600,
+            )
+            _apply_action(
+                staged,
+                actions,
+                "V2_QUALITY_SYMBOL_REENTRY_MIN_SECONDS",
+                _to_int_str(quality_symbol_reentry_min_seconds),
+                "cooldown_dominant_flow_expand symbol_reentry",
+            )
         top_n = _clamp_int(top_n + 4, 8, 80)
         novelty_share = _clamp_float(novelty_share + 0.04, 0.05, 0.90)
         symbol_share_cap = _clamp_float(symbol_share_cap - 0.02, 0.08, 0.50)
-        plan_watchlist_share = _clamp_float(plan_watchlist_share + 0.04, flow_watchlist_share_floor, 0.35)
+        if watchlist_source_concentration:
+            plan_watchlist_share = _clamp_float(
+                plan_watchlist_share - 0.04,
+                flow_watchlist_share_floor,
+                0.35,
+            )
+        else:
+            plan_watchlist_share = _clamp_float(plan_watchlist_share + 0.04, flow_watchlist_share_floor, 0.35)
         plan_single_source_share = _clamp_float(plan_single_source_share - 0.04, 0.20, 1.0)
         per_symbol_cycle_cap = _clamp_int(per_symbol_cycle_cap - 1, flow_per_symbol_cap_floor, 20)
         _apply_action(staged, actions, "AUTO_TRADE_TOP_N", _to_int_str(top_n), "cooldown_dominant_flow_expand topn")
@@ -4842,6 +5157,28 @@ def _build_action_plan(
                 _to_int_str(per_symbol_cycle_cap),
                 "flow_floor_guard per_symbol_cap",
             )
+        if qos_caps:
+            watch_cap_qos = int(qos_caps.get("watchlist", 0) or 0)
+            if watch_cap_qos > 0 and watch_cap_qos < flow_qos_watchlist_cap_floor:
+                qos_caps["watchlist"] = int(flow_qos_watchlist_cap_floor)
+                _apply_action(
+                    staged,
+                    actions,
+                    "V2_SOURCE_QOS_SOURCE_CAPS",
+                    _format_source_cap_map(qos_caps),
+                    "flow_floor_guard source_qos_watchlist_cap",
+                )
+        if universe_caps:
+            watch_cap_universe = int(universe_caps.get("watchlist", 0) or 0)
+            if watch_cap_universe > 0 and watch_cap_universe < flow_universe_watchlist_cap_floor:
+                universe_caps["watchlist"] = int(flow_universe_watchlist_cap_floor)
+                _apply_action(
+                    staged,
+                    actions,
+                    "V2_UNIVERSE_SOURCE_CAPS",
+                    _format_source_cap_map(universe_caps),
+                    "flow_floor_guard universe_watchlist_cap",
+                )
 
     # Guard relation from safe-contract.
     strict = _get_int(staged, "MARKET_MODE_STRICT_SCORE", strict)
@@ -4888,6 +5225,19 @@ def _build_action_plan(
     limited = prioritized[: mode.max_actions_per_tick]
     trimmed = max(0, len(prioritized) - len(limited))
     meta: dict[str, Any] = {"rule_hits": dict(rule_hits)}
+    meta["flow_choke"] = {
+        "safe_volume_hits": int(safe_volume_hits),
+        "filter_fail_total": int(filter_fail_total),
+        "safe_volume_share": round(float(safe_volume_share), 6),
+        "volume_soft_choke": bool(volume_soft_choke),
+    }
+    meta["blacklist_dominator"] = {
+        "choke": bool(blacklist_dominator_choke),
+        "hits_15m": int(blacklist_dominator_hits),
+        "unique_15m": int(blacklist_dominator_unique),
+        "top_symbol": str(blacklist_dominator_top_symbol or ""),
+        "top_share_15m": round(float(blacklist_dominator_top_share), 6),
+    }
     meta["churn_lock"] = {
         "active": bool(churn_lock_active),
         "symbol": str(churn_lock_symbol),
@@ -5603,6 +5953,17 @@ def _tick(
         forced_phase=forced_phase,
         effective_target_trades_per_hour=float(effective_target_tph),
     )
+    source_profile_before = telemetry_before.get("source_profile_15m", {}) if isinstance(telemetry_before, dict) else {}
+    if not isinstance(source_profile_before, dict):
+        source_profile_before = {}
+    source_top_name_before = str((source_profile_before or {}).get("plan_top_source", "") or "").strip().lower()
+    source_top_share_before = float(_safe_float((source_profile_before or {}).get("plan_top_source_share", 0.0), 0.0))
+    source_qos_cap_pressure_now = int(metrics.filter_fail_reasons.get("source_qos_cap", 0))
+    source_rollback_guard_active = bool(
+        source_top_name_before.startswith("watchlist")
+        and source_top_share_before >= 0.85
+        and source_qos_cap_pressure_now >= max(24, int(metrics.selected_from_batch) // 3)
+    )
     silence_before = telemetry_before.get("silence_diagnostics_15m", {}) if isinstance(telemetry_before, dict) else {}
     if not isinstance(silence_before, dict):
         silence_before = {}
@@ -5660,16 +6021,38 @@ def _tick(
     blocked_actions = blocked_mutations + blocked_phase + blocked_idle_relax
     rollback_triggered = False
     rollback_reason = ""
-    projected_degrade_streak = (
-        state.degrade_streak + 1
-        if (
-            policy_decision.risk_fail
-            or policy_decision.pre_risk_fail
-            or policy_decision.blacklist_fail
-            or policy_decision.diversity_fail
-        )
-        else 0
+    fail_now_for_degrade = bool(
+        policy_decision.risk_fail
+        or policy_decision.pre_risk_fail
+        or policy_decision.blacklist_fail
+        or policy_decision.diversity_fail
     )
+    tail_loss_only_fail = bool(
+        policy_decision.tail_loss_fail
+        and (not policy_decision.risk_fail_core)
+        and (not policy_decision.pre_risk_fail)
+        and (not policy_decision.blacklist_fail)
+        and (not policy_decision.diversity_fail)
+        and (not policy_decision.flow_fail)
+    )
+    tail_loss_guard_hold = bool(
+        fail_now_for_degrade
+        and tail_loss_only_fail
+        and int(state.tail_loss_fail_streak) < 2
+    )
+    if tail_loss_guard_hold:
+        projected_degrade_streak = int(max(0, state.degrade_streak))
+        decision_trace.append(
+            "tail_loss_guard_hold "
+            f"tail_streak={int(state.tail_loss_fail_streak)} "
+            f"ratio_only={bool(policy_decision.tail_loss_fail)}"
+        )
+    else:
+        projected_degrade_streak = (
+            int(max(0, state.degrade_streak)) + 1
+            if fail_now_for_degrade
+            else 0
+        )
     current_mutable = {
         str(k): str(v)
         for k, v in overrides.items()
@@ -5692,6 +6075,38 @@ def _tick(
         and (not warmup_guard_active)
     ):
         rollback_actions = _build_rollback_actions(current=overrides, stable=state.stable_overrides)
+        rollback_guard_keys: set[str] = set()
+        guard_source_active = bool(policy_decision.source_concentration_fail) or bool(source_rollback_guard_active)
+        guard_source_name = str(policy_decision.source_top_name_15m or "").strip().lower()
+        guard_source_share = float(policy_decision.source_top_share_15m or 0.0)
+        if not guard_source_name:
+            guard_source_name = str(source_top_name_before or "").strip().lower()
+            guard_source_share = float(source_top_share_before or 0.0)
+        if guard_source_active and guard_source_name.startswith("watchlist"):
+            rollback_guard_keys.update(ROLLBACK_SOURCE_GUARD_KEYS)
+        if rollback_guard_keys:
+            kept_rollback_actions: list[Action] = []
+            rollback_guard_blocked: list[dict[str, Any]] = []
+            for action in rollback_actions:
+                key = str(action.key or "").strip()
+                if key in rollback_guard_keys:
+                    rollback_guard_blocked.append(
+                        {
+                            "key": key,
+                            "reason": str(action.reason or ""),
+                            "blocked_by": "rollback_source_guard",
+                        }
+                    )
+                    continue
+                kept_rollback_actions.append(action)
+            rollback_actions = kept_rollback_actions
+            if rollback_guard_blocked:
+                blocked_actions.extend(rollback_guard_blocked)
+                decision_trace.append(
+                    "rollback_source_guard "
+                    f"blocked_keys={len(rollback_guard_blocked)} source_top={guard_source_name} "
+                    f"source_share={guard_source_share:.3f}"
+                )
         rollback_actions, rollback_blocked = _enforce_mutable_action_keys(
             actions=rollback_actions,
             protected_keys=protected_keys,
@@ -5991,15 +6406,31 @@ def _tick(
     }
 
     state.last_phase = str(policy_decision.phase)
-    if (
+    fail_now_for_degrade = bool(
         policy_decision.risk_fail
         or policy_decision.pre_risk_fail
         or policy_decision.blacklist_fail
         or policy_decision.diversity_fail
-    ):
-        state.degrade_streak = max(0, int(state.degrade_streak) + 1)
+    )
+    tail_loss_only_fail = bool(
+        policy_decision.tail_loss_fail
+        and (not policy_decision.risk_fail_core)
+        and (not policy_decision.pre_risk_fail)
+        and (not policy_decision.blacklist_fail)
+        and (not policy_decision.diversity_fail)
+        and (not policy_decision.flow_fail)
+    )
+    if fail_now_for_degrade:
+        if tail_loss_only_fail:
+            state.tail_loss_fail_streak = int(max(0, state.tail_loss_fail_streak) + 1)
+            if int(state.tail_loss_fail_streak) >= 2:
+                state.degrade_streak = max(0, int(state.degrade_streak) + 1)
+        else:
+            state.tail_loss_fail_streak = 0
+            state.degrade_streak = max(0, int(state.degrade_streak) + 1)
     else:
         state.degrade_streak = 0
+        state.tail_loss_fail_streak = 0
     if bool(tuner_effective):
         state.last_effective_hash = _overrides_hash(target_overrides)
         state.last_effective_at = _now_iso()
@@ -6030,6 +6461,30 @@ def _tick(
             if str(k) in TUNER_MUTABLE_KEYS and str(k) not in TUNER_EPHEMERAL_KEYS
         }
         state.stable_hash = _overrides_hash(state.stable_overrides)
+    elif (
+        bool(tuner_effective)
+        and (
+            bool(policy_decision.source_concentration_fail)
+            or bool(source_rollback_guard_active)
+        )
+        and (
+            str(policy_decision.source_top_name_15m or "").strip().lower().startswith("watchlist")
+            or str(source_top_name_before or "").strip().lower().startswith("watchlist")
+        )
+    ):
+        # Keep source-diversity baseline fresh during long concentration windows.
+        stable_source = dict(state.stable_overrides or {})
+        target_source = dict(target_overrides)
+        for key in ROLLBACK_SOURCE_GUARD_KEYS:
+            if str(key) in target_source:
+                stable_source[str(key)] = str(target_source[str(key)])
+        if stable_source:
+            state.stable_overrides = {
+                str(k): str(v)
+                for k, v in stable_source.items()
+                if str(k) in TUNER_MUTABLE_KEYS and str(k) not in TUNER_EPHEMERAL_KEYS
+            }
+            state.stable_hash = _overrides_hash(state.stable_overrides)
     state.restart_history_ts = list(restart_history)
     _save_runtime_state(root, profile_id, state)
 
@@ -6045,8 +6500,14 @@ def _tick(
         "flow_fail": bool(policy_decision.flow_fail),
         "pre_risk_fail": bool(policy_decision.pre_risk_fail),
         "risk_fail": bool(policy_decision.risk_fail),
+        "risk_fail_core": bool(policy_decision.risk_fail_core),
+        "tail_loss_fail": bool(policy_decision.tail_loss_fail),
         "blacklist_fail": bool(policy_decision.blacklist_fail),
         "diversity_fail": bool(policy_decision.diversity_fail),
+        "plan_concentration_fail": bool(policy_decision.plan_concentration_fail),
+        "source_concentration_fail": bool(policy_decision.source_concentration_fail),
+        "source_top_name_15m": str(policy_decision.source_top_name_15m or ""),
+        "source_top_share_15m": round(float(policy_decision.source_top_share_15m), 6),
         "degrade_streak": int(state.degrade_streak),
         "rollback_degrade_streak": int(target_policy.rollback_degrade_streak),
         "target_trades_per_hour_requested": float(policy_decision.target_trades_per_hour_requested),

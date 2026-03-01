@@ -2075,7 +2075,7 @@ class AutoTrader:
         key = str(reason or "unknown").strip().lower() or "unknown"
         self._skip_reason_counts_window[key] = int(self._skip_reason_counts_window.get(key, 0)) + 1
         ctx = dict(self._active_trade_decision_context or {})
-        source_key = str(ctx.get("source", "unknown") or "unknown").strip().lower() or "unknown"
+        source_key = self._normalized_source_value(ctx.get("source", "unknown"))
         src_skips = self._skip_reasons_by_source_window.setdefault(source_key, {})
         src_skips[key] = int(src_skips.get(key, 0)) + 1
         if ctx:
@@ -2088,6 +2088,36 @@ class AutoTrader:
             }
             self._write_trade_decision(payload)
             self._active_trade_decision_context = None
+
+    @staticmethod
+    def _normalized_source_value(value: Any) -> str:
+        src = str(value or "").strip().lower()
+        return src or "unknown"
+
+    def _write_plan_trade_pass(self, position: PaperPosition, *, reason: str = "planned") -> None:
+        payload = {
+            "ts": time.time(),
+            "decision_stage": "plan_trade",
+            "decision": "pass",
+            "reason": str(reason or "planned"),
+            "trace_id": str(position.trace_id or ""),
+            "position_id": str(position.position_id or ""),
+            "candidate_id": str(position.candidate_id or ""),
+            "token_address": str(position.token_address or ""),
+            "symbol": str(position.symbol or ""),
+            "score": int(position.score),
+            "entry_tier": str(position.entry_tier or ""),
+            "entry_channel": str(position.entry_channel or ""),
+            "market_mode": str(position.market_mode or ""),
+            "source": self._normalized_source_value(position.source),
+            "position_size_usd": float(position.position_size_usd),
+            "expected_edge_percent": float(position.expected_edge_percent),
+            "ev_expected_net_usd": float(position.ev_expected_net_usd),
+            "ev_confidence": float(position.ev_confidence),
+            "execution_lane": str(position.execution_lane or ""),
+            "token_cluster_key": str(position.token_cluster_key or ""),
+        }
+        self._write_trade_decision(payload)
 
     def pop_skip_reason_counts_window(self) -> dict[str, int]:
         out = dict(self._skip_reason_counts_window)
@@ -4812,13 +4842,14 @@ class AutoTrader:
             self.total_plans += 1
             self.total_executed += 1
             self.trade_open_timestamps.append(datetime.now(timezone.utc).timestamp())
-            source_key_open = str(source_name or "unknown").strip().lower() or "unknown"
+            source_key_open = self._normalized_source_value(source_name)
             self._opens_by_source_window[source_key_open] = int(self._opens_by_source_window.get(source_key_open, 0)) + 1
             if core_probe_applied:
                 self._record_core_probe_open()
             self._record_open_symbol(pos.symbol)
             self._record_open_source(source_key_open)
             self._record_tx_event()
+            self._write_plan_trade_pass(pos)
             logger.info(
                 "AUTO_BUY Live BUY token=%s address=%s mode=%s tier=%s channel=%s lane=%s spend=%.8f ETH score=%s edge=%.2f%% edge_usd=$%.3f size=$%.2f mult=%.2f(%s) hold=%ss tx=%s",
                 pos.symbol,
@@ -4851,6 +4882,7 @@ class AutoTrader:
                     "score": int(pos.score),
                     "entry_tier": pos.entry_tier,
                     "entry_channel": pos.entry_channel,
+                    "source": self._normalized_source_value(pos.source),
                     "market_mode": pos.market_mode,
                     "position_size_usd": float(pos.position_size_usd),
                     "expected_edge_percent": float(pos.expected_edge_percent),
@@ -4923,7 +4955,7 @@ class AutoTrader:
         self.total_plans += 1
         self.total_executed += 1
         self.trade_open_timestamps.append(datetime.now(timezone.utc).timestamp())
-        source_key_open = str(source_name or "unknown").strip().lower() or "unknown"
+        source_key_open = self._normalized_source_value(source_name)
         self._opens_by_source_window[source_key_open] = int(self._opens_by_source_window.get(source_key_open, 0)) + 1
         if core_probe_applied:
             self._record_core_probe_open()
@@ -4932,6 +4964,7 @@ class AutoTrader:
         self._record_tx_event()
         self.paper_balance_usd -= position_size_usd
 
+        self._write_plan_trade_pass(pos)
         logger.info(
             "AUTO_BUY Paper BUY token=%s address=%s mode=%s tier=%s channel=%s lane=%s entry=$%.8f size=$%.2f score=%s edge=%.2f%% edge_usd=$%.3f mult=%.2f(%s) hold=%ss costs=%.2f%% gas=$%.2f",
             pos.symbol,
@@ -4965,6 +4998,7 @@ class AutoTrader:
                 "score": int(pos.score),
                 "entry_tier": pos.entry_tier,
                 "entry_channel": pos.entry_channel,
+                "source": self._normalized_source_value(pos.source),
                 "market_mode": pos.market_mode,
                 "position_size_usd": float(pos.position_size_usd),
                 "expected_edge_percent": float(pos.expected_edge_percent),
@@ -5909,6 +5943,7 @@ class AutoTrader:
                 "score": int(position.score),
                 "entry_tier": str(position.entry_tier or ""),
                 "entry_channel": str(position.entry_channel or ""),
+                "source": self._normalized_source_value(position.source),
                 "execution_lane": str(position.execution_lane or ""),
                 "market_mode": str(position.market_mode or ""),
                 "pnl_percent": float(position.pnl_percent),
@@ -6017,6 +6052,7 @@ class AutoTrader:
                 "score": int(position.score),
                 "entry_tier": str(position.entry_tier or ""),
                 "entry_channel": str(position.entry_channel or ""),
+                "source": self._normalized_source_value(position.source),
                 "execution_lane": str(position.execution_lane or ""),
                 "market_mode": str(position.market_mode or ""),
                 "pnl_percent": float(position.pnl_percent),
@@ -6118,6 +6154,7 @@ class AutoTrader:
                 "score": int(position.score),
                 "entry_tier": str(position.entry_tier or ""),
                 "entry_channel": str(position.entry_channel or ""),
+                "source": self._normalized_source_value(position.source),
                 "market_mode": str(position.market_mode or ""),
                 "partial_realized_pnl_usd": float(realized_slice_pnl),
                 "remaining_position_size_usd": float(position.position_size_usd),

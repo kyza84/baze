@@ -86,7 +86,7 @@ if ($Run) {
     try {
       $wdPsi = New-Object System.Diagnostics.ProcessStartInfo
       $wdPsi.FileName = $python
-      $wdPsi.Arguments = "tools/matrix_watchdog.py --root . --follow --loop-seconds 20 --stale-seconds 180 --restart-cooldown-seconds 120"
+      $wdPsi.Arguments = "tools/matrix_watchdog.py --root . --follow --loop-seconds 20 --stale-seconds 180 --restart-cooldown-seconds 120 --watch-tuner --tuner-stale-seconds 420 --tuner-restart-cooldown-seconds 300"
       $wdPsi.WorkingDirectory = $root
       $wdPsi.UseShellExecute = $false
       $wdPsi.RedirectStandardOutput = $false
