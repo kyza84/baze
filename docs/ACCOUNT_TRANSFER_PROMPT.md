@@ -16,8 +16,9 @@ Do not change strategy. Do only evidence-based engineering/debug work.
 Read first:
 1) NEXT_CHAT_CONTEXT.md
 2) docs/NEXT_CHAT_CONTEXT.md
-3) data/matrix/runs/active_matrix.json
-4) latest logs in logs/matrix/u_station_ab_night_autotune_v2/
+3) docs/OPERATOR_PATTERNS.md
+4) data/matrix/runs/active_matrix.json
+5) latest logs in logs/matrix/u_station_ab_night_autotune_v2/
 
 Hard rules:
 - No destructive git commands.

@@ -81,6 +81,7 @@ For every material commit (code/config/docs that affect behavior), update both f
 
 Also ensure the handoff prompt remains valid:
 - `docs/ACCOUNT_TRANSFER_PROMPT.md`
+- `docs/OPERATOR_PATTERNS.md` (операционные команды пользователя)
 
 ## Quick Ops Commands
 ```powershell
@@ -99,3 +100,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\matrix_runtime_tuner_o
 2. 30m/60m funnel cut from candidates+decisions.
 3. Correlate with tuner actions in same windows.
 4. Patch only after single primary bottleneck is proven.
+
+## Operator Interaction Contract
+- Базовые пользовательские фразы и поведение агента зафиксированы в:
+  - `docs/OPERATOR_PATTERNS.md`
+- При переносе сессии сначала загружать этот файл, затем выполнять действия.

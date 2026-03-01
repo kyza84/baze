@@ -13,9 +13,10 @@
 
 Прочитай в таком порядке:
 1) docs/PROJECT_STATE.md
-2) docs/ACCOUNT_TRANSFER_PROMPT.md
-3) data/matrix/runs/active_matrix.json
-4) последние логи профиля logs/matrix/u_station_ab_night_autotune_v2/
+2) docs/OPERATOR_PATTERNS.md
+3) docs/ACCOUNT_TRANSFER_PROMPT.md
+4) data/matrix/runs/active_matrix.json
+5) последние логи профиля logs/matrix/u_station_ab_night_autotune_v2/
 
 Текущий профиль:
 - u_station_ab_night_autotune_v2
@@ -31,6 +32,10 @@
 - destructive git
 - отключать hard safety / anti-scam
 - делать большие переписывания без локальных доказательств
+
+Отдельно:
+- Если пользователь пишет "только ответ" или "ничего не меняй" — соблюдать это строго.
+- Команды из docs/OPERATOR_PATTERNS.md трактовать как контракт исполнения.
 ```
 
 ## Правило актуальности
