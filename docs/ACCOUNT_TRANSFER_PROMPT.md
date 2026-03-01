@@ -2,6 +2,8 @@
 
 Use this prompt when switching to a second account/VSCode session and continuing work from current project state without losing context.
 
+Before opening a new chat, send `docs/CHAT_FIRST_MESSAGE.md` first (copy-paste as the first message).
+
 ## Prompt Template
 
 ```text

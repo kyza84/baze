@@ -1,0 +1,9 @@
+#!/bin/sh
+set -e
+
+PYTHON="python"
+if [ -x ".venv/Scripts/python.exe" ]; then
+  PYTHON=".venv/Scripts/python.exe"
+fi
+
+"$PYTHON" tools/context_commit_guard.py
