@@ -85,6 +85,8 @@ class PaperPosition:
     cluster_ev_avg_net_usd: float = 0.0
     cluster_ev_loss_share: float = 0.0
     cluster_ev_samples: float = 0.0
+    trace_id: str = ""
+    position_id: str = ""
 
 
 class AutoTrader:
@@ -2125,6 +2127,34 @@ class AutoTrader:
             return inst
         return "single_or_other"
 
+    @staticmethod
+    def _build_trace_id(*, candidate_id: str, token_address: str, symbol: str, ts: float | None = None) -> str:
+        cid = str(candidate_id or "").strip()
+        if cid:
+            return cid
+        addr = normalize_address(token_address)
+        sym = str(symbol or "").strip().upper()
+        stamp = float(ts if ts is not None else time.time())
+        digest = hashlib.sha1(f"{addr}|{sym}|{stamp:.6f}".encode("utf-8", errors="ignore")).hexdigest()[:20]
+        return f"tr_{digest}"
+
+    @staticmethod
+    def _build_position_id(
+        *,
+        trace_id: str,
+        candidate_id: str,
+        token_address: str,
+        symbol: str,
+        opened_at: datetime,
+    ) -> str:
+        tid = str(trace_id or "").strip()
+        cid = str(candidate_id or "").strip()
+        addr = normalize_address(token_address)
+        sym = str(symbol or "").strip().upper()
+        opened = opened_at.astimezone(timezone.utc).isoformat() if isinstance(opened_at, datetime) else ""
+        digest = hashlib.sha1(f"{tid}|{cid}|{addr}|{sym}|{opened}".encode("utf-8", errors="ignore")).hexdigest()[:20]
+        return f"pos_{digest}"
+
     def _write_trade_decision(self, event: dict[str, Any]) -> None:
         if not self.trade_decisions_log_enabled:
             return
@@ -2294,6 +2324,157 @@ class AutoTrader:
             )
 
         return picked
+
+    def _batch_candidate_profit_hint(
+        self,
+        token_data: dict[str, Any],
+        score_data: dict[str, Any],
+    ) -> tuple[float, float, float]:
+        score = int(score_data.get("score", 0) or 0)
+        liquidity_usd = float(token_data.get("liquidity") or 0.0)
+        volume_5m = float(token_data.get("volume_5m") or 0.0)
+        price_change_5m = float(token_data.get("price_change_5m") or 0.0)
+        risk_level = str(token_data.get("risk_level", "MEDIUM") or "MEDIUM").upper()
+        tp = int(getattr(config, "PROFIT_TARGET_PERCENT", 5) or 5)
+        sl = int(getattr(config, "STOP_LOSS_PERCENT", 3) or 3)
+
+        # Use minimum trade size for a stable, conservative ranking baseline.
+        min_size = max(0.1, float(getattr(config, "PAPER_TRADE_SIZE_MIN_USD", 0.1) or 0.1))
+        max_size = max(min_size, float(getattr(config, "PAPER_TRADE_SIZE_MAX_USD", min_size) or min_size))
+
+        cost_profile = self._estimate_cost_profile(
+            liquidity_usd,
+            risk_level,
+            score,
+            position_size_usd=min_size,
+        )
+        edge_pct = self._estimate_edge_percent(score, tp, sl, float(cost_profile["total_percent"]), risk_level)
+
+        regime_edge_mult = max(0.75, min(1.35, _safe_float(token_data.get("_regime_edge_mult"), 1.0)))
+        regime_size_mult = max(0.25, min(1.50, _safe_float(token_data.get("_regime_size_mult"), 1.0)))
+        channel_edge_pct_mult = max(0.05, min(1.50, _safe_float(token_data.get("_entry_channel_edge_pct_mult"), 1.0)))
+        channel_size_mult = max(0.10, min(1.40, _safe_float(token_data.get("_entry_channel_size_mult"), 1.0)))
+        entry_tier = str(token_data.get("_entry_tier", "") or "").strip().upper()
+        entry_channel = str(token_data.get("_entry_channel", "core") or "core").strip().lower()
+        if entry_channel not in {"core", "explore"}:
+            entry_channel = "core"
+        quality_edge_mult, quality_size_mult, _quality_detail = self._quality_entry_adaptation(
+            token_data,
+            entry_tier=entry_tier,
+            entry_channel=entry_channel,
+        )
+        edge_pct_for_decision = float(edge_pct) * float(regime_edge_mult) * float(channel_edge_pct_mult) * float(
+            quality_edge_mult
+        )
+        size_est = float(self._choose_position_size(edge_pct_for_decision))
+        size_est *= float(regime_size_mult) * float(channel_size_mult) * float(quality_size_mult)
+        size_est = max(min_size, min(max_size * 1.8, float(size_est)))
+        edge_usd_est = float(size_est) * float(edge_pct_for_decision) / 100.0
+        return float(edge_usd_est), float(edge_pct_for_decision), float(size_est)
+
+    def _profit_tier_mix_select(
+        self,
+        *,
+        ranked: list[tuple[dict[str, Any], dict[str, Any]]],
+        budget: int,
+    ) -> tuple[list[tuple[dict[str, Any], dict[str, Any]]], dict[str, Any]]:
+        budget = max(0, int(budget))
+        if budget <= 0:
+            return [], {
+                "enabled": False,
+                "reason": "budget_zero",
+            }
+        if (not bool(getattr(config, "PLAN_PROFIT_PRIORITY_ENABLED", True))) or budget <= 1:
+            return list(ranked[:budget]), {
+                "enabled": False,
+                "reason": "disabled_or_budget",
+            }
+
+        high_edge_usd = max(
+            0.0001,
+            float(getattr(config, "PLAN_PROFIT_PRIORITY_HIGH_EDGE_USD", 0.015) or 0.015),
+        )
+        mid_edge_usd = max(
+            0.0,
+            float(getattr(config, "PLAN_PROFIT_PRIORITY_MID_EDGE_USD", 0.006) or 0.006),
+        )
+        if high_edge_usd < mid_edge_usd:
+            high_edge_usd = mid_edge_usd
+
+        minor_share = max(0.0, min(0.80, float(getattr(config, "PLAN_PROFIT_PRIORITY_MINOR_SHARE", 0.35) or 0.35)))
+        minor_min_slots = max(0, int(getattr(config, "PLAN_PROFIT_PRIORITY_MINOR_MIN_SLOTS", 1) or 1))
+
+        high_rows: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        mid_rows: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        low_rows: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        for row in ranked:
+            token_data, _score_data = row
+            hint_usd = _safe_float((token_data or {}).get("_batch_profit_hint_edge_usd"), 0.0)
+            if hint_usd >= high_edge_usd:
+                high_rows.append(row)
+            elif hint_usd >= mid_edge_usd:
+                mid_rows.append(row)
+            else:
+                low_rows.append(row)
+
+        reserve_minor = 0
+        if mid_rows:
+            reserve_minor = max(minor_min_slots, int(math.ceil(float(budget) * float(minor_share))))
+            reserve_minor = min(reserve_minor, len(mid_rows), max(0, budget - 1))
+
+        selected: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        selected_keys: set[str] = set()
+
+        def _add(row: tuple[dict[str, Any], dict[str, Any]]) -> bool:
+            key = self._batch_candidate_key(row[0])
+            if key in selected_keys:
+                return False
+            selected_keys.add(key)
+            selected.append(row)
+            return True
+
+        high_quota = max(0, budget - reserve_minor)
+        for row in high_rows:
+            if len(selected) >= high_quota:
+                break
+            _add(row)
+        for row in mid_rows:
+            if len(selected) >= (high_quota + reserve_minor):
+                break
+            _add(row)
+        if len(selected) < budget:
+            for row in ranked:
+                if len(selected) >= budget:
+                    break
+                _add(row)
+
+        selected_high = 0
+        selected_mid = 0
+        selected_low = 0
+        for token_data, _score_data in selected:
+            hint_usd = _safe_float((token_data or {}).get("_batch_profit_hint_edge_usd"), 0.0)
+            if hint_usd >= high_edge_usd:
+                selected_high += 1
+            elif hint_usd >= mid_edge_usd:
+                selected_mid += 1
+            else:
+                selected_low += 1
+
+        meta = {
+            "enabled": True,
+            "high_edge_usd": round(float(high_edge_usd), 6),
+            "mid_edge_usd": round(float(mid_edge_usd), 6),
+            "budget": int(budget),
+            "minor_share": round(float(minor_share), 4),
+            "reserve_minor": int(reserve_minor),
+            "pool_high": int(len(high_rows)),
+            "pool_mid": int(len(mid_rows)),
+            "pool_low": int(len(low_rows)),
+            "selected_high": int(selected_high),
+            "selected_mid": int(selected_mid),
+            "selected_low": int(selected_low),
+        }
+        return selected, meta
 
     @staticmethod
     def _pnl_outcome(pnl_usd: float) -> str:
@@ -2853,21 +3034,31 @@ class AutoTrader:
         if mode not in {"single", "all", "top_n"}:
             mode = "single"
 
-        # Prefer the highest score, but break ties by liquidity/volume to avoid selecting thin pools
-        # when multiple candidates have similar scores.
-        eligible.sort(
+        ranked_rows: list[tuple[dict[str, Any], dict[str, Any], float, float]] = []
+        for token_data, score_data in eligible:
+            edge_usd_est, edge_pct_est, size_est = self._batch_candidate_profit_hint(token_data, score_data)
+            token_data["_batch_profit_hint_edge_usd"] = float(edge_usd_est)
+            token_data["_batch_profit_hint_edge_pct"] = float(edge_pct_est)
+            token_data["_batch_profit_hint_size_usd"] = float(size_est)
+            ranked_rows.append((token_data, score_data, edge_usd_est, edge_pct_est))
+        ranked_rows.sort(
             key=lambda item: (
+                float(item[2]),
+                float(item[3]),
                 int(item[1].get("score", 0)),
                 float(item[0].get("liquidity") or 0),
                 float(item[0].get("volume_5m") or 0),
             ),
             reverse=True,
         )
+        eligible = [(row[0], row[1]) for row in ranked_rows]
+
+        profit_mix_meta: dict[str, Any] = {"enabled": False, "reason": "n/a"}
         if mode == "single":
             selected = eligible[:1]
         elif mode == "top_n":
             n = max(1, int(config.AUTO_TRADE_TOP_N or 1))
-            selected = eligible[:n]
+            selected, profit_mix_meta = self._profit_tier_mix_select(ranked=eligible, budget=n)
         else:
             selected = eligible
 
@@ -2986,13 +3177,23 @@ class AutoTrader:
                 self._recent_batch_open_timestamps.append(datetime.now(timezone.utc).timestamp())
         self._prune_batch_open_window()
         logger.info(
-            "AutoTrade batch mode=%s candidates=%s eligible=%s selected=%s opened=%s pe=%s burst_window=%s",
+            "AutoTrade batch mode=%s candidates=%s eligible=%s selected=%s opened=%s pe=%s profit_mix=%s burst_window=%s",
             mode,
             len(candidates),
             len(eligible),
             len(selected),
             opened,
             pe_detail,
+            (
+                "off"
+                if not bool(profit_mix_meta.get("enabled", False))
+                else (
+                    f"cuts(usdh={profit_mix_meta.get('high_edge_usd')},usdm={profit_mix_meta.get('mid_edge_usd')}) "
+                    f"pool(h={profit_mix_meta.get('pool_high')},m={profit_mix_meta.get('pool_mid')},l={profit_mix_meta.get('pool_low')}) "
+                    f"sel(h={profit_mix_meta.get('selected_high')},m={profit_mix_meta.get('selected_mid')},l={profit_mix_meta.get('selected_low')}) "
+                    f"reserve_mid={profit_mix_meta.get('reserve_minor')}"
+                )
+            ),
             self._opens_in_burst_window(),
         )
         return opened
@@ -3100,9 +3301,16 @@ class AutoTrader:
         ctx_entry_tier = str(token_data.get("_entry_tier", "") or "").strip().upper()
         ctx_market_mode = str(token_data.get("_regime_name", "") or "").strip().upper()
         ctx_entry_channel = str(token_data.get("_entry_channel", "") or "").strip().lower()
+        trace_id = self._build_trace_id(
+            candidate_id=candidate_id,
+            token_address=ctx_token_address,
+            symbol=symbol,
+            ts=time.time(),
+        )
         if ctx_market_mode in {"GREEN", "YELLOW", "RED"}:
             self._last_market_mode_seen = ctx_market_mode
         self._active_trade_decision_context = {
+            "trace_id": trace_id,
             "candidate_id": candidate_id,
             "token_address": ctx_token_address,
             "symbol": symbol,
@@ -4552,6 +4760,14 @@ class AutoTrader:
                 )
                 self._blacklist_add(token_address, "live_buy_zero_amount")
                 return None
+            opened_at = datetime.now(timezone.utc)
+            position_id = self._build_position_id(
+                trace_id=trace_id,
+                candidate_id=candidate_id,
+                token_address=token_address,
+                symbol=symbol,
+                opened_at=opened_at,
+            )
             pos = PaperPosition(
                 token_address=token_address,
                 candidate_id=candidate_id,
@@ -4562,7 +4778,7 @@ class AutoTrader:
                 score=score,
                 liquidity_usd=liquidity_usd,
                 risk_level=risk_level,
-                opened_at=datetime.now(timezone.utc),
+                opened_at=opened_at,
                 max_hold_seconds=max_hold_seconds,
                 take_profit_percent=tp,
                 stop_loss_percent=sl,
@@ -4589,6 +4805,8 @@ class AutoTrader:
                 cluster_ev_avg_net_usd=float(cluster_route.get("avg_net_usd", 0.0) or 0.0),
                 cluster_ev_loss_share=float(cluster_route.get("loss_share", 0.0) or 0.0),
                 cluster_ev_samples=float(cluster_route.get("samples", 0.0) or 0.0),
+                trace_id=trace_id,
+                position_id=position_id,
             )
             self._set_open_position(pos)
             self.total_plans += 1
@@ -4625,6 +4843,8 @@ class AutoTrader:
                     "decision_stage": "trade_open",
                     "decision": "open",
                     "reason": "buy_live",
+                    "trace_id": pos.trace_id,
+                    "position_id": pos.position_id,
                     "candidate_id": pos.candidate_id,
                     "token_address": pos.token_address,
                     "symbol": pos.symbol,
@@ -4654,6 +4874,14 @@ class AutoTrader:
             self._save_state()
             return pos
 
+        opened_at = datetime.now(timezone.utc)
+        position_id = self._build_position_id(
+            trace_id=trace_id,
+            candidate_id=candidate_id,
+            token_address=token_address,
+            symbol=symbol,
+            opened_at=opened_at,
+        )
         pos = PaperPosition(
             token_address=token_address,
             candidate_id=candidate_id,
@@ -4664,7 +4892,7 @@ class AutoTrader:
             score=score,
             liquidity_usd=liquidity_usd,
             risk_level=risk_level,
-            opened_at=datetime.now(timezone.utc),
+            opened_at=opened_at,
             max_hold_seconds=max_hold_seconds,
             take_profit_percent=tp,
             stop_loss_percent=sl,
@@ -4687,6 +4915,8 @@ class AutoTrader:
             cluster_ev_avg_net_usd=float(cluster_route.get("avg_net_usd", 0.0) or 0.0),
             cluster_ev_loss_share=float(cluster_route.get("loss_share", 0.0) or 0.0),
             cluster_ev_samples=float(cluster_route.get("samples", 0.0) or 0.0),
+            trace_id=trace_id,
+            position_id=position_id,
         )
 
         self._set_open_position(pos)
@@ -4727,6 +4957,8 @@ class AutoTrader:
                 "decision_stage": "trade_open",
                 "decision": "open",
                 "reason": "buy_paper",
+                "trace_id": pos.trace_id,
+                "position_id": pos.position_id,
                 "candidate_id": pos.candidate_id,
                 "token_address": pos.token_address,
                 "symbol": pos.symbol,
@@ -5669,6 +5901,8 @@ class AutoTrader:
                 "decision_stage": "trade_close",
                 "decision": "close",
                 "reason": str(reason),
+                "trace_id": str(position.trace_id or ""),
+                "position_id": str(position.position_id or ""),
                 "candidate_id": str(position.candidate_id or ""),
                 "token_address": position.token_address,
                 "symbol": position.symbol,
@@ -5775,6 +6009,8 @@ class AutoTrader:
                 "decision_stage": "trade_close",
                 "decision": "close",
                 "reason": str(reason),
+                "trace_id": str(position.trace_id or ""),
+                "position_id": str(position.position_id or ""),
                 "candidate_id": str(position.candidate_id or ""),
                 "token_address": position.token_address,
                 "symbol": position.symbol,
@@ -5871,6 +6107,8 @@ class AutoTrader:
                 "decision_stage": "trade_partial",
                 "decision": "partial_take_profit",
                 "reason": str(reason),
+                "trace_id": str(position.trace_id or ""),
+                "position_id": str(position.position_id or ""),
                 "stage": int(stage),
                 "trigger_percent": float(trigger_percent),
                 "raw_price_pnl_percent": float(raw_price_pnl_percent),
@@ -7063,6 +7301,8 @@ class AutoTrader:
     def _serialize_pos(pos: PaperPosition) -> dict[str, Any]:
         return {
             "token_address": normalize_address(pos.token_address),
+            "trace_id": str(pos.trace_id or ""),
+            "position_id": str(pos.position_id or ""),
             "candidate_id": pos.candidate_id,
             "symbol": pos.symbol,
             "entry_price_usd": pos.entry_price_usd,
@@ -7132,8 +7372,23 @@ class AutoTrader:
                 closed_at = datetime.fromisoformat(str(closed_at_raw))
                 if closed_at.tzinfo is None:
                     closed_at = closed_at.replace(tzinfo=timezone.utc)
+            trace_id = str(row.get("trace_id", row.get("candidate_id", "")) or "")
+            position_id = str(row.get("position_id", "") or "")
+            if not position_id:
+                token_for_id = normalize_address(str(row.get("token_address", "")))
+                symbol_for_id = str(row.get("symbol", "N/A") or "N/A")
+                candidate_for_id = str(row.get("candidate_id", "") or "")
+                opened_for_id = opened_at.astimezone(timezone.utc).isoformat()
+                digest = hashlib.sha1(
+                    f"{trace_id}|{candidate_for_id}|{token_for_id}|{symbol_for_id}|{opened_for_id}".encode(
+                        "utf-8", errors="ignore"
+                    )
+                ).hexdigest()[:20]
+                position_id = f"pos_{digest}"
             return PaperPosition(
                 token_address=normalize_address(str(row.get("token_address", ""))),
+                trace_id=trace_id,
+                position_id=position_id,
                 candidate_id=str(row.get("candidate_id", "")),
                 symbol=str(row.get("symbol", "N/A")),
                 entry_price_usd=float(row.get("entry_price_usd", 0)),

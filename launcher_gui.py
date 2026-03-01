@@ -36,21 +36,160 @@ except Exception:  # pragma: no cover
     HTTPProvider = None  # type: ignore[assignment]
     Web3 = None  # type: ignore[assignment]
 
+_CP1252_PUNCT_REV = {
+    0x20AC: 0x80,
+    0x201A: 0x82,
+    0x0192: 0x83,
+    0x201E: 0x84,
+    0x2026: 0x85,
+    0x2020: 0x86,
+    0x2021: 0x87,
+    0x02C6: 0x88,
+    0x2030: 0x89,
+    0x0160: 0x8A,
+    0x2039: 0x8B,
+    0x0152: 0x8C,
+    0x017D: 0x8E,
+    0x2018: 0x91,
+    0x2019: 0x92,
+    0x201C: 0x93,
+    0x201D: 0x94,
+    0x2022: 0x95,
+    0x2013: 0x96,
+    0x2014: 0x97,
+    0x02DC: 0x98,
+    0x2122: 0x99,
+    0x0161: 0x9A,
+    0x203A: 0x9B,
+    0x0153: 0x9C,
+    0x017E: 0x9E,
+    0x0178: 0x9F,
+}
+
+
+def _to_cp1252ish_bytes(text: str) -> bytes | None:
+    data = bytearray()
+    for ch in text:
+        code = ord(ch)
+        if code <= 0xFF:
+            data.append(code)
+            continue
+        mapped = _CP1252_PUNCT_REV.get(code)
+        if mapped is None:
+            return None
+        data.append(mapped)
+    return bytes(data)
+
+
 def _fix_mojibake(text: str) -> str:
-    """Fix common UTF-8 mojibake variants (e.g. Ã..., Ð..., Ñ...)."""
+    """Best-effort fix for UTF-8 mojibake (e.g. `?...`, `?...`, `?...`)."""
     if not isinstance(text, str):
         return str(text)
-    if not any(marker in text for marker in ("Ã", "Ð", "Ñ")):
+    if not text:
         return text
-    for source_encoding in ("latin1", "cp1252"):
-        try:
-            fixed = text.encode(source_encoding).decode("utf-8")
-        except Exception:
-            continue
-        if fixed != text and re.search(r"[А-Яа-яЁё]", fixed):
-            return fixed
-    return text
 
+    current = text
+    for _ in range(3):
+        raw = _to_cp1252ish_bytes(current)
+        if raw is None:
+            break
+        try:
+            fixed = raw.decode('utf-8')
+        except Exception:
+            break
+        if fixed == current:
+            break
+        current = fixed
+    return current
+
+
+def _sanitize_gui_text(value):
+    if isinstance(value, str):
+        return _fix_mojibake(value)
+    return value
+
+
+def _patch_gui_text_surfaces() -> None:
+    # Central patch point: decode corrupted literals before widgets render.
+    widget_classes = (
+        ttk.Label,
+        ttk.Button,
+        ttk.Checkbutton,
+        ttk.Radiobutton,
+    )
+    for widget_cls in widget_classes:
+        original_init = widget_cls.__init__
+
+        def _patched_init(self, *args, _orig=original_init, **kwargs):
+            if 'text' in kwargs:
+                kwargs['text'] = _sanitize_gui_text(kwargs.get('text'))
+            return _orig(self, *args, **kwargs)
+
+        widget_cls.__init__ = _patched_init  # type: ignore[method-assign]
+
+    original_notebook_add = ttk.Notebook.add
+
+    def _patched_notebook_add(self, child, **kwargs):
+        if 'text' in kwargs:
+            kwargs['text'] = _sanitize_gui_text(kwargs.get('text'))
+        return original_notebook_add(self, child, **kwargs)
+
+    ttk.Notebook.add = _patched_notebook_add  # type: ignore[method-assign]
+
+    original_tree_heading = ttk.Treeview.heading
+
+    def _patched_tree_heading(self, column, **kwargs):
+        if 'text' in kwargs:
+            kwargs['text'] = _sanitize_gui_text(kwargs.get('text'))
+        return original_tree_heading(self, column, **kwargs)
+
+    ttk.Treeview.heading = _patched_tree_heading  # type: ignore[method-assign]
+
+    original_string_var = tk.StringVar
+
+    class _FixedStringVar(original_string_var):
+        def __init__(self, *args, **kwargs):
+            if 'value' in kwargs:
+                kwargs['value'] = _sanitize_gui_text(kwargs.get('value'))
+            super().__init__(*args, **kwargs)
+
+        def set(self, value):
+            super().set(_sanitize_gui_text(value))
+
+    tk.StringVar = _FixedStringVar  # type: ignore[assignment]
+
+    for fn_name in (
+        'showerror',
+        'showinfo',
+        'showwarning',
+        'askquestion',
+        'askokcancel',
+        'askretrycancel',
+        'askyesno',
+        'askyesnocancel',
+    ):
+        original_fn = getattr(messagebox, fn_name, None)
+        if original_fn is None:
+            continue
+
+        def _patched_msgbox(*args, _orig=original_fn, **kwargs):
+            new_args = list(args)
+            if len(new_args) >= 1:
+                new_args[0] = _sanitize_gui_text(new_args[0])
+            if len(new_args) >= 2:
+                new_args[1] = _sanitize_gui_text(new_args[1])
+            if 'title' in kwargs:
+                kwargs['title'] = _sanitize_gui_text(kwargs.get('title'))
+            if 'message' in kwargs:
+                kwargs['message'] = _sanitize_gui_text(kwargs.get('message'))
+            if 'detail' in kwargs:
+                kwargs['detail'] = _sanitize_gui_text(kwargs.get('detail'))
+            return _orig(*new_args, **kwargs)
+
+        setattr(messagebox, fn_name, _patched_msgbox)
+
+
+_patch_gui_text_surfaces()
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 PYTHON_PATH = os.path.join(PROJECT_ROOT, ".venv", "Scripts", "python.exe")
 PID_FILE = os.path.join(PROJECT_ROOT, "bot.pid")
@@ -3938,15 +4077,15 @@ class App(tk.Tk):
         def _closed_row_identity(row: dict) -> str:
             # Keep dedup key stable across state/fallback sources:
             # source-specific reason/pnl formatting can differ for the same close event.
-            position_id_k = str((row or {}).get("position_id", "") or "").strip()
             candidate_id_k = str((row or {}).get("candidate_id", "") or "").strip()
+            position_id_k = str((row or {}).get("position_id", "") or "").strip()
             token_k = str((row or {}).get("token_address", "") or "").strip().lower()
             opened_k = _norm_close_ts((row or {}).get("opened_at", ""))
             closed_k = _norm_close_ts((row or {}).get("closed_at", ""))
-            if position_id_k:
-                return f"pid:{position_id_k}"
             if candidate_id_k:
                 return f"cid:{candidate_id_k}"
+            if position_id_k:
+                return f"pid:{position_id_k}"
             if token_k and opened_k and closed_k:
                 return f"tok:{token_k}|opened:{opened_k}|closed:{closed_k}"
             if token_k and opened_k:

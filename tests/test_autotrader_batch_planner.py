@@ -172,6 +172,89 @@ class AutoTraderBatchPlannerTests(ConfigPatchMixin, unittest.IsolatedAsyncioTest
         self.assertGreaterEqual(len(attempted), 2)
         self.assertEqual(attempted[:2], ["CAND1", "CAND2"])
 
+    async def test_profit_priority_prefers_higher_net_edge_over_raw_score(self) -> None:
+        self.patch_cfg(
+            MIN_TOKEN_SCORE=0,
+            AUTO_TRADE_ENTRY_MODE="single",
+            AUTO_TRADE_TOP_N=1,
+            PROFIT_ENGINE_ENABLED=False,
+            BURST_GOVERNOR_ENABLED=False,
+            PLAN_PROFIT_PRIORITY_ENABLED=True,
+        )
+        trader = self._blank_trader()
+        attempted: list[str] = []
+
+        async def _plan_trade(token_data: dict, score_data: dict) -> object | None:
+            attempted.append(str(token_data.get("symbol", "")))
+            return object()
+
+        trader.plan_trade = _plan_trade  # type: ignore[method-assign]
+        weak_high_score = self._candidate(
+            "HI_SCORE_WEAK",
+            "0x1111111111111111111111111111111111111112",
+            100,
+            risk_level="HIGH",
+        )
+        weak_high_score[0]["liquidity"] = 8_000.0
+        weak_high_score[0]["volume_5m"] = 800.0
+        strong_lower_score = self._candidate(
+            "LOWER_SCORE_STRONG",
+            "0x2222222222222222222222222222222222222223",
+            92,
+            risk_level="LOW",
+        )
+        strong_lower_score[0]["liquidity"] = 450_000.0
+        strong_lower_score[0]["volume_5m"] = 80_000.0
+
+        opened = await trader.plan_batch([weak_high_score, strong_lower_score])
+        self.assertEqual(opened, 1)
+        self.assertEqual(attempted, ["LOWER_SCORE_STRONG"])
+
+    async def test_profit_tier_mix_keeps_mid_tier_in_topn(self) -> None:
+        self.patch_cfg(
+            MIN_TOKEN_SCORE=0,
+            AUTO_TRADE_ENTRY_MODE="top_n",
+            AUTO_TRADE_TOP_N=3,
+            PROFIT_ENGINE_ENABLED=False,
+            BURST_GOVERNOR_ENABLED=False,
+            PLAN_PROFIT_PRIORITY_ENABLED=True,
+            PLAN_PROFIT_PRIORITY_HIGH_EDGE_USD=0.02,
+            PLAN_PROFIT_PRIORITY_MID_EDGE_USD=0.008,
+            PLAN_PROFIT_PRIORITY_MINOR_SHARE=0.34,
+            PLAN_PROFIT_PRIORITY_MINOR_MIN_SLOTS=1,
+        )
+        trader = self._blank_trader()
+
+        hint_map = {
+            "A_HI": (0.060, 5.0, 1.0),
+            "B_HI": (0.050, 4.5, 1.0),
+            "C_HI": (0.040, 4.0, 1.0),
+            "D_MID": (0.009, 2.0, 1.0),
+        }
+
+        def _hint(token_data: dict, score_data: dict) -> tuple[float, float, float]:
+            symbol = str(token_data.get("symbol", ""))
+            return hint_map.get(symbol, (0.0, 0.0, 0.1))
+
+        trader._batch_candidate_profit_hint = _hint  # type: ignore[method-assign]
+        attempted: list[str] = []
+
+        async def _plan_trade(token_data: dict, score_data: dict) -> object | None:
+            attempted.append(str(token_data.get("symbol", "")))
+            return None
+
+        trader.plan_trade = _plan_trade  # type: ignore[method-assign]
+        candidates = [
+            self._candidate("A_HI", "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 100, risk_level="LOW"),
+            self._candidate("B_HI", "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 99, risk_level="LOW"),
+            self._candidate("C_HI", "0xcccccccccccccccccccccccccccccccccccccccc", 98, risk_level="LOW"),
+            self._candidate("D_MID", "0xdddddddddddddddddddddddddddddddddddddddd", 97, risk_level="LOW"),
+        ]
+
+        await trader.plan_batch(candidates)
+        self.assertEqual(len(attempted), 3)
+        self.assertIn("D_MID", attempted)
+
 
 if __name__ == "__main__":
     unittest.main()

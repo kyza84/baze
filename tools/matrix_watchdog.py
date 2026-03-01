@@ -137,6 +137,7 @@ def _scan_once(root: Path, stale_seconds: int, restart_cooldown_seconds: int) ->
     state_path = _state_path(root)
     meta = _read_json(meta_path)
     items = meta.get("items") if isinstance(meta.get("items"), list) else []
+    requested_run = bool(meta.get("requested_run", False))
     state = _read_json(state_path)
     last_restarts = state.get("last_restarts", {}) if isinstance(state.get("last_restarts"), dict) else {}
     events: list[dict[str, Any]] = []
@@ -150,18 +151,26 @@ def _scan_once(root: Path, stale_seconds: int, restart_cooldown_seconds: int) ->
         alive = _pid_alive(pid)
         hb_age = _heartbeat_age_seconds(root, row)
         stale = alive and (hb_age is not None) and (hb_age >= float(stale_seconds))
+        dead = not alive
         now_ts = time.time()
         last_ts = float(last_restarts.get(profile_id, 0.0) or 0.0)
         cooldown_left = float(restart_cooldown_seconds) - (now_ts - last_ts)
 
-        if stale and cooldown_left <= 0.0:
-            _kill_pid(pid)
+        restart_reason = ""
+        if requested_run and stale:
+            restart_reason = "stale_heartbeat"
+        elif requested_run and dead:
+            restart_reason = "pid_dead_or_missing"
+
+        if restart_reason and cooldown_left <= 0.0:
+            if alive:
+                _kill_pid(pid)
             ok, msg, new_pid = _restart_item(root, row)
             evt = {
                 "ts": now_ts,
                 "timestamp": _now_iso(),
                 "id": profile_id,
-                "reason": "stale_heartbeat",
+                "reason": restart_reason,
                 "heartbeat_age_sec": round(float(hb_age or 0.0), 2),
                 "old_pid": pid,
                 "restart_ok": bool(ok),

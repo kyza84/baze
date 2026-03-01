@@ -21,6 +21,45 @@ def _actions_by_key(actions: list[mrt.Action]) -> dict[str, mrt.Action]:
 
 
 class MatrixRuntimeTunerTests(unittest.TestCase):
+    def test_active_override_subset_prefers_env_over_stale_active_matrix(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runs_dir = root / "data" / "matrix" / "runs"
+            env_dir = root / "data" / "matrix" / "env"
+            runs_dir.mkdir(parents=True, exist_ok=True)
+            env_dir.mkdir(parents=True, exist_ok=True)
+
+            env_file = env_dir / "u_case.env"
+            env_file.write_text(
+                "PLAN_MAX_WATCHLIST_SHARE=0.35\nMIN_EXPECTED_EDGE_PERCENT=0.03\n",
+                encoding="utf-8",
+            )
+
+            active_payload = {
+                "items": [
+                    {
+                        "id": "u_case",
+                        "env_file": str(env_file),
+                        "overrides": {
+                            "PLAN_MAX_WATCHLIST_SHARE": "0.20",
+                            "MIN_EXPECTED_EDGE_PERCENT": "0.05",
+                        },
+                    }
+                ]
+            }
+            (runs_dir / "active_matrix.json").write_text(
+                json.dumps(active_payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+
+            subset = mrt._active_override_subset(
+                root,
+                "u_case",
+                {"PLAN_MAX_WATCHLIST_SHARE", "MIN_EXPECTED_EDGE_PERCENT"},
+            )
+            self.assertEqual(subset.get("PLAN_MAX_WATCHLIST_SHARE"), "0.35")
+            self.assertEqual(subset.get("MIN_EXPECTED_EDGE_PERCENT"), "0.03")
+
     def test_relax_score_can_go_below_static_mode_floor_when_flow_is_starved(self) -> None:
         metrics = mrt.WindowMetrics(
             selected_from_batch=30,
@@ -691,6 +730,37 @@ class MatrixRuntimeTunerTests(unittest.TestCase):
         self.assertIn("watchlist:80", by_key["V2_SOURCE_QOS_SOURCE_CAPS"].new_value)
         self.assertGreaterEqual(len(capped_rows), 1)
 
+    def test_apply_contract_bounds_clamps_to_safe_limits(self) -> None:
+        contract = {
+            "allowed_keys": {
+                "AUTO_TRADE_TOP_N": {"type": "int", "min": 10, "max": 80},
+                "MIN_EXPECTED_EDGE_PERCENT": {"type": "float", "min": 0.05, "max": 1.0},
+                "V2_SOURCE_QOS_SOURCE_CAPS": {
+                    "type": "source_cap_map",
+                    "max_items": 6,
+                    "min_value": 1,
+                    "max_value": 500,
+                },
+            }
+        }
+        actions = [
+            mrt.Action("AUTO_TRADE_TOP_N", "80", "90", "low_throughput_expand_topn"),
+            mrt.Action("MIN_EXPECTED_EDGE_PERCENT", "0.05", "0.03", "relax_ev_low"),
+            mrt.Action(
+                "V2_SOURCE_QOS_SOURCE_CAPS",
+                "onchain:300,onchain+market:300,dexscreener:260,geckoterminal:260,watchlist:20,dex_boosts:100",
+                "onchain:700,onchain+market:700,dexscreener:700,geckoterminal:700,watchlist:0,dex_boosts:700",
+                "route_pressure source_qos_caps",
+            ),
+        ]
+        bounded, rows = mrt._apply_contract_bounds(actions=actions, contract=contract)
+        by_key = _actions_by_key(bounded)
+        self.assertEqual(by_key["AUTO_TRADE_TOP_N"].new_value, "80")
+        self.assertEqual(by_key["MIN_EXPECTED_EDGE_PERCENT"].new_value, "0.05")
+        self.assertIn("onchain:500", by_key["V2_SOURCE_QOS_SOURCE_CAPS"].new_value)
+        self.assertIn("watchlist:1", by_key["V2_SOURCE_QOS_SOURCE_CAPS"].new_value)
+        self.assertGreaterEqual(len(rows), 3)
+
     def test_resolve_policy_phase_tighten_on_blacklist_pressure(self) -> None:
         metrics = mrt.WindowMetrics(selected_from_batch=40, opened_from_batch=0)
         telemetry = {
@@ -1122,6 +1192,116 @@ class MatrixRuntimeTunerTests(unittest.TestCase):
         self.assertEqual(decision.phase, "expand")
         self.assertTrue(any("diversity_fail" in r for r in decision.reasons))
 
+    def test_idle_relax_state_activates_after_min_ticks(self) -> None:
+        metrics = mrt.WindowMetrics(
+            selected_from_batch=26,
+            opened_from_batch=0,
+            open_positions=0,
+        )
+        target = mrt.TargetPolicy(
+            idle_relax_enabled=True,
+            idle_relax_min_no_open_ticks=2,
+            idle_relax_min_selected_15m=12,
+            idle_relax_min_opportunity_per_hour=6.0,
+        )
+        state = mrt.RuntimeState(idle_no_open_ticks=1, idle_relax_ticks=0)
+        decision = mrt.PolicyDecision(
+            phase="expand",
+            reasons=[],
+            target_trades_per_hour_effective=8.0,
+            target_trades_per_hour_requested=12.0,
+            throughput_est_trades_h=0.0,
+            pnl_hour_usd=0.0,
+            blacklist_added_15m=0,
+            blacklist_share_15m=0.0,
+            open_rate_15m=0.0,
+            risk_fail=False,
+            flow_fail=True,
+            blacklist_fail=False,
+            pre_risk_fail=False,
+            diversity_fail=False,
+        )
+        snap = mrt._update_idle_relax_state(
+            metrics=metrics,
+            target=target,
+            state=state,
+            policy_decision=decision,
+            silence_diagnostics={
+                "opportunity_rate_per_hour": 10.0,
+                "action_rate_per_hour": 0.0,
+                "execution_open_rate_per_hour": 0.0,
+                "bottleneck_stage": "action",
+                "bottleneck_hint": "plan_or_policy",
+            },
+        )
+        self.assertTrue(bool(snap.get("active")))
+        self.assertGreaterEqual(int(state.idle_no_open_ticks), 2)
+        self.assertGreaterEqual(int(state.idle_relax_ticks), 1)
+
+    def test_idle_relax_guard_allows_only_safe_expand_keys_with_cap(self) -> None:
+        actions = [
+            mrt.Action("MIN_EXPECTED_EDGE_PERCENT", "0.10", "0.05", "ev_net_low"),
+            mrt.Action("MIN_EXPECTED_EDGE_USD", "0.003", "0.002", "ev_net_low"),
+            mrt.Action("TOKEN_AGE_MAX", "3600", "4500", "feed_starvation token_age_max"),
+            mrt.Action("WATCHLIST_MIN_LIQUIDITY_USD", "200000", "180000", "feed_starvation watch_min_liq"),
+            mrt.Action("MARKET_MODE_SOFT_SCORE", "52", "50", "score_min_dominant"),
+        ]
+        target = mrt.TargetPolicy(idle_relax_max_expand_actions_per_tick=2)
+        filtered, blocked = mrt._apply_idle_relax_guard(
+            actions=actions,
+            idle_relax_snapshot={"active": True},
+            target=target,
+        )
+        kept_keys = [str(a.key) for a in filtered]
+        self.assertIn("MIN_EXPECTED_EDGE_PERCENT", kept_keys)
+        self.assertIn("MIN_EXPECTED_EDGE_USD", kept_keys)
+        self.assertNotIn("TOKEN_AGE_MAX", kept_keys)
+        self.assertNotIn("WATCHLIST_MIN_LIQUIDITY_USD", kept_keys)
+        self.assertNotIn("MARKET_MODE_SOFT_SCORE", kept_keys)
+        self.assertGreaterEqual(len(blocked), 1)
+
+    def test_idle_relax_fast_rollback_requires_tighten_and_relax_history(self) -> None:
+        decision = mrt.PolicyDecision(
+            phase="tighten",
+            reasons=[],
+            target_trades_per_hour_effective=8.0,
+            target_trades_per_hour_requested=12.0,
+            throughput_est_trades_h=0.0,
+            pnl_hour_usd=-0.02,
+            blacklist_added_15m=0,
+            blacklist_share_15m=0.0,
+            open_rate_15m=0.0,
+            risk_fail=True,
+            flow_fail=False,
+            blacklist_fail=False,
+            pre_risk_fail=False,
+            diversity_fail=False,
+        )
+        target = mrt.TargetPolicy(idle_relax_fast_rollback_enabled=True)
+        self.assertTrue(
+            mrt._idle_relax_fast_rollback_required(
+                target=target,
+                decision=decision,
+                state=mrt.RuntimeState(idle_relax_ticks=2),
+            )
+        )
+        self.assertFalse(
+            mrt._idle_relax_fast_rollback_required(
+                target=target,
+                decision=decision,
+                state=mrt.RuntimeState(idle_relax_ticks=0),
+            )
+        )
+
+    def test_target_policy_parses_idle_relax_defaults(self) -> None:
+        parser = mrt.build_parser()
+        args = parser.parse_args(["once", "--profile-id", "u_case", "--dry-run"])
+        policy = mrt._target_policy_from_args(args)
+        self.assertTrue(bool(policy.idle_relax_enabled))
+        self.assertEqual(int(policy.idle_relax_min_no_open_ticks), 3)
+        self.assertEqual(int(policy.idle_relax_min_selected_15m), 12)
+        self.assertAlmostEqual(float(policy.idle_relax_min_opportunity_per_hour), 6.0, places=6)
+
     def test_collect_telemetry_v2_builds_funnel_and_reasons(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1213,6 +1393,12 @@ class MatrixRuntimeTunerTests(unittest.TestCase):
             self.assertTrue(any(str(x.get("reason_code")) == "ev_net_low" for x in plan_skip))
             exit_rows = telemetry["exit_mix_60m"]["distribution"]
             self.assertTrue(any(str(x.get("reason")) == "TIMEOUT" for x in exit_rows))
+            silence = telemetry["silence_diagnostics_15m"]
+            self.assertAlmostEqual(float(silence["opportunity_rate_per_hour"]), 8.0, places=6)
+            self.assertAlmostEqual(float(silence["action_rate_per_hour"]), 0.0, places=6)
+            self.assertAlmostEqual(float(silence["execution_open_rate_per_hour"]), 4.0, places=6)
+            self.assertEqual(str(silence["bottleneck_stage"]), "action")
+            self.assertEqual(str(silence["bottleneck_hint"]), "plan_or_policy")
 
     def test_overrides_hash_is_order_independent(self) -> None:
         h1 = mrt._overrides_hash({"B": "2", "A": "1"})

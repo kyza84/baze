@@ -181,6 +181,43 @@ TIGHTEN_FLOW_ESCAPE_SIGNALS = {
     "quality_duplicate_choke",
     "feed_starvation",
     "route_floor_normalize",
+    "anti_concentration",
+    "low_throughput_expand_topn",
+    "cooldown_dominant_flow_expand",
+    "ev_net_low",
+    "ev_net_low_gate",
+    "ev_net_low_probe_tolerance",
+    "plan_concentration",
+    "source_diversity_rebalance",
+}
+HOLD_FLOW_ESCAPE_SIGNALS = {
+    "source_qos_cap_rebalance",
+    "route_floor_normalize",
+    "feed_starvation",
+    "plan_concentration",
+    "source_diversity_rebalance",
+}
+IDLE_RELAX_SAFE_KEYS = {
+    "AUTO_TRADE_TOP_N",
+    "MAX_TOKEN_COOLDOWN_SECONDS",
+    "MARKET_MODE_STRICT_SCORE",
+    "MARKET_MODE_SOFT_SCORE",
+    "SAFE_MIN_VOLUME_5M_USD",
+    "MIN_EXPECTED_EDGE_PERCENT",
+    "MIN_EXPECTED_EDGE_USD",
+    "EV_FIRST_ENTRY_MIN_NET_USD",
+    "EV_FIRST_ENTRY_CORE_PROBE_EV_TOLERANCE_USD",
+    "HEAVY_CHECK_DEDUP_TTL_SECONDS",
+    "V2_UNIVERSE_NOVELTY_MIN_SHARE",
+    "SYMBOL_CONCENTRATION_MAX_SHARE",
+    "V2_SOURCE_QOS_MAX_PER_SYMBOL_PER_CYCLE",
+    "V2_SOURCE_QOS_TOPK_PER_CYCLE",
+    "V2_SOURCE_QOS_SOURCE_CAPS",
+    "V2_UNIVERSE_SOURCE_CAPS",
+    "PLAN_MAX_WATCHLIST_SHARE",
+    "PLAN_MIN_NON_WATCHLIST_PER_BATCH",
+    "PLAN_MAX_SINGLE_SOURCE_SHARE",
+    "V2_QUALITY_SYMBOL_REENTRY_MIN_SECONDS",
 }
 PHASE_CHOICES = ("expand", "hold", "tighten")
 STATE_MACHINE_CHOICES = ("auto",) + PHASE_CHOICES
@@ -221,6 +258,12 @@ class TargetPolicy:
     adaptive_target_headroom_add_trades_per_hour: float = 2.0
     adaptive_target_stable_ticks_for_step_up: int = 2
     adaptive_target_fail_ticks_for_step_down: int = 2
+    idle_relax_enabled: bool = True
+    idle_relax_min_no_open_ticks: int = 3
+    idle_relax_min_selected_15m: int = 12
+    idle_relax_min_opportunity_per_hour: float = 6.0
+    idle_relax_max_expand_actions_per_tick: int = 4
+    idle_relax_fast_rollback_enabled: bool = True
 
 
 @dataclass
@@ -256,6 +299,9 @@ class RuntimeState:
     effective_target_stable_ticks: int = 0
     effective_target_fail_ticks: int = 0
     effective_target_last_reason: str = ""
+    idle_no_open_ticks: int = 0
+    idle_relax_ticks: int = 0
+    idle_last_reason: str = ""
     restart_history_ts: list[float] = field(default_factory=list)
 
 
@@ -694,6 +740,9 @@ def _load_runtime_state(root: Path, profile_id: str) -> RuntimeState:
         effective_target_stable_ticks=int(payload.get("effective_target_stable_ticks", 0) or 0),
         effective_target_fail_ticks=int(payload.get("effective_target_fail_ticks", 0) or 0),
         effective_target_last_reason=str(payload.get("effective_target_last_reason", "") or ""),
+        idle_no_open_ticks=int(payload.get("idle_no_open_ticks", 0) or 0),
+        idle_relax_ticks=int(payload.get("idle_relax_ticks", 0) or 0),
+        idle_last_reason=str(payload.get("idle_last_reason", "") or ""),
         restart_history_ts=restart_history,
     )
 
@@ -715,6 +764,9 @@ def _save_runtime_state(root: Path, profile_id: str, state: RuntimeState) -> Non
         "effective_target_stable_ticks": int(max(0, state.effective_target_stable_ticks)),
         "effective_target_fail_ticks": int(max(0, state.effective_target_fail_ticks)),
         "effective_target_last_reason": str(state.effective_target_last_reason or ""),
+        "idle_no_open_ticks": int(max(0, state.idle_no_open_ticks)),
+        "idle_relax_ticks": int(max(0, state.idle_relax_ticks)),
+        "idle_last_reason": str(state.idle_last_reason or ""),
         "restart_history_ts": [
             float(x)
             for x in (state.restart_history_ts or [])
@@ -1097,6 +1149,65 @@ def _exec_health_15m(trade_rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _silence_diagnostics_15m(
+    *,
+    funnel: dict[str, Any],
+    exec_health: dict[str, Any],
+    plan_concentration: dict[str, Any],
+    source_profile: dict[str, Any],
+) -> dict[str, Any]:
+    post_filters_passed = int(_safe_float((funnel or {}).get("post_filters_passed", (funnel or {}).get("thr", 0)), 0.0))
+    plan_attempts = int(_safe_float((funnel or {}).get("plan_attempts", (exec_health or {}).get("plan_attempts", 0)), 0.0))
+    plan_skips = int(_safe_float((funnel or {}).get("plan_skips", (exec_health or {}).get("plan_skips", 0)), 0.0))
+    action_pass = max(0, int(plan_attempts - plan_skips))
+    trade_open = int(_safe_float((funnel or {}).get("trade_open", (exec_health or {}).get("opens", 0)), 0.0))
+    trade_close = int(_safe_float((funnel or {}).get("trade_close", (exec_health or {}).get("closes", 0)), 0.0))
+    execution_events = int(max(0, trade_open + trade_close))
+
+    opportunity_rate_h = float(post_filters_passed) * 4.0
+    action_rate_h = float(action_pass) * 4.0
+    execution_open_rate_h = float(trade_open) * 4.0
+    execution_event_rate_h = float(execution_events) * 4.0
+
+    plan_unique_symbols = int(_safe_float((plan_concentration or {}).get("plan_unique_symbols", 0), 0.0))
+    plan_top_share = float(_safe_float((plan_concentration or {}).get("plan_top_share", 0.0), 0.0))
+    source_top_share = float(_safe_float((source_profile or {}).get("plan_top_source_share", 0.0), 0.0))
+
+    if post_filters_passed <= 0:
+        bottleneck_stage = "opportunity"
+        bottleneck_hint = "discovery_or_filters"
+    elif action_pass <= 0:
+        bottleneck_stage = "action"
+        bottleneck_hint = "plan_or_policy"
+    elif trade_open <= 0:
+        bottleneck_stage = "execution"
+        bottleneck_hint = "executor_or_market"
+    else:
+        bottleneck_stage = "none"
+        bottleneck_hint = "active"
+
+    if opportunity_rate_h >= 12.0 and action_rate_h <= 0.5:
+        bottleneck_hint = "plan_or_policy"
+    elif opportunity_rate_h <= 2.0:
+        bottleneck_hint = "discovery_or_filters"
+
+    return {
+        "opportunity_count_15m": int(post_filters_passed),
+        "action_count_15m": int(action_pass),
+        "execution_open_count_15m": int(trade_open),
+        "execution_event_count_15m": int(execution_events),
+        "opportunity_rate_per_hour": round(opportunity_rate_h, 6),
+        "action_rate_per_hour": round(action_rate_h, 6),
+        "execution_open_rate_per_hour": round(execution_open_rate_h, 6),
+        "execution_event_rate_per_hour": round(execution_event_rate_h, 6),
+        "plan_unique_symbols_15m": int(plan_unique_symbols),
+        "plan_top1_share_15m": round(plan_top_share, 6),
+        "source_top_share_15m": round(source_top_share, 6),
+        "bottleneck_stage": str(bottleneck_stage),
+        "bottleneck_hint": str(bottleneck_hint),
+    }
+
+
 def _exit_mix_60m(trade_rows: list[dict[str, Any]]) -> dict[str, Any]:
     close_reasons = Counter[str]()
     pnl_sum = 0.0
@@ -1223,6 +1334,182 @@ def _symbol_churn_15m(trade_rows: list[dict[str, Any]]) -> dict[str, Any]:
         "ttl_seconds": int(ttl_seconds),
         "top_open_symbols": top_opens,
         "top_close_symbols": top_closes,
+    }
+
+
+def _resolve_trade_source(
+    row: dict[str, Any],
+    *,
+    candidate_source_by_id: dict[str, str],
+) -> str:
+    src = str(row.get("source", "") or row.get("source_mode", "") or "").strip().lower()
+    if src:
+        return src
+    cid = str(row.get("candidate_id", "") or "").strip()
+    if cid:
+        mapped = str(candidate_source_by_id.get(cid, "") or "").strip().lower()
+        if mapped:
+            return mapped
+    return "unknown"
+
+
+def _source_profile_15m(candidate_rows: list[dict[str, Any]], trade_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    candidate_source_by_id: dict[str, str] = {}
+    pass_by_source = Counter[str]()
+    fail_by_source = Counter[str]()
+    plan_attempts_by_source = Counter[str]()
+    plan_skips_by_source = Counter[str]()
+    opens_by_source = Counter[str]()
+    closes_by_source = Counter[str]()
+    close_pnl_by_source: dict[str, float] = {}
+
+    for idx, row in enumerate(candidate_rows):
+        key = _row_candidate_key(row, idx)
+        src = str(row.get("source", "") or row.get("source_mode", "") or "").strip().lower() or "unknown"
+        candidate_source_by_id[key] = src
+        stage = str(row.get("decision_stage", "") or "").strip().lower()
+        decision = str(row.get("decision", "") or "").strip().lower()
+        if stage == "post_filters" and decision in {"candidate_pass", "pass", "ok"}:
+            pass_by_source[src] += 1
+        elif stage == "filter_fail":
+            fail_by_source[src] += 1
+
+    for row in trade_rows:
+        stage = str(row.get("decision_stage", "") or "").strip().lower()
+        decision = str(row.get("decision", "") or "").strip().lower()
+        src = _resolve_trade_source(row, candidate_source_by_id=candidate_source_by_id)
+        if stage == "plan_trade":
+            plan_attempts_by_source[src] += 1
+            if decision == "skip":
+                plan_skips_by_source[src] += 1
+        elif stage == "trade_open" and decision == "open":
+            opens_by_source[src] += 1
+        elif stage == "trade_close" and decision == "close":
+            closes_by_source[src] += 1
+            try:
+                pnl = float(row.get("pnl_usd", 0.0) or 0.0)
+                close_pnl_by_source[src] = float(close_pnl_by_source.get(src, 0.0)) + float(pnl)
+            except Exception:
+                pass
+
+    all_sources = set(pass_by_source.keys()) | set(fail_by_source.keys()) | set(plan_attempts_by_source.keys())
+    all_sources |= set(opens_by_source.keys()) | set(closes_by_source.keys()) | set(close_pnl_by_source.keys())
+    rows: list[dict[str, Any]] = []
+    for src in sorted(all_sources):
+        attempts = int(plan_attempts_by_source.get(src, 0))
+        opens = int(opens_by_source.get(src, 0))
+        rows.append(
+            {
+                "source": str(src),
+                "candidate_pass": int(pass_by_source.get(src, 0)),
+                "candidate_fail": int(fail_by_source.get(src, 0)),
+                "plan_attempts": attempts,
+                "plan_skips": int(plan_skips_by_source.get(src, 0)),
+                "opens": opens,
+                "closes": int(closes_by_source.get(src, 0)),
+                "open_rate": round(float(opens) / float(max(1, attempts)), 6),
+                "close_pnl_usd": round(float(close_pnl_by_source.get(src, 0.0)), 6),
+            }
+        )
+    rows.sort(key=lambda r: (int(r.get("plan_attempts", 0)), int(r.get("candidate_pass", 0))), reverse=True)
+    top_source = str(rows[0].get("source", "")) if rows else ""
+    total_plan_attempts = int(sum(int(r.get("plan_attempts", 0) or 0) for r in rows))
+    top_source_plan_attempts = int(rows[0].get("plan_attempts", 0) or 0) if rows else 0
+    top_source_share = (
+        float(top_source_plan_attempts) / float(max(1, total_plan_attempts))
+        if total_plan_attempts > 0
+        else 0.0
+    )
+    return {
+        "rows": rows[:8],
+        "plan_attempts_total": int(total_plan_attempts),
+        "plan_top_source": str(top_source),
+        "plan_top_source_attempts": int(top_source_plan_attempts),
+        "plan_top_source_share": round(float(top_source_share), 6),
+    }
+
+
+def _plan_symbol_concentration_15m(trade_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    plan_attempts = Counter[str]()
+    plan_skips = Counter[str]()
+    opens = Counter[str]()
+    for row in trade_rows:
+        stage = str(row.get("decision_stage", "") or "").strip().lower()
+        decision = str(row.get("decision", "") or "").strip().lower()
+        symbol = str(row.get("symbol", "") or "").strip().upper()
+        if not symbol:
+            continue
+        if stage == "plan_trade":
+            plan_attempts[symbol] += 1
+            if decision == "skip":
+                plan_skips[symbol] += 1
+        elif stage == "trade_open" and decision == "open":
+            opens[symbol] += 1
+    plan_total = int(sum(int(v) for v in plan_attempts.values()))
+    open_total = int(sum(int(v) for v in opens.values()))
+    top_symbol = str(plan_attempts.most_common(1)[0][0]) if plan_attempts else ""
+    top_count = int(plan_attempts.get(top_symbol, 0))
+    top_share = float(top_count) / float(max(1, plan_total))
+    open_top_symbol = str(opens.most_common(1)[0][0]) if opens else ""
+    open_top_count = int(opens.get(open_top_symbol, 0))
+    open_top_share = float(open_top_count) / float(max(1, open_total))
+    return {
+        "plan_attempts": int(plan_total),
+        "plan_unique_symbols": int(len(plan_attempts)),
+        "plan_top_symbol": str(top_symbol),
+        "plan_top_count": int(top_count),
+        "plan_top_share": round(float(top_share), 6),
+        "open_total": int(open_total),
+        "open_unique_symbols": int(len(opens)),
+        "open_top_symbol": str(open_top_symbol),
+        "open_top_share": round(float(open_top_share), 6),
+        "top_plan_symbols": [
+            {
+                "symbol": str(sym),
+                "count": int(cnt),
+                "share": round(float(cnt) / float(max(1, plan_total)), 6),
+                "skip_count": int(plan_skips.get(sym, 0)),
+            }
+            for sym, cnt in plan_attempts.most_common(8)
+        ],
+    }
+
+
+def _ev_forensics_15m(trade_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    reasons = {"ev_net_low", "edge_low", "edge_usd_low", "negative_edge"}
+    by_reason = Counter[str]()
+    expected_edge_values: list[float] = []
+    expected_net_values: list[float] = []
+    size_values: list[float] = []
+    for row in trade_rows:
+        stage = str(row.get("decision_stage", "") or "").strip().lower()
+        decision = str(row.get("decision", "") or "").strip().lower()
+        reason = str(row.get("reason", "") or "").strip().lower()
+        if stage != "plan_trade" or decision != "skip" or reason not in reasons:
+            continue
+        by_reason[reason] += 1
+        try:
+            expected_edge_values.append(float(row.get("expected_edge_percent", 0.0) or 0.0))
+        except Exception:
+            pass
+        try:
+            expected_net_values.append(float(row.get("ev_expected_net_usd", 0.0) or 0.0))
+        except Exception:
+            pass
+        try:
+            size_values.append(float(row.get("position_size_usd", 0.0) or 0.0))
+        except Exception:
+            pass
+    return {
+        "ev_skip_total": int(sum(int(v) for v in by_reason.values())),
+        "by_reason": _to_share_rows(by_reason, limit=6),
+        "expected_edge_percent_median": (
+            round(float(_median(expected_edge_values) or 0.0), 6) if expected_edge_values else "N/A"
+        ),
+        "expected_net_usd_median": (
+            round(float(_median(expected_net_values) or 0.0), 6) if expected_net_values else "N/A"
+        ),
+        "position_size_usd_median": round(float(_median(size_values) or 0.0), 6) if size_values else "N/A",
     }
 
 
@@ -1398,6 +1685,28 @@ def _target_policy_from_args(args: argparse.Namespace) -> TargetPolicy:
             1,
             int(_safe_float(_pick("adaptive_target_fail_ticks_for_step_down", 2), 2)),
         ),
+        idle_relax_enabled=str(_pick("idle_relax_enabled", "true")).strip().lower()
+        in {"1", "true", "yes", "y", "on"},
+        idle_relax_min_no_open_ticks=max(
+            1,
+            int(_safe_float(_pick("idle_relax_min_no_open_ticks", 3), 3)),
+        ),
+        idle_relax_min_selected_15m=max(
+            1,
+            int(_safe_float(_pick("idle_relax_min_selected_15m", 12), 12)),
+        ),
+        idle_relax_min_opportunity_per_hour=max(
+            0.0,
+            _safe_float(_pick("idle_relax_min_opportunity_per_hour", 6.0), 6.0),
+        ),
+        idle_relax_max_expand_actions_per_tick=max(
+            1,
+            int(_safe_float(_pick("idle_relax_max_expand_actions_per_tick", 4), 4)),
+        ),
+        idle_relax_fast_rollback_enabled=str(
+            _pick("idle_relax_fast_rollback_enabled", "true")
+        ).strip().lower()
+        in {"1", "true", "yes", "y", "on"},
     )
 
 
@@ -1631,6 +1940,13 @@ def _resolve_policy_phase(
     buy_total_15m = int(metrics.autobuy_total)
     buy_unique_15m = int(metrics.unique_buy_symbols)
     buy_top_share_15m = float(metrics.top_buy_symbol_share)
+    plan_concentration = telemetry.get("plan_symbol_concentration_15m", {}) if isinstance(telemetry, dict) else {}
+    source_profile = telemetry.get("source_profile_15m", {}) if isinstance(telemetry, dict) else {}
+    plan_attempts_total_15m = int(_safe_float((plan_concentration or {}).get("plan_attempts", 0), 0.0))
+    plan_unique_symbols_15m = int(_safe_float((plan_concentration or {}).get("plan_unique_symbols", 0), 0.0))
+    plan_top_share_15m = _safe_float((plan_concentration or {}).get("plan_top_share", 0.0), 0.0)
+    source_top_share_15m = _safe_float((source_profile or {}).get("plan_top_source_share", 0.0), 0.0)
+    source_top_name_15m = str((source_profile or {}).get("plan_top_source", "") or "")
 
     def _rows_count(rows: Any) -> int:
         total = 0
@@ -1707,13 +2023,26 @@ def _resolve_policy_phase(
             )
         )
     )
-    diversity_fail = (
+    diversity_fail_buys = (
         buy_total_15m >= int(target.diversity_min_buys_15m)
         and (
             buy_unique_15m < int(target.diversity_min_unique_symbols_15m)
             or buy_top_share_15m > float(target.diversity_max_top1_open_share_15m)
         )
     )
+    plan_concentration_fail = (
+        plan_attempts_total_15m >= max(24, int(target.min_selected_15m))
+        and plan_unique_symbols_15m <= 2
+        and plan_top_share_15m >= max(0.55, float(target.diversity_max_top1_open_share_15m) + 0.08)
+        and opens <= 2
+    )
+    source_concentration_fail = (
+        plan_attempts_total_15m >= max(24, int(target.min_selected_15m))
+        and source_top_share_15m >= 0.90
+        and source_top_name_15m not in {"", "unknown"}
+        and opens <= 2
+    )
+    diversity_fail = bool(diversity_fail_buys or plan_concentration_fail or source_concentration_fail)
     risk_fail_core = (
         closes >= int(target.min_closed_for_risk_checks)
         and (winrate < float(target.min_winrate_closed_15m) or pnl_hour < float(target.target_pnl_per_hour_usd) * -1.0)
@@ -1773,6 +2102,18 @@ def _resolve_policy_phase(
             f"buys15={buy_total_15m} unique15={buy_unique_15m} top1_share15={buy_top_share_15m:.3f} "
             f"limits(min_unique={int(target.diversity_min_unique_symbols_15m)} "
             f"max_top1={float(target.diversity_max_top1_open_share_15m):.3f})"
+        )
+    if plan_concentration_fail:
+        reasons.append(
+            "plan_concentration_fail "
+            f"plan_attempts15={plan_attempts_total_15m} plan_unique15={plan_unique_symbols_15m} "
+            f"plan_top1_share15={plan_top_share_15m:.3f}"
+        )
+    if source_concentration_fail:
+        reasons.append(
+            "source_concentration_fail "
+            f"plan_attempts15={plan_attempts_total_15m} source_top={source_top_name_15m} "
+            f"source_top_share15={source_top_share_15m:.3f}"
         )
     if risk_fail:
         if tail_loss_fail:
@@ -2033,6 +2374,9 @@ def _filter_actions_by_phase(actions: list[Action], phase: str) -> tuple[list[Ac
                     allow = True
         elif phase == "hold":
             allow = family == "neutral"
+            if (not allow) and family == "expand":
+                if any(sig in reason_low for sig in HOLD_FLOW_ESCAPE_SIGNALS):
+                    allow = True
         if allow:
             out.append(action)
         else:
@@ -2045,6 +2389,148 @@ def _filter_actions_by_phase(actions: list[Action], phase: str) -> tuple[list[Ac
                 }
             )
     return out, blocked
+
+
+def _update_idle_relax_state(
+    *,
+    metrics: WindowMetrics,
+    target: TargetPolicy,
+    state: RuntimeState,
+    policy_decision: PolicyDecision,
+    silence_diagnostics: dict[str, Any],
+) -> dict[str, Any]:
+    opportunity_rate_h = _safe_float((silence_diagnostics or {}).get("opportunity_rate_per_hour", 0.0), 0.0)
+    action_rate_h = _safe_float((silence_diagnostics or {}).get("action_rate_per_hour", 0.0), 0.0)
+    execution_open_rate_h = _safe_float((silence_diagnostics or {}).get("execution_open_rate_per_hour", 0.0), 0.0)
+    bottleneck_stage = str((silence_diagnostics or {}).get("bottleneck_stage", "") or "")
+    bottleneck_hint = str((silence_diagnostics or {}).get("bottleneck_hint", "") or "")
+
+    selected_now = int(metrics.selected_from_batch)
+    opened_now = int(metrics.opened_from_batch)
+    open_positions_now = int(metrics.open_positions)
+    fail_now = bool(
+        policy_decision.risk_fail
+        or policy_decision.pre_risk_fail
+        or policy_decision.blacklist_fail
+        or policy_decision.diversity_fail
+    )
+    eligible_window = bool(
+        selected_now >= int(target.idle_relax_min_selected_15m)
+        and opened_now <= 0
+        and open_positions_now <= 0
+        and opportunity_rate_h >= float(target.idle_relax_min_opportunity_per_hour)
+    )
+    if eligible_window:
+        state.idle_no_open_ticks = int(max(0, state.idle_no_open_ticks) + 1)
+    elif opened_now > 0 or open_positions_now > 0:
+        state.idle_no_open_ticks = 0
+        state.idle_relax_ticks = 0
+        state.idle_last_reason = "activity_recovered"
+    else:
+        state.idle_no_open_ticks = 0
+
+    active = bool(
+        bool(target.idle_relax_enabled)
+        and policy_decision.phase == "expand"
+        and (not fail_now)
+        and eligible_window
+        and int(state.idle_no_open_ticks) >= int(target.idle_relax_min_no_open_ticks)
+    )
+    if active:
+        state.idle_relax_ticks = int(max(0, state.idle_relax_ticks) + 1)
+        state.idle_last_reason = (
+            f"idle_relax_active no_open_ticks={int(state.idle_no_open_ticks)} "
+            f"opp_h={opportunity_rate_h:.2f} action_h={action_rate_h:.2f} exec_open_h={execution_open_rate_h:.2f}"
+        )
+    elif eligible_window and fail_now:
+        state.idle_last_reason = (
+            f"idle_relax_blocked_fail stage={bottleneck_stage} hint={bottleneck_hint} "
+            f"risk={bool(policy_decision.risk_fail)} pre_risk={bool(policy_decision.pre_risk_fail)} "
+            f"blacklist={bool(policy_decision.blacklist_fail)} diversity={bool(policy_decision.diversity_fail)}"
+        )
+    elif eligible_window:
+        state.idle_last_reason = (
+            f"idle_relax_wait ticks={int(state.idle_no_open_ticks)}/{int(target.idle_relax_min_no_open_ticks)} "
+            f"stage={bottleneck_stage} hint={bottleneck_hint}"
+        )
+    elif opened_now <= 0 and open_positions_now <= 0:
+        state.idle_last_reason = (
+            f"idle_relax_not_eligible selected={selected_now} "
+            f"opp_h={opportunity_rate_h:.2f} min_selected={int(target.idle_relax_min_selected_15m)} "
+            f"min_opp_h={float(target.idle_relax_min_opportunity_per_hour):.2f}"
+        )
+
+    return {
+        "enabled": bool(target.idle_relax_enabled),
+        "eligible_window": bool(eligible_window),
+        "active": bool(active),
+        "no_open_ticks": int(state.idle_no_open_ticks),
+        "relax_ticks": int(state.idle_relax_ticks),
+        "min_no_open_ticks": int(target.idle_relax_min_no_open_ticks),
+        "selected_15m": int(selected_now),
+        "opened_15m": int(opened_now),
+        "open_positions": int(open_positions_now),
+        "opportunity_rate_h": round(float(opportunity_rate_h), 6),
+        "action_rate_h": round(float(action_rate_h), 6),
+        "execution_open_rate_h": round(float(execution_open_rate_h), 6),
+        "bottleneck_stage": bottleneck_stage,
+        "bottleneck_hint": bottleneck_hint,
+        "last_reason": str(state.idle_last_reason or ""),
+    }
+
+
+def _apply_idle_relax_guard(
+    *,
+    actions: list[Action],
+    idle_relax_snapshot: dict[str, Any],
+    target: TargetPolicy,
+) -> tuple[list[Action], list[dict[str, Any]]]:
+    if not bool((idle_relax_snapshot or {}).get("active")):
+        return list(actions), []
+    cap = max(1, int(target.idle_relax_max_expand_actions_per_tick))
+    kept: list[Action] = []
+    blocked: list[dict[str, Any]] = []
+    kept_expand = 0
+    for action in actions:
+        family = _action_family(action)
+        key = str(action.key or "").strip().upper()
+        if family != "expand":
+            kept.append(action)
+            continue
+        allow = key in IDLE_RELAX_SAFE_KEYS and kept_expand < cap
+        if allow:
+            kept.append(action)
+            kept_expand += 1
+            continue
+        blocked.append(
+            {
+                "key": key,
+                "reason": str(action.reason or ""),
+                "blocked_by": "idle_relax_guard",
+                "family": family,
+            }
+        )
+    return kept, blocked
+
+
+def _idle_relax_fast_rollback_required(
+    *,
+    target: TargetPolicy,
+    decision: PolicyDecision,
+    state: RuntimeState,
+) -> bool:
+    if not bool(target.idle_relax_fast_rollback_enabled):
+        return False
+    if int(state.idle_relax_ticks) <= 0:
+        return False
+    if str(decision.phase or "") != "tighten":
+        return False
+    return bool(
+        decision.pre_risk_fail
+        or decision.risk_fail
+        or decision.blacklist_fail
+        or decision.diversity_fail
+    )
 
 
 def _enforce_mutable_action_keys(
@@ -2176,6 +2662,17 @@ def _collect_telemetry_v2(
     last_row = _latest_jsonl_row(_runtime_log_path(root, profile_id))
     last_hash = str((last_row.get("telemetry_v2") or {}).get("config_hash_after", "") or "")
     run_tag = _pick_run_tag(candidate_rows_15m, trade_rows_15m, profile_id)
+    funnel_15m = _funnel_15m(candidate_rows_15m, trade_rows_15m)
+    top_reasons_15m = _top_reasons_15m(candidate_rows_15m, trade_rows_15m)
+    exec_health_15m = _exec_health_15m(trade_rows_15m)
+    source_profile_15m = _source_profile_15m(candidate_rows_15m, trade_rows_15m)
+    plan_concentration_15m = _plan_symbol_concentration_15m(trade_rows_15m)
+    silence_diagnostics_15m = _silence_diagnostics_15m(
+        funnel=funnel_15m,
+        exec_health=exec_health_15m,
+        plan_concentration=plan_concentration_15m,
+        source_profile=source_profile_15m,
+    )
     blacklist_forensics = _blacklist_forensics(
         candidate_rows_15m=candidate_rows_15m,
         trade_rows_15m=trade_rows_15m,
@@ -2190,9 +2687,13 @@ def _collect_telemetry_v2(
             "candidate_log_file": str(candidate_log),
             "trade_decisions_log_file": str(trade_log),
         },
-        "funnel_15m": _funnel_15m(candidate_rows_15m, trade_rows_15m),
-        "top_reasons_15m": _top_reasons_15m(candidate_rows_15m, trade_rows_15m),
-        "exec_health_15m": _exec_health_15m(trade_rows_15m),
+        "funnel_15m": funnel_15m,
+        "top_reasons_15m": top_reasons_15m,
+        "exec_health_15m": exec_health_15m,
+        "source_profile_15m": source_profile_15m,
+        "plan_symbol_concentration_15m": plan_concentration_15m,
+        "silence_diagnostics_15m": silence_diagnostics_15m,
+        "ev_forensics_15m": _ev_forensics_15m(trade_rows_15m),
         "symbol_churn_15m": _symbol_churn_15m(trade_rows_15m),
         "exit_mix_60m": _exit_mix_60m(trade_rows_60m),
         "blacklist_forensics_15m": blacklist_forensics,
@@ -2804,6 +3305,9 @@ def _build_action_plan(
     plan_skip_rows: list[dict[str, Any]] = []
     funnel_15m: dict[str, Any] = {}
     churn_15m: dict[str, Any] = {}
+    source_profile_15m: dict[str, Any] = {}
+    plan_concentration_15m: dict[str, Any] = {}
+    ev_forensics_15m: dict[str, Any] = {}
     if isinstance(telemetry, dict):
         top_reasons = telemetry.get("top_reasons_15m", {}) or {}
         if isinstance(top_reasons, dict):
@@ -2819,6 +3323,15 @@ def _build_action_plan(
         churn_raw = telemetry.get("symbol_churn_15m", {}) or {}
         if isinstance(churn_raw, dict):
             churn_15m = churn_raw
+        src_raw = telemetry.get("source_profile_15m", {}) or {}
+        if isinstance(src_raw, dict):
+            source_profile_15m = src_raw
+        plan_conc_raw = telemetry.get("plan_symbol_concentration_15m", {}) or {}
+        if isinstance(plan_conc_raw, dict):
+            plan_concentration_15m = plan_conc_raw
+        ev_raw = telemetry.get("ev_forensics_15m", {}) or {}
+        if isinstance(ev_raw, dict):
+            ev_forensics_15m = ev_raw
 
     quality_skip_total = 0
     for row in quality_skip_rows:
@@ -2834,6 +3347,12 @@ def _build_action_plan(
     funnel_raw_count = int(_safe_float((funnel_15m or {}).get("raw", 0), 0.0))
     funnel_pre_count = int(_safe_float((funnel_15m or {}).get("pre", 0), 0.0))
     funnel_buy_count = int(_safe_float((funnel_15m or {}).get("buy", 0), 0.0))
+    plan_attempts_15m = int(_safe_float((plan_concentration_15m or {}).get("plan_attempts", 0), 0.0))
+    plan_unique_symbols_15m = int(_safe_float((plan_concentration_15m or {}).get("plan_unique_symbols", 0), 0.0))
+    plan_top_share_15m = _safe_float((plan_concentration_15m or {}).get("plan_top_share", 0.0), 0.0)
+    source_top_share_15m = _safe_float((source_profile_15m or {}).get("plan_top_source_share", 0.0), 0.0)
+    source_top_name_15m = str((source_profile_15m or {}).get("plan_top_source", "") or "").strip().lower()
+    ev_skip_total_15m = int(_safe_float((ev_forensics_15m or {}).get("ev_skip_total", 0), 0.0))
     churn_detected = bool((churn_15m or {}).get("detected", False))
     churn_symbol = str((churn_15m or {}).get("symbol", "") or "").strip().upper()
     churn_open_share = _safe_float((churn_15m or {}).get("open_share", 0.0), 0.0)
@@ -2854,6 +3373,114 @@ def _build_action_plan(
         if quality_skip_total > 0
         else 0.0
     )
+    plan_concentration_choke = (
+        plan_attempts_15m >= max(24, int(metrics.selected_from_batch))
+        and plan_unique_symbols_15m <= 2
+        and plan_top_share_15m >= 0.55
+        and int(metrics.opened_from_batch) <= 2
+    )
+    source_concentration_choke = (
+        plan_attempts_15m >= max(24, int(metrics.selected_from_batch))
+        and source_top_share_15m >= 0.90
+        and source_top_name_15m not in {"", "unknown"}
+        and int(metrics.opened_from_batch) <= 2
+    )
+
+    if plan_concentration_choke:
+        rule_hits["plan_concentration_choke"] += 1
+        trace.append(
+            "plan_concentration "
+            f"attempts15={plan_attempts_15m} unique15={plan_unique_symbols_15m} "
+            f"top1_share15={plan_top_share_15m:.3f}"
+        )
+        novelty_share = _clamp_float(novelty_share + 0.05, 0.05, 0.90)
+        symbol_share_cap = _clamp_float(symbol_share_cap - 0.04, 0.08, 0.50)
+        per_symbol_cycle_cap = _clamp_int(per_symbol_cycle_cap - 1, flow_per_symbol_cap_floor, 20)
+        plan_single_source_share = _clamp_float(plan_single_source_share - 0.05, 0.20, 1.0)
+        plan_min_non_watchlist = _clamp_int(plan_min_non_watchlist + 1, 0, flow_non_watchlist_ceiling)
+        top_n = _clamp_int(top_n + 4, 8, 80)
+        quality_symbol_max_share = _clamp_float(quality_symbol_max_share - 0.02, 0.05, 0.50)
+        _apply_action(
+            staged,
+            actions,
+            "V2_UNIVERSE_NOVELTY_MIN_SHARE",
+            _to_float_str(novelty_share),
+            "plan_concentration novelty",
+        )
+        _apply_action(
+            staged,
+            actions,
+            "SYMBOL_CONCENTRATION_MAX_SHARE",
+            _to_float_str(symbol_share_cap),
+            "plan_concentration symbol_share",
+        )
+        _apply_action(
+            staged,
+            actions,
+            "V2_SOURCE_QOS_MAX_PER_SYMBOL_PER_CYCLE",
+            _to_int_str(per_symbol_cycle_cap),
+            "plan_concentration per_symbol_cap",
+        )
+        _apply_action(
+            staged,
+            actions,
+            "PLAN_MAX_SINGLE_SOURCE_SHARE",
+            _to_float_str(plan_single_source_share),
+            "plan_concentration single_source_share",
+        )
+        _apply_action(
+            staged,
+            actions,
+            "PLAN_MIN_NON_WATCHLIST_PER_BATCH",
+            _to_int_str(plan_min_non_watchlist),
+            "plan_concentration non_watch_min",
+        )
+        _apply_action(staged, actions, "AUTO_TRADE_TOP_N", _to_int_str(top_n), "plan_concentration topn")
+        _apply_action(
+            staged,
+            actions,
+            "V2_QUALITY_SYMBOL_MAX_SHARE",
+            _to_float_str(quality_symbol_max_share),
+            "plan_concentration quality_symbol_share",
+        )
+
+    if source_concentration_choke:
+        rule_hits["source_diversity_rebalance"] += 1
+        trace.append(
+            "source_diversity_rebalance "
+            f"top_source={source_top_name_15m} share15={source_top_share_15m:.3f} attempts15={plan_attempts_15m}"
+        )
+        plan_single_source_share = _clamp_float(plan_single_source_share - 0.04, 0.20, 1.0)
+        _apply_action(
+            staged,
+            actions,
+            "PLAN_MAX_SINGLE_SOURCE_SHARE",
+            _to_float_str(plan_single_source_share),
+            "source_diversity_rebalance single_source_share",
+        )
+        if qos_caps:
+            top_source_cap = int(qos_caps.get(source_top_name_15m, 0) or 0)
+            if top_source_cap > 0:
+                qos_caps[source_top_name_15m] = _clamp_int(top_source_cap - 10, 1, 600)
+            for src_name in ("dexscreener", "geckoterminal", "watchlist", "dex_boosts"):
+                prev = int(qos_caps.get(src_name, 0) or 0)
+                if prev > 0:
+                    qos_caps[src_name] = _clamp_int(prev + 4, 1, 600)
+            _apply_action(
+                staged,
+                actions,
+                "V2_SOURCE_QOS_SOURCE_CAPS",
+                _format_source_cap_map(qos_caps),
+                "source_diversity_rebalance source_qos_caps",
+            )
+        source_qos_topk_per_cycle = _clamp_int(source_qos_topk_per_cycle + 18, 20, 600)
+        _apply_action(
+            staged,
+            actions,
+            "V2_SOURCE_QOS_TOPK_PER_CYCLE",
+            _to_int_str(source_qos_topk_per_cycle),
+            "source_diversity_rebalance topk",
+        )
 
     if mode.name in {"fast", "conveyor"} and cold_start_hits > 0 and pe_enabled:
         pe_enabled = False
@@ -3619,6 +4246,33 @@ def _build_action_plan(
             trace.append(f"relax_ev_low hits={ev_low_hits}")
             _apply_action(staged, actions, "MIN_EXPECTED_EDGE_PERCENT", _to_float_str(min_edge_pct), "ev_net_low")
             _apply_action(staged, actions, "MIN_EXPECTED_EDGE_USD", _to_float_str(min_edge_usd), "ev_net_low")
+            ev_net_median = None
+            try:
+                ev_net_median = float((ev_forensics_15m or {}).get("expected_net_usd_median"))
+            except Exception:
+                ev_net_median = None
+            near_edge_band = (
+                ev_skip_total_15m >= max(10, int(metrics.selected_from_batch) // 3)
+                and ev_net_median is not None
+                and float(ev_net_median) >= -0.005
+            )
+            if near_edge_band:
+                rolling_edge_min_usd = _clamp_float(rolling_edge_min_usd - 0.0005, 0.0005, 0.05)
+                calibration_edge_usd_min = _clamp_float(calibration_edge_usd_min - 0.0005, 0.0005, 0.05)
+                _apply_action(
+                    staged,
+                    actions,
+                    "V2_ROLLING_EDGE_MIN_USD",
+                    _to_float_str(rolling_edge_min_usd),
+                    "ev_net_low rolling_usd",
+                )
+                _apply_action(
+                    staged,
+                    actions,
+                    "V2_CALIBRATION_EDGE_USD_MIN",
+                    _to_float_str(calibration_edge_usd_min),
+                    "ev_net_low calibration_usd",
+                )
             if ev_low_hits >= 6 or int(metrics.selected_from_batch) <= 8:
                 ev_first_min_net_usd = _clamp_float(ev_first_min_net_usd - 0.0004, -0.0020, 0.02)
                 ev_probe_tolerance_usd = _clamp_float(ev_probe_tolerance_usd + 0.0005, 0.001, 0.01)
@@ -3649,6 +4303,22 @@ def _build_action_plan(
                     "cooldown_floor_reached "
                     f"hits={cooldown_hits} current={cooldown} floor={bounds.cooldown_floor}"
                 )
+                if cooldown_hits >= max(12, int(metrics.selected_from_batch) // 2):
+                    reentry_floor = 15 if low_throughput else 30
+                    next_reentry = _clamp_int(
+                        quality_symbol_reentry_min_seconds - 30,
+                        reentry_floor,
+                        3600,
+                    )
+                    if next_reentry < quality_symbol_reentry_min_seconds:
+                        quality_symbol_reentry_min_seconds = next_reentry
+                        _apply_action(
+                            staged,
+                            actions,
+                            "V2_QUALITY_SYMBOL_REENTRY_MIN_SECONDS",
+                            _to_int_str(quality_symbol_reentry_min_seconds),
+                            "cooldown_floor_reached reentry_relax",
+                        )
         if min_trade_hits > 0:
             trade_min_gate = _clamp_float(trade_min_gate - 0.05, 0.1, 2.0)
             trade_min_paper = _clamp_float(trade_min_paper - 0.05, 0.1, 2.0)
@@ -4238,6 +4908,91 @@ def _validate_overrides(root: Path, overrides: dict[str, str]) -> list[str]:
     return validate_overrides(overrides, contract)
 
 
+def _apply_contract_bounds(
+    *,
+    actions: list[Action],
+    contract: dict[str, Any],
+) -> tuple[list[Action], list[dict[str, Any]]]:
+    allow = contract.get("allowed_keys", {}) if isinstance(contract, dict) else {}
+    if not isinstance(allow, dict):
+        allow = {}
+    out: list[Action] = []
+    capped_rows: list[dict[str, Any]] = []
+    for action in actions:
+        key = str(action.key or "").strip()
+        old_value = str(action.old_value or "").strip()
+        new_value = str(action.new_value or "").strip()
+        updated = new_value
+        spec = allow.get(key, {})
+        if isinstance(spec, dict):
+            kind = str(spec.get("type", "")).strip().lower()
+            if kind == "int":
+                try:
+                    val = int(str(new_value).strip())
+                    lo = spec.get("min", None)
+                    hi = spec.get("max", None)
+                    if lo is not None:
+                        val = max(val, int(lo))
+                    if hi is not None:
+                        val = min(val, int(hi))
+                    updated = _to_int_str(val)
+                except Exception:
+                    updated = new_value
+            elif kind == "float":
+                try:
+                    val = float(str(new_value).strip())
+                    lo = spec.get("min", None)
+                    hi = spec.get("max", None)
+                    if lo is not None:
+                        val = max(val, float(lo))
+                    if hi is not None:
+                        val = min(val, float(hi))
+                    updated = _to_float_str(val)
+                except Exception:
+                    updated = new_value
+            elif kind == "source_cap_map":
+                try:
+                    caps = _get_source_cap_map({"k": new_value}, "k")
+                    if caps:
+                        min_value = int(spec.get("min_value", 1) or 1)
+                        max_value = int(spec.get("max_value", 999) or 999)
+                        max_items = int(spec.get("max_items", len(caps)) or len(caps))
+                        clamped: dict[str, int] = {}
+                        for source in SOURCE_CAP_ORDER:
+                            if source not in caps:
+                                continue
+                            if len(clamped) >= max_items:
+                                break
+                            clamped[source] = _clamp_int(caps[source], min_value, max_value)
+                        for source in sorted(caps.keys()):
+                            if source in clamped:
+                                continue
+                            if len(clamped) >= max_items:
+                                break
+                            clamped[source] = _clamp_int(caps[source], min_value, max_value)
+                        updated = _format_source_cap_map(clamped)
+                except Exception:
+                    updated = new_value
+        if updated != new_value:
+            capped_rows.append(
+                {
+                    "key": key,
+                    "old": old_value,
+                    "requested": new_value,
+                    "applied": updated,
+                }
+            )
+        out.append(
+            Action(
+                key=action.key,
+                old_value=action.old_value,
+                new_value=updated,
+                reason=action.reason,
+            )
+        )
+    return out, capped_rows
+
+
 def _append_runtime_log(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
@@ -4693,25 +5448,44 @@ def _profile_running(root: Path, profile_id: str) -> bool:
 
 
 def _active_override_subset(root: Path, profile_id: str, keys: set[str]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    wanted = {str(k).strip() for k in (keys or set()) if str(k).strip()}
+    if not wanted:
+        return out
+
+    # Source of truth for hot-applied values is the live profile env file.
+    # active_matrix.overrides can remain stale until a launcher/writeback cycle.
+    env_file = _profile_env_file(root, profile_id)
+    env_path = Path(env_file)
+    if not env_path.is_absolute():
+        env_path = (root / env_path).resolve()
+    if env_path.exists():
+        _rows, env_map = _load_env_entries(env_path)
+        for key in wanted:
+            if key in env_map:
+                out[key] = str(env_map.get(key, ""))
+
+    # Fallback to active_matrix only for keys missing in env snapshot.
     path = _active_matrix_path(root)
     if not path.exists():
-        return {}
+        return out
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
-        return {}
+        return out
     for item in payload.get("items", []) or []:
         if str(item.get("id", "")).strip() != profile_id:
             continue
         raw = item.get("overrides", {})
         if not isinstance(raw, dict):
-            return {}
-        out: dict[str, str] = {}
-        for key in keys:
+            return out
+        for key in wanted:
+            if key in out:
+                continue
             if key in raw:
-                out[str(key)] = str(raw.get(key))
+                out[key] = str(raw.get(key))
         return out
-    return {}
+    return out
 
 
 def _diff_override_keys(current: dict[str, str], target: dict[str, str]) -> list[str]:
@@ -4829,6 +5603,16 @@ def _tick(
         forced_phase=forced_phase,
         effective_target_trades_per_hour=float(effective_target_tph),
     )
+    silence_before = telemetry_before.get("silence_diagnostics_15m", {}) if isinstance(telemetry_before, dict) else {}
+    if not isinstance(silence_before, dict):
+        silence_before = {}
+    idle_relax_snapshot = _update_idle_relax_state(
+        metrics=metrics,
+        target=target_policy,
+        state=state,
+        policy_decision=policy_decision,
+        silence_diagnostics=silence_before,
+    )
 
     actions, decision_trace, decision_meta = _build_action_plan(
         metrics=metrics,
@@ -4858,10 +5642,24 @@ def _tick(
         }
     actions, blocked_mutations = _enforce_mutable_action_keys(actions=actions, protected_keys=protected_keys)
     actions, blocked_phase = _filter_actions_by_phase(actions=actions, phase=policy_decision.phase)
+    actions, blocked_idle_relax = _apply_idle_relax_guard(
+        actions=actions,
+        idle_relax_snapshot=idle_relax_snapshot,
+        target=target_policy,
+    )
     actions, capped_actions = _apply_action_delta_caps(actions=actions, phase=policy_decision.phase)
+    contract = load_contract(root)
+    actions, contract_capped_actions = _apply_contract_bounds(actions=actions, contract=contract)
+    capped_actions.extend(contract_capped_actions)
+    actions = [
+        a
+        for a in actions
+        if str(a.old_value or "").strip() != str(a.new_value or "").strip()
+    ]
 
-    blocked_actions = blocked_mutations + blocked_phase
+    blocked_actions = blocked_mutations + blocked_phase + blocked_idle_relax
     rollback_triggered = False
+    rollback_reason = ""
     projected_degrade_streak = (
         state.degrade_streak + 1
         if (
@@ -4878,9 +5676,16 @@ def _tick(
         if str(k) in TUNER_MUTABLE_KEYS and str(k) not in TUNER_EPHEMERAL_KEYS
     }
     current_hash = _overrides_hash(current_mutable)
+    idle_fast_rollback = _idle_relax_fast_rollback_required(
+        target=target_policy,
+        decision=policy_decision,
+        state=state,
+    )
+    idle_relax_snapshot["blocked_expand_actions"] = int(len(blocked_idle_relax))
+    idle_relax_snapshot["fast_rollback_required"] = bool(idle_fast_rollback)
     if (
         policy_decision.phase == "tighten"
-        and projected_degrade_streak >= int(target_policy.rollback_degrade_streak)
+        and (projected_degrade_streak >= int(target_policy.rollback_degrade_streak) or idle_fast_rollback)
         and bool(state.stable_overrides)
         and str(state.stable_hash or "")
         and str(state.stable_hash or "") != current_hash
@@ -4894,12 +5699,25 @@ def _tick(
         rollback_actions, rollback_capped = _apply_action_delta_caps(actions=rollback_actions, phase="tighten")
         if rollback_actions:
             rollback_triggered = True
+            rollback_reason = (
+                "idle_relax_fast_rollback"
+                if idle_fast_rollback and projected_degrade_streak < int(target_policy.rollback_degrade_streak)
+                else "degrade_streak"
+            )
             actions = rollback_actions
             blocked_actions.extend(rollback_blocked)
             capped_actions.extend(rollback_capped)
-            decision_trace.insert(0, f"rollback_triggered degrade_streak={projected_degrade_streak}")
+            decision_trace.insert(
+                0,
+                f"rollback_triggered reason={rollback_reason} degrade_streak={projected_degrade_streak}",
+            )
             decision_meta = dict(decision_meta or {})
             decision_meta["rollback_target_hash"] = str(state.stable_hash or "")
+            if rollback_reason == "idle_relax_fast_rollback":
+                state.idle_relax_ticks = 0
+                state.idle_no_open_ticks = 0
+                state.idle_last_reason = "idle_relax_fast_rollback"
+    idle_relax_snapshot["rollback_reason"] = str(rollback_reason or "")
 
     staged_overrides: dict[str, str] = {str(k): str(v) for k, v in overrides.items()}
     for action in actions:
@@ -4937,7 +5755,7 @@ def _tick(
 
     if actions:
         changed_restart_required_keys = _restart_required_changed_keys(actions)
-        issues = _validate_overrides(root, staged_overrides)
+        issues = validate_overrides(staged_overrides, contract)
         if issues:
             apply_state = "validation_failed"
         elif dry_run:
@@ -5120,7 +5938,14 @@ def _tick(
     telemetry_v2["runtime_patch_sync_ok"] = bool(runtime_patch_sync_ok)
     if runtime_patch_sync_detail:
         telemetry_v2["runtime_patch_sync_detail"] = str(runtime_patch_sync_detail)
+    idle_relax_snapshot = dict(idle_relax_snapshot or {})
+    idle_relax_snapshot["max_expand_actions_per_tick"] = int(target_policy.idle_relax_max_expand_actions_per_tick)
+    telemetry_v2["idle_relax_v1"] = idle_relax_snapshot
     telemetry_v2["policy_phase"] = str(policy_decision.phase)
+    plan_conc_snapshot = telemetry_v2.get("plan_symbol_concentration_15m", {}) or {}
+    source_profile_snapshot = telemetry_v2.get("source_profile_15m", {}) or {}
+    ev_forensics_snapshot = telemetry_v2.get("ev_forensics_15m", {}) or {}
+    silence_snapshot = telemetry_v2.get("silence_diagnostics_15m", {}) or {}
     telemetry_v2["policy_snapshot"] = {
         "target_trades_per_hour": float(target_policy.target_trades_per_hour),
         "target_trades_per_hour_requested": float(policy_decision.target_trades_per_hour_requested),
@@ -5134,8 +5959,34 @@ def _tick(
         "diversity_buys_15m": int(metrics.autobuy_total),
         "diversity_unique_symbols_15m": int(metrics.unique_buy_symbols),
         "diversity_top1_open_share_15m": float(metrics.top_buy_symbol_share),
+        "plan_unique_symbols_15m": int(_safe_float((plan_conc_snapshot or {}).get("plan_unique_symbols", 0), 0.0)),
+        "plan_top1_share_15m": float(_safe_float((plan_conc_snapshot or {}).get("plan_top_share", 0.0), 0.0)),
+        "source_top_15m": str((source_profile_snapshot or {}).get("plan_top_source", "") or ""),
+        "source_top_share_15m": float(
+            _safe_float((source_profile_snapshot or {}).get("plan_top_source_share", 0.0), 0.0)
+        ),
+        "ev_skip_total_15m": int(_safe_float((ev_forensics_snapshot or {}).get("ev_skip_total", 0), 0.0)),
+        "ev_net_median_usd_15m": (
+            float(_safe_float((ev_forensics_snapshot or {}).get("expected_net_usd_median", 0.0), 0.0))
+            if isinstance((ev_forensics_snapshot or {}).get("expected_net_usd_median"), (int, float))
+            else "N/A"
+        ),
+        "opportunity_rate_h_15m": float(_safe_float((silence_snapshot or {}).get("opportunity_rate_per_hour", 0.0), 0.0)),
+        "action_rate_h_15m": float(_safe_float((silence_snapshot or {}).get("action_rate_per_hour", 0.0), 0.0)),
+        "execution_open_rate_h_15m": float(
+            _safe_float((silence_snapshot or {}).get("execution_open_rate_per_hour", 0.0), 0.0)
+        ),
+        "execution_event_rate_h_15m": float(
+            _safe_float((silence_snapshot or {}).get("execution_event_rate_per_hour", 0.0), 0.0)
+        ),
+        "silence_bottleneck_stage_15m": str((silence_snapshot or {}).get("bottleneck_stage", "") or ""),
+        "silence_bottleneck_hint_15m": str((silence_snapshot or {}).get("bottleneck_hint", "") or ""),
         "blacklist_added_15m": int(policy_decision.blacklist_added_15m),
         "blacklist_share_15m": float(policy_decision.blacklist_share_15m),
+        "idle_relax_active": bool((idle_relax_snapshot or {}).get("active", False)),
+        "idle_relax_no_open_ticks": int((idle_relax_snapshot or {}).get("no_open_ticks", 0)),
+        "idle_relax_relax_ticks": int((idle_relax_snapshot or {}).get("relax_ticks", 0)),
+        "idle_relax_last_reason": str((idle_relax_snapshot or {}).get("last_reason", "") or ""),
         "adaptive_target_pre": effective_target_meta_pre,
     }
 
@@ -5211,10 +6062,12 @@ def _tick(
         "pending_restart_diff_keys": [str(x) for x in pending_restart_diff_keys[:64]],
         "pending_hot_apply_diff_keys": [str(x) for x in pending_hot_apply_diff_keys[:64]],
     }
+    decision_meta["idle_relax_v1"] = dict(idle_relax_snapshot or {})
     decision_meta["blocked_actions"] = int(len(blocked_actions))
     decision_meta["delta_capped_actions"] = int(len(capped_actions))
     if rollback_triggered:
         decision_meta["rollback_triggered"] = True
+        decision_meta["rollback_reason"] = str(rollback_reason or "")
 
     report = {
         "ts": _now_iso(),
@@ -5292,6 +6145,26 @@ def _print_tick(report: dict[str, Any]) -> None:
         f"buy_total={m.get('autobuy_total')} unique_buy={m.get('unique_buy_symbols')} "
         f"top_symbol={m.get('top_buy_symbol')} top_share={m.get('top_buy_symbol_share')}"
     )
+    if isinstance(ps, dict):
+        print(
+            "  plan15 "
+            f"unique={ps.get('plan_unique_symbols_15m')} top1_share={ps.get('plan_top1_share_15m')} "
+            f"src_top={ps.get('source_top_15m')} src_share={ps.get('source_top_share_15m')} "
+            f"ev_skip={ps.get('ev_skip_total_15m')}"
+        )
+        print(
+            "  silence15 "
+            f"opp_h={ps.get('opportunity_rate_h_15m')} "
+            f"action_h={ps.get('action_rate_h_15m')} "
+            f"exec_open_h={ps.get('execution_open_rate_h_15m')} "
+            f"bottleneck={ps.get('silence_bottleneck_stage_15m')}/{ps.get('silence_bottleneck_hint_15m')}"
+        )
+        print(
+            "  idle_relax "
+            f"active={ps.get('idle_relax_active')} "
+            f"ticks={ps.get('idle_relax_no_open_ticks')}/{ps.get('idle_relax_relax_ticks')} "
+            f"reason={ps.get('idle_relax_last_reason')}"
+        )
     print(f"  target_tph effective={target_eff} requested={target_req}")
     actions = report.get("actions", [])
     if actions:
@@ -5480,6 +6353,20 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--adaptive-target-headroom-add-trades-per-hour", type=float, default=2.0)
         sp.add_argument("--adaptive-target-stable-ticks-for-step-up", type=int, default=2)
         sp.add_argument("--adaptive-target-fail-ticks-for-step-down", type=int, default=2)
+        sp.add_argument(
+            "--idle-relax-enabled",
+            default="true",
+            help="Enable idle-relax v1 guardrail (true|false).",
+        )
+        sp.add_argument("--idle-relax-min-no-open-ticks", type=int, default=3)
+        sp.add_argument("--idle-relax-min-selected-15m", type=int, default=12)
+        sp.add_argument("--idle-relax-min-opportunity-per-hour", type=float, default=6.0)
+        sp.add_argument("--idle-relax-max-expand-actions-per-tick", type=int, default=4)
+        sp.add_argument(
+            "--idle-relax-fast-rollback-enabled",
+            default="true",
+            help="Allow immediate rollback to last stable overrides on tighten after idle-relax window (true|false).",
+        )
         sp.add_argument("--dry-run", action="store_true", help="Analyze and propose actions without writing preset.")
         sp.add_argument("--root", default="", help="Project root (auto-detected by default).")
 

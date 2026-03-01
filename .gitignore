@@ -43,3 +43,11 @@ trading/paper_state*.json.*
 snapshots/
 collected_info/
 data/
+
+# Local AI/private context (keep local, never push)
+FULL_CHAT_HISTORY_EXPORT.md
+NEXT_CHAT_CONTEXT.md
+docs/NEXT_CHAT_CONTEXT.md
+.private_ai/
+prompts/
+chat_exports/
