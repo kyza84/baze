@@ -216,3 +216,32 @@ When lock is active:
 
 Lock is released automatically when TTL expires or when diversity recovers in-window.
 Churn lock state is persisted in `runtime_tuner_state.json`.
+
+## Non-Watch Starvation Recovery (New)
+
+The tuner now includes explicit recovery hooks for cases where non-watch sources exist in supply
+but fail to reach post-filters or planning windows.
+
+Runtime-tuned keys:
+
+- `SAFE_AGE_NON_WATCH_SOFT_RATIO`
+- `SAFE_AGE_NON_WATCH_MAX_PASSES_PER_CYCLE`
+- `SAFE_CHANGE_5M_NON_WATCH_SOFT_MULT`
+- `SAFE_CHANGE_5M_NON_WATCH_MAX_PASSES_PER_CYCLE`
+
+Runtime signals:
+
+- `source_starvation_guard.non_watch_post_filter_starved`
+- `supply_sanity_15m.post_filters_pass_non_watch_15m`
+- `source_starvation_guard.non_watch_zero_hits_15m`
+
+Guardrails:
+
+- Hard anti-scam and safety blocks are unchanged and never disabled by this recovery path.
+- Soft passes are per-cycle capped and logged for forensic analysis.
+- Recovery actions are still restricted by safe-tuning contract boundaries.
+
+Expected effect:
+
+- Increase `post_filters_pass_non_watch_15m` from zero starvation states.
+- Reduce structural watchlist-only planning without forcing unsafe entries.

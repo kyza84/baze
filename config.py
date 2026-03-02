@@ -322,6 +322,42 @@ SAFE_VOLUME_TWO_TIER_NON_WATCH_MAX_PASSES_PER_CYCLE = max(
     0,
     int(os.getenv("SAFE_VOLUME_TWO_TIER_NON_WATCH_MAX_PASSES_PER_CYCLE", "2")),
 )
+SAFE_AGE_NON_WATCH_SOFT_ENABLED = os.getenv(
+    "SAFE_AGE_NON_WATCH_SOFT_ENABLED",
+    "true",
+).lower() == "true"
+SAFE_AGE_NON_WATCH_SOFT_RATIO = max(
+    0.20,
+    min(1.00, float(os.getenv("SAFE_AGE_NON_WATCH_SOFT_RATIO", "0.70"))),
+)
+SAFE_AGE_NON_WATCH_MIN_SECONDS = max(
+    0,
+    int(os.getenv("SAFE_AGE_NON_WATCH_MIN_SECONDS", "60")),
+)
+SAFE_AGE_NON_WATCH_MAX_PASSES_PER_CYCLE = max(
+    0,
+    int(os.getenv("SAFE_AGE_NON_WATCH_MAX_PASSES_PER_CYCLE", "2")),
+)
+SAFE_CHANGE_5M_NON_WATCH_SOFT_ENABLED = os.getenv(
+    "SAFE_CHANGE_5M_NON_WATCH_SOFT_ENABLED",
+    "true",
+).lower() == "true"
+SAFE_CHANGE_5M_NON_WATCH_SOFT_MULT = max(
+    1.00,
+    min(2.00, float(os.getenv("SAFE_CHANGE_5M_NON_WATCH_SOFT_MULT", "1.20"))),
+)
+SAFE_CHANGE_5M_NON_WATCH_MIN_LIQUIDITY_MULT = max(
+    0.50,
+    min(3.00, float(os.getenv("SAFE_CHANGE_5M_NON_WATCH_MIN_LIQUIDITY_MULT", "1.00"))),
+)
+SAFE_CHANGE_5M_NON_WATCH_MIN_VOLUME_MULT = max(
+    0.10,
+    min(2.00, float(os.getenv("SAFE_CHANGE_5M_NON_WATCH_MIN_VOLUME_MULT", "0.60"))),
+)
+SAFE_CHANGE_5M_NON_WATCH_MAX_PASSES_PER_CYCLE = max(
+    0,
+    int(os.getenv("SAFE_CHANGE_5M_NON_WATCH_MAX_PASSES_PER_CYCLE", "2")),
+)
 SAFE_REQUIRE_CONTRACT_SAFE = os.getenv("SAFE_REQUIRE_CONTRACT_SAFE", "true").lower() == "true"
 SAFE_REQUIRE_RISK_LEVEL = os.getenv("SAFE_REQUIRE_RISK_LEVEL", "MEDIUM").strip().upper()
 SAFE_MAX_WARNING_FLAGS = int(os.getenv("SAFE_MAX_WARNING_FLAGS", "1"))

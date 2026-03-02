@@ -86,3 +86,8 @@ python -m unittest discover -s tests -p "test_*.py" -v
 - `docs/MATRIX_RUNTIME_TUNER.md`
 - `docs/MATRIX_PRESET_MANUAL.md`
 - `docs/SAFE_TUNING_AGENT_PROTOCOL.md`
+## Recent Update: Non-Watch Recovery
+- Added controlled non-watch soft filtering for `safe_age` and `safe_change_5m`.
+- Added tuner-aware starvation recovery hooks for non-watch post-filter bottlenecks.
+- Hard anti-scam and hard safety guards remain unchanged.
+- For details see: `docs/MATRIX_RUNTIME_TUNER.md` and `docs/PROJECT_STATE.md`.

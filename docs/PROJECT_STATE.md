@@ -8,6 +8,22 @@
 - Active profile: u_station_ab_night_autotune_v2
 - Last validated runtime: matrix+tuner running, no runtime exceptions, watchlist concentration remains the primary bottleneck.
 
+## Latest Commit Scope (Non-Watch Recovery)
+- Added non-watch soft filter controls in runtime config:
+  - `SAFE_AGE_NON_WATCH_SOFT_*`
+  - `SAFE_CHANGE_5M_NON_WATCH_SOFT_*`
+- Added main pipeline handling for non-watch soft passes with per-cycle caps and explicit logs:
+  - `NON_WATCH_SAFE_AGE_SOFT_PASS`
+  - `NON_WATCH_SAFE_CHANGE_SOFT_PASS`
+- Extended tuner mutable/contract-aware key set for these controls.
+- Extended tuner starvation diagnostics to include non-watch post-filter starvation.
+- Added/updated tests:
+  - `tests/test_config_env_loading.py`
+  - `tests/test_matrix_runtime_tuner.py`
+
+Safety boundary (unchanged):
+- Hard anti-scam/honeypot/hard-blocklist behavior was not relaxed.
+
 ## Runtime Topology
 - Trader runtime: `main_local.py`
 - Matrix launcher/stop:

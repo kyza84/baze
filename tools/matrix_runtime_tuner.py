@@ -77,6 +77,10 @@ TUNER_RUNTIME_FALLBACK_KEYS = {
     "MARKET_MODE_STRICT_SCORE",
     "MARKET_MODE_SOFT_SCORE",
     "SAFE_MIN_VOLUME_5M_USD",
+    "SAFE_AGE_NON_WATCH_SOFT_RATIO",
+    "SAFE_AGE_NON_WATCH_MAX_PASSES_PER_CYCLE",
+    "SAFE_CHANGE_5M_NON_WATCH_SOFT_MULT",
+    "SAFE_CHANGE_5M_NON_WATCH_MAX_PASSES_PER_CYCLE",
     "MIN_EXPECTED_EDGE_PERCENT",
     "MIN_EXPECTED_EDGE_USD",
     "V2_ROLLING_EDGE_MIN_PERCENT",
@@ -145,6 +149,10 @@ TUNER_MUTABLE_KEYS = {
     "PLAN_MIN_NON_WATCHLIST_PER_BATCH",
     "PROFIT_ENGINE_ENABLED",
     "SAFE_MIN_VOLUME_5M_USD",
+    "SAFE_AGE_NON_WATCH_SOFT_RATIO",
+    "SAFE_AGE_NON_WATCH_MAX_PASSES_PER_CYCLE",
+    "SAFE_CHANGE_5M_NON_WATCH_SOFT_MULT",
+    "SAFE_CHANGE_5M_NON_WATCH_MAX_PASSES_PER_CYCLE",
     "SOURCE_ROUTER_BAD_ENTRY_PROBABILITY",
     "SOURCE_ROUTER_MIN_TRADES",
     "SOURCE_ROUTER_SEVERE_ENTRY_PROBABILITY",
@@ -188,6 +196,8 @@ TIGHTEN_FLOW_ESCAPE_SIGNALS = {
     "low_throughput_expand_topn",
     "cooldown_dominant_flow_expand",
     "safe_volume_soft_flow_expand",
+    "safe_age_non_watch_soft",
+    "safe_change_non_watch_soft",
     "blacklist_dominator_shaping",
     "ev_net_low",
     "ev_net_low_gate",
@@ -203,6 +213,8 @@ HOLD_FLOW_ESCAPE_SIGNALS = {
     "plan_concentration",
     "source_diversity_rebalance",
     "safe_volume_soft_flow_expand",
+    "safe_age_non_watch_soft",
+    "safe_change_non_watch_soft",
     "blacklist_dominator_shaping",
     "source_starvation_guard",
 }
@@ -221,6 +233,10 @@ IDLE_RELAX_SAFE_KEYS = {
     "MARKET_MODE_STRICT_SCORE",
     "MARKET_MODE_SOFT_SCORE",
     "SAFE_MIN_VOLUME_5M_USD",
+    "SAFE_AGE_NON_WATCH_SOFT_RATIO",
+    "SAFE_AGE_NON_WATCH_MAX_PASSES_PER_CYCLE",
+    "SAFE_CHANGE_5M_NON_WATCH_SOFT_MULT",
+    "SAFE_CHANGE_5M_NON_WATCH_MAX_PASSES_PER_CYCLE",
     "MIN_EXPECTED_EDGE_PERCENT",
     "MIN_EXPECTED_EDGE_USD",
     "EV_FIRST_ENTRY_MIN_NET_USD",
@@ -2553,6 +2569,8 @@ def _action_family(action: Action) -> str:
         "score_min_dominant",
         "safe_volume_dominant",
         "safe_volume_soft_flow_expand",
+        "safe_age_non_watch_soft",
+        "safe_change_non_watch_soft",
         "ev_net_low",
         "ev_net_low_gate",
         "ev_net_low_probe_tolerance",
@@ -2622,6 +2640,10 @@ def _apply_action_delta_caps(actions: list[Action], phase: str) -> tuple[list[Ac
         "MARKET_MODE_STRICT_SCORE": (2.0, True),
         "MARKET_MODE_SOFT_SCORE": (2.0, True),
         "SAFE_MIN_VOLUME_5M_USD": (3.0, False),
+        "SAFE_AGE_NON_WATCH_SOFT_RATIO": (0.08, False),
+        "SAFE_AGE_NON_WATCH_MAX_PASSES_PER_CYCLE": (2.0, True),
+        "SAFE_CHANGE_5M_NON_WATCH_SOFT_MULT": (0.10, False),
+        "SAFE_CHANGE_5M_NON_WATCH_MAX_PASSES_PER_CYCLE": (2.0, True),
         "MIN_EXPECTED_EDGE_PERCENT": (0.10, False),
         "MIN_EXPECTED_EDGE_USD": (0.0015, False),
         "V2_ROLLING_EDGE_MIN_PERCENT": (0.08, False),
@@ -3476,6 +3498,10 @@ def _action_priority(action: Action) -> int:
         "MARKET_MODE_STRICT_SCORE",
         "MARKET_MODE_SOFT_SCORE",
         "SAFE_MIN_VOLUME_5M_USD",
+        "SAFE_AGE_NON_WATCH_SOFT_RATIO",
+        "SAFE_AGE_NON_WATCH_MAX_PASSES_PER_CYCLE",
+        "SAFE_CHANGE_5M_NON_WATCH_SOFT_MULT",
+        "SAFE_CHANGE_5M_NON_WATCH_MAX_PASSES_PER_CYCLE",
         "MIN_EXPECTED_EDGE_PERCENT",
         "MIN_EXPECTED_EDGE_USD",
         "AUTO_TRADE_TOP_N",
@@ -3496,6 +3522,10 @@ def _action_priority(action: Action) -> int:
         "PLAN_MAX_WATCHLIST_SHARE",
         "PLAN_MIN_NON_WATCHLIST_PER_BATCH",
         "PLAN_MAX_SINGLE_SOURCE_SHARE",
+        "SAFE_AGE_NON_WATCH_SOFT_RATIO",
+        "SAFE_AGE_NON_WATCH_MAX_PASSES_PER_CYCLE",
+        "SAFE_CHANGE_5M_NON_WATCH_SOFT_MULT",
+        "SAFE_CHANGE_5M_NON_WATCH_MAX_PASSES_PER_CYCLE",
         "V2_SOURCE_QOS_MAX_PER_SYMBOL_PER_CYCLE",
         "V2_SOURCE_QOS_TOPK_PER_CYCLE",
         "V2_UNIVERSE_NOVELTY_MIN_SHARE",
@@ -3615,6 +3645,10 @@ def _build_action_plan(
     paper_watchlist_min_score = _get_int(staged, "PAPER_WATCHLIST_MIN_SCORE", 90)
     paper_watchlist_min_liquidity = _get_float(staged, "PAPER_WATCHLIST_MIN_LIQUIDITY_USD", 150000.0)
     paper_watchlist_min_volume_5m = _get_float(staged, "PAPER_WATCHLIST_MIN_VOLUME_5M_USD", 500.0)
+    safe_age_non_watch_soft_ratio = _get_float(staged, "SAFE_AGE_NON_WATCH_SOFT_RATIO", 0.70)
+    safe_age_non_watch_max_passes = _get_int(staged, "SAFE_AGE_NON_WATCH_MAX_PASSES_PER_CYCLE", 2)
+    safe_change_non_watch_soft_mult = _get_float(staged, "SAFE_CHANGE_5M_NON_WATCH_SOFT_MULT", 1.20)
+    safe_change_non_watch_max_passes = _get_int(staged, "SAFE_CHANGE_5M_NON_WATCH_MAX_PASSES_PER_CYCLE", 2)
     quality_source_budget_enabled = _get_bool(staged, "V2_QUALITY_SOURCE_BUDGET_ENABLED", True)
     excluded_symbols = _parse_symbol_csv(staged.get("AUTO_TRADE_EXCLUDED_SYMBOLS", ""))
     excluded_symbol_set = {str(x).strip().upper() for x in excluded_symbols}
@@ -3622,6 +3656,7 @@ def _build_action_plan(
     score_min_hits = int(metrics.filter_fail_reasons.get("score_min", 0))
     safe_volume_hits = int(metrics.filter_fail_reasons.get("safe_volume", 0))
     safe_age_hits = int(metrics.filter_fail_reasons.get("safe_age", 0))
+    safe_change_hits = int(metrics.filter_fail_reasons.get("safe_change_5m", 0))
     heavy_dedup_hits = int(metrics.filter_fail_reasons.get("heavy_dedup_ttl", 0))
     ev_low_hits = int(metrics.autotrade_skip_reasons.get("ev_net_low", 0))
     edge_low_hits = int(metrics.autotrade_skip_reasons.get("edge_low", 0))
@@ -3794,12 +3829,16 @@ def _build_action_plan(
     )
     source_non_watch_actionable_min_15m = max(4, int(plan_attempts_15m // 12))
     source_non_watch_actionable = bool(post_filters_non_watch_15m >= source_non_watch_actionable_min_15m)
+    non_watch_post_filter_starved = bool(
+        supply_non_watch_15m >= max(12, int(metrics.selected_from_batch) // 3)
+        and post_filters_non_watch_15m <= 0
+    )
     source_starvation_guard = bool(
         low_throughput
         and source_top_name_15m.startswith("watchlist")
         and source_top_share_15m >= 0.75
         and supply_non_watch_15m >= max(12, int(metrics.selected_from_batch) // 3)
-        and source_non_watch_actionable
+        and (source_non_watch_actionable or non_watch_post_filter_starved)
         and plan_non_watch_15m <= 0
         and source_non_watch_zero_hits_15m >= max(3, int(plan_attempts_15m // 8))
     )
@@ -5017,6 +5056,68 @@ def _build_action_plan(
                 rule_hits["relax_safe_volume"] += 1
                 trace.append(f"relax_safe_volume hits={safe_volume_hits}")
                 _apply_action(staged, actions, "SAFE_MIN_VOLUME_5M_USD", _to_float_str(min_vol), "safe_volume_dominant")
+        if safe_age_hits > 0 and (source_starvation_guard or non_watch_post_filter_starved):
+            safe_age_non_watch_soft_ratio = _clamp_float(
+                safe_age_non_watch_soft_ratio - 0.05,
+                0.35,
+                1.00,
+            )
+            safe_age_non_watch_max_passes = _clamp_int(
+                safe_age_non_watch_max_passes + 1,
+                0,
+                8,
+            )
+            rule_hits["relax_safe_age_non_watch"] += 1
+            trace.append(
+                "relax_safe_age_non_watch "
+                f"hits={safe_age_hits} supply_non_watch={supply_non_watch_15m} "
+                f"post_filters_non_watch={post_filters_non_watch_15m}"
+            )
+            _apply_action(
+                staged,
+                actions,
+                "SAFE_AGE_NON_WATCH_SOFT_RATIO",
+                _to_float_str(safe_age_non_watch_soft_ratio),
+                "safe_age_non_watch_soft ratio",
+            )
+            _apply_action(
+                staged,
+                actions,
+                "SAFE_AGE_NON_WATCH_MAX_PASSES_PER_CYCLE",
+                _to_int_str(safe_age_non_watch_max_passes),
+                "safe_age_non_watch_soft cap",
+            )
+        if safe_change_hits > 0 and (source_starvation_guard or non_watch_post_filter_starved):
+            safe_change_non_watch_soft_mult = _clamp_float(
+                safe_change_non_watch_soft_mult + 0.05,
+                1.00,
+                1.80,
+            )
+            safe_change_non_watch_max_passes = _clamp_int(
+                safe_change_non_watch_max_passes + 1,
+                0,
+                8,
+            )
+            rule_hits["relax_safe_change_non_watch"] += 1
+            trace.append(
+                "relax_safe_change_non_watch "
+                f"hits={safe_change_hits} supply_non_watch={supply_non_watch_15m} "
+                f"post_filters_non_watch={post_filters_non_watch_15m}"
+            )
+            _apply_action(
+                staged,
+                actions,
+                "SAFE_CHANGE_5M_NON_WATCH_SOFT_MULT",
+                _to_float_str(safe_change_non_watch_soft_mult),
+                "safe_change_non_watch_soft mult",
+            )
+            _apply_action(
+                staged,
+                actions,
+                "SAFE_CHANGE_5M_NON_WATCH_MAX_PASSES_PER_CYCLE",
+                _to_int_str(safe_change_non_watch_max_passes),
+                "safe_change_non_watch_soft cap",
+            )
         if ev_low_hits > 0:
             min_edge_pct = _clamp_float(min_edge_pct - 0.05, bounds.edge_floor, bounds.edge_ceiling)
             min_edge_usd = _clamp_float(min_edge_usd - 0.001, bounds.edge_usd_floor, bounds.edge_usd_ceiling)
@@ -5782,6 +5883,7 @@ def _build_action_plan(
         "post_filters_non_watch_15m": int(post_filters_non_watch_15m),
         "post_filters_non_watch_min_15m": int(source_non_watch_actionable_min_15m),
         "non_watch_actionable": bool(source_non_watch_actionable),
+        "non_watch_post_filter_starved": bool(non_watch_post_filter_starved),
         "plan_non_watch_15m": int(plan_non_watch_15m),
         "non_watch_zero_hits_15m": int(source_non_watch_zero_hits_15m),
     }

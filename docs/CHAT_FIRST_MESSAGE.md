@@ -41,3 +41,14 @@
 ## Правило актуальности
 - Файл `docs/CHAT_FIRST_MESSAGE.md` должен обновляться в каждом material-коммите вместе с `docs/PROJECT_STATE.md`.
 - Проверяется pre-commit guard (`tools/context_commit_guard.py`, `.githooks/pre-commit`).
+
+## Additional Handoff Checklist (Current)
+- Confirm non-watch recovery keys are visible in active runtime/preset:
+  - `SAFE_AGE_NON_WATCH_SOFT_RATIO`
+  - `SAFE_AGE_NON_WATCH_MAX_PASSES_PER_CYCLE`
+  - `SAFE_CHANGE_5M_NON_WATCH_SOFT_MULT`
+  - `SAFE_CHANGE_5M_NON_WATCH_MAX_PASSES_PER_CYCLE`
+- Verify telemetry fields in latest tuner tick:
+  - `source_starvation_guard.non_watch_post_filter_starved`
+  - `supply_sanity_15m.post_filters_pass_non_watch_15m`
+- Keep hard anti-scam unchanged: no disabling of honeypot/hard blocklist paths.

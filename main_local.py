@@ -2890,6 +2890,68 @@ async def run_local_loop() -> None:
                         int(getattr(config, "SAFE_VOLUME_TWO_TIER_NON_WATCH_MAX_PASSES_PER_CYCLE", 2) or 2),
                     )
                     non_watch_volume_probe_used_cycle = 0
+                    non_watch_age_soft_enabled = bool(
+                        getattr(config, "SAFE_AGE_NON_WATCH_SOFT_ENABLED", True)
+                    )
+                    non_watch_age_soft_ratio = max(
+                        0.20,
+                        min(
+                            1.00,
+                            float(getattr(config, "SAFE_AGE_NON_WATCH_SOFT_RATIO", 0.70) or 0.70),
+                        ),
+                    )
+                    non_watch_age_soft_min_seconds = max(
+                        0,
+                        int(getattr(config, "SAFE_AGE_NON_WATCH_MIN_SECONDS", 60) or 60),
+                    )
+                    non_watch_age_soft_max_per_cycle = max(
+                        0,
+                        int(getattr(config, "SAFE_AGE_NON_WATCH_MAX_PASSES_PER_CYCLE", 2) or 2),
+                    )
+                    non_watch_age_soft_used_cycle = 0
+                    non_watch_change_soft_enabled = bool(
+                        getattr(config, "SAFE_CHANGE_5M_NON_WATCH_SOFT_ENABLED", True)
+                    )
+                    non_watch_change_soft_mult = max(
+                        1.00,
+                        min(
+                            2.00,
+                            float(getattr(config, "SAFE_CHANGE_5M_NON_WATCH_SOFT_MULT", 1.20) or 1.20),
+                        ),
+                    )
+                    non_watch_change_soft_min_liquidity_mult = max(
+                        0.50,
+                        min(
+                            3.00,
+                            float(
+                                getattr(
+                                    config,
+                                    "SAFE_CHANGE_5M_NON_WATCH_MIN_LIQUIDITY_MULT",
+                                    1.00,
+                                )
+                                or 1.00
+                            ),
+                        ),
+                    )
+                    non_watch_change_soft_min_volume_mult = max(
+                        0.10,
+                        min(
+                            2.00,
+                            float(
+                                getattr(
+                                    config,
+                                    "SAFE_CHANGE_5M_NON_WATCH_MIN_VOLUME_MULT",
+                                    0.60,
+                                )
+                                or 0.60
+                            ),
+                        ),
+                    )
+                    non_watch_change_soft_max_per_cycle = max(
+                        0,
+                        int(getattr(config, "SAFE_CHANGE_5M_NON_WATCH_MAX_PASSES_PER_CYCLE", 2) or 2),
+                    )
+                    non_watch_change_soft_used_cycle = 0
                     soft_selected_cycle = 0
                     excluded_symbols_cycle = _excluded_trade_symbols()
                     excluded_keywords_cycle = _excluded_trade_symbol_keywords()
@@ -3193,12 +3255,127 @@ async def run_local_loop() -> None:
                                     continue
                             elif token_address:
                                 safe_volume_probe_state.pop(token_address, None)
-                            if int(token.get("age_seconds") or 0) < int(config.SAFE_MIN_AGE_SECONDS):
-                                _filter_fail("safe_age", token)
-                                continue
-                            if abs(float(token.get("price_change_5m") or 0)) > float(config.SAFE_MAX_PRICE_CHANGE_5M_ABS_PERCENT):
-                                _filter_fail("safe_change_5m", token)
-                                continue
+                            token_age_seconds = int(token.get("age_seconds") or 0)
+                            safe_age_floor = int(config.SAFE_MIN_AGE_SECONDS)
+                            if token_age_seconds < safe_age_floor:
+                                age_soft_passed = False
+                                relaxed_age_floor = max(
+                                    int(non_watch_age_soft_min_seconds),
+                                    int(round(float(safe_age_floor) * float(non_watch_age_soft_ratio))),
+                                )
+                                if (
+                                    is_non_watch_source
+                                    and non_watch_age_soft_enabled
+                                    and token_age_seconds >= relaxed_age_floor
+                                ):
+                                    if (
+                                        non_watch_age_soft_max_per_cycle > 0
+                                        and non_watch_age_soft_used_cycle >= non_watch_age_soft_max_per_cycle
+                                    ):
+                                        _filter_fail(
+                                            "safe_age_non_watch_cycle_cap",
+                                            token,
+                                            (
+                                                f"age={token_age_seconds}/{safe_age_floor} "
+                                                f"used={non_watch_age_soft_used_cycle}/{non_watch_age_soft_max_per_cycle}"
+                                            ),
+                                        )
+                                        continue
+                                    if non_watch_age_soft_max_per_cycle > 0:
+                                        non_watch_age_soft_used_cycle += 1
+                                    age_soft_passed = True
+                                    token["_safe_age_soft_pass"] = True
+                                    token["_safe_age_soft_detail"] = (
+                                        f"age={token_age_seconds}/{safe_age_floor} "
+                                        f"relaxed={relaxed_age_floor} "
+                                        f"used={non_watch_age_soft_used_cycle}/{non_watch_age_soft_max_per_cycle}"
+                                    )
+                                    logger.info(
+                                        "NON_WATCH_SAFE_AGE_SOFT_PASS token=%s age=%s min=%s relaxed=%s used=%s/%s source=%s",
+                                        token.get("symbol", "N/A"),
+                                        token_age_seconds,
+                                        safe_age_floor,
+                                        relaxed_age_floor,
+                                        non_watch_age_soft_used_cycle,
+                                        non_watch_age_soft_max_per_cycle,
+                                        source_name or "unknown",
+                                    )
+                                if not age_soft_passed:
+                                    _filter_fail(
+                                        "safe_age",
+                                        token,
+                                        f"age={token_age_seconds} min={safe_age_floor}",
+                                    )
+                                    continue
+                            token_abs_change_5m = abs(float(token.get("price_change_5m") or 0.0))
+                            safe_change_abs_limit = float(config.SAFE_MAX_PRICE_CHANGE_5M_ABS_PERCENT)
+                            if token_abs_change_5m > safe_change_abs_limit:
+                                change_soft_passed = False
+                                relaxed_change_limit = float(safe_change_abs_limit) * float(
+                                    non_watch_change_soft_mult
+                                )
+                                min_change_liquidity = float(config.SAFE_MIN_LIQUIDITY_USD) * float(
+                                    non_watch_change_soft_min_liquidity_mult
+                                )
+                                min_change_volume_5m = float(safe_volume_floor) * float(
+                                    non_watch_change_soft_min_volume_mult
+                                )
+                                token_liquidity_now = float(token.get("liquidity") or 0.0)
+                                if (
+                                    is_non_watch_source
+                                    and non_watch_change_soft_enabled
+                                    and token_abs_change_5m <= relaxed_change_limit
+                                    and token_liquidity_now >= min_change_liquidity
+                                    and token_volume_5m >= min_change_volume_5m
+                                ):
+                                    if (
+                                        non_watch_change_soft_max_per_cycle > 0
+                                        and non_watch_change_soft_used_cycle >= non_watch_change_soft_max_per_cycle
+                                    ):
+                                        _filter_fail(
+                                            "safe_change_non_watch_cycle_cap",
+                                            token,
+                                            (
+                                                f"abs5m={token_abs_change_5m:.2f}/{safe_change_abs_limit:.2f} "
+                                                f"used={non_watch_change_soft_used_cycle}/{non_watch_change_soft_max_per_cycle}"
+                                            ),
+                                        )
+                                        continue
+                                    if non_watch_change_soft_max_per_cycle > 0:
+                                        non_watch_change_soft_used_cycle += 1
+                                    change_soft_passed = True
+                                    token["_safe_change_soft_pass"] = True
+                                    token["_safe_change_soft_detail"] = (
+                                        f"abs5m={token_abs_change_5m:.2f}/{safe_change_abs_limit:.2f} "
+                                        f"relaxed={relaxed_change_limit:.2f} "
+                                        f"liq={token_liquidity_now:.0f}/{min_change_liquidity:.0f} "
+                                        f"vol5m={token_volume_5m:.0f}/{min_change_volume_5m:.0f} "
+                                        f"used={non_watch_change_soft_used_cycle}/{non_watch_change_soft_max_per_cycle}"
+                                    )
+                                    logger.info(
+                                        "NON_WATCH_SAFE_CHANGE_SOFT_PASS token=%s abs5m=%.2f max=%.2f relaxed=%.2f liq=%.0f/%.0f vol5m=%.0f/%.0f used=%s/%s source=%s",
+                                        token.get("symbol", "N/A"),
+                                        token_abs_change_5m,
+                                        safe_change_abs_limit,
+                                        relaxed_change_limit,
+                                        token_liquidity_now,
+                                        min_change_liquidity,
+                                        token_volume_5m,
+                                        min_change_volume_5m,
+                                        non_watch_change_soft_used_cycle,
+                                        non_watch_change_soft_max_per_cycle,
+                                        source_name or "unknown",
+                                    )
+                                if not change_soft_passed:
+                                    _filter_fail(
+                                        "safe_change_5m",
+                                        token,
+                                        (
+                                            f"abs5m={token_abs_change_5m:.2f} "
+                                            f"max={safe_change_abs_limit:.2f}"
+                                        ),
+                                    )
+                                    continue
 
                         # Heavy safety-check dedup: avoid re-checking same token address too often.
                         heavy_ttl_raw = getattr(config, "HEAVY_CHECK_DEDUP_TTL_SECONDS", 900)
@@ -3373,6 +3550,8 @@ async def run_local_loop() -> None:
                                 "is_contract_safe": bool(token.get("is_contract_safe", False)),
                                 "score_probe_pass": bool(token.get("_non_watch_score_probe_pass", False)),
                                 "safe_volume_soft_pass": bool(token.get("_safe_volume_soft_pass", False)),
+                                "safe_age_soft_pass": bool(token.get("_safe_age_soft_pass", False)),
+                                "safe_change_soft_pass": bool(token.get("_safe_change_soft_pass", False)),
                                 "quality": _candidate_quality_features(token, score_data),
                             }
                         )

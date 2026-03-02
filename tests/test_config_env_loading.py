@@ -86,6 +86,44 @@ class ConfigEnvLoadingTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, msg=result.stderr)
         self.assertEqual(result.stdout.strip(), "0.42|0.18|4")
 
+    def test_non_watch_soft_filter_keys_are_loaded_from_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env_path = Path(tmpdir) / "bot.env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "SAFE_AGE_NON_WATCH_SOFT_RATIO=0.65",
+                        "SAFE_AGE_NON_WATCH_MAX_PASSES_PER_CYCLE=3",
+                        "SAFE_CHANGE_5M_NON_WATCH_SOFT_MULT=1.35",
+                        "SAFE_CHANGE_5M_NON_WATCH_MAX_PASSES_PER_CYCLE=4",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            root = Path(__file__).resolve().parents[1]
+            env = os.environ.copy()
+            env["BOT_ENV_FILE"] = str(env_path)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import config; "
+                        "print(f\"{config.SAFE_AGE_NON_WATCH_SOFT_RATIO}|"
+                        "{config.SAFE_AGE_NON_WATCH_MAX_PASSES_PER_CYCLE}|"
+                        "{config.SAFE_CHANGE_5M_NON_WATCH_SOFT_MULT}|"
+                        "{config.SAFE_CHANGE_5M_NON_WATCH_MAX_PASSES_PER_CYCLE}\")"
+                    ),
+                ],
+                cwd=str(root),
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertEqual(result.stdout.strip(), "0.65|3|1.35|4")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -149,6 +149,34 @@
       "sensitivity": "medium",
       "importance": "entry_quality"
     },
+    "SAFE_AGE_NON_WATCH_SOFT_RATIO": {
+      "type": "float",
+      "min": 0.35,
+      "max": 1.0,
+      "sensitivity": "medium",
+      "importance": "entry_quality"
+    },
+    "SAFE_AGE_NON_WATCH_MAX_PASSES_PER_CYCLE": {
+      "type": "int",
+      "min": 0,
+      "max": 8,
+      "sensitivity": "medium",
+      "importance": "flow"
+    },
+    "SAFE_CHANGE_5M_NON_WATCH_SOFT_MULT": {
+      "type": "float",
+      "min": 1.0,
+      "max": 1.8,
+      "sensitivity": "medium",
+      "importance": "entry_quality"
+    },
+    "SAFE_CHANGE_5M_NON_WATCH_MAX_PASSES_PER_CYCLE": {
+      "type": "int",
+      "min": 0,
+      "max": 8,
+      "sensitivity": "medium",
+      "importance": "flow"
+    },
     "SAFE_MIN_LIQUIDITY_USD": {
       "type": "float",
       "min": 100.0,

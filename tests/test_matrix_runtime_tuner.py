@@ -1703,6 +1703,67 @@ class MatrixRuntimeTunerTests(unittest.TestCase):
         self.assertGreater(float(cooldown_left), 0.0)
         self.assertGreaterEqual(int(budget_left), 1)
 
+    def test_source_starvation_relaxes_non_watch_soft_filters(self) -> None:
+        metrics = mrt.WindowMetrics(
+            selected_from_batch=180,
+            opened_from_batch=0,
+            filter_fail_reasons=Counter(
+                {
+                    "safe_age": 48,
+                    "safe_change_5m": 42,
+                    "safe_volume": 64,
+                }
+            ),
+            autotrade_skip_reasons=Counter({"cooldown": 12}),
+        )
+        overrides = {
+            "SAFE_AGE_NON_WATCH_SOFT_RATIO": "0.70",
+            "SAFE_AGE_NON_WATCH_MAX_PASSES_PER_CYCLE": "2",
+            "SAFE_CHANGE_5M_NON_WATCH_SOFT_MULT": "1.20",
+            "SAFE_CHANGE_5M_NON_WATCH_MAX_PASSES_PER_CYCLE": "2",
+            "PLAN_MAX_WATCHLIST_SHARE": "0.18",
+            "PLAN_MIN_NON_WATCHLIST_PER_BATCH": "2",
+            "PLAN_MAX_SINGLE_SOURCE_SHARE": "0.45",
+        }
+        telemetry = {
+            "funnel_15m": {"raw": 420, "pre": 210, "buy": 0},
+            "top_reasons_15m": {"quality_skip": [], "plan_skip": []},
+            "source_profile_15m": {
+                "plan_top_source": "watchlist",
+                "plan_top_source_share": 1.0,
+            },
+            "supply_sanity_15m": {
+                "candidate_supply_non_watch_15m": 96,
+                "post_filters_pass_non_watch_15m": 0,
+                "plan_attempts_non_watch_15m": 0,
+            },
+            "source_diversity_guard_15m": {
+                "non_watch_final_zero_hits": 9,
+            },
+            "plan_symbol_concentration_15m": {
+                "plan_attempts": 72,
+                "plan_unique_symbols": 4,
+                "plan_top_share": 0.41,
+            },
+        }
+        actions, _trace, _meta = mrt._build_action_plan(
+            metrics=metrics,
+            overrides=overrides,
+            mode=mrt.MODE_SPECS["conveyor"],
+            telemetry=telemetry,
+            runtime_state=mrt.RuntimeState(),
+            now_ts=1000.0,
+        )
+        by_key = _actions_by_key(actions)
+        self.assertIn("SAFE_AGE_NON_WATCH_SOFT_RATIO", by_key)
+        self.assertIn("SAFE_AGE_NON_WATCH_MAX_PASSES_PER_CYCLE", by_key)
+        self.assertIn("SAFE_CHANGE_5M_NON_WATCH_SOFT_MULT", by_key)
+        self.assertIn("SAFE_CHANGE_5M_NON_WATCH_MAX_PASSES_PER_CYCLE", by_key)
+        self.assertLess(float(by_key["SAFE_AGE_NON_WATCH_SOFT_RATIO"].new_value), 0.70)
+        self.assertGreater(int(by_key["SAFE_AGE_NON_WATCH_MAX_PASSES_PER_CYCLE"].new_value), 2)
+        self.assertGreater(float(by_key["SAFE_CHANGE_5M_NON_WATCH_SOFT_MULT"].new_value), 1.20)
+        self.assertGreater(int(by_key["SAFE_CHANGE_5M_NON_WATCH_MAX_PASSES_PER_CYCLE"].new_value), 2)
+
 
 if __name__ == "__main__":
     unittest.main()
