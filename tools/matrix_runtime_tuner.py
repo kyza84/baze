@@ -19,11 +19,14 @@ from matrix_preset_guard import load_contract, validate_overrides
 SUMMARY_RE = re.compile(r"Scanned\s+(\d+)\s+tokens.*Trade candidates:\s+(\d+).*Opened:\s+(\d+)")
 FILTER_FAIL_RE = re.compile(r"FILTER_FAIL .*reason=([^\s|]+)")
 AUTOTRADE_SKIP_RE = re.compile(r"AutoTrade skip token=.* reason=([^\s]+)")
+AUTOTRADE_SKIP_TOKEN_RE = re.compile(r"AutoTrade skip token=([^\s]+)\s+reason=([^\s]+)")
 AUTOTRADE_SKIP_DETAIL_RE = re.compile(r"AutoTrade skip token=.* reason=([^\s]+)(?:\s+detail=([^\r\n]+))?")
 AUTOTRADE_BATCH_RE = re.compile(
     r"AutoTrade batch .*selected=(\d+)\s+opened=(\d+)\s+pe=([^\s]+)"
 )
 AUTO_BUY_RE = re.compile(r"AUTO_BUY .*token=([^\s]+)")
+PLAN_SOURCE_NON_WATCH_RE = re.compile(r"PLAN_SOURCE_DIVERSITY .*non_watch_final=(\d+)")
+SAFETY_SUMMARY_RE = re.compile(r"Safety:\s*checked=(\d+)\s+fail_closed=(\d+)\s+reasons=([^|]+)")
 SYMBOL_CONCENTRATION_DROP_RE = re.compile(r"symbol_concentration['\"]?\s*:\s*(\d+)")
 PAPER_SUMMARY_RE = re.compile(
     r"PAPER_SUMMARY .*total_closed=(\d+)\s+winrate_total=([0-9.]+)%\s+realized_total=\$(-?[0-9.]+).*open=(\d+)"
@@ -191,6 +194,7 @@ TIGHTEN_FLOW_ESCAPE_SIGNALS = {
     "ev_net_low_probe_tolerance",
     "plan_concentration",
     "source_diversity_rebalance",
+    "source_starvation_guard",
 }
 HOLD_FLOW_ESCAPE_SIGNALS = {
     "source_qos_cap_rebalance",
@@ -200,6 +204,7 @@ HOLD_FLOW_ESCAPE_SIGNALS = {
     "source_diversity_rebalance",
     "safe_volume_soft_flow_expand",
     "blacklist_dominator_shaping",
+    "source_starvation_guard",
 }
 ROLLBACK_SOURCE_GUARD_KEYS = {
     # Do not rollback these keys while source concentration is still unresolved.
@@ -238,6 +243,37 @@ PROCESS_PROBE_TIMEOUT_SECONDS = 3
 LOCK_STALE_SECONDS = 900
 LOCK_STALE_TERMINATE_TIMEOUT_SECONDS = 8
 DEAD_PROFILE_HEARTBEAT_MAX_AGE_SECONDS = 90.0
+
+_BASE_TO_REASON_CODE: dict[str, str] = {
+    "ev_net_low": "PLAN_EV_NET_LOW",
+    "edge_low": "PLAN_EDGE_LOW",
+    "edge_usd_low": "PLAN_EDGE_USD_LOW",
+    "negative_edge": "PLAN_NEGATIVE_EDGE",
+    "cooldown": "PLAN_COOLDOWN",
+    "blacklist": "PRE_BLACKLIST",
+    "honeypot_guard": "PRE_HONEYPOT_GUARD",
+    "safe_source": "PRE_SAFE_SOURCE",
+    "watchlist_strict_guard": "PRE_WATCHLIST_STRICT_GUARD",
+    "source_disabled": "PRE_SOURCE_DISABLED",
+    "safe_risky_flags": "PRE_RISKY_FLAGS",
+    "safe_volume": "FILTER_SAFE_VOLUME",
+    "safe_age": "FILTER_SAFE_AGE",
+    "safe_liquidity": "FILTER_SAFE_LIQUIDITY",
+    "safe_change_5m": "FILTER_SAFE_CHANGE_5M",
+    "score_min": "FILTER_SCORE_MIN",
+    "safety_budget": "FILTER_SAFETY_BUDGET",
+    "source_qos_cap": "FILTER_SOURCE_QOS_CAP",
+    "source_qos_symbol_cap": "FILTER_SOURCE_QOS_SYMBOL_CAP",
+    "excluded_base_token": "FILTER_EXCLUDED_BASE_TOKEN",
+    "no_momentum": "EXIT_NO_MOMENTUM",
+    "timeout": "EXIT_TIMEOUT",
+    "sl": "EXIT_STOP_LOSS",
+    "weak_early": "EXIT_WEAK_EARLY",
+    "post_partial_protect": "EXIT_POST_PARTIAL_PROTECT",
+}
+_REASON_CODE_TO_BASE: dict[str, str] = {
+    str(code).strip().lower(): base for base, code in _BASE_TO_REASON_CODE.items()
+}
 
 
 @dataclass
@@ -424,6 +460,9 @@ class WindowMetrics:
     pe_reasons: Counter[str] = field(default_factory=Counter)
     buy_symbol_counts: Counter[str] = field(default_factory=Counter)
     blacklist_detail_reasons: Counter[str] = field(default_factory=Counter)
+    cooldown_skip_symbol_counts: Counter[str] = field(default_factory=Counter)
+    safety_reason_counts: Counter[str] = field(default_factory=Counter)
+    source_diversity_non_watch_zero_hits: int = 0
     symbol_concentration_drop_hits: int = 0
     open_positions: int = 0
     total_closed: int = 0
@@ -530,6 +569,22 @@ def _runtime_lock_path(root: Path, profile_id: str) -> Path:
 
 def _runtime_patch_path(root: Path, profile_id: str) -> Path:
     return root / "logs" / "matrix" / profile_id / "runtime_tuner_runtime_overrides.json"
+
+
+def _profile_log_dir(root: Path, profile_id: str) -> Path:
+    return root / "logs" / "matrix" / str(profile_id)
+
+
+def _profile_startup_exit_path(root: Path, profile_id: str) -> Path:
+    return _profile_log_dir(root, profile_id) / "startup_exit.json"
+
+
+def _read_json_object(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
 def _session_age_seconds(session_path: Path) -> float:
@@ -848,6 +903,38 @@ def _latest_session_log(root: Path, profile_id: str) -> Path | None:
     return files[0] if files else None
 
 
+def _spawn_failure_diagnostics(
+    root: Path,
+    profile_id: str,
+    *,
+    spawn_started_ts: float,
+) -> str:
+    parts: list[str] = []
+    hb_recent = _heartbeat_recent(root, profile_id, max_age_seconds=90.0)
+    parts.append(f"hb_recent={bool(hb_recent)}")
+    session = _latest_session_log(root, profile_id)
+    if session is None:
+        parts.append("session=-")
+    else:
+        parts.append(f"session={session.name}")
+        parts.append(f"session_age={round(_session_age_seconds(session), 1)}s")
+
+    startup_path = _profile_startup_exit_path(root, profile_id)
+    try:
+        startup_fresh = startup_path.exists() and float(startup_path.stat().st_mtime) >= (float(spawn_started_ts) - 1.0)
+    except Exception:
+        startup_fresh = False
+    if startup_fresh:
+        startup = _read_json_object(startup_path)
+        reason = str(startup.get("reason", "") or "").strip()
+        detail = str(startup.get("detail", "") or "").strip()
+        if reason:
+            parts.append(f"startup_exit_reason={reason}")
+        if detail:
+            parts.append(f"startup_exit_detail={detail[:180]}")
+    return ";".join(parts)
+
+
 def _parse_ts(line: str) -> datetime | None:
     if len(line) < 23:
         return None
@@ -903,6 +990,17 @@ def _read_window_metrics(session_log: Path, window_minutes: int) -> WindowMetric
         m = AUTOTRADE_SKIP_RE.search(line)
         if m:
             metrics.autotrade_skip_reasons[m.group(1)] += 1
+        m = AUTOTRADE_SKIP_TOKEN_RE.search(line)
+        if m:
+            symbol = str(m.group(1) or "").strip().upper()
+            reason = str(m.group(2) or "").strip().lower()
+            if symbol and (
+                reason == "cooldown"
+                or reason == "symbol_cooldown"
+                or reason.startswith("cooldown_left_")
+                or reason.startswith("symbol_cooldown_left_")
+            ):
+                metrics.cooldown_skip_symbol_counts[symbol] += 1
         m = AUTOTRADE_SKIP_DETAIL_RE.search(line)
         if m and str(m.group(1) or "").strip().lower() == "blacklist":
             metrics.blacklist_detail_reasons[_normalize_blacklist_detail(str(m.group(2) or ""))] += 1
@@ -922,6 +1020,33 @@ def _read_window_metrics(session_log: Path, window_minutes: int) -> WindowMetric
                 metrics.symbol_concentration_drop_hits += int(m.group(1))
             else:
                 metrics.symbol_concentration_drop_hits += 1
+        m = PLAN_SOURCE_NON_WATCH_RE.search(line)
+        if m:
+            try:
+                if int(m.group(1) or 0) <= 0:
+                    metrics.source_diversity_non_watch_zero_hits += 1
+            except Exception:
+                pass
+        m = SAFETY_SUMMARY_RE.search(line)
+        if m:
+            reasons_blob = str(m.group(3) or "").strip()
+            if reasons_blob and reasons_blob.lower() not in {"none", "n/a"}:
+                for chunk in reasons_blob.split(","):
+                    part = str(chunk or "").strip()
+                    if not part:
+                        continue
+                    reason_key = part
+                    reason_count = 1
+                    if ":" in part:
+                        raw_reason, raw_count = part.rsplit(":", 1)
+                        reason_key = str(raw_reason or "").strip()
+                        try:
+                            reason_count = max(1, int(float(str(raw_count or "0").strip())))
+                        except Exception:
+                            reason_count = 1
+                    reason_key = str(reason_key or "").strip().lower()
+                    if reason_key:
+                        metrics.safety_reason_counts[reason_key] += int(reason_count)
         m = PAPER_SUMMARY_RE.search(line)
         if m:
             metrics.total_closed = int(m.group(1))
@@ -990,6 +1115,39 @@ def _counter_top(counter: Counter[str], limit: int = 6) -> list[tuple[str, int]]
     return [(str(k), int(v)) for k, v in counter.most_common(limit)]
 
 
+def _reason_base(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return "unknown"
+    norm = re.sub(r"[^a-z0-9]+", "_", raw.lower()).strip("_")
+    if not norm:
+        return "unknown"
+    if norm.startswith("cooldown_left_") or norm.startswith("symbol_cooldown_left_"):
+        return "cooldown"
+    return str(_REASON_CODE_TO_BASE.get(norm, norm))
+
+
+def _reason_code(value: Any) -> str:
+    base = _reason_base(value)
+    if base and base != "unknown":
+        return base
+    raw = str(value or "").strip()
+    if not raw:
+        return "unknown"
+    token = re.sub(r"[^a-z0-9]+", "_", raw.lower()).strip("_")
+    if token.startswith("cooldown_left_") or token.startswith("symbol_cooldown_left_"):
+        return "cooldown"
+    return token or "unknown"
+
+
+def _row_reason_base(row: dict[str, Any]) -> str:
+    return _reason_base(str(row.get("reason_code", "") or row.get("reason", "") or ""))
+
+
+def _row_reason_code(row: dict[str, Any]) -> str:
+    return _reason_code(str(row.get("reason_code", "") or row.get("reason", "") or ""))
+
+
 def _to_share_rows(counter: Counter[str], *, limit: int = 8) -> list[dict[str, Any]]:
     total = int(sum(int(v) for v in counter.values()))
     out: list[dict[str, Any]] = []
@@ -1023,7 +1181,7 @@ def _funnel_15m(candidate_rows: list[dict[str, Any]], trade_rows: list[dict[str,
         raw_ids.add(key)
         stage = str(row.get("decision_stage", "") or "").strip().lower()
         decision = str(row.get("decision", "") or "").strip().lower()
-        reason = str(row.get("reason", "") or "").strip().lower()
+        reason = _row_reason_base(row)
         if stage == "filter_fail":
             if reason in SOURCE_BLOCK_REASONS:
                 blocked_source.add(key)
@@ -1087,7 +1245,7 @@ def _top_reasons_15m(candidate_rows: list[dict[str, Any]], trade_rows: list[dict
     for row in candidate_rows:
         stage = str(row.get("decision_stage", "") or "").strip().lower()
         decision = str(row.get("decision", "") or "").strip().lower()
-        reason = str(row.get("reason", "") or "").strip().lower() or "unknown"
+        reason = _row_reason_code(row)
         if stage == "filter_fail":
             filter_fail[reason] += 1
         elif stage == "quality_gate" and decision == "skip":
@@ -1095,10 +1253,11 @@ def _top_reasons_15m(candidate_rows: list[dict[str, Any]], trade_rows: list[dict
     for row in trade_rows:
         stage = str(row.get("decision_stage", "") or "").strip().lower()
         decision = str(row.get("decision", "") or "").strip().lower()
-        reason = str(row.get("reason", "") or "").strip().lower() or "unknown"
+        reason = _row_reason_code(row)
+        reason_base = _row_reason_base(row)
         if stage == "plan_trade" and decision == "skip":
             plan_skip[reason] += 1
-        if decision == "fail" or reason in EXEC_ROUTE_FAIL_REASONS:
+        if decision == "fail" or reason_base in EXEC_ROUTE_FAIL_REASONS:
             execute_fail[reason] += 1
         if stage == "trade_close":
             exit_reasons[reason] += 1
@@ -1117,7 +1276,7 @@ def _blacklist_filter_dominator_15m(candidate_rows: list[dict[str, Any]]) -> dic
     for row in candidate_rows:
         stage = str(row.get("decision_stage", "") or "").strip().lower()
         decision = str(row.get("decision", "") or "").strip().lower()
-        reason = str(row.get("reason", "") or "").strip().lower()
+        reason = _row_reason_base(row)
         if stage != "filter_fail" or decision != "skip" or reason != "blacklist":
             continue
         total_hits += 1
@@ -1158,12 +1317,13 @@ def _exec_health_15m(trade_rows: list[dict[str, Any]]) -> dict[str, Any]:
     for row in trade_rows:
         stage = str(row.get("decision_stage", "") or "").strip().lower()
         decision = str(row.get("decision", "") or "").strip().lower()
-        reason = str(row.get("reason", "") or "").strip().lower() or "unknown"
+        reason = _row_reason_code(row)
+        reason_base = _row_reason_base(row)
         if stage == "plan_trade":
             plan_attempts += 1
             if decision == "skip":
                 plan_skips += 1
-            if reason in EXEC_ROUTE_FAIL_REASONS:
+            if reason_base in EXEC_ROUTE_FAIL_REASONS:
                 route_fail[reason] += 1
         elif stage == "trade_open":
             if decision == "open":
@@ -1276,7 +1436,7 @@ def _exit_mix_60m(trade_rows: list[dict[str, Any]]) -> dict[str, Any]:
         stage = str(row.get("decision_stage", "") or "").strip().lower()
         if stage != "trade_close":
             continue
-        reason = str(row.get("reason", "") or "").strip().upper() or "UNKNOWN"
+        reason = _row_reason_base(row).upper()
         close_reasons[reason] += 1
         try:
             pnl = float(row.get("pnl_usd", 0.0) or 0.0)
@@ -1489,6 +1649,108 @@ def _source_profile_15m(candidate_rows: list[dict[str, Any]], trade_rows: list[d
     }
 
 
+def _supply_sanity_15m(
+    *,
+    candidate_rows_15m: list[dict[str, Any]],
+    candidate_rows_60m: list[dict[str, Any]],
+    trade_rows_15m: list[dict[str, Any]],
+) -> dict[str, Any]:
+    candidate_source_by_id: dict[str, str] = {}
+    seen_candidate_15m: set[str] = set()
+    seen_candidate_60m: set[str] = set()
+    candidate_count_by_source = Counter[str]()
+    post_filters_pass_by_source = Counter[str]()
+    source_symbols: dict[str, set[str]] = {}
+    unique_symbols_15m: set[str] = set()
+    unique_symbols_60m: set[str] = set()
+
+    for idx, row in enumerate(candidate_rows_15m):
+        key = _row_candidate_key(row, idx)
+        if key in seen_candidate_15m:
+            continue
+        seen_candidate_15m.add(key)
+        src = str(row.get("source", "") or row.get("source_mode", "") or "").strip().lower() or "unknown"
+        candidate_source_by_id[key] = src
+        candidate_count_by_source[src] += 1
+        stage = str(row.get("decision_stage", "") or "").strip().lower()
+        decision = str(row.get("decision", "") or "").strip().lower()
+        if stage == "post_filters" and decision in {"candidate_pass", "pass", "ok"}:
+            post_filters_pass_by_source[src] += 1
+        symbol = str(row.get("symbol", "") or "").strip().upper()
+        if symbol:
+            unique_symbols_15m.add(symbol)
+            source_symbols.setdefault(src, set()).add(symbol)
+
+    for idx, row in enumerate(candidate_rows_60m):
+        key = _row_candidate_key(row, idx)
+        if key in seen_candidate_60m:
+            continue
+        seen_candidate_60m.add(key)
+        symbol = str(row.get("symbol", "") or "").strip().upper()
+        if symbol:
+            unique_symbols_60m.add(symbol)
+
+    plan_attempts_by_source = Counter[str]()
+    for row in trade_rows_15m:
+        stage = str(row.get("decision_stage", "") or "").strip().lower()
+        if stage != "plan_trade":
+            continue
+        src = _resolve_trade_source(row, candidate_source_by_id=candidate_source_by_id)
+        plan_attempts_by_source[src] += 1
+
+    total_candidates = int(sum(int(v) for v in candidate_count_by_source.values()))
+    watch_candidates = int(candidate_count_by_source.get("watchlist", 0))
+    non_watch_candidates = max(0, total_candidates - watch_candidates)
+
+    watch_symbols = source_symbols.get("watchlist", set())
+    non_watch_symbols = set()
+    for src, symbols in source_symbols.items():
+        if src == "watchlist":
+            continue
+        non_watch_symbols.update(symbols)
+
+    total_plan_attempts = int(sum(int(v) for v in plan_attempts_by_source.values()))
+    watch_plan_attempts = int(plan_attempts_by_source.get("watchlist", 0))
+    non_watch_plan_attempts = max(0, total_plan_attempts - watch_plan_attempts)
+    total_post_filters_pass = int(sum(int(v) for v in post_filters_pass_by_source.values()))
+    watch_post_filters_pass = int(post_filters_pass_by_source.get("watchlist", 0))
+    non_watch_post_filters_pass = max(0, total_post_filters_pass - watch_post_filters_pass)
+
+    rows: list[dict[str, Any]] = []
+    all_sources = set(candidate_count_by_source.keys()) | set(plan_attempts_by_source.keys())
+    for src in sorted(all_sources):
+        cnt = int(candidate_count_by_source.get(src, 0))
+        rows.append(
+            {
+                "source": str(src),
+                "candidate_count": int(cnt),
+                "candidate_share": round(float(cnt) / float(max(1, total_candidates)), 6),
+                "unique_symbols": int(len(source_symbols.get(src, set()))),
+                "post_filters_pass": int(post_filters_pass_by_source.get(src, 0)),
+                "plan_attempts": int(plan_attempts_by_source.get(src, 0)),
+            }
+        )
+    rows.sort(key=lambda x: (int(x.get("candidate_count", 0)), int(x.get("plan_attempts", 0))), reverse=True)
+
+    return {
+        "candidate_supply_total_15m": int(total_candidates),
+        "candidate_supply_watchlist_15m": int(watch_candidates),
+        "candidate_supply_non_watch_15m": int(non_watch_candidates),
+        "candidate_supply_watchlist_share_15m": round(float(watch_candidates) / float(max(1, total_candidates)), 6),
+        "candidate_unique_symbols_15m": int(len(unique_symbols_15m)),
+        "candidate_unique_symbols_watchlist_15m": int(len(watch_symbols)),
+        "candidate_unique_symbols_non_watch_15m": int(len(non_watch_symbols)),
+        "candidate_unique_symbols_60m": int(len(unique_symbols_60m)),
+        "post_filters_pass_total_15m": int(total_post_filters_pass),
+        "post_filters_pass_watchlist_15m": int(watch_post_filters_pass),
+        "post_filters_pass_non_watch_15m": int(non_watch_post_filters_pass),
+        "plan_attempts_total_15m": int(total_plan_attempts),
+        "plan_attempts_watchlist_15m": int(watch_plan_attempts),
+        "plan_attempts_non_watch_15m": int(non_watch_plan_attempts),
+        "source_rows": rows[:8],
+    }
+
+
 def _plan_symbol_concentration_15m(trade_rows: list[dict[str, Any]]) -> dict[str, Any]:
     plan_attempts = Counter[str]()
     plan_skips = Counter[str]()
@@ -1544,10 +1806,10 @@ def _ev_forensics_15m(trade_rows: list[dict[str, Any]]) -> dict[str, Any]:
     for row in trade_rows:
         stage = str(row.get("decision_stage", "") or "").strip().lower()
         decision = str(row.get("decision", "") or "").strip().lower()
-        reason = str(row.get("reason", "") or "").strip().lower()
+        reason = _row_reason_base(row)
         if stage != "plan_trade" or decision != "skip" or reason not in reasons:
             continue
-        by_reason[reason] += 1
+        by_reason[_reason_code(reason)] += 1
         try:
             expected_edge_values.append(float(row.get("expected_edge_percent", 0.0) or 0.0))
         except Exception:
@@ -1590,13 +1852,13 @@ def _blacklist_forensics(
     detail_class_counter_15m = Counter[str]()
     for row in candidate_rows_15m:
         stage = str(row.get("decision_stage", "") or "").strip().lower()
-        reason = str(row.get("reason", "") or "").strip().lower()
+        reason = _row_reason_base(row)
         if stage == "filter_fail" and reason == "blacklist":
             filter_blacklist_15m += 1
     for row in trade_rows_15m:
         stage = str(row.get("decision_stage", "") or "").strip().lower()
         decision = str(row.get("decision", "") or "").strip().lower()
-        reason = str(row.get("reason", "") or "").strip().lower()
+        reason = _row_reason_base(row)
         if stage == "plan_trade":
             plan_attempts_15m += 1
             if decision == "skip" and reason == "blacklist":
@@ -1610,7 +1872,7 @@ def _blacklist_forensics(
     for row in trade_rows_60m:
         stage = str(row.get("decision_stage", "") or "").strip().lower()
         decision = str(row.get("decision", "") or "").strip().lower()
-        reason = str(row.get("reason", "") or "").strip().lower()
+        reason = _row_reason_base(row)
         if stage == "plan_trade" and decision == "skip" and reason == "blacklist":
             plan_blacklist_60m += 1
     if metrics is not None:
@@ -2002,11 +2264,18 @@ def _resolve_policy_phase(
     buy_top_share_15m = float(metrics.top_buy_symbol_share)
     plan_concentration = telemetry.get("plan_symbol_concentration_15m", {}) if isinstance(telemetry, dict) else {}
     source_profile = telemetry.get("source_profile_15m", {}) if isinstance(telemetry, dict) else {}
+    supply_sanity = telemetry.get("supply_sanity_15m", {}) if isinstance(telemetry, dict) else {}
     plan_attempts_total_15m = int(_safe_float((plan_concentration or {}).get("plan_attempts", 0), 0.0))
     plan_unique_symbols_15m = int(_safe_float((plan_concentration or {}).get("plan_unique_symbols", 0), 0.0))
     plan_top_share_15m = _safe_float((plan_concentration or {}).get("plan_top_share", 0.0), 0.0)
     source_top_share_15m = _safe_float((source_profile or {}).get("plan_top_source_share", 0.0), 0.0)
     source_top_name_15m = str((source_profile or {}).get("plan_top_source", "") or "")
+    non_watch_supply_15m = int(_safe_float((supply_sanity or {}).get("candidate_supply_non_watch_15m", 0), 0.0))
+    non_watch_plan_attempts_15m = int(_safe_float((supply_sanity or {}).get("plan_attempts_non_watch_15m", 0), 0.0))
+    source_non_watch_plan_starved = (
+        non_watch_supply_15m >= max(12, int(target.min_selected_15m) // 2)
+        and non_watch_plan_attempts_15m <= 0
+    )
 
     def _rows_count(rows: Any) -> int:
         total = 0
@@ -2100,7 +2369,7 @@ def _resolve_policy_phase(
         plan_attempts_total_15m >= max(24, int(target.min_selected_15m))
         and source_top_share_15m >= 0.90
         and source_top_name_15m not in {"", "unknown"}
-        and opens <= 2
+        and (opens <= 2 or source_non_watch_plan_starved)
     )
     diversity_fail = bool(diversity_fail_buys or plan_concentration_fail or source_concentration_fail)
     risk_fail_core = (
@@ -2173,7 +2442,8 @@ def _resolve_policy_phase(
         reasons.append(
             "source_concentration_fail "
             f"plan_attempts15={plan_attempts_total_15m} source_top={source_top_name_15m} "
-            f"source_top_share15={source_top_share_15m:.3f}"
+            f"source_top_share15={source_top_share_15m:.3f} "
+            f"non_watch_supply15={non_watch_supply_15m} non_watch_plan15={non_watch_plan_attempts_15m}"
         )
     if risk_fail:
         if tail_loss_fail:
@@ -2304,6 +2574,8 @@ def _action_family(action: Action) -> str:
         "edge_deadlock_recovery",
         "source_qos_cap_rebalance",
         "diversity_kpi_penalty",
+        "source_diversity_rebalance",
+        "source_starvation_guard",
     )
     if any(sig in reason for sig in expand_signals):
         return "expand"
@@ -2725,6 +2997,7 @@ def _collect_telemetry_v2(
     candidate_log = root / "logs" / "matrix" / profile_id / "candidates.jsonl"
     trade_log = root / "logs" / "matrix" / profile_id / "trade_decisions.jsonl"
     candidate_rows_15m = _read_jsonl_window(candidate_log, cutoff=cutoff_15m)
+    candidate_rows_60m = _read_jsonl_window(candidate_log, cutoff=cutoff_60m)
     trade_rows_15m = _read_jsonl_window(trade_log, cutoff=cutoff_15m)
     trade_rows_60m = _read_jsonl_window(trade_log, cutoff=cutoff_60m)
     last_row = _latest_jsonl_row(_runtime_log_path(root, profile_id))
@@ -2734,6 +3007,11 @@ def _collect_telemetry_v2(
     top_reasons_15m = _top_reasons_15m(candidate_rows_15m, trade_rows_15m)
     exec_health_15m = _exec_health_15m(trade_rows_15m)
     source_profile_15m = _source_profile_15m(candidate_rows_15m, trade_rows_15m)
+    supply_sanity_15m = _supply_sanity_15m(
+        candidate_rows_15m=candidate_rows_15m,
+        candidate_rows_60m=candidate_rows_60m,
+        trade_rows_15m=trade_rows_15m,
+    )
     plan_concentration_15m = _plan_symbol_concentration_15m(trade_rows_15m)
     blacklist_filter_dominator_15m = _blacklist_filter_dominator_15m(candidate_rows_15m)
     silence_diagnostics_15m = _silence_diagnostics_15m(
@@ -2748,6 +3026,21 @@ def _collect_telemetry_v2(
         trade_rows_60m=trade_rows_60m,
         metrics=metrics,
     )
+    safety_reason_rows: list[dict[str, Any]] = []
+    safety_reason_total = 0
+    source_diversity_non_watch_zero_hits = 0
+    safety_api_4029_hits = 0
+    if metrics is not None:
+        safety_reason_total = int(
+            sum(int(v) for v in (metrics.safety_reason_counts or Counter()).values())
+        )
+        safety_api_4029_hits = int((metrics.safety_reason_counts or Counter()).get("api_code_4029", 0) or 0)
+        safety_reason_rows = _to_share_rows(metrics.safety_reason_counts, limit=8)
+        source_diversity_non_watch_zero_hits = int(max(0, metrics.source_diversity_non_watch_zero_hits))
+    safety_api_only = bool(safety_reason_total > 0 and safety_reason_total == safety_api_4029_hits)
+    safety_mode = "normal"
+    if safety_reason_total > 0:
+        safety_mode = "api_unavailable_info_only" if safety_api_only else "mixed_degraded"
     return {
         "ts_utc": now_utc.isoformat(),
         "run_tag": run_tag,
@@ -2760,6 +3053,7 @@ def _collect_telemetry_v2(
         "top_reasons_15m": top_reasons_15m,
         "exec_health_15m": exec_health_15m,
         "source_profile_15m": source_profile_15m,
+        "supply_sanity_15m": supply_sanity_15m,
         "plan_symbol_concentration_15m": plan_concentration_15m,
         "blacklist_filter_dominator_15m": blacklist_filter_dominator_15m,
         "silence_diagnostics_15m": silence_diagnostics_15m,
@@ -2767,6 +3061,16 @@ def _collect_telemetry_v2(
         "symbol_churn_15m": _symbol_churn_15m(trade_rows_15m),
         "exit_mix_60m": _exit_mix_60m(trade_rows_60m),
         "blacklist_forensics_15m": blacklist_forensics,
+        "safety_degraded_15m": {
+            "total_hits": int(safety_reason_total),
+            "api_code_4029_hits": int(safety_api_4029_hits),
+            "api_only": bool(safety_api_only),
+            "mode": str(safety_mode),
+            "reasons": safety_reason_rows,
+        },
+        "source_diversity_guard_15m": {
+            "non_watch_final_zero_hits": int(source_diversity_non_watch_zero_hits),
+        },
         "config_hash_before": _overrides_hash(config_before),
         "config_hash_after": _overrides_hash(config_after),
         "previous_config_hash_after": last_hash,
@@ -3284,6 +3588,9 @@ def _build_action_plan(
     plan_watchlist_share = _get_float(staged, "PLAN_MAX_WATCHLIST_SHARE", 0.30)
     plan_min_non_watchlist = _get_int(staged, "PLAN_MIN_NON_WATCHLIST_PER_BATCH", 1)
     plan_single_source_share = _get_float(staged, "PLAN_MAX_SINGLE_SOURCE_SHARE", 0.50)
+    plan_watchlist_share_initial = float(plan_watchlist_share)
+    plan_min_non_watchlist_initial = int(plan_min_non_watchlist)
+    plan_single_source_share_initial = float(plan_single_source_share)
     qos_caps = _get_source_cap_map(staged, "V2_SOURCE_QOS_SOURCE_CAPS")
     universe_caps = _get_source_cap_map(staged, "V2_UNIVERSE_SOURCE_CAPS")
     source_router_min_trades = _get_int(staged, "SOURCE_ROUTER_MIN_TRADES", 8)
@@ -3363,13 +3670,13 @@ def _build_action_plan(
     safe_volume_share = float(safe_volume_hits) / float(max(1, filter_fail_total))
 
     def _reason_count(rows: list[dict[str, Any]], reason_code: str) -> int:
-        target = str(reason_code or "").strip().lower()
+        target = _reason_code(reason_code)
         if not target:
             return 0
         for row in rows or []:
             if not isinstance(row, dict):
                 continue
-            code = str(row.get("reason_code", "") or "").strip().lower()
+            code = _reason_code(str(row.get("reason_code", "") or ""))
             if code != target:
                 continue
             try:
@@ -3383,6 +3690,9 @@ def _build_action_plan(
     funnel_15m: dict[str, Any] = {}
     churn_15m: dict[str, Any] = {}
     source_profile_15m: dict[str, Any] = {}
+    supply_sanity_15m: dict[str, Any] = {}
+    safety_degraded_15m: dict[str, Any] = {}
+    source_diversity_guard_15m: dict[str, Any] = {}
     plan_concentration_15m: dict[str, Any] = {}
     ev_forensics_15m: dict[str, Any] = {}
     blacklist_dominator_15m: dict[str, Any] = {}
@@ -3404,6 +3714,15 @@ def _build_action_plan(
         src_raw = telemetry.get("source_profile_15m", {}) or {}
         if isinstance(src_raw, dict):
             source_profile_15m = src_raw
+        supply_raw = telemetry.get("supply_sanity_15m", {}) or {}
+        if isinstance(supply_raw, dict):
+            supply_sanity_15m = supply_raw
+        safety_raw = telemetry.get("safety_degraded_15m", {}) or {}
+        if isinstance(safety_raw, dict):
+            safety_degraded_15m = safety_raw
+        source_guard_raw = telemetry.get("source_diversity_guard_15m", {}) or {}
+        if isinstance(source_guard_raw, dict):
+            source_diversity_guard_15m = source_guard_raw
         plan_conc_raw = telemetry.get("plan_symbol_concentration_15m", {}) or {}
         if isinstance(plan_conc_raw, dict):
             plan_concentration_15m = plan_conc_raw
@@ -3443,6 +3762,52 @@ def _build_action_plan(
     churn_open_share = _safe_float((churn_15m or {}).get("open_share", 0.0), 0.0)
     churn_flat_share = _safe_float((churn_15m or {}).get("flat_close_share", 0.0), 0.0)
     churn_ttl_seconds = _clamp_int(int(_safe_float((churn_15m or {}).get("ttl_seconds", 0), 0.0)), 120, 3600)
+    supply_non_watch_15m = int(_safe_float((supply_sanity_15m or {}).get("candidate_supply_non_watch_15m", 0), 0.0))
+    supply_watch_15m = int(_safe_float((supply_sanity_15m or {}).get("candidate_supply_watchlist_15m", 0), 0.0))
+    post_filters_non_watch_15m = int(
+        _safe_float((supply_sanity_15m or {}).get("post_filters_pass_non_watch_15m", 0), 0.0)
+    )
+    plan_non_watch_15m = int(_safe_float((supply_sanity_15m or {}).get("plan_attempts_non_watch_15m", 0), 0.0))
+    source_non_watch_zero_hits_15m = int(
+        _safe_float((source_diversity_guard_15m or {}).get("non_watch_final_zero_hits", 0), 0.0)
+    )
+    safety_total_hits_15m = int(_safe_float((safety_degraded_15m or {}).get("total_hits", 0), 0.0))
+    safety_api_4029_hits_15m = int(_safe_float((safety_degraded_15m or {}).get("api_code_4029_hits", 0), 0.0))
+    safety_api_only_15m = bool((safety_degraded_15m or {}).get("api_only", False))
+    safety_degraded_mode_15m = str((safety_degraded_15m or {}).get("mode", "normal") or "normal").strip().lower()
+    cooldown_top_symbol = ""
+    cooldown_top_hits = 0
+    cooldown_top_share = 0.0
+    if metrics.cooldown_skip_symbol_counts:
+        cooldown_total_symbol_hits = int(sum(int(v) for v in metrics.cooldown_skip_symbol_counts.values()))
+        top_row = metrics.cooldown_skip_symbol_counts.most_common(1)
+        if top_row:
+            cooldown_top_symbol = str(top_row[0][0] or "").strip().upper()
+            cooldown_top_hits = int(top_row[0][1] or 0)
+            cooldown_top_share = float(cooldown_top_hits) / float(max(1, cooldown_total_symbol_hits))
+    cooldown_symbol_dominant = bool(
+        low_throughput
+        and cooldown_top_symbol not in {"", "N/A", "UNKNOWN"}
+        and cooldown_hits >= max(18, int(metrics.selected_from_batch) // 2)
+        and cooldown_top_hits >= max(8, int(cooldown_hits * 0.35))
+        and cooldown_top_share >= 0.45
+    )
+    source_non_watch_actionable_min_15m = max(4, int(plan_attempts_15m // 12))
+    source_non_watch_actionable = bool(post_filters_non_watch_15m >= source_non_watch_actionable_min_15m)
+    source_starvation_guard = bool(
+        low_throughput
+        and source_top_name_15m.startswith("watchlist")
+        and source_top_share_15m >= 0.75
+        and supply_non_watch_15m >= max(12, int(metrics.selected_from_batch) // 3)
+        and source_non_watch_actionable
+        and plan_non_watch_15m <= 0
+        and source_non_watch_zero_hits_15m >= max(3, int(plan_attempts_15m // 8))
+    )
+    if source_starvation_guard:
+        # Keep floor guards from re-expanding watchlist while non-watch supply is available.
+        flow_watchlist_share_floor = min(flow_watchlist_share_floor, 0.02)
+        flow_qos_watchlist_cap_floor = min(flow_qos_watchlist_cap_floor, 2)
+        flow_universe_watchlist_cap_floor = min(flow_universe_watchlist_cap_floor, 2)
     churn_lock_active = False
     churn_lock_symbol = ""
     churn_lock_remaining = 0
@@ -3473,6 +3838,8 @@ def _build_action_plan(
     watchlist_source_concentration = bool(
         source_concentration_choke and str(source_top_name_15m or "").strip().lower().startswith("watchlist")
     )
+    if source_starvation_guard:
+        watchlist_source_concentration = True
     if watchlist_source_concentration:
         # When plan is fully dominated by watchlist, allow deeper watchlist-share tightening.
         flow_watchlist_share_floor = min(flow_watchlist_share_floor, 0.02)
@@ -3604,6 +3971,104 @@ def _build_action_plan(
             "source_diversity_rebalance topk",
         )
 
+    if source_starvation_guard:
+        rule_hits["source_starvation_guard"] += 1
+        trace.append(
+            "source_starvation_guard "
+            f"source_top={source_top_name_15m} share15={source_top_share_15m:.3f} "
+            f"supply_non_watch15={supply_non_watch_15m} post_filter_non_watch15={post_filters_non_watch_15m} "
+            f"post_filter_non_watch_min15={source_non_watch_actionable_min_15m} "
+            f"plan_non_watch15={plan_non_watch_15m} "
+            f"non_watch_zero_hits15={source_non_watch_zero_hits_15m}"
+        )
+        plan_watchlist_share = _clamp_float(
+            min(plan_watchlist_share, 0.04) - 0.02,
+            flow_watchlist_share_floor,
+            flow_watchlist_share_ceiling,
+        )
+        plan_min_non_watchlist = _clamp_int(
+            max(plan_min_non_watchlist, plan_min_non_watchlist_initial + 1),
+            0,
+            max(flow_non_watchlist_ceiling, 8),
+        )
+        plan_single_source_share = _clamp_float(min(plan_single_source_share, 0.40), 0.20, 1.0)
+        novelty_share = _clamp_float(novelty_share + 0.05, 0.05, 0.90)
+        top_n = _clamp_int(top_n + 6, 8, 80)
+        if qos_caps:
+            watch_cap = int(qos_caps.get("watchlist", 0) or 0)
+            if watch_cap > 0:
+                qos_caps["watchlist"] = _clamp_int(watch_cap - 8, flow_qos_watchlist_cap_floor, 600)
+            for src in ("onchain", "onchain+market", "dexscreener", "geckoterminal"):
+                prev = int(qos_caps.get(src, 0) or 0)
+                if prev > 0:
+                    qos_caps[src] = _clamp_int(prev + 4, 1, 600)
+            _apply_action(
+                staged,
+                actions,
+                "V2_SOURCE_QOS_SOURCE_CAPS",
+                _format_source_cap_map(qos_caps),
+                "source_starvation_guard source_qos_caps",
+            )
+        if universe_caps:
+            watch_cap = int(universe_caps.get("watchlist", 0) or 0)
+            if watch_cap > 0:
+                universe_caps["watchlist"] = _clamp_int(watch_cap - 6, flow_universe_watchlist_cap_floor, 600)
+            for src in ("onchain", "onchain+market", "dexscreener", "geckoterminal"):
+                prev = int(universe_caps.get(src, 0) or 0)
+                if prev > 0:
+                    universe_caps[src] = _clamp_int(prev + 3, 1, 600)
+            _apply_action(
+                staged,
+                actions,
+                "V2_UNIVERSE_SOURCE_CAPS",
+                _format_source_cap_map(universe_caps),
+                "source_starvation_guard universe_caps",
+            )
+        _apply_action(
+            staged,
+            actions,
+            "PLAN_MAX_WATCHLIST_SHARE",
+            _to_float_str(plan_watchlist_share),
+            "source_starvation_guard watchlist_share",
+        )
+        _apply_action(
+            staged,
+            actions,
+            "PLAN_MIN_NON_WATCHLIST_PER_BATCH",
+            _to_int_str(plan_min_non_watchlist),
+            "source_starvation_guard non_watch_min",
+        )
+        _apply_action(
+            staged,
+            actions,
+            "PLAN_MAX_SINGLE_SOURCE_SHARE",
+            _to_float_str(plan_single_source_share),
+            "source_starvation_guard single_source_share",
+        )
+        _apply_action(
+            staged,
+            actions,
+            "V2_UNIVERSE_NOVELTY_MIN_SHARE",
+            _to_float_str(novelty_share),
+            "source_starvation_guard novelty",
+        )
+        _apply_action(
+            staged,
+            actions,
+            "AUTO_TRADE_TOP_N",
+            _to_int_str(top_n),
+            "source_starvation_guard topn",
+        )
+
+    if safety_api_4029_hits_15m > 0:
+        # API degradation must be visible in telemetry/trace but should not mutate trading knobs directly.
+        rule_hits["safety_degraded_api_info"] += 1
+        trace.append(
+            "safety_degraded_api_info "
+            f"api_code_4029_hits15={safety_api_4029_hits_15m} total_hits15={safety_total_hits_15m} "
+            f"api_only={bool(safety_api_only_15m)} mode={safety_degraded_mode_15m or 'normal'}"
+        )
+
     if mode.name in {"fast", "conveyor"} and cold_start_hits > 0 and pe_enabled:
         pe_enabled = False
         rule_hits["pe_cold_start_guard"] += 1
@@ -3720,6 +4185,29 @@ def _build_action_plan(
                 f"open_share={churn_open_share:.2f} flat_share={churn_flat_share:.2f}"
             )
             rule_hits["churn_lock_activate"] += 1
+        elif cooldown_symbol_dominant and cooldown_top_symbol:
+            ttl_seconds = _clamp_int(
+                max(900, int(cooldown * 10)),
+                900,
+                3600,
+            )
+            lock_until = tick_ts + float(ttl_seconds)
+            if active_lock_symbol == cooldown_top_symbol:
+                active_lock_until = max(float(active_lock_until), float(lock_until))
+            else:
+                active_lock_symbol = cooldown_top_symbol
+                active_lock_until = float(lock_until)
+            runtime_state.churn_lock_symbol = str(cooldown_top_symbol)
+            runtime_state.churn_lock_until_ts = float(active_lock_until)
+            runtime_state.churn_lock_last_reason = (
+                f"cooldown_share={cooldown_top_share:.2f} cooldown_hits={cooldown_hits}"
+            )
+            rule_hits["cooldown_symbol_lock"] += 1
+            trace.append(
+                "cooldown_symbol_lock "
+                f"symbol={cooldown_top_symbol} hits={cooldown_top_hits} share={cooldown_top_share:.2f} "
+                f"cooldown_hits={cooldown_hits}"
+            )
         release_ready = (
             bool(active_lock_symbol)
             and int(metrics.opened_from_batch) >= 3
@@ -3747,9 +4235,13 @@ def _build_action_plan(
             runtime_state.churn_lock_last_reason = "diversity_recovered"
             active_lock_symbol = ""
             active_lock_until = 0.0
-    if runtime_state is None and churn_detected and churn_symbol:
-        active_lock_symbol = churn_symbol
-        active_lock_until = tick_ts + float(max(600, int(churn_ttl_seconds or 0)))
+    if runtime_state is None:
+        if churn_detected and churn_symbol:
+            active_lock_symbol = churn_symbol
+            active_lock_until = tick_ts + float(max(600, int(churn_ttl_seconds or 0)))
+        elif cooldown_symbol_dominant and cooldown_top_symbol:
+            active_lock_symbol = str(cooldown_top_symbol)
+            active_lock_until = tick_ts + float(_clamp_int(max(900, int(cooldown * 10)), 900, 3600))
 
     if active_lock_symbol and tick_ts < active_lock_until:
         churn_lock_active = True
@@ -5128,6 +5620,42 @@ def _build_action_plan(
                 "anti_concentration cooldown",
             )
 
+    if source_starvation_guard:
+        guarded_watchlist_cap = _clamp_float(
+            min(plan_watchlist_share_initial, 0.04),
+            flow_watchlist_share_floor,
+            flow_watchlist_share_ceiling,
+        )
+        if plan_watchlist_share > guarded_watchlist_cap:
+            plan_watchlist_share = guarded_watchlist_cap
+            _apply_action(
+                staged,
+                actions,
+                "PLAN_MAX_WATCHLIST_SHARE",
+                _to_float_str(plan_watchlist_share),
+                "source_starvation_guard watchlist_clamp",
+            )
+        guarded_non_watch_min = _clamp_int(max(plan_min_non_watchlist_initial, 2), 0, max(flow_non_watchlist_ceiling, 8))
+        if plan_min_non_watchlist < guarded_non_watch_min:
+            plan_min_non_watchlist = guarded_non_watch_min
+            _apply_action(
+                staged,
+                actions,
+                "PLAN_MIN_NON_WATCHLIST_PER_BATCH",
+                _to_int_str(plan_min_non_watchlist),
+                "source_starvation_guard non_watch_clamp",
+            )
+        guarded_single_source_share = _clamp_float(min(plan_single_source_share_initial, 0.45), 0.20, 1.0)
+        if plan_single_source_share > guarded_single_source_share:
+            plan_single_source_share = guarded_single_source_share
+            _apply_action(
+                staged,
+                actions,
+                "PLAN_MAX_SINGLE_SOURCE_SHARE",
+                _to_float_str(plan_single_source_share),
+                "source_starvation_guard single_source_clamp",
+            )
+
     # Final low-throughput floor guards: keep flow knobs within survivable band.
     if low_throughput:
         if plan_watchlist_share < flow_watchlist_share_floor:
@@ -5245,6 +5773,29 @@ def _build_action_plan(
         "detected_15m": bool(churn_detected),
         "open_share_15m": round(float(churn_open_share), 6),
         "flat_close_share_15m": round(float(churn_flat_share), 6),
+    }
+    meta["source_starvation_guard"] = {
+        "active": bool(source_starvation_guard),
+        "source_top": str(source_top_name_15m or ""),
+        "source_top_share_15m": round(float(source_top_share_15m), 6),
+        "supply_non_watch_15m": int(supply_non_watch_15m),
+        "post_filters_non_watch_15m": int(post_filters_non_watch_15m),
+        "post_filters_non_watch_min_15m": int(source_non_watch_actionable_min_15m),
+        "non_watch_actionable": bool(source_non_watch_actionable),
+        "plan_non_watch_15m": int(plan_non_watch_15m),
+        "non_watch_zero_hits_15m": int(source_non_watch_zero_hits_15m),
+    }
+    meta["cooldown_symbol_dominance"] = {
+        "active": bool(cooldown_symbol_dominant),
+        "symbol": str(cooldown_top_symbol or ""),
+        "hits": int(cooldown_top_hits),
+        "share": round(float(cooldown_top_share), 6),
+    }
+    meta["safety_degraded_15m"] = {
+        "total_hits": int(safety_total_hits_15m),
+        "api_code_4029_hits": int(safety_api_4029_hits_15m),
+        "api_only": bool(safety_api_only_15m),
+        "mode": str(safety_degraded_mode_15m or "normal"),
     }
     if trimmed > 0:
         meta["trimmed_actions"] = int(trimmed)
@@ -5587,6 +6138,13 @@ def _spawn_profile_process(root: Path, profile_id: str) -> tuple[bool, str, int]
         env_path = (root / env_path).resolve()
     if not env_path.exists():
         return False, f"env_missing:{env_path}", 0
+    spawn_started_ts = float(time.time())
+    startup_exit_path = _profile_startup_exit_path(root, profile_id)
+    try:
+        if startup_exit_path.exists():
+            startup_exit_path.unlink()
+    except Exception:
+        pass
     py = _python_executable(root)
     try:
         env = os.environ.copy()
@@ -5616,7 +6174,15 @@ def _spawn_profile_process(root: Path, profile_id: str) -> tuple[bool, str, int]
         if _pid_is_running(pid):
             return True, f"spawned_pid={pid}", pid
         time.sleep(0.5)
-    return False, f"spawned_not_alive pid={pid}", pid
+    diag = _spawn_failure_diagnostics(
+        root,
+        profile_id,
+        spawn_started_ts=spawn_started_ts,
+    )
+    detail = f"spawned_not_alive pid={pid}"
+    if diag:
+        detail = f"{detail} diag={diag}"
+    return False, detail, pid
 
 
 def _update_active_matrix_pid(root: Path, profile_id: str, pid: int, status: str) -> bool:
@@ -5649,12 +6215,14 @@ def _run_dead_profile_recovery(root: Path, profile_id: str) -> tuple[bool, str]:
     _clear_profile_graceful_stop(root, profile_id)
     ok, detail, pid = _spawn_profile_process(root, profile_id)
     if not ok:
+        _update_active_matrix_pid(root, profile_id, 0, "stopped")
         return False, detail
     _update_active_matrix_pid(root, profile_id, pid, "running")
     for _ in range(10):
         if _profile_running(root, profile_id):
             return True, detail
         time.sleep(0.4)
+    _update_active_matrix_pid(root, profile_id, 0, "stopped")
     return False, f"{detail} profile_check_failed"
 
 
@@ -5958,11 +6526,40 @@ def _tick(
         source_profile_before = {}
     source_top_name_before = str((source_profile_before or {}).get("plan_top_source", "") or "").strip().lower()
     source_top_share_before = float(_safe_float((source_profile_before or {}).get("plan_top_source_share", 0.0), 0.0))
+    supply_before = telemetry_before.get("supply_sanity_15m", {}) if isinstance(telemetry_before, dict) else {}
+    source_guard_before = telemetry_before.get("source_diversity_guard_15m", {}) if isinstance(telemetry_before, dict) else {}
+    if not isinstance(supply_before, dict):
+        supply_before = {}
+    if not isinstance(source_guard_before, dict):
+        source_guard_before = {}
     source_qos_cap_pressure_now = int(metrics.filter_fail_reasons.get("source_qos_cap", 0))
+    supply_non_watch_before = int(_safe_float((supply_before or {}).get("candidate_supply_non_watch_15m", 0), 0.0))
+    post_filters_non_watch_before = int(
+        _safe_float((supply_before or {}).get("post_filters_pass_non_watch_15m", 0), 0.0)
+    )
+    plan_non_watch_before = int(_safe_float((supply_before or {}).get("plan_attempts_non_watch_15m", 0), 0.0))
+    non_watch_zero_hits_before = int(
+        _safe_float((source_guard_before or {}).get("non_watch_final_zero_hits", 0), 0.0)
+    )
+    source_non_watch_actionable_min_before = max(4, int(pre_buy_15m // 2))
+    source_non_watch_actionable_before = bool(post_filters_non_watch_before >= source_non_watch_actionable_min_before)
+    source_starvation_before = bool(
+        source_top_name_before.startswith("watchlist")
+        and source_top_share_before >= 0.75
+        and supply_non_watch_before >= max(12, int(metrics.selected_from_batch) // 3)
+        and source_non_watch_actionable_before
+        and plan_non_watch_before <= 0
+        and non_watch_zero_hits_before >= 3
+    )
     source_rollback_guard_active = bool(
         source_top_name_before.startswith("watchlist")
-        and source_top_share_before >= 0.85
-        and source_qos_cap_pressure_now >= max(24, int(metrics.selected_from_batch) // 3)
+        and (
+            (
+                source_top_share_before >= 0.85
+                and source_qos_cap_pressure_now >= max(24, int(metrics.selected_from_batch) // 3)
+            )
+            or source_starvation_before
+        )
     )
     silence_before = telemetry_before.get("silence_diagnostics_15m", {}) if isinstance(telemetry_before, dict) else {}
     if not isinstance(silence_before, dict):
@@ -6290,6 +6887,7 @@ def _tick(
         if (not alive) and (not hb_recent):
             now_ts = time.time()
             can_restart, restart_cooldown_left, restart_budget_left = _can_restart(now_ts)
+            restart_tail = ""
             if can_restart:
                 ok, restart_tail = _run_dead_profile_recovery(root, profile_id)
                 restarted = ok and _profile_running(root, profile_id)
@@ -6307,7 +6905,8 @@ def _tick(
                 "dead_profile_recovery "
                 f"alive={alive} hb_recent={hb_recent} can_restart={can_restart} "
                 f"cooldown_left={round(float(restart_cooldown_left), 2)} "
-                f"restart_budget_left={int(restart_budget_left)}"
+                f"restart_budget_left={int(restart_budget_left)} "
+                f"detail={str(restart_tail or '-')}"
             )
 
     if not dry_run and restarted:

@@ -1,4 +1,4 @@
-﻿# Architecture Deep Dive
+# Architecture Deep Dive
 
 ## 1. System Layers
 

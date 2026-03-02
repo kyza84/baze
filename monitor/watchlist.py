@@ -209,6 +209,7 @@ class WatchlistMonitor:
                     await self._fetch_dexscreener_watchlist(
                         min_liq=relaxed_min_liq,
                         min_vol_h24=relaxed_min_vol_h24,
+                        min_vol_5m=relaxed_min_vol_5m,
                         require_weth_quote=relaxed_require_weth,
                     )
                 )
@@ -340,6 +341,7 @@ class WatchlistMonitor:
         *,
         min_liq: float | None = None,
         min_vol_h24: float | None = None,
+        min_vol_5m: float | None = None,
         require_weth_quote: bool | None = None,
     ) -> list[dict[str, Any]]:
         raw_queries = getattr(config, "DEX_SEARCH_QUERIES", None)
@@ -353,6 +355,8 @@ class WatchlistMonitor:
             min_liq = float(getattr(config, "WATCHLIST_MIN_LIQUIDITY_USD", 200000) or 200000)
         if min_vol_h24 is None:
             min_vol_h24 = float(getattr(config, "WATCHLIST_MIN_VOLUME_24H_USD", 500000) or 500000)
+        if min_vol_5m is None:
+            min_vol_5m = float(getattr(config, "WATCHLIST_MIN_VOLUME_5M_USD", 0.0) or 0.0)
 
         out: list[dict[str, Any]] = []
         active_queries = [str(q or "").strip() for q in list(queries)[:20] if str(q or "").strip()]
@@ -402,9 +406,6 @@ class WatchlistMonitor:
                     vol_h24 = float((vol or {}).get("h24") or 0.0)
                 except Exception:
                     vol_h24 = 0.0
-                if vol_h24 < min_vol_h24:
-                    continue
-
                 created_ms = pair.get("pairCreatedAt")
                 created_at = None
                 if created_ms:
@@ -427,6 +428,8 @@ class WatchlistMonitor:
                     vol_5m = float((vol or {}).get("m5") or 0.0)
                 except Exception:
                     vol_5m = 0.0
+                if vol_h24 < min_vol_h24 or (min_vol_5m > 0 and vol_5m < min_vol_5m):
+                    continue
                 pc = pair.get("priceChange") or {}
                 try:
                     pc_5m = float((pc or {}).get("m5") or 0.0)

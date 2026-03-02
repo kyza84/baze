@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
+import time
 import unittest
 from collections import Counter
 from datetime import datetime, timedelta, timezone
@@ -1395,15 +1396,72 @@ class MatrixRuntimeTunerTests(unittest.TestCase):
             self.assertTrue(any(str(x.get("reason")) == "TIMEOUT" for x in exit_rows))
             silence = telemetry["silence_diagnostics_15m"]
             self.assertAlmostEqual(float(silence["opportunity_rate_per_hour"]), 8.0, places=6)
-            self.assertAlmostEqual(float(silence["action_rate_per_hour"]), 0.0, places=6)
+            # Action rate falls back to observed opens when plan-pass observability is sparse.
+            self.assertAlmostEqual(float(silence["action_rate_per_hour"]), 4.0, places=6)
             self.assertAlmostEqual(float(silence["execution_open_rate_per_hour"]), 4.0, places=6)
-            self.assertEqual(str(silence["bottleneck_stage"]), "action")
-            self.assertEqual(str(silence["bottleneck_hint"]), "plan_or_policy")
+            self.assertEqual(str(silence["bottleneck_stage"]), "none")
+            self.assertEqual(str(silence["bottleneck_hint"]), "active")
+
+    def test_collect_telemetry_v2_marks_api_only_safety_degraded_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            profile_id = "u_test_profile"
+            log_dir = root / "logs" / "matrix" / profile_id
+            log_dir.mkdir(parents=True, exist_ok=True)
+            (log_dir / "candidates.jsonl").write_text("", encoding="utf-8")
+            (log_dir / "trade_decisions.jsonl").write_text("", encoding="utf-8")
+
+            telemetry = mrt._collect_telemetry_v2(
+                root=root,
+                profile_id=profile_id,
+                config_before={},
+                config_after={},
+                actions=[],
+                metrics=mrt.WindowMetrics(
+                    safety_reason_counts=Counter({"api_code_4029": 3}),
+                ),
+            )
+            safety = telemetry.get("safety_degraded_15m", {}) or {}
+            self.assertEqual(int(safety.get("total_hits", 0) or 0), 3)
+            self.assertEqual(int(safety.get("api_code_4029_hits", 0) or 0), 3)
+            self.assertTrue(bool(safety.get("api_only", False)))
+            self.assertEqual(str(safety.get("mode", "")), "api_unavailable_info_only")
 
     def test_overrides_hash_is_order_independent(self) -> None:
         h1 = mrt._overrides_hash({"B": "2", "A": "1"})
         h2 = mrt._overrides_hash({"A": "1", "B": "2"})
         self.assertEqual(h1, h2)
+
+    def test_top_reasons_normalizes_legacy_and_prefixed_reason_codes(self) -> None:
+        candidate_rows: list[dict[str, object]] = []
+        trade_rows = [
+            {
+                "decision_stage": "plan_trade",
+                "decision": "skip",
+                "reason": "ev_net_low",
+            },
+            {
+                "decision_stage": "plan_trade",
+                "decision": "skip",
+                "reason": "PLAN_EV_NET_LOW",
+                "reason_code": "PLAN_EV_NET_LOW",
+            },
+            {
+                "decision_stage": "plan_trade",
+                "decision": "skip",
+                "reason": "cooldown_left_120s",
+            },
+            {
+                "decision_stage": "plan_trade",
+                "decision": "skip",
+                "reason_code": "PLAN_COOLDOWN",
+            },
+        ]
+        top = mrt._top_reasons_15m(candidate_rows, trade_rows)
+        plan_rows = top.get("plan_skip", []) or []
+        by_reason = {str(x.get("reason_code")): int(x.get("count", 0) or 0) for x in plan_rows if isinstance(x, dict)}
+        self.assertEqual(int(by_reason.get("ev_net_low", 0)), 2)
+        self.assertEqual(int(by_reason.get("cooldown", 0)), 2)
 
     def test_diff_override_keys_detects_mismatch(self) -> None:
         diff = mrt._diff_override_keys(
@@ -1547,6 +1605,71 @@ class MatrixRuntimeTunerTests(unittest.TestCase):
             )
             with mock.patch.object(mrt, "_pid_is_running", return_value=True):
                 self.assertTrue(mrt._profile_running(root, "u1"))
+
+    def test_dead_profile_recovery_marks_active_matrix_stopped_on_spawn_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            active = root / "data" / "matrix" / "runs" / "active_matrix.json"
+            active.parent.mkdir(parents=True, exist_ok=True)
+            active.write_text(
+                json.dumps(
+                    {
+                        "running": True,
+                        "alive_count": 1,
+                        "items": [
+                            {
+                                "id": "u1",
+                                "status": "running",
+                                "pid": 22222,
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with (
+                mock.patch.object(mrt, "_spawn_profile_process", return_value=(False, "spawned_not_alive pid=33333", 33333)),
+                mock.patch.object(mrt, "_pid_is_running", return_value=False),
+            ):
+                ok, detail = mrt._run_dead_profile_recovery(root, "u1")
+            self.assertFalse(ok)
+            self.assertIn("spawned_not_alive", detail)
+            payload = json.loads(active.read_text(encoding="utf-8"))
+            item = (payload.get("items") or [{}])[0]
+            self.assertEqual(str(item.get("status", "")), "stopped")
+            self.assertIn(item.get("pid", None), (None, 0))
+            self.assertFalse(bool(payload.get("running", True)))
+            self.assertEqual(int(payload.get("alive_count", 1) or 0), 0)
+
+    def test_spawn_failure_diagnostics_reads_startup_exit_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            profile = "u_diag"
+            log_dir = root / "logs" / "matrix" / profile
+            log_dir.mkdir(parents=True, exist_ok=True)
+            startup_path = log_dir / "startup_exit.json"
+            startup_path.write_text(
+                json.dumps(
+                    {
+                        "ts": float(time.time()),
+                        "run_tag": profile,
+                        "reason": "instance_lock_busy",
+                        "detail": "lock acquire failed",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            diag = mrt._spawn_failure_diagnostics(
+                root,
+                profile,
+                spawn_started_ts=float(time.time()) - 0.5,
+            )
+            self.assertIn("startup_exit_reason=instance_lock_busy", diag)
+            self.assertIn("hb_recent=False", diag)
 
     def test_prune_restart_history_keeps_recent_sorted_values(self) -> None:
         now_ts = 10000.0

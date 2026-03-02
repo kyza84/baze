@@ -246,6 +246,89 @@ def _runtime_tuner_patch_file(run_tag: str) -> str:
     return os.path.join(PROJECT_ROOT, "logs", "matrix", safe_tag, "runtime_tuner_runtime_overrides.json")
 
 
+def _runtime_profile_log_dir(run_tag: str) -> str:
+    safe_tag = str(run_tag or "").strip() or "single"
+    return os.path.join(PROJECT_ROOT, "logs", "matrix", safe_tag)
+
+
+def _runtime_startup_exit_file(run_tag: str) -> str:
+    return os.path.join(_runtime_profile_log_dir(run_tag), "startup_exit.json")
+
+
+def _runtime_shutdown_report_file(run_tag: str) -> str:
+    return os.path.join(_runtime_profile_log_dir(run_tag), "shutdown_report.json")
+
+
+def _write_json_atomic(path: str, payload: dict[str, Any]) -> None:
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, sort_keys=False, indent=2)
+            f.write("\n")
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def _clear_startup_exit_report() -> None:
+    path = _runtime_startup_exit_file(RUN_TAG)
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
+
+
+def _write_startup_exit_report(*, reason: str, detail: str = "", extra: dict[str, Any] | None = None) -> None:
+    payload: dict[str, Any] = {
+        "ts": float(time.time()),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "run_tag": RUN_TAG,
+        "instance_id": INSTANCE_ID,
+        "pid": int(os.getpid()),
+        "reason": str(reason or "").strip() or "unknown",
+        "detail": str(detail or "").strip(),
+    }
+    if isinstance(extra, dict) and extra:
+        payload["extra"] = dict(extra)
+    _write_json_atomic(_runtime_startup_exit_file(RUN_TAG), payload)
+
+
+def _write_shutdown_report(
+    *,
+    reason: str,
+    detail: str,
+    cycle_index: int,
+    auto_stats: dict[str, Any] | None = None,
+    meta: dict[str, Any] | None = None,
+) -> None:
+    stats = auto_stats if isinstance(auto_stats, dict) else {}
+    payload: dict[str, Any] = {
+        "ts": float(time.time()),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "run_tag": RUN_TAG,
+        "instance_id": INSTANCE_ID,
+        "pid": int(os.getpid()),
+        "cycle_index": int(max(0, int(cycle_index or 0))),
+        "reason": str(reason or "").strip() or "unknown",
+        "detail": str(detail or "").strip(),
+        "stats": {
+            "open_trades": int(stats.get("open_trades", 0) or 0),
+            "closed": int(stats.get("closed", 0) or 0),
+            "wins": int(stats.get("wins", 0) or 0),
+            "losses": int(stats.get("losses", 0) or 0),
+            "realized_pnl_usd": float(stats.get("realized_pnl_usd", 0.0) or 0.0),
+            "day_realized_pnl_usd": float(stats.get("day_realized_pnl_usd", 0.0) or 0.0),
+            "win_rate_percent": float(stats.get("win_rate_percent", 0.0) or 0.0),
+            "trades_last_hour": int(stats.get("trades_last_hour", 0) or 0),
+        },
+    }
+    if isinstance(meta, dict) and meta:
+        payload["meta"] = dict(meta)
+    _write_json_atomic(_runtime_shutdown_report_file(RUN_TAG), payload)
+
+
 def _runtime_tuner_applied_keys() -> list[str]:
     raw = _RUNTIME_TUNER_PATCH_STATE.get("applied_keys", [])
     if not isinstance(raw, list):
@@ -2547,6 +2630,9 @@ async def run_local_loop() -> None:
     market_regime_prev = market_regime_current
     runtime_tuner_lock_prev: bool | None = None
     cycle_index = 0
+    shutdown_reason = "loop_exit"
+    shutdown_detail = ""
+    shutdown_meta: dict[str, Any] = {}
 
     logger.info("Local mode started (Telegram disabled).")
     _write_heartbeat(stage="startup", cycle_index=cycle_index, open_trades=0)
@@ -2633,6 +2719,14 @@ async def run_local_loop() -> None:
                     )
                 else:
                     logger.warning("GRACEFUL_STOP requested path=%s", stop_path)
+                shutdown_reason = "graceful_stop_signal"
+                shutdown_detail = str((stop_meta or {}).get("reason", "") or "").strip() or "graceful_stop"
+                shutdown_meta = {
+                    "path": str(stop_path),
+                    "source": str((stop_meta or {}).get("source", "unknown") or "unknown"),
+                    "actor": str((stop_meta or {}).get("actor", "unknown") or "unknown"),
+                    "timestamp": str((stop_meta or {}).get("timestamp", "") or ""),
+                }
                 break
             cycle_started = time.perf_counter()
             try:
@@ -2763,6 +2857,39 @@ async def run_local_loop() -> None:
                     )
                     soft_score_base = int(getattr(config, "MARKET_MODE_SOFT_SCORE", 70) or 70)
                     soft_score_min = max(base_score_floor, min(strict_score_min, soft_score_base + int(regime_score_delta)))
+                    non_watch_soft_enabled = bool(getattr(config, "MARKET_MODE_NON_WATCH_SOFT_ENABLED", True))
+                    non_watch_soft_score_delta = max(
+                        0,
+                        int(getattr(config, "MARKET_MODE_NON_WATCH_SOFT_SCORE_DELTA", 8) or 8),
+                    )
+                    non_watch_soft_min_score = max(
+                        0,
+                        int(getattr(config, "MARKET_MODE_NON_WATCH_SOFT_MIN_SCORE", 20) or 20),
+                    )
+                    non_watch_soft_max_per_cycle = max(
+                        0,
+                        int(getattr(config, "MARKET_MODE_NON_WATCH_SOFT_MAX_PER_CYCLE", 2) or 2),
+                    )
+                    non_watch_soft_used_cycle = 0
+                    non_watch_volume_probe_enabled = bool(
+                        getattr(config, "SAFE_VOLUME_TWO_TIER_NON_WATCH_ENABLED", True)
+                    )
+                    non_watch_volume_probe_soft_ratio = max(
+                        0.20,
+                        min(
+                            0.99,
+                            float(getattr(config, "SAFE_VOLUME_TWO_TIER_NON_WATCH_SOFT_RATIO", 0.55) or 0.55),
+                        ),
+                    )
+                    non_watch_volume_probe_stable_cycles = max(
+                        1,
+                        int(getattr(config, "SAFE_VOLUME_TWO_TIER_NON_WATCH_STABLE_CYCLES", 1) or 1),
+                    )
+                    non_watch_volume_probe_max_per_cycle = max(
+                        0,
+                        int(getattr(config, "SAFE_VOLUME_TWO_TIER_NON_WATCH_MAX_PASSES_PER_CYCLE", 2) or 2),
+                    )
+                    non_watch_volume_probe_used_cycle = 0
                     soft_selected_cycle = 0
                     excluded_symbols_cycle = _excluded_trade_symbols()
                     excluded_keywords_cycle = _excluded_trade_symbol_keywords()
@@ -2779,6 +2906,7 @@ async def run_local_loop() -> None:
                                 "cycle_index": cycle_index,
                                 "candidate_id": candidate_id,
                                 "source_mode": source_mode,
+                                "source": str(token.get("source", "") or ""),
                                 "decision_stage": "filter_fail",
                                 "decision": "skip",
                                 "reason": key,
@@ -2871,10 +2999,19 @@ async def run_local_loop() -> None:
                         token["score_data"] = score_data
                         if int(score_data.get("score", 0)) >= 70:
                             high_quality += 1
+                        source_name = str(token.get("source", "") or "").strip().lower()
+                        is_watchlist_source = source_name.startswith("watchlist")
+                        is_non_watch_source = not is_watchlist_source
                         score_now = int(score_data.get("score", 0) or 0)
+                        soft_score_effective = int(soft_score_min)
+                        if is_non_watch_source and non_watch_soft_enabled:
+                            soft_score_effective = max(
+                                int(non_watch_soft_min_score),
+                                int(soft_score_min) - int(non_watch_soft_score_delta),
+                            )
                         if score_now >= strict_score_min:
                             entry_tier = "A"
-                        elif score_now >= soft_score_min:
+                        elif score_now >= soft_score_effective:
                             entry_tier = "B"
                         else:
                             entry_tier = ""
@@ -2883,7 +3020,11 @@ async def run_local_loop() -> None:
                             _filter_fail(
                                 "score_min",
                                 token,
-                                f"score={score_now} strict_min={strict_score_min} soft_min={soft_score_min} mode={market_regime_current}",
+                                (
+                                    f"score={score_now} strict_min={strict_score_min} "
+                                    f"soft_min={soft_score_min} soft_effective={soft_score_effective} "
+                                    f"source={source_name or 'unknown'} mode={market_regime_current}"
+                                ),
                             )
                             continue
                         if entry_tier == "B" and not allow_soft:
@@ -2893,6 +3034,40 @@ async def run_local_loop() -> None:
                                 f"score={score_now} mode={market_regime_current}",
                             )
                             continue
+                        if (
+                            entry_tier == "B"
+                            and is_non_watch_source
+                            and score_now < int(soft_score_min)
+                        ):
+                            if (
+                                non_watch_soft_max_per_cycle > 0
+                                and non_watch_soft_used_cycle >= non_watch_soft_max_per_cycle
+                            ):
+                                _filter_fail(
+                                    "non_watch_score_cycle_cap",
+                                    token,
+                                    (
+                                        f"score={score_now} soft_effective={soft_score_effective} "
+                                        f"used={non_watch_soft_used_cycle}/{non_watch_soft_max_per_cycle}"
+                                    ),
+                                )
+                                continue
+                            non_watch_soft_used_cycle += 1
+                            token["_non_watch_score_probe_pass"] = True
+                            token["_non_watch_score_probe_detail"] = (
+                                f"score={score_now} soft={soft_score_min} soft_effective={soft_score_effective} "
+                                f"used={non_watch_soft_used_cycle}/{non_watch_soft_max_per_cycle}"
+                            )
+                            logger.info(
+                                "NON_WATCH_SCORE_PROBE_PASS token=%s score=%s soft=%s soft_effective=%s used=%s/%s mode=%s",
+                                token.get("symbol", "N/A"),
+                                score_now,
+                                soft_score_min,
+                                soft_score_effective,
+                                non_watch_soft_used_cycle,
+                                non_watch_soft_max_per_cycle,
+                                market_regime_current,
+                            )
                         if entry_tier == "B" and soft_cap > 0 and soft_selected_cycle >= soft_cap:
                             _filter_fail(
                                 "tier_b_cycle_cap",
@@ -2913,12 +3088,19 @@ async def run_local_loop() -> None:
                                     0.20,
                                     min(0.99, float(getattr(config, "SAFE_VOLUME_TWO_TIER_SOFT_RATIO", 0.80) or 0.80)),
                                 )
+                                if is_non_watch_source and non_watch_volume_probe_enabled:
+                                    soft_ratio = min(float(soft_ratio), float(non_watch_volume_probe_soft_ratio))
                                 soft_min_volume = float(safe_volume_floor) * float(soft_ratio)
                                 if soft_enabled and token_address and token_volume_5m >= soft_min_volume:
                                     stable_cycles_required = max(
                                         1,
                                         int(getattr(config, "SAFE_VOLUME_TWO_TIER_STABLE_CYCLES", 2) or 2),
                                     )
+                                    if is_non_watch_source and non_watch_volume_probe_enabled:
+                                        stable_cycles_required = min(
+                                            int(stable_cycles_required),
+                                            int(non_watch_volume_probe_stable_cycles),
+                                        )
                                     stability_ratio = max(
                                         0.50,
                                         min(
@@ -2952,6 +3134,22 @@ async def run_local_loop() -> None:
                                         "until": float(now_mono + float(probe_ttl_seconds)),
                                     }
                                     if probe_hits >= stable_cycles_required:
+                                        if (
+                                            is_non_watch_source
+                                            and non_watch_volume_probe_max_per_cycle > 0
+                                            and non_watch_volume_probe_used_cycle >= non_watch_volume_probe_max_per_cycle
+                                        ):
+                                            _filter_fail(
+                                                "safe_volume_non_watch_cycle_cap",
+                                                token,
+                                                (
+                                                    f"vol5m={token_volume_5m:.0f}/{safe_volume_floor:.0f} "
+                                                    f"used={non_watch_volume_probe_used_cycle}/{non_watch_volume_probe_max_per_cycle}"
+                                                ),
+                                            )
+                                            continue
+                                        if is_non_watch_source and non_watch_volume_probe_max_per_cycle > 0:
+                                            non_watch_volume_probe_used_cycle += 1
                                         token["_safe_volume_soft_pass"] = True
                                         token["_safe_volume_soft_detail"] = (
                                             f"vol5m={token_volume_5m:.0f}/{safe_volume_floor:.0f} "
@@ -2967,6 +3165,14 @@ async def run_local_loop() -> None:
                                             stable_cycles_required,
                                             market_regime_current,
                                         )
+                                        if is_non_watch_source:
+                                            logger.info(
+                                                "NON_WATCH_VOLUME_PROBE_PASS token=%s used=%s/%s source=%s",
+                                                token.get("symbol", "N/A"),
+                                                non_watch_volume_probe_used_cycle,
+                                                non_watch_volume_probe_max_per_cycle,
+                                                source_name or "unknown",
+                                            )
                                     else:
                                         _filter_fail(
                                             "safe_volume_quarantine",
@@ -3148,6 +3354,7 @@ async def run_local_loop() -> None:
                                 "cycle_index": cycle_index,
                                 "candidate_id": candidate_id,
                                 "source_mode": source_mode,
+                                "source": str(token.get("source", "") or ""),
                                 "decision_stage": "post_filters",
                                 "decision": "candidate_pass",
                                 "reason": "passed_all_filters",
@@ -3164,6 +3371,8 @@ async def run_local_loop() -> None:
                                 "risk_level": str(token.get("risk_level", "")),
                                 "warning_flags": int(token.get("warning_flags") or 0),
                                 "is_contract_safe": bool(token.get("is_contract_safe", False)),
+                                "score_probe_pass": bool(token.get("_non_watch_score_probe_pass", False)),
+                                "safe_volume_soft_pass": bool(token.get("_safe_volume_soft_pass", False)),
                                 "quality": _candidate_quality_features(token, score_data),
                             }
                         )
@@ -3271,6 +3480,7 @@ async def run_local_loop() -> None:
                                 "cycle_index": cycle_index,
                                 "candidate_id": cid,
                                 "source_mode": source_mode,
+                                "source": str((token_data or {}).get("source", "") or ""),
                                 "decision_stage": "quality_gate",
                                 "decision": "skip",
                                 "reason": str((drop_row or {}).get("reason", "quality_gate")),
@@ -3412,6 +3622,7 @@ async def run_local_loop() -> None:
                                 "cycle_index": cycle_index,
                                 "candidate_id": candidate_id,
                                 "source_mode": source_mode,
+                                "source": str(token_data.get("source", "") or ""),
                                 "decision_stage": "policy_gate",
                                 "decision": "skip",
                                 "reason": policy_skip_reason,
@@ -3575,6 +3786,12 @@ async def run_local_loop() -> None:
                             await local_alerter.send_event(stop_event)
                         except Exception:
                             logger.exception("PROFILE_AUTOSTOP notification write failed")
+                    shutdown_reason = "profile_autostop"
+                    shutdown_detail = str(reason or "").strip() or "profile_autostop_triggered"
+                    shutdown_meta = {
+                        "event_tag": str(stop_tag or ""),
+                        "reason": str(reason or ""),
+                    }
                     break
                 champ_stop, champ_event = v2_champion_guard.maybe_stop(auto_stats=auto_stats)
                 if champ_stop:
@@ -3591,6 +3808,11 @@ async def run_local_loop() -> None:
                             await local_alerter.send_event(champ_event)
                         except Exception:
                             logger.exception("V2_CHAMPION_GUARD event write failed")
+                    shutdown_reason = "champion_guard"
+                    shutdown_detail = str(reason or "").strip() or "champion_guard_triggered"
+                    shutdown_meta = {
+                        "reason": str(reason or ""),
+                    }
                     break
                 mini_analyzer.maybe_emit(auto_stats=auto_stats)
 
@@ -3668,6 +3890,18 @@ async def run_local_loop() -> None:
             await asyncio.sleep(sleep_seconds)
     finally:
         _write_heartbeat(stage="shutdown", cycle_index=cycle_index, open_trades=len(auto_trader.open_positions))
+        stats_snapshot: dict[str, Any] = {}
+        try:
+            stats_snapshot = auto_trader.get_stats()
+        except Exception:
+            logger.exception("SHUTDOWN_REPORT stats snapshot failed")
+        _write_shutdown_report(
+            reason=str(shutdown_reason or "loop_exit"),
+            detail=str(shutdown_detail or ""),
+            cycle_index=int(cycle_index),
+            auto_stats=stats_snapshot,
+            meta=shutdown_meta,
+        )
         auto_trader.flush_state()
         await auto_trader.shutdown("main_local_shutdown")
         if onchain_monitor is not None:
@@ -3680,16 +3914,32 @@ async def run_local_loop() -> None:
 
 
 def main() -> None:
+    _clear_startup_exit_report()
     lock = InstanceLock()
     if not lock.acquire():
+        _write_startup_exit_report(
+            reason="instance_lock_busy",
+            detail="lock acquire failed",
+            extra={
+                "mutex": WINDOWS_MUTEX_NAME,
+                "instance_id": INSTANCE_ID,
+            },
+        )
         print("Another main_local.py instance is already running. Exit.")
         return
     atexit.register(lock.release)
     _write_single_pid_file()
     configure_logging()
+    _clear_startup_exit_report()
     _clear_graceful_stop_flag()
     try:
         asyncio.run(run_local_loop())
+    except Exception as exc:
+        _write_startup_exit_report(
+            reason="fatal_main_exception",
+            detail=f"{exc.__class__.__name__}:{exc}",
+        )
+        raise
     finally:
         _clear_single_pid_file()
         lock.release()

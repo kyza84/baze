@@ -1103,13 +1103,20 @@ class AutoTrader:
             return False, ""
         if not self._is_watchlist_source(source_name):
             return False, ""
-        if not bool(batch_has_non_watchlist):
-            return False, ""
         min_non_watch = max(0, int(getattr(config, "PLAN_MIN_NON_WATCHLIST_PER_BATCH", 1) or 1))
         if min_non_watch <= 0:
             return False, ""
         window_seconds = max(300, int(getattr(config, "PLAN_NON_WATCHLIST_QUOTA_WINDOW_SECONDS", 900) or 900))
         min_opens = max(2, int(getattr(config, "PLAN_NON_WATCHLIST_QUOTA_MIN_OPENS", 4) or 4))
+        enforce_empty_batch = bool(getattr(config, "PLAN_NON_WATCHLIST_QUOTA_ENFORCE_EMPTY_BATCH", True))
+        if not bool(batch_has_non_watchlist):
+            if not enforce_empty_batch:
+                return False, ""
+            empty_batch_min_opens = max(
+                1,
+                int(getattr(config, "PLAN_NON_WATCHLIST_QUOTA_EMPTY_BATCH_MIN_OPENS", 10) or 10),
+            )
+            min_opens = max(min_opens, empty_batch_min_opens)
         watch_share_cap = max(
             0.0,
             min(1.0, float(getattr(config, "PLAN_MAX_WATCHLIST_SHARE", 0.30) or 0.30)),
@@ -1126,6 +1133,7 @@ class AutoTrader:
             f"non_watch={non_watch}/{total} min_non_watch={min_non_watch} "
             f"watch_share={watch_share:.3f} projected_watch_share={projected_watch_share:.3f} "
             f"watch_share_cap={watch_share_cap:.3f} batch_has_non_watch={bool(batch_has_non_watchlist)} "
+            f"enforce_empty_batch={bool(enforce_empty_batch)} "
             f"window={window_seconds}s"
         )
         return True, detail
@@ -1250,6 +1258,11 @@ class AutoTrader:
         max_strikes = max(1, int(getattr(config, "AUTO_TRADE_TOKEN_COOLDOWN_MAX_STRIKES", 1) or 1))
         recovery_step = max(1, int(getattr(config, "AUTO_TRADE_TOKEN_COOLDOWN_RECOVERY_STEP", 1) or 1))
         cap_seconds = max(base, int(getattr(config, "AUTO_TRADE_TOKEN_COOLDOWN_MAX_SECONDS", base) or base))
+        effective_cap = max(
+            base,
+            int(getattr(config, "AUTO_TRADE_TOKEN_COOLDOWN_DYNAMIC_EFFECTIVE_MAX_SECONDS", cap_seconds) or cap_seconds),
+        )
+        cap_seconds = min(cap_seconds, effective_cap)
         patterns = list(getattr(config, "AUTO_TRADE_TOKEN_COOLDOWN_ESCALATE_REASONS", []) or [])
         if "EARLY_RISK" not in {str(x or "").strip().upper() for x in patterns}:
             # Always escalate quick re-entry after early-risk exits to prevent churn loops.
@@ -1274,7 +1287,10 @@ class AutoTrader:
             self.token_cooldowns[normalized] = now_ts + cooldown_seconds
             self.token_cooldown_reasons[normalized] = f"close:{str(close_reason or '').strip().upper() or 'UNKNOWN'}"
             logger.info(
-                "TOKEN_COOLDOWN token=%s reason=%s pnl=$%.4f cooldown=%ss strikes=%s->%s dynamic=%s",
+                (
+                    "TOKEN_COOLDOWN token=%s reason=%s pnl=$%.4f cooldown=%ss strikes=%s->%s "
+                    "dynamic=%s base=%s step=%s cap=%s"
+                ),
                 normalized,
                 close_reason,
                 float(pnl_usd),
@@ -1282,6 +1298,9 @@ class AutoTrader:
                 strikes_prev,
                 strikes_next,
                 dynamic_enabled,
+                base,
+                step_seconds,
+                cap_seconds,
             )
 
         if bool(getattr(config, "EXTREME_SL_GUARD_ENABLED", True)):
@@ -2323,11 +2342,16 @@ class AutoTrader:
                 _try_add(item, enforce_watch_cap=True, enforce_source_cap=False)
 
         # Pass 4: final fallback fill (do not return empty if market is thin).
+        allow_watch_cap_bypass = bool(getattr(config, "PLAN_SOURCE_DIVERSITY_ALLOW_WATCHLIST_CAP_BYPASS", False))
         if len(picked) < budget:
             for item in pool:
                 if len(picked) >= budget:
                     break
-                _try_add(item, enforce_watch_cap=False, enforce_source_cap=False)
+                _try_add(
+                    item,
+                    enforce_watch_cap=not allow_watch_cap_bypass,
+                    enforce_source_cap=False,
+                )
 
         if not picked:
             return selected
@@ -2343,7 +2367,10 @@ class AutoTrader:
         new_hist = _source_hist(picked)
         if old_hist != new_hist or len(picked) != len(selected):
             logger.info(
-                "PLAN_SOURCE_DIVERSITY budget=%s old=%s new=%s watch_cap=%s source_cap=%s min_non_watch=%s non_watch_final=%s",
+                (
+                    "PLAN_SOURCE_DIVERSITY budget=%s old=%s new=%s watch_cap=%s source_cap=%s "
+                    "min_non_watch=%s non_watch_final=%s watch_cap_bypass=%s"
+                ),
                 budget,
                 old_hist,
                 new_hist,
@@ -2351,6 +2378,7 @@ class AutoTrader:
                 max_per_source,
                 min_non_watch,
                 non_watch_count,
+                bool(allow_watch_cap_bypass),
             )
 
         return picked

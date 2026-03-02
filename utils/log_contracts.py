@@ -270,6 +270,7 @@ def candidate_decision_event(event: dict[str, Any], *, run_tag: str = "") -> dic
     payload["score"] = _safe_int(payload.get("score", 0), 0)
     payload["market_regime"] = str(payload.get("market_regime", payload.get("market_mode", "")) or "")
     payload["market_mode"] = str(payload.get("market_mode", payload.get("market_regime", "")) or "")
+    payload["source"] = str(payload.get("source", payload.get("source_mode", "")) or "")
     payload["reason_code"] = str(
         payload.get("reason_code", "")
         or reason_code_for_event(
@@ -309,8 +310,17 @@ def trade_decision_event(event: dict[str, Any], *, run_tag: str = "") -> dict[st
     payload["market_mode"] = str(payload.get("market_mode", payload.get("market_regime", "")) or "")
     payload["entry_tier"] = str(payload.get("entry_tier", "") or "")
     payload["entry_channel"] = str(payload.get("entry_channel", "") or "")
+    payload["source"] = str(payload.get("source", "") or "")
     payload["position_size_usd"] = _safe_float(payload.get("position_size_usd", 0.0), 0.0)
     payload["expected_edge_percent"] = _safe_float(payload.get("expected_edge_percent", 0.0), 0.0)
+    stage_norm = _normalize_reason_text(payload.get("decision_stage", ""))
+    if not str(payload.get("type", "") or "").strip():
+        if stage_norm == "trade_open":
+            payload["type"] = "open"
+        elif stage_norm == "trade_close":
+            payload["type"] = "close"
+        elif stage_norm == "trade_partial":
+            payload["type"] = "partial"
     payload["reason_code"] = str(
         payload.get("reason_code", "")
         or reason_code_for_event(

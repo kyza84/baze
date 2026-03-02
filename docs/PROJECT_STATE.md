@@ -1,11 +1,12 @@
-﻿# PROJECT_STATE
+# PROJECT_STATE
 
 ## Snapshot
-- Updated: 2026-03-01
+- Updated: 2026-03-02
 - Repo: d:\earnforme\solana-alert-bot
 - Remote: https://github.com/kyza84/baze
 - Branch: main
 - Active profile: u_station_ab_night_autotune_v2
+- Last validated runtime: matrix+tuner running, no runtime exceptions, watchlist concentration remains the primary bottleneck.
 
 ## Runtime Topology
 - Trader runtime: `main_local.py`

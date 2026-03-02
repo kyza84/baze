@@ -1,4 +1,4 @@
-﻿# CONTEXT_UPDATE_RULES
+# CONTEXT_UPDATE_RULES
 
 ## Goal
 Keep transfer context always up to date across accounts/sessions.

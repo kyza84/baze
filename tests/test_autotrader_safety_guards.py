@@ -338,6 +338,49 @@ class AutoTraderSafetyGuardTests(ConfigPatchMixin, unittest.TestCase):
         self.assertTrue(blocked)
         self.assertIn("plan_non_watchlist_quota", detail)
 
+    def test_plan_non_watchlist_quota_blocks_watchlist_on_empty_batch_when_enforced(self) -> None:
+        self.patch_cfg(
+            PLAN_NON_WATCHLIST_QUOTA_ENABLED=True,
+            PLAN_NON_WATCHLIST_QUOTA_ENFORCE_EMPTY_BATCH=True,
+            PLAN_NON_WATCHLIST_QUOTA_EMPTY_BATCH_MIN_OPENS=4,
+            PLAN_NON_WATCHLIST_QUOTA_WINDOW_SECONDS=900,
+            PLAN_NON_WATCHLIST_QUOTA_MIN_OPENS=2,
+            PLAN_MIN_NON_WATCHLIST_PER_BATCH=2,
+            PLAN_MAX_WATCHLIST_SHARE=0.30,
+        )
+        trader = self._blank_trader()
+        now_ts = datetime.now(timezone.utc).timestamp()
+        trader._recent_open_sources = [
+            (now_ts - 10, "watchlist"),
+            (now_ts - 20, "watchlist"),
+            (now_ts - 30, "watchlist"),
+            (now_ts - 40, "watchlist"),
+        ]
+        blocked, detail = trader._plan_non_watchlist_quota_blocked(
+            source_name="watchlist",
+            batch_has_non_watchlist=False,
+        )
+        self.assertTrue(blocked)
+        self.assertIn("enforce_empty_batch=True", detail)
+
+    def test_rebalance_respects_watchlist_cap_when_bypass_disabled(self) -> None:
+        self.patch_cfg(
+            PLAN_SOURCE_DIVERSITY_ENABLED=True,
+            PLAN_MAX_SINGLE_SOURCE_SHARE=1.0,
+            PLAN_MAX_WATCHLIST_SHARE=0.02,
+            PLAN_MIN_NON_WATCHLIST_PER_BATCH=0,
+            PLAN_SOURCE_DIVERSITY_ALLOW_WATCHLIST_CAP_BYPASS=False,
+        )
+        trader = self._blank_trader()
+        selected = [
+            ({"address": "0x1000000000000000000000000000000000000001", "symbol": "A1", "source": "watchlist"}, {}),
+            ({"address": "0x1000000000000000000000000000000000000002", "symbol": "A2", "source": "watchlist"}, {}),
+            ({"address": "0x1000000000000000000000000000000000000003", "symbol": "A3", "source": "watchlist"}, {}),
+        ]
+        out = trader._rebalance_plan_batch_sources(selected=selected, eligible=list(selected))
+        watch_count = sum(1 for token, _ in out if str((token or {}).get("source", "")).startswith("watchlist"))
+        self.assertLessEqual(int(watch_count), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

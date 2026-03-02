@@ -1,4 +1,4 @@
-﻿# ACCOUNT_TRANSFER_PROMPT
+# ACCOUNT_TRANSFER_PROMPT
 
 Use this prompt when switching to a second account/VSCode session and continuing work from current project state without losing context.
 

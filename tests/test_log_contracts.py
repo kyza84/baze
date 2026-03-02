@@ -13,6 +13,7 @@ class LogContractsTests(unittest.TestCase):
                 "decision_stage": "filter_fail",
                 "decision": "skip",
                 "reason": "safe_volume",
+                "source_mode": "onchain+market",
                 "symbol": "AAA",
                 "address": "0x1111111111111111111111111111111111111111",
             },
@@ -22,6 +23,7 @@ class LogContractsTests(unittest.TestCase):
         self.assertTrue(str(row.get("decision_id", "")).startswith("dec_"))
         self.assertEqual(row["reason_code"], "FILTER_SAFE_VOLUME")
         self.assertEqual(row["reason_category"], "filter")
+        self.assertEqual(str(row.get("source", "")), "onchain+market")
 
     def test_trade_event_generates_position_id_for_trade_stages(self) -> None:
         row = log_contracts.trade_decision_event(
@@ -39,6 +41,7 @@ class LogContractsTests(unittest.TestCase):
         self.assertTrue(str(row.get("position_id", "")).startswith("pos_"))
         self.assertEqual(row["reason_code"], "EXEC_BUY_PAPER")
         self.assertEqual(row["reason_category"], "execute")
+        self.assertEqual(row.get("type"), "open")
 
     def test_local_alert_event_gets_reason_code(self) -> None:
         row = log_contracts.local_alert_event(
