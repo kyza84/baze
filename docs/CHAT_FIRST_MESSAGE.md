@@ -14,9 +14,10 @@
 Прочитай в таком порядке:
 1) docs/PROJECT_STATE.md
 2) docs/OPERATOR_PATTERNS.md
-3) docs/ACCOUNT_TRANSFER_PROMPT.md
-4) data/matrix/runs/active_matrix.json
-5) последние логи профиля logs/matrix/u_station_ab_night_autotune_v2/
+3) docs/LOGGING_REFERENCE.md
+4) docs/ACCOUNT_TRANSFER_PROMPT.md
+5) data/matrix/runs/active_matrix.json
+6) последние логи профиля logs/matrix/u_station_ab_night_autotune_v2/
 
 Текущий профиль:
 - u_station_ab_night_autotune_v2

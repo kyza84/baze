@@ -17,8 +17,9 @@ Read first:
 1) NEXT_CHAT_CONTEXT.md
 2) docs/NEXT_CHAT_CONTEXT.md
 3) docs/OPERATOR_PATTERNS.md
-4) data/matrix/runs/active_matrix.json
-5) latest logs in logs/matrix/u_station_ab_night_autotune_v2/
+4) docs/LOGGING_REFERENCE.md
+5) data/matrix/runs/active_matrix.json
+6) latest logs in logs/matrix/u_station_ab_night_autotune_v2/
 
 Hard rules:
 - No destructive git commands.

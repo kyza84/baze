@@ -83,6 +83,7 @@ python -m unittest discover -s tests -p "test_*.py" -v
 
 ## Документация
 - `docs/ARCHITECTURE.md`
+- `docs/LOGGING_REFERENCE.md`
 - `docs/MATRIX_RUNTIME_TUNER.md`
 - `docs/MATRIX_PRESET_MANUAL.md`
 - `docs/SAFE_TUNING_AGENT_PROTOCOL.md`

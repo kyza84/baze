@@ -8,6 +8,18 @@
 - Active profile: u_station_ab_night_autotune_v2
 - Last validated runtime: matrix+tuner+watchdog running, no runtime exceptions, primary bottleneck remains plan-stage economics (edge/cost/cooldown).
 
+## Documentation Update (2026-03-03, logging/transfer)
+- Added `docs/LOGGING_REFERENCE.md`:
+  - complete map of matrix profile logs,
+  - core JSONL field contracts and telemetry blocks,
+  - minimal file set for external analyzer chat handoff.
+- Updated transfer chain to include logging reference:
+  - `docs/CHAT_FIRST_MESSAGE.md`
+  - `docs/ACCOUNT_TRANSFER_PROMPT.md`
+- Updated documentation index links:
+  - `README.md`
+  - `docs/ARCHITECTURE.md`
+
 ## Latest Update (2026-03-03)
 - `main_local.py`
   - Added early cycle-level skip for `address_or_duplicate/open_duplicate` when token is already in `auto_trader.open_positions`.

@@ -48,6 +48,8 @@
   - Schema-stamped log records.
 - `monitor/local_alerter.py`
   - Alert event emission.
+- `docs/LOGGING_REFERENCE.md`
+  - Full per-file logging map and field-level reference.
 - Runtime files:
   - `logs/matrix/<profile>/candidates.jsonl`
   - `logs/matrix/<profile>/trade_decisions.jsonl`
