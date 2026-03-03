@@ -173,6 +173,7 @@ class AutoTrader:
         self._recent_open_symbols: list[tuple[float, str]] = []
         self._recent_open_sources: list[tuple[float, str]] = []
         self._recent_batch_open_timestamps: list[float] = []
+        self._edge_cost_dominant_hits_by_symbol: dict[str, list[float]] = {}
         self._new_token_pause_until_ts = 0.0
         self._quarantine_rows: dict[str, dict[str, float | int]] = {}
         self._verified_sell_tokens: set[str] = set()
@@ -782,16 +783,36 @@ class AutoTrader:
         is_contract_safe = bool(token_data.get("is_contract_safe", (safety or {}).get("is_safe", False)))
         warning_flags = int(token_data.get("warning_flags", len((safety or {}).get("warnings") or [])) or 0)
         risk_level = str(token_data.get("risk_level", (safety or {}).get("risk_level", "HIGH"))).upper()
+        source_key = self._token_source_key(token_data)
+        is_non_watch_source = self._is_non_watch_source(source_key)
 
         if config.SAFE_TEST_MODE:
             if float(token_data.get("liquidity") or 0) < float(config.SAFE_MIN_LIQUIDITY_USD):
                 return False, "safe_min_liquidity"
             if float(token_data.get("volume_5m") or 0) < float(config.SAFE_MIN_VOLUME_5M_USD):
-                return False, "safe_min_volume_5m"
+                volume_soft_ok = bool(token_data.get("_safe_volume_soft_pass", False))
+                if not (
+                    is_non_watch_source
+                    and bool(getattr(config, "SAFE_VOLUME_TWO_TIER_NON_WATCH_ENABLED", True))
+                    and volume_soft_ok
+                ):
+                    return False, "safe_min_volume_5m"
             if int(token_data.get("age_seconds") or 0) < int(config.SAFE_MIN_AGE_SECONDS):
-                return False, "safe_min_age"
+                age_soft_ok = bool(token_data.get("_safe_age_soft_pass", False))
+                if not (
+                    is_non_watch_source
+                    and bool(getattr(config, "SAFE_AGE_NON_WATCH_SOFT_ENABLED", True))
+                    and age_soft_ok
+                ):
+                    return False, "safe_min_age"
             if abs(float(token_data.get("price_change_5m") or 0)) > float(config.SAFE_MAX_PRICE_CHANGE_5M_ABS_PERCENT):
-                return False, "safe_max_price_change_5m"
+                change_soft_ok = bool(token_data.get("_safe_change_soft_pass", False))
+                if not (
+                    is_non_watch_source
+                    and bool(getattr(config, "SAFE_CHANGE_5M_NON_WATCH_SOFT_ENABLED", True))
+                    and change_soft_ok
+                ):
+                    return False, "safe_max_price_change_5m"
             if config.SAFE_REQUIRE_CONTRACT_SAFE and not is_contract_safe:
                 return False, "safe_contract"
             required_risk = str(config.SAFE_REQUIRE_RISK_LEVEL).upper()
@@ -1367,6 +1388,130 @@ class AutoTrader:
             key,
             sec,
             reason,
+        )
+
+    def _cost_dominant_skip_guard(
+        self,
+        *,
+        symbol: str,
+        skip_reason: str,
+        gross_percent: float,
+        cost_total_percent: float,
+        source_name: str = "",
+        entry_channel: str = "",
+        position_size_usd: float | None = None,
+    ) -> None:
+        if not bool(getattr(config, "EDGE_COST_DOMINANT_GUARD_ENABLED", True)):
+            return
+        key = self._symbol_key(symbol)
+        if not key:
+            return
+        source_key = str(source_name or "").strip().lower()
+        channel_key = str(entry_channel or "").strip().lower()
+        is_non_watch_source = bool(source_key) and (not source_key.startswith("watchlist"))
+        gross = float(gross_percent or 0.0)
+        cost = float(cost_total_percent or 0.0)
+        min_gross = max(0.0, float(getattr(config, "EDGE_COST_DOMINANT_MIN_GROSS_PERCENT", 2.0) or 2.0))
+        min_cost = max(0.0, float(getattr(config, "EDGE_COST_DOMINANT_MIN_COST_PERCENT", 6.0) or 6.0))
+        min_delta = max(0.0, float(getattr(config, "EDGE_COST_DOMINANT_MIN_DELTA_PERCENT", 2.0) or 2.0))
+        window_seconds = max(
+            300,
+            int(getattr(config, "EDGE_COST_DOMINANT_HIT_WINDOW_SECONDS", 1800) or 1800),
+        )
+        hits_to_cooldown = max(
+            2,
+            int(getattr(config, "EDGE_COST_DOMINANT_HITS_TO_COOLDOWN", 3) or 3),
+        )
+        cooldown_seconds = max(
+            0,
+            int(getattr(config, "EDGE_COST_DOMINANT_SYMBOL_COOLDOWN_SECONDS", 900) or 900),
+        )
+        if (
+            bool(getattr(config, "EDGE_COST_DOMINANT_NON_WATCH_EXPLORE_FAST_GUARD_ENABLED", True))
+            and is_non_watch_source
+            and channel_key == "explore"
+        ):
+            max_size_usd = max(
+                0.0,
+                float(getattr(config, "EDGE_COST_DOMINANT_NON_WATCH_EXPLORE_MAX_SIZE_USD", 0.30) or 0.30),
+            )
+            size_ref = max(0.0, float(position_size_usd or 0.0))
+            if size_ref <= max_size_usd:
+                min_gross = min(
+                    min_gross,
+                    max(
+                        0.0,
+                        float(
+                            getattr(config, "EDGE_COST_DOMINANT_NON_WATCH_EXPLORE_MIN_GROSS_PERCENT", 1.0) or 1.0
+                        ),
+                    ),
+                )
+                min_cost = max(
+                    min_cost,
+                    max(
+                        0.0,
+                        float(
+                            getattr(config, "EDGE_COST_DOMINANT_NON_WATCH_EXPLORE_MIN_COST_PERCENT", 10.0) or 10.0
+                        ),
+                    ),
+                )
+                min_delta = max(
+                    min_delta,
+                    max(
+                        0.0,
+                        float(
+                            getattr(config, "EDGE_COST_DOMINANT_NON_WATCH_EXPLORE_MIN_DELTA_PERCENT", 6.0) or 6.0
+                        ),
+                    ),
+                )
+                window_seconds = max(
+                    120,
+                    int(
+                        getattr(config, "EDGE_COST_DOMINANT_NON_WATCH_EXPLORE_HIT_WINDOW_SECONDS", 900) or 900
+                    ),
+                )
+                hits_to_cooldown = max(
+                    1,
+                    int(getattr(config, "EDGE_COST_DOMINANT_NON_WATCH_EXPLORE_HITS_TO_COOLDOWN", 2) or 2),
+                )
+                cooldown_seconds = max(
+                    cooldown_seconds,
+                    int(
+                        getattr(
+                            config,
+                            "EDGE_COST_DOMINANT_NON_WATCH_EXPLORE_SYMBOL_COOLDOWN_SECONDS",
+                            1800,
+                        )
+                        or 1800
+                    ),
+                )
+        if gross < min_gross or cost < min_cost or (cost - gross) < min_delta:
+            return
+        now_ts = datetime.now(timezone.utc).timestamp()
+        cutoff_ts = now_ts - float(window_seconds)
+        rows = [
+            float(ts)
+            for ts in (self._edge_cost_dominant_hits_by_symbol.get(key) or [])
+            if float(ts) >= cutoff_ts
+        ]
+        rows.append(float(now_ts))
+        self._edge_cost_dominant_hits_by_symbol[key] = rows
+        hit_count = len(rows)
+        if hit_count < hits_to_cooldown:
+            return
+        if cooldown_seconds > 0:
+            self._set_symbol_cooldown(key, cooldown_seconds, "cost_dominant_edge")
+        self._edge_cost_dominant_hits_by_symbol[key] = [float(now_ts)]
+        logger.info(
+            "EDGE_COST_DOMINANT_COOLDOWN symbol=%s reason=%s hits=%s/%s gross=%.2f%% cost=%.2f%% cooldown=%ss window=%ss",
+            key,
+            str(skip_reason or "").strip().lower() or "edge_low",
+            hit_count,
+            hits_to_cooldown,
+            gross,
+            cost,
+            cooldown_seconds,
+            window_seconds,
         )
 
     def _symbol_window_metrics(self, symbol: str) -> dict[str, float | int]:
@@ -2090,23 +2235,61 @@ class AutoTrader:
             self.open_positions.pop(raw, None)
             self.price_guard_pending.pop(raw, None)
 
-    def _bump_skip_reason(self, reason: str) -> None:
+    def _bump_skip_reason(
+        self,
+        reason: str,
+        *,
+        extra: dict[str, Any] | None = None,
+        context: dict[str, Any] | None = None,
+        decision_stage: str = "plan_trade",
+    ) -> None:
         key = str(reason or "unknown").strip().lower() or "unknown"
         self._skip_reason_counts_window[key] = int(self._skip_reason_counts_window.get(key, 0)) + 1
-        ctx = dict(self._active_trade_decision_context or {})
+        ctx = dict(context or self._active_trade_decision_context or {})
         source_key = self._normalized_source_value(ctx.get("source", "unknown"))
         src_skips = self._skip_reasons_by_source_window.setdefault(source_key, {})
         src_skips[key] = int(src_skips.get(key, 0)) + 1
         if ctx:
             payload = {
                 "ts": time.time(),
-                "decision_stage": "plan_trade",
+                "decision_stage": str(decision_stage or "plan_trade"),
                 "decision": "skip",
                 "reason": key,
                 **ctx,
             }
+            if isinstance(extra, dict) and extra:
+                for raw_key, raw_value in extra.items():
+                    field = str(raw_key or "").strip()
+                    if not field:
+                        continue
+                    if raw_value is None:
+                        continue
+                    if isinstance(raw_value, (str, int, float, bool, dict, list, tuple)):
+                        payload[field] = raw_value
+                    else:
+                        payload[field] = str(raw_value)
             self._write_trade_decision(payload)
-            self._active_trade_decision_context = None
+            if context is None:
+                self._active_trade_decision_context = None
+
+    def _bump_skip_reason_ext(
+        self,
+        reason: str,
+        *,
+        extra: dict[str, Any] | None = None,
+        context: dict[str, Any] | None = None,
+        decision_stage: str = "plan_trade",
+    ) -> None:
+        # Backward-compatible adapter for tests/mocks that monkeypatch _bump_skip_reason(reason).
+        try:
+            self._bump_skip_reason(
+                reason,
+                extra=extra,
+                context=context,
+                decision_stage=decision_stage,
+            )
+        except TypeError:
+            self._bump_skip_reason(reason)
 
     @staticmethod
     def _normalized_source_value(value: Any) -> str:
@@ -2205,7 +2388,7 @@ class AutoTrader:
         return f"pos_{digest}"
 
     def _write_trade_decision(self, event: dict[str, Any]) -> None:
-        if not self.trade_decisions_log_enabled:
+        if not bool(getattr(self, "trade_decisions_log_enabled", False)):
             return
         try:
             payload = trade_decision_event(dict(event or {}), run_tag=self._decision_run_tag())
@@ -2233,6 +2416,13 @@ class AutoTrader:
     @staticmethod
     def _is_watchlist_source(source_key: str) -> bool:
         return str(source_key or "").strip().lower().startswith("watchlist")
+
+    @staticmethod
+    def _is_non_watch_source(source_key: str) -> bool:
+        key = str(source_key or "").strip().lower()
+        if not key or key == "unknown":
+            return False
+        return not AutoTrader._is_watchlist_source(key)
 
     @staticmethod
     def _batch_candidate_key(token: dict[str, Any]) -> str:
@@ -2698,6 +2888,20 @@ class AutoTrader:
             k: v for k, v in self.token_cooldown_reasons.items() if k in self.token_cooldowns
         }
         self.symbol_cooldowns = {k: v for k, v in self.symbol_cooldowns.items() if v > now_ts}
+        edge_window_seconds = max(
+            300,
+            int(getattr(config, "EDGE_COST_DOMINANT_HIT_WINDOW_SECONDS", 1800) or 1800),
+        )
+        edge_cutoff = now_ts - float(edge_window_seconds)
+        edge_hits_next: dict[str, list[float]] = {}
+        for symbol_key, rows in list((self._edge_cost_dominant_hits_by_symbol or {}).items()):
+            key = str(symbol_key or "").strip().upper()
+            if not key:
+                continue
+            kept = [float(ts) for ts in (rows or []) if float(ts) >= edge_cutoff]
+            if kept:
+                edge_hits_next[key] = kept
+        self._edge_cost_dominant_hits_by_symbol = edge_hits_next
         self._prune_symbol_open_window(max(300, int(getattr(config, "SYMBOL_CONCENTRATION_WINDOW_SECONDS", 3600) or 3600)))
         self._prune_daily_tx_window()
         current_day = self._current_day_id()
@@ -2995,6 +3199,69 @@ class AutoTrader:
             if str(score.get("recommendation", "SKIP")) == "BUY"
             and int(score.get("score", 0)) >= int(config.MIN_TOKEN_SCORE)
         ]
+        prefilter_removed_total = 0
+        prefilter_removed_rows = 0
+        prefilter_removed_by_reason: dict[str, int] = {}
+        prefilter_removed_by_stage: dict[str, int] = {}
+        prefilter_removed_by_source: dict[str, int] = {}
+        prefilter_removed_by_source_reason: dict[str, dict[str, int]] = {}
+
+        def _inc_bucket(bucket: dict[str, int], key: str, amount: int = 1) -> None:
+            norm = str(key or "unknown").strip().lower() or "unknown"
+            bucket[norm] = int(bucket.get(norm, 0)) + int(amount)
+
+        def _prefilter_context(token: dict[str, Any], score: dict[str, Any]) -> dict[str, Any]:
+            candidate_id = str((token or {}).get("_candidate_id", "") or "").strip()
+            token_address = normalize_address(str((token or {}).get("address", "") or ""))
+            symbol = str((token or {}).get("symbol", "N/A") or "N/A")
+            trace_id = self._build_trace_id(
+                candidate_id=candidate_id,
+                token_address=token_address,
+                symbol=symbol,
+                ts=time.time(),
+            )
+            return {
+                "trace_id": str(trace_id),
+                "candidate_id": str(candidate_id),
+                "token_address": str(token_address),
+                "symbol": str(symbol),
+                "score": int((score or {}).get("score", 0) or 0),
+                "source": self._normalized_source_value((token or {}).get("source", "unknown")),
+                "market_mode": str((token or {}).get("_regime_name", "") or "").strip().upper(),
+                "entry_tier": str((token or {}).get("_entry_tier", "") or "").strip().upper(),
+                "entry_channel": str((token or {}).get("_entry_channel", "") or "").strip().lower(),
+            }
+
+        def _record_prefilter_skip(
+            *,
+            token: dict[str, Any],
+            score: dict[str, Any],
+            stage: str,
+            reason: str,
+            detail: str = "",
+        ) -> None:
+            nonlocal prefilter_removed_total
+            nonlocal prefilter_removed_rows
+            reason_key = str(reason or "unknown").strip().lower() or "unknown"
+            stage_key = str(stage or "pre").strip().lower() or "pre"
+            source_key = self._normalized_source_value((token or {}).get("source", "unknown"))
+            prefilter_removed_total += 1
+            prefilter_removed_rows += 1
+            _inc_bucket(prefilter_removed_by_reason, reason_key)
+            _inc_bucket(prefilter_removed_by_stage, stage_key)
+            _inc_bucket(prefilter_removed_by_source, source_key)
+            src_reason = prefilter_removed_by_source_reason.setdefault(source_key, {})
+            _inc_bucket(src_reason, reason_key)
+            self._bump_skip_reason_ext(
+                reason_key,
+                context=_prefilter_context(token, score),
+                decision_stage="plan_prefilter",
+                extra={
+                    "prefilter_stage": stage_key,
+                    "prefilter_detail": self._short_error_text(detail),
+                },
+            )
+
         # Do not waste planner slots on rows that cannot be opened by construction.
         # They would fail in plan_trade anyway (address/duplicate/blacklist/hard-blocklist).
         def _prefilter_eligible(
@@ -3013,20 +3280,44 @@ class AutoTrader:
                 symbol = str((token or {}).get("symbol", "N/A") or "N/A")
                 if not token_address:
                     removed_missing_addr += 1
-                    self._bump_skip_reason("address_or_duplicate")
+                    _record_prefilter_skip(
+                        token=token,
+                        score=score,
+                        stage=stage,
+                        reason="address_or_duplicate",
+                        detail="missing_address",
+                    )
                     continue
                 if self._is_placeholder_token_address(token_address):
                     removed_placeholder_addr += 1
-                    self._bump_skip_reason("address_or_duplicate")
+                    _record_prefilter_skip(
+                        token=token,
+                        score=score,
+                        stage=stage,
+                        reason="address_or_duplicate",
+                        detail="placeholder_address",
+                    )
                     continue
                 if token_address in self.open_positions:
                     removed_open_duplicate += 1
-                    self._bump_skip_reason("address_or_duplicate")
+                    _record_prefilter_skip(
+                        token=token,
+                        score=score,
+                        stage=stage,
+                        reason="address_or_duplicate",
+                        detail="open_duplicate",
+                    )
                     continue
                 blocked, blk_reason = self._blacklist_is_blocked(token_address)
                 if blocked:
                     removed_blacklist += 1
-                    self._bump_skip_reason("blacklist")
+                    _record_prefilter_skip(
+                        token=token,
+                        score=score,
+                        stage=stage,
+                        reason="blacklist",
+                        detail=str(blk_reason or "blacklist"),
+                    )
                     logger.info(
                         "AutoTrade skip token=%s reason=blacklist detail=%s",
                         symbol,
@@ -3035,9 +3326,17 @@ class AutoTrader:
                     continue
                 if self._is_hard_blocked_token(token_address, symbol=symbol):
                     removed_hard_blocklist += 1
-                    self._bump_skip_reason("hard_blocklist")
-                    self._blacklist_add(token_address, "hard_blocklist:config", ttl_seconds=90 * 24 * 3600)
-                    logger.warning("AutoTrade skip token=%s reason=hard_blocklist address=%s", symbol, token_address)
+                    _record_prefilter_skip(
+                        token=token,
+                        score=score,
+                        stage=stage,
+                        reason="hard_blocklist",
+                        detail="hard_blocklist:config",
+                    )
+                    already_blocked, _ = self._blacklist_is_blocked(token_address)
+                    if not already_blocked:
+                        self._blacklist_add(token_address, "hard_blocklist:config", ttl_seconds=90 * 24 * 3600)
+                        logger.warning("AutoTrade skip token=%s reason=hard_blocklist address=%s", symbol, token_address)
                     continue
                 out.append((token, score))
 
@@ -3234,6 +3533,31 @@ class AutoTrader:
                 opened += 1
                 self._recent_batch_open_timestamps.append(datetime.now(timezone.utc).timestamp())
         self._prune_batch_open_window()
+        self._write_trade_decision(
+            {
+                "ts": time.time(),
+                "decision_stage": "plan_select",
+                "decision": "summary",
+                "reason": "selection_summary",
+                "source": "mixed",
+                "symbol": "BATCH",
+                "plan_mode": str(mode),
+                "candidates_total": int(len(candidates)),
+                "eligible_total": int(len(eligible)),
+                "selected_total": int(len(selected)),
+                "opened_total": int(opened),
+                "burst_open_budget": int(open_budget) if open_budget is not None else -1,
+                "prefilter_removed_total": int(prefilter_removed_total),
+                "prefilter_removed_rows": int(prefilter_removed_rows),
+                "prefilter_removed_by_reason": dict(prefilter_removed_by_reason),
+                "prefilter_removed_by_stage": dict(prefilter_removed_by_stage),
+                "prefilter_removed_by_source": dict(prefilter_removed_by_source),
+                "prefilter_removed_by_source_reason": {
+                    str(src): dict(reason_map)
+                    for src, reason_map in prefilter_removed_by_source_reason.items()
+                },
+            }
+        )
         logger.info(
             "AutoTrade batch mode=%s candidates=%s eligible=%s selected=%s opened=%s pe=%s profit_mix=%s burst_window=%s",
             mode,
@@ -3528,8 +3852,10 @@ class AutoTrader:
             return None
         if self._is_hard_blocked_token(token_address, symbol=symbol):
             self._bump_skip_reason("hard_blocklist")
-            self._blacklist_add(token_address, "hard_blocklist:config", ttl_seconds=90 * 24 * 3600)
-            logger.warning("AutoTrade skip token=%s reason=hard_blocklist address=%s", symbol, token_address)
+            already_blocked, _ = self._blacklist_is_blocked(token_address)
+            if not already_blocked:
+                self._blacklist_add(token_address, "hard_blocklist:config", ttl_seconds=90 * 24 * 3600)
+                logger.warning("AutoTrade skip token=%s reason=hard_blocklist address=%s", symbol, token_address)
             return None
         anti_choke = self._anti_choke_active()
         cooldown_until = float(self.token_cooldowns.get(token_address, 0.0))
@@ -4165,6 +4491,46 @@ class AutoTrader:
                     edge_percent_for_decision = float(expected_edge_percent) * float(regime_edge_mult)
 
         min_trade_usd = max(0.01, float(getattr(config, "MIN_TRADE_USD", 0.25) or 0.25))
+        if (
+            bool(getattr(config, "NON_WATCH_EXPLORE_MIN_TRADE_FLOOR_ENABLED", True))
+            and (entry_channel == "explore")
+            and (not source_is_watchlist)
+            and (not self._is_live_mode())
+        ):
+            floor_usd = max(
+                min_trade_usd,
+                float(getattr(config, "NON_WATCH_EXPLORE_MIN_TRADE_USD", 0.30) or 0.30),
+            )
+            gas_mult = max(
+                0.0,
+                float(getattr(config, "NON_WATCH_EXPLORE_GAS_MULT_FLOOR", 8.0) or 8.0),
+            )
+            gas_usd = max(0.0, float(cost_profile.get("gas_usd", 0.0) or 0.0))
+            if gas_usd > 0.0 and gas_mult > 0.0:
+                floor_usd = max(floor_usd, gas_usd * gas_mult)
+            available_usd = float(self._available_balance_usd())
+            if max_buy_weth > 0:
+                floor_usd = min(floor_usd, float(cap_usd))
+            floor_usd = min(floor_usd, available_usd)
+            if floor_usd >= min_trade_usd and floor_usd > position_size_usd:
+                prev_size = float(position_size_usd)
+                position_size_usd = float(floor_usd)
+                cost_profile = self._estimate_cost_profile(
+                    liquidity_usd,
+                    risk_level,
+                    score,
+                    position_size_usd=position_size_usd,
+                )
+                expected_edge_percent = self._estimate_edge_percent(score, tp, sl, cost_profile["total_percent"], risk_level)
+                edge_percent_for_decision = float(expected_edge_percent) * float(regime_edge_mult)
+                logger.info(
+                    "AutoTrade adjust token=%s reason=non_watch_explore_floor size=$%.2f->$%.2f floor=$%.2f gas=$%.4f",
+                    symbol,
+                    prev_size,
+                    position_size_usd,
+                    floor_usd,
+                    gas_usd,
+                )
         if position_size_usd < min_trade_usd and (not self._is_live_mode()):
             paper_floor = max(
                 min_trade_usd,
@@ -4277,7 +4643,30 @@ class AutoTrader:
                             f" probe_budget={core_probe_budget_used}/{core_probe_budget_cap} "
                             f"probe_detail={core_probe_detail or '-'}"
                         )
-                    self._bump_skip_reason("ev_net_low")
+                    self._bump_skip_reason_ext(
+                        "ev_net_low",
+                        extra={
+                            "ev_expected_net_usd": float(ev_expected_net),
+                            "ev_min_net_usd": float(ev_min),
+                            "ev_samples": float(ev_samples),
+                            "ev_confidence": float(ev_snapshot.get("confidence", 0.0) or 0.0),
+                            "ev_win_rate": float(ev_snapshot.get("win_rate", 0.0) or 0.0),
+                            "ev_avg_win_usd": float(ev_snapshot.get("avg_win_usd", 0.0) or 0.0),
+                            "ev_avg_loss_usd": float(ev_snapshot.get("avg_loss_usd", 0.0) or 0.0),
+                            "position_size_usd": float(position_size_usd),
+                            "expected_edge_percent": float(expected_edge_percent),
+                            "edge_percent_for_decision": float(edge_percent_for_decision),
+                            "gross_percent": float(edge_dbg.get("gross_percent", 0.0) or 0.0),
+                            "cost_total_percent": float(cost_profile.get("total_percent", 0.0) or 0.0),
+                            "cost_buy_percent": float(cost_profile.get("buy_percent", 0.0) or 0.0),
+                            "cost_sell_percent": float(cost_profile.get("sell_percent", 0.0) or 0.0),
+                            "cost_gas_usd": float(cost_profile.get("gas_usd", 0.0) or 0.0),
+                            "kelly_fraction": float(kelly_fraction),
+                            "core_probe_budget_used": int(core_probe_budget_used),
+                            "core_probe_budget_cap": int(core_probe_budget_cap),
+                            "core_probe_detail": str(core_probe_detail or ""),
+                        },
+                    )
                     logger.info(
                         (
                             "AutoTrade skip token=%s reason=ev_net_low expected_net=$%.5f min=$%.5f "
@@ -4295,6 +4684,15 @@ class AutoTrader:
                         float(kelly_fraction),
                         str(token_ev_memory.get("detail", "")),
                         probe_tail,
+                    )
+                    self._cost_dominant_skip_guard(
+                        symbol=symbol,
+                        skip_reason="ev_net_low",
+                        gross_percent=float(edge_dbg.get("gross_percent", 0.0) or 0.0),
+                        cost_total_percent=float(cost_profile.get("total_percent", 0.0) or 0.0),
+                        source_name=source_name,
+                        entry_channel=entry_channel,
+                        position_size_usd=float(position_size_usd),
                     )
                     return None
         if self._active_trade_decision_context is not None:
@@ -4429,7 +4827,28 @@ class AutoTrader:
                             f"base_pct={min_edge_pct:.4f} base_usd={min_edge_usd:.5f} budget={probe_used}/{probe_cap}"
                         )
             if mode == "percent" and not pct_ok:
-                self._bump_skip_reason("negative_edge")
+                self._bump_skip_reason_ext(
+                    "negative_edge",
+                    extra={
+                        "mode": str(mode),
+                        "edge_percent_for_decision": float(edge_percent_for_decision),
+                        "expected_edge_percent": float(expected_edge_percent),
+                        "regime_edge_mult": float(regime_edge_mult),
+                        "position_size_usd": float(position_size_usd),
+                        "expected_edge_usd": float(expected_edge_usd),
+                        "min_edge_pct": float(min_edge_pct),
+                        "probe_min_edge_pct": float(edge_min_pct_effective),
+                        "gross_percent": float(edge_dbg.get("gross_percent", 0.0) or 0.0),
+                        "cost_total_percent": float(cost_profile.get("total_percent", 0.0) or 0.0),
+                        "cost_buy_percent": float(cost_profile.get("buy_percent", 0.0) or 0.0),
+                        "cost_sell_percent": float(cost_profile.get("sell_percent", 0.0) or 0.0),
+                        "cost_gas_usd": float(cost_profile.get("gas_usd", 0.0) or 0.0),
+                        "p_win": float(edge_dbg.get("p_win", 0.0) or 0.0),
+                        "core_probe_budget_used": int(core_probe_budget_used),
+                        "core_probe_budget_cap": int(core_probe_budget_cap),
+                        "core_probe_detail": str(core_probe_detail or ""),
+                    },
+                )
                 logger.info(
                     "AutoTrade skip token=%s reason=negative_edge edge=%.2f%% raw=%.2f%% mult=%.2f min=%.2f%% probe_min=%.2f%% edge_usd=$%.3f size=$%.2f gross=%.2f%% costs=%.2f%% pwin=%.2f probe=%s budget=%s/%s",
                     symbol,
@@ -4447,9 +4866,39 @@ class AutoTrader:
                     core_probe_budget_used,
                     core_probe_budget_cap,
                 )
+                self._cost_dominant_skip_guard(
+                    symbol=symbol,
+                    skip_reason="negative_edge",
+                    gross_percent=float(edge_dbg.get("gross_percent", 0.0) or 0.0),
+                    cost_total_percent=float(cost_profile.get("total_percent", 0.0) or 0.0),
+                    source_name=source_name,
+                    entry_channel=entry_channel,
+                    position_size_usd=float(position_size_usd),
+                )
                 return None
             if mode == "usd" and not usd_ok:
-                self._bump_skip_reason("edge_usd_low")
+                self._bump_skip_reason_ext(
+                    "edge_usd_low",
+                    extra={
+                        "mode": str(mode),
+                        "edge_percent_for_decision": float(edge_percent_for_decision),
+                        "expected_edge_percent": float(expected_edge_percent),
+                        "regime_edge_mult": float(regime_edge_mult),
+                        "position_size_usd": float(position_size_usd),
+                        "expected_edge_usd": float(expected_edge_usd),
+                        "min_edge_usd": float(min_edge_usd),
+                        "probe_min_edge_usd": float(edge_min_usd_effective),
+                        "gross_percent": float(edge_dbg.get("gross_percent", 0.0) or 0.0),
+                        "cost_total_percent": float(cost_profile.get("total_percent", 0.0) or 0.0),
+                        "cost_buy_percent": float(cost_profile.get("buy_percent", 0.0) or 0.0),
+                        "cost_sell_percent": float(cost_profile.get("sell_percent", 0.0) or 0.0),
+                        "cost_gas_usd": float(cost_profile.get("gas_usd", 0.0) or 0.0),
+                        "p_win": float(edge_dbg.get("p_win", 0.0) or 0.0),
+                        "core_probe_budget_used": int(core_probe_budget_used),
+                        "core_probe_budget_cap": int(core_probe_budget_cap),
+                        "core_probe_detail": str(core_probe_detail or ""),
+                    },
+                )
                 logger.info(
                     "AutoTrade skip token=%s reason=edge_usd_low edge_usd=$%.3f min=$%.3f probe_min=$%.3f edge=%.2f%% raw=%.2f%% mult=%.2f size=$%.2f gross=%.2f%% costs=%.2f%% pwin=%.2f probe=%s budget=%s/%s",
                     symbol,
@@ -4467,9 +4916,41 @@ class AutoTrader:
                     core_probe_budget_used,
                     core_probe_budget_cap,
                 )
+                self._cost_dominant_skip_guard(
+                    symbol=symbol,
+                    skip_reason="edge_usd_low",
+                    gross_percent=float(edge_dbg.get("gross_percent", 0.0) or 0.0),
+                    cost_total_percent=float(cost_profile.get("total_percent", 0.0) or 0.0),
+                    source_name=source_name,
+                    entry_channel=entry_channel,
+                    position_size_usd=float(position_size_usd),
+                )
                 return None
             if mode == "both" and not (pct_ok and usd_ok):
-                self._bump_skip_reason("edge_low")
+                self._bump_skip_reason_ext(
+                    "edge_low",
+                    extra={
+                        "mode": str(mode),
+                        "edge_percent_for_decision": float(edge_percent_for_decision),
+                        "expected_edge_percent": float(expected_edge_percent),
+                        "regime_edge_mult": float(regime_edge_mult),
+                        "position_size_usd": float(position_size_usd),
+                        "expected_edge_usd": float(expected_edge_usd),
+                        "min_edge_pct": float(min_edge_pct),
+                        "probe_min_edge_pct": float(edge_min_pct_effective),
+                        "min_edge_usd": float(min_edge_usd),
+                        "probe_min_edge_usd": float(edge_min_usd_effective),
+                        "gross_percent": float(edge_dbg.get("gross_percent", 0.0) or 0.0),
+                        "cost_total_percent": float(cost_profile.get("total_percent", 0.0) or 0.0),
+                        "cost_buy_percent": float(cost_profile.get("buy_percent", 0.0) or 0.0),
+                        "cost_sell_percent": float(cost_profile.get("sell_percent", 0.0) or 0.0),
+                        "cost_gas_usd": float(cost_profile.get("gas_usd", 0.0) or 0.0),
+                        "p_win": float(edge_dbg.get("p_win", 0.0) or 0.0),
+                        "core_probe_budget_used": int(core_probe_budget_used),
+                        "core_probe_budget_cap": int(core_probe_budget_cap),
+                        "core_probe_detail": str(core_probe_detail or ""),
+                    },
+                )
                 logger.info(
                     "AutoTrade skip token=%s reason=edge_low mode=both edge=%.2f%% raw=%.2f%% mult=%.2f min=%.2f%% probe_min=%.2f%% edge_usd=$%.3f min_usd=$%.3f probe_min_usd=$%.3f size=$%.2f gross=%.2f%% costs=%.2f%% pwin=%.2f probe=%s budget=%s/%s",
                     symbol,
@@ -4488,6 +4969,15 @@ class AutoTrader:
                     str(core_probe_detail or "-"),
                     core_probe_budget_used,
                     core_probe_budget_cap,
+                )
+                self._cost_dominant_skip_guard(
+                    symbol=symbol,
+                    skip_reason="edge_low",
+                    gross_percent=float(edge_dbg.get("gross_percent", 0.0) or 0.0),
+                    cost_total_percent=float(cost_profile.get("total_percent", 0.0) or 0.0),
+                    source_name=source_name,
+                    entry_channel=entry_channel,
+                    position_size_usd=float(position_size_usd),
                 )
                 return None
 
@@ -6604,6 +7094,7 @@ class AutoTrader:
         self.token_cooldown_reasons.clear()
         self.token_cooldown_strikes.clear()
         self.symbol_cooldowns.clear()
+        self._edge_cost_dominant_hits_by_symbol.clear()
         self.trade_open_timestamps.clear()
         self._recent_open_symbols.clear()
         self._recent_open_sources.clear()

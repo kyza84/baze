@@ -152,6 +152,31 @@ class MatrixRuntimeTunerTests(unittest.TestCase):
             actions = mrt._build_actions(metrics=metrics, overrides=overrides, mode=mode)
             self.assertTrue(all(a.key not in locked for a in actions))
 
+    def test_build_action_plan_filters_protected_keys_before_budget(self) -> None:
+        metrics = mrt.WindowMetrics(
+            selected_from_batch=16,
+            opened_from_batch=0,
+            filter_fail_reasons=Counter({"score_min": 10}),
+        )
+        overrides = {
+            "MARKET_MODE_STRICT_SCORE": "60",
+            "MARKET_MODE_SOFT_SCORE": "52",
+        }
+        actions, _trace, meta = mrt._build_action_plan(
+            metrics=metrics,
+            overrides=overrides,
+            mode=mrt.MODE_SPECS["conveyor"],
+            telemetry={"funnel_15m": {"raw": 40, "pre": 20, "buy": 0}, "top_reasons_15m": {"quality_skip": [], "plan_skip": []}},
+            runtime_state=mrt.RuntimeState(),
+            now_ts=123.0,
+            protected_keys={"MARKET_MODE_STRICT_SCORE", "MARKET_MODE_SOFT_SCORE"},
+        )
+        blocked = list((meta or {}).get("prelimit_blocked_actions") or [])
+        self.assertGreaterEqual(len(blocked), 1)
+        by_key = _actions_by_key(actions)
+        self.assertNotIn("MARKET_MODE_STRICT_SCORE", by_key)
+        self.assertNotIn("MARKET_MODE_SOFT_SCORE", by_key)
+
     def test_anti_concentration_actions_when_single_symbol_dominates(self) -> None:
         metrics = mrt.WindowMetrics(
             selected_from_batch=8,
@@ -258,6 +283,230 @@ class MatrixRuntimeTunerTests(unittest.TestCase):
         self.assertNotIn("CBBTC", by_key["AUTO_TRADE_EXCLUDED_SYMBOLS"].new_value)
         self.assertEqual(state.churn_lock_symbol, "")
         self.assertEqual(float(state.churn_lock_until_ts), 0.0)
+
+    def test_non_watch_conversion_guard_relaxes_only_soft_non_watch_knobs(self) -> None:
+        metrics = mrt.WindowMetrics(
+            selected_from_batch=80,
+            opened_from_batch=0,
+            filter_fail_reasons=Counter({"score_min": 5, "safe_volume": 4}),
+        )
+        overrides = {
+            "MARKET_MODE_NON_WATCH_SOFT_SCORE_DELTA": "10",
+            "MARKET_MODE_NON_WATCH_SOFT_MAX_PER_CYCLE": "2",
+            "SAFE_VOLUME_TWO_TIER_NON_WATCH_SOFT_RATIO": "0.50",
+            "SAFE_VOLUME_TWO_TIER_NON_WATCH_MAX_PASSES_PER_CYCLE": "3",
+            "SAFE_AGE_NON_WATCH_SOFT_RATIO": "0.55",
+            "SAFE_AGE_NON_WATCH_MAX_PASSES_PER_CYCLE": "3",
+            "SAFE_CHANGE_5M_NON_WATCH_SOFT_MULT": "1.20",
+            "SAFE_CHANGE_5M_NON_WATCH_MAX_PASSES_PER_CYCLE": "2",
+            "PLAN_MAX_WATCHLIST_SHARE": "0.20",
+            "PLAN_MIN_NON_WATCHLIST_PER_BATCH": "1",
+            "PLAN_MAX_SINGLE_SOURCE_SHARE": "0.50",
+            "V2_UNIVERSE_NOVELTY_MIN_SHARE": "0.30",
+            "AUTO_TRADE_TOP_N": "40",
+            "V2_SOURCE_QOS_SOURCE_CAPS": "onchain:220,onchain+market:220,dexscreener:180,geckoterminal:180,watchlist:30,dex_boosts:120",
+            "V2_UNIVERSE_SOURCE_CAPS": "onchain:160,onchain+market:160,dexscreener:130,geckoterminal:130,watchlist:22,dex_boosts:90",
+        }
+        telemetry = {
+            "funnel_15m": {"raw": 160, "pre": 80, "buy": 0},
+            "top_reasons_15m": {"quality_skip": [], "plan_skip": []},
+            "source_profile_15m": {"plan_top_source": "watchlist", "plan_top_source_share": 0.95},
+            "plan_symbol_concentration_15m": {"plan_attempts": 40, "plan_unique_symbols": 5, "plan_top_share": 0.40},
+            "supply_sanity_15m": {
+                "candidate_supply_non_watch_15m": 120,
+                "candidate_supply_watchlist_15m": 40,
+                "post_filters_pass_non_watch_15m": 6,
+                "plan_attempts_non_watch_15m": 0,
+            },
+            "source_diversity_guard_15m": {"non_watch_final_zero_hits": 4},
+        }
+        actions, _trace, meta = mrt._build_action_plan(
+            metrics=metrics,
+            overrides=overrides,
+            mode=mrt.MODE_SPECS["conveyor"],
+            telemetry=telemetry,
+            runtime_state=mrt.RuntimeState(),
+            now_ts=1234.0,
+        )
+        by_key = _actions_by_key(actions)
+        self.assertIn("SAFE_VOLUME_TWO_TIER_NON_WATCH_SOFT_RATIO", by_key)
+        self.assertIn("SAFE_AGE_NON_WATCH_SOFT_RATIO", by_key)
+        self.assertLess(float(by_key["SAFE_VOLUME_TWO_TIER_NON_WATCH_SOFT_RATIO"].new_value), 0.50)
+        self.assertLess(float(by_key["SAFE_AGE_NON_WATCH_SOFT_RATIO"].new_value), 0.55)
+        conv_meta = (meta or {}).get("non_watch_conversion", {}) or {}
+        self.assertTrue(bool(conv_meta.get("active", False)))
+
+    def test_loss_symbol_lock_adds_symbol_to_excluded(self) -> None:
+        metrics = mrt.WindowMetrics(
+            selected_from_batch=36,
+            opened_from_batch=0,
+        )
+        overrides = {
+            "AUTO_TRADE_EXCLUDED_SYMBOLS": "ZORA",
+            "MAX_TOKEN_COOLDOWN_SECONDS": "60",
+            "V2_UNIVERSE_NOVELTY_MIN_SHARE": "0.22",
+            "SYMBOL_CONCENTRATION_MAX_SHARE": "0.30",
+            "V2_SOURCE_QOS_MAX_PER_SYMBOL_PER_CYCLE": "4",
+            "V2_QUALITY_SYMBOL_REENTRY_MIN_SECONDS": "180",
+            "PLAN_MIN_NON_WATCHLIST_PER_BATCH": "1",
+            "PLAN_MAX_SINGLE_SOURCE_SHARE": "0.55",
+            "TOKEN_EV_MEMORY_MIN_TRADES": "4",
+            "TOKEN_EV_MEMORY_BAD_ENTRY_PROBABILITY": "0.72",
+            "TOKEN_EV_MEMORY_SEVERE_ENTRY_PROBABILITY": "0.42",
+            "SOURCE_ROUTER_BAD_ENTRY_PROBABILITY": "0.55",
+            "SOURCE_ROUTER_SEVERE_ENTRY_PROBABILITY": "0.35",
+        }
+        telemetry = {
+            "symbol_churn_15m": {"detected": False, "symbol": "", "open_share": 0.0, "flat_close_share": 0.0, "ttl_seconds": 0},
+            "symbol_pnl_60m": {
+                "top_loss_symbol": "SERV",
+                "top_loss_pnl_usd": -0.032,
+                "top_loss_close_count": 5,
+                "top_loss_share_abs": 0.72,
+            },
+            "funnel_15m": {"raw": 80, "pre": 40, "buy": 0},
+            "top_reasons_15m": {"quality_skip": [], "plan_skip": []},
+        }
+        state = mrt.RuntimeState()
+        actions, _trace, meta = mrt._build_action_plan(
+            metrics=metrics,
+            overrides=overrides,
+            mode=mrt.MODE_SPECS["conveyor"],
+            telemetry=telemetry,
+            runtime_state=state,
+            now_ts=2000.0,
+        )
+        by_key = _actions_by_key(actions)
+        self.assertIn("AUTO_TRADE_EXCLUDED_SYMBOLS", by_key)
+        self.assertIn("SERV", by_key["AUTO_TRADE_EXCLUDED_SYMBOLS"].new_value)
+        self.assertEqual(state.churn_lock_symbol, "SERV")
+        self.assertGreater(float(state.churn_lock_until_ts), 2000.0)
+        loss_meta = (meta or {}).get("symbol_loss_pressure_60m", {}) or {}
+        self.assertTrue(bool(loss_meta.get("active", False)))
+
+    def test_prefilter_plan_choke_targets_symbol_cap_not_non_watch_min(self) -> None:
+        metrics = mrt.WindowMetrics(
+            selected_from_batch=36,
+            opened_from_batch=0,
+        )
+        overrides = {
+            "PLAN_MIN_NON_WATCHLIST_PER_BATCH": "3",
+            "V2_SOURCE_QOS_MAX_PER_SYMBOL_PER_CYCLE": "6",
+            "V2_UNIVERSE_NOVELTY_MIN_SHARE": "0.30",
+            "AUTO_TRADE_TOP_N": "24",
+            "PLAN_MAX_WATCHLIST_SHARE": "0.20",
+            "PLAN_MAX_SINGLE_SOURCE_SHARE": "0.55",
+        }
+        telemetry = {
+            "funnel_15m": {"raw": 140, "pre": 60, "buy": 0},
+            "top_reasons_15m": {"quality_skip": [], "plan_skip": []},
+            "prefilter_15m": {
+                "removed": {"total": 20, "open_duplicate": 12},
+                "open_duplicate_share": 0.60,
+            },
+            "post_filter_plan_bridge_15m": {
+                "post_filters_total": 30,
+                "lost_before_plan": 24,
+                "lost_share": 0.80,
+                "lost_by_source": [
+                    {"source": "watchlist", "count": 14},
+                    {"source": "onchain+market", "count": 10},
+                ],
+            },
+            "source_profile_15m": {"plan_top_source": "watchlist", "plan_top_source_share": 0.70},
+            "supply_sanity_15m": {
+                "candidate_supply_non_watch_15m": 8,
+                "candidate_supply_watchlist_15m": 50,
+                "post_filters_pass_non_watch_15m": 1,
+                "plan_attempts_non_watch_15m": 0,
+            },
+            "source_diversity_guard_15m": {"non_watch_final_zero_hits": 0},
+            "plan_symbol_concentration_15m": {
+                "plan_attempts": 12,
+                "plan_unique_symbols": 5,
+                "plan_top_symbol": "AAA",
+                "plan_top_count": 3,
+                "plan_top_share": 0.25,
+            },
+        }
+        actions, _trace, _meta = mrt._build_action_plan(
+            metrics=metrics,
+            overrides=overrides,
+            mode=mrt.MODE_SPECS["conveyor"],
+            telemetry=telemetry,
+            runtime_state=mrt.RuntimeState(),
+            now_ts=2500.0,
+        )
+        by_key = _actions_by_key(actions)
+        self.assertIn("V2_SOURCE_QOS_MAX_PER_SYMBOL_PER_CYCLE", by_key)
+        self.assertIn("AUTO_TRADE_TOP_N", by_key)
+        self.assertLess(int(by_key["V2_SOURCE_QOS_MAX_PER_SYMBOL_PER_CYCLE"].new_value), 6)
+        self.assertGreater(int(by_key["AUTO_TRADE_TOP_N"].new_value), 24)
+        if "V2_UNIVERSE_NOVELTY_MIN_SHARE" in by_key:
+            self.assertGreater(float(by_key["V2_UNIVERSE_NOVELTY_MIN_SHARE"].new_value), 0.30)
+        self.assertNotIn("PLAN_MIN_NON_WATCHLIST_PER_BATCH", by_key)
+
+    def test_edge_low_symbol_lock_adds_symbol_to_excluded(self) -> None:
+        metrics = mrt.WindowMetrics(
+            selected_from_batch=40,
+            opened_from_batch=0,
+            autotrade_skip_reasons=Counter({"edge_low": 24}),
+        )
+        overrides = {
+            "AUTO_TRADE_EXCLUDED_SYMBOLS": "NOOK",
+            "MAX_TOKEN_COOLDOWN_SECONDS": "30",
+            "PLAN_MAX_WATCHLIST_SHARE": "0.20",
+            "PLAN_MIN_NON_WATCHLIST_PER_BATCH": "2",
+            "PLAN_MAX_SINGLE_SOURCE_SHARE": "0.50",
+        }
+        telemetry = {
+            "funnel_15m": {"raw": 120, "pre": 80, "buy": 0},
+            "top_reasons_15m": {"quality_skip": [], "plan_skip": [{"reason_code": "edge_low", "count": 24, "share": 1.0}]},
+            "source_profile_15m": {"plan_top_source": "watchlist", "plan_top_source_share": 1.0},
+            "plan_symbol_concentration_15m": {
+                "plan_attempts": 24,
+                "plan_unique_symbols": 1,
+                "plan_top_symbol": "AMBERVIBE",
+                "plan_top_count": 24,
+                "plan_top_share": 1.0,
+            },
+            "supply_sanity_15m": {
+                "candidate_supply_non_watch_15m": 28,
+                "candidate_supply_watchlist_15m": 12,
+                "post_filters_pass_non_watch_15m": 2,
+                "plan_attempts_non_watch_15m": 0,
+            },
+        }
+        state = mrt.RuntimeState()
+        actions, _trace, meta = mrt._build_action_plan(
+            metrics=metrics,
+            overrides=overrides,
+            mode=mrt.MODE_SPECS["conveyor"],
+            telemetry=telemetry,
+            runtime_state=state,
+            now_ts=3000.0,
+        )
+        by_key = _actions_by_key(actions)
+        self.assertIn("AUTO_TRADE_EXCLUDED_SYMBOLS", by_key)
+        self.assertIn("AMBERVIBE", by_key["AUTO_TRADE_EXCLUDED_SYMBOLS"].new_value)
+        self.assertEqual(state.churn_lock_symbol, "AMBERVIBE")
+        self.assertGreater(float(state.churn_lock_until_ts), 3000.0)
+        loop_meta = (meta or {}).get("edge_low_loop_15m", {}) or {}
+        self.assertTrue(bool(loop_meta.get("active", False)))
+
+    def test_apply_action_delta_caps_hold_moves_integer_key(self) -> None:
+        actions = [
+            mrt.Action(
+                key="PLAN_MIN_NON_WATCHLIST_PER_BATCH",
+                old_value="6",
+                new_value="3",
+                reason="prefilter_plan_choke non_watch_min",
+            )
+        ]
+        capped, capped_rows = mrt._apply_action_delta_caps(actions=actions, phase="hold")
+        self.assertEqual(len(capped), 1)
+        self.assertEqual(str(capped[0].new_value), "5")
+        self.assertTrue(any(str(x.get("key")) == "PLAN_MIN_NON_WATCHLIST_PER_BATCH" for x in capped_rows))
 
     def test_recover_tighten_when_over_relaxed_signals_high(self) -> None:
         metrics = mrt.WindowMetrics(
@@ -1401,6 +1650,11 @@ class MatrixRuntimeTunerTests(unittest.TestCase):
             self.assertAlmostEqual(float(silence["execution_open_rate_per_hour"]), 4.0, places=6)
             self.assertEqual(str(silence["bottleneck_stage"]), "none")
             self.assertEqual(str(silence["bottleneck_hint"]), "active")
+            self.assertIn("prefilter_15m", telemetry)
+            self.assertIn("post_filter_plan_bridge_15m", telemetry)
+            bridge = telemetry["post_filter_plan_bridge_15m"]
+            self.assertEqual(int(bridge["post_filters_total"]), 2)
+            self.assertEqual(int(bridge["post_filters_with_plan"]), 1)
 
     def test_collect_telemetry_v2_marks_api_only_safety_degraded_mode(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1763,6 +2017,127 @@ class MatrixRuntimeTunerTests(unittest.TestCase):
         self.assertGreater(int(by_key["SAFE_AGE_NON_WATCH_MAX_PASSES_PER_CYCLE"].new_value), 2)
         self.assertGreater(float(by_key["SAFE_CHANGE_5M_NON_WATCH_SOFT_MULT"].new_value), 1.20)
         self.assertGreater(int(by_key["SAFE_CHANGE_5M_NON_WATCH_MAX_PASSES_PER_CYCLE"].new_value), 2)
+
+    def test_source_starvation_relaxes_non_watch_soft_filters_when_nonzero_but_starved(self) -> None:
+        metrics = mrt.WindowMetrics(
+            selected_from_batch=160,
+            opened_from_batch=0,
+            filter_fail_reasons=Counter(
+                {
+                    "safe_age": 32,
+                    "safe_change_5m": 18,
+                    "safe_volume": 20,
+                }
+            ),
+            autotrade_skip_reasons=Counter({"edge_low": 22, "cooldown": 8}),
+        )
+        overrides = {
+            "SAFE_AGE_NON_WATCH_SOFT_RATIO": "0.70",
+            "SAFE_AGE_NON_WATCH_MAX_PASSES_PER_CYCLE": "2",
+            "SAFE_CHANGE_5M_NON_WATCH_SOFT_MULT": "1.20",
+            "SAFE_CHANGE_5M_NON_WATCH_MAX_PASSES_PER_CYCLE": "2",
+            "PLAN_MAX_WATCHLIST_SHARE": "0.18",
+            "PLAN_MIN_NON_WATCHLIST_PER_BATCH": "2",
+            "PLAN_MAX_SINGLE_SOURCE_SHARE": "0.45",
+        }
+        telemetry = {
+            "funnel_15m": {"raw": 360, "pre": 180, "buy": 0},
+            "top_reasons_15m": {"quality_skip": [], "plan_skip": []},
+            "source_profile_15m": {
+                "plan_top_source": "watchlist",
+                "plan_top_source_share": 1.0,
+            },
+            "supply_sanity_15m": {
+                "candidate_supply_non_watch_15m": 88,
+                "post_filters_pass_non_watch_15m": 2,
+                "plan_attempts_non_watch_15m": 0,
+            },
+            "source_diversity_guard_15m": {
+                "non_watch_final_zero_hits": 7,
+            },
+            "plan_symbol_concentration_15m": {
+                "plan_attempts": 48,
+                "plan_unique_symbols": 5,
+                "plan_top_share": 0.44,
+            },
+        }
+        actions, _trace, meta = mrt._build_action_plan(
+            metrics=metrics,
+            overrides=overrides,
+            mode=mrt.MODE_SPECS["conveyor"],
+            telemetry=telemetry,
+            runtime_state=mrt.RuntimeState(),
+            now_ts=1000.0,
+        )
+        by_key = _actions_by_key(actions)
+        self.assertIn("SAFE_AGE_NON_WATCH_SOFT_RATIO", by_key)
+        self.assertIn("SAFE_AGE_NON_WATCH_MAX_PASSES_PER_CYCLE", by_key)
+        self.assertIn("SAFE_CHANGE_5M_NON_WATCH_SOFT_MULT", by_key)
+        self.assertIn("SAFE_CHANGE_5M_NON_WATCH_MAX_PASSES_PER_CYCLE", by_key)
+        starvation_meta = dict((meta or {}).get("source_starvation_guard") or {})
+        self.assertTrue(bool(starvation_meta.get("non_watch_post_filter_starved", False)))
+
+    def test_source_starvation_relaxes_non_watch_score_and_volume_soft(self) -> None:
+        metrics = mrt.WindowMetrics(
+            selected_from_batch=170,
+            opened_from_batch=0,
+            filter_fail_reasons=Counter(
+                {
+                    "safe_volume": 28,
+                    "score_min": 24,
+                }
+            ),
+            autotrade_skip_reasons=Counter({"edge_low": 18, "cooldown": 6}),
+        )
+        overrides = {
+            "MARKET_MODE_NON_WATCH_SOFT_SCORE_DELTA": "8",
+            "MARKET_MODE_NON_WATCH_SOFT_MAX_PER_CYCLE": "2",
+            "SAFE_VOLUME_TWO_TIER_NON_WATCH_SOFT_RATIO": "0.55",
+            "SAFE_VOLUME_TWO_TIER_NON_WATCH_MAX_PASSES_PER_CYCLE": "2",
+            "PLAN_MAX_WATCHLIST_SHARE": "0.18",
+            "PLAN_MIN_NON_WATCHLIST_PER_BATCH": "2",
+            "PLAN_MAX_SINGLE_SOURCE_SHARE": "0.45",
+        }
+        telemetry = {
+            "funnel_15m": {"raw": 350, "pre": 170, "buy": 0},
+            "top_reasons_15m": {"quality_skip": [], "plan_skip": []},
+            "source_profile_15m": {
+                "plan_top_source": "watchlist",
+                "plan_top_source_share": 1.0,
+            },
+            "supply_sanity_15m": {
+                "candidate_supply_non_watch_15m": 92,
+                "post_filters_pass_non_watch_15m": 1,
+                "plan_attempts_non_watch_15m": 0,
+            },
+            "source_diversity_guard_15m": {
+                "non_watch_final_zero_hits": 8,
+            },
+            "plan_symbol_concentration_15m": {
+                "plan_attempts": 54,
+                "plan_unique_symbols": 5,
+                "plan_top_share": 0.42,
+            },
+        }
+        actions, _trace, meta = mrt._build_action_plan(
+            metrics=metrics,
+            overrides=overrides,
+            mode=mrt.MODE_SPECS["conveyor"],
+            telemetry=telemetry,
+            runtime_state=mrt.RuntimeState(),
+            now_ts=1000.0,
+        )
+        by_key = _actions_by_key(actions)
+        self.assertIn("MARKET_MODE_NON_WATCH_SOFT_SCORE_DELTA", by_key)
+        self.assertIn("MARKET_MODE_NON_WATCH_SOFT_MAX_PER_CYCLE", by_key)
+        self.assertIn("SAFE_VOLUME_TWO_TIER_NON_WATCH_SOFT_RATIO", by_key)
+        self.assertIn("SAFE_VOLUME_TWO_TIER_NON_WATCH_MAX_PASSES_PER_CYCLE", by_key)
+        self.assertGreater(int(by_key["MARKET_MODE_NON_WATCH_SOFT_SCORE_DELTA"].new_value), 8)
+        self.assertGreater(int(by_key["MARKET_MODE_NON_WATCH_SOFT_MAX_PER_CYCLE"].new_value), 2)
+        self.assertLess(float(by_key["SAFE_VOLUME_TWO_TIER_NON_WATCH_SOFT_RATIO"].new_value), 0.55)
+        self.assertGreater(int(by_key["SAFE_VOLUME_TWO_TIER_NON_WATCH_MAX_PASSES_PER_CYCLE"].new_value), 2)
+        starvation_meta = dict((meta or {}).get("source_starvation_guard") or {})
+        self.assertTrue(bool(starvation_meta.get("non_watch_post_filter_starved", False)))
 
 
 if __name__ == "__main__":

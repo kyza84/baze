@@ -76,6 +76,92 @@ class AutoTraderSafetyGuardTests(ConfigPatchMixin, unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(reason, "ok")
 
+    def test_non_watch_soft_age_pass_is_respected_by_safety_guards(self) -> None:
+        self.patch_cfg(
+            ENTRY_FAIL_CLOSED_ON_SAFETY_GAP=False,
+            SAFE_TEST_MODE=True,
+            SAFE_MIN_LIQUIDITY_USD=5000.0,
+            SAFE_MIN_VOLUME_5M_USD=100.0,
+            SAFE_MIN_AGE_SECONDS=240,
+            SAFE_MAX_PRICE_CHANGE_5M_ABS_PERCENT=18.0,
+            SAFE_REQUIRE_CONTRACT_SAFE=False,
+            SAFE_MAX_WARNING_FLAGS=10,
+            SAFE_MIN_HOLDERS=0,
+            SAFE_AGE_NON_WATCH_SOFT_ENABLED=True,
+        )
+        trader = self._blank_trader()
+        ok, reason = trader._token_guard_result(
+            {
+                "source": "onchain",
+                "liquidity": 25000.0,
+                "volume_5m": 350.0,
+                "age_seconds": 120,
+                "price_change_5m": 1.2,
+                "_safe_age_soft_pass": True,
+                "risk_level": "LOW",
+            }
+        )
+        self.assertTrue(ok)
+        self.assertEqual(reason, "ok")
+
+    def test_watchlist_does_not_get_non_watch_soft_age_bypass(self) -> None:
+        self.patch_cfg(
+            ENTRY_FAIL_CLOSED_ON_SAFETY_GAP=False,
+            SAFE_TEST_MODE=True,
+            SAFE_MIN_LIQUIDITY_USD=5000.0,
+            SAFE_MIN_VOLUME_5M_USD=100.0,
+            SAFE_MIN_AGE_SECONDS=240,
+            SAFE_MAX_PRICE_CHANGE_5M_ABS_PERCENT=18.0,
+            SAFE_REQUIRE_CONTRACT_SAFE=False,
+            SAFE_MAX_WARNING_FLAGS=10,
+            SAFE_MIN_HOLDERS=0,
+            SAFE_AGE_NON_WATCH_SOFT_ENABLED=True,
+        )
+        trader = self._blank_trader()
+        ok, reason = trader._token_guard_result(
+            {
+                "source": "watchlist",
+                "liquidity": 25000.0,
+                "volume_5m": 350.0,
+                "age_seconds": 120,
+                "price_change_5m": 1.2,
+                "_safe_age_soft_pass": True,
+                "risk_level": "LOW",
+            }
+        )
+        self.assertFalse(ok)
+        self.assertEqual(reason, "safe_min_age")
+
+    def test_non_watch_soft_volume_and_change_pass_are_respected(self) -> None:
+        self.patch_cfg(
+            ENTRY_FAIL_CLOSED_ON_SAFETY_GAP=False,
+            SAFE_TEST_MODE=True,
+            SAFE_MIN_LIQUIDITY_USD=5000.0,
+            SAFE_MIN_VOLUME_5M_USD=100.0,
+            SAFE_MIN_AGE_SECONDS=240,
+            SAFE_MAX_PRICE_CHANGE_5M_ABS_PERCENT=18.0,
+            SAFE_REQUIRE_CONTRACT_SAFE=False,
+            SAFE_MAX_WARNING_FLAGS=10,
+            SAFE_MIN_HOLDERS=0,
+            SAFE_VOLUME_TWO_TIER_NON_WATCH_ENABLED=True,
+            SAFE_CHANGE_5M_NON_WATCH_SOFT_ENABLED=True,
+        )
+        trader = self._blank_trader()
+        ok, reason = trader._token_guard_result(
+            {
+                "source": "geckoterminal",
+                "liquidity": 25000.0,
+                "volume_5m": 10.0,
+                "age_seconds": 360,
+                "price_change_5m": 32.0,
+                "_safe_volume_soft_pass": True,
+                "_safe_change_soft_pass": True,
+                "risk_level": "LOW",
+            }
+        )
+        self.assertTrue(ok)
+        self.assertEqual(reason, "ok")
+
     def test_hard_blocked_address_matches_case_insensitive(self) -> None:
         self.patch_cfg(
             AUTO_TRADE_HARD_BLOCKED_ADDRESSES=["0xf30bf00edd0c22db54c9274b90d2a4c21fc09b07"],
@@ -250,6 +336,44 @@ class AutoTraderSafetyGuardTests(ConfigPatchMixin, unittest.TestCase):
 
         self.assertGreater(capped, legacy_double_count)
         self.assertAlmostEqual(capped, expected_without_double_count, places=6)
+
+    def test_cost_dominant_non_watch_explore_fast_guard_sets_symbol_cooldown(self) -> None:
+        self.patch_cfg(
+            EDGE_COST_DOMINANT_GUARD_ENABLED=True,
+            EDGE_COST_DOMINANT_NON_WATCH_EXPLORE_FAST_GUARD_ENABLED=True,
+            EDGE_COST_DOMINANT_NON_WATCH_EXPLORE_MAX_SIZE_USD=0.30,
+            EDGE_COST_DOMINANT_NON_WATCH_EXPLORE_MIN_GROSS_PERCENT=0.5,
+            EDGE_COST_DOMINANT_NON_WATCH_EXPLORE_MIN_COST_PERCENT=10.0,
+            EDGE_COST_DOMINANT_NON_WATCH_EXPLORE_MIN_DELTA_PERCENT=6.0,
+            EDGE_COST_DOMINANT_NON_WATCH_EXPLORE_HIT_WINDOW_SECONDS=900,
+            EDGE_COST_DOMINANT_NON_WATCH_EXPLORE_HITS_TO_COOLDOWN=2,
+            EDGE_COST_DOMINANT_NON_WATCH_EXPLORE_SYMBOL_COOLDOWN_SECONDS=600,
+        )
+        trader = self._blank_trader()
+        trader._edge_cost_dominant_hits_by_symbol = {}
+        trader.symbol_cooldowns = {}
+        now_ts = datetime.now(timezone.utc).timestamp()
+
+        trader._cost_dominant_skip_guard(
+            symbol="SERV",
+            skip_reason="edge_low",
+            gross_percent=1.2,
+            cost_total_percent=22.0,
+            source_name="onchain+market",
+            entry_channel="explore",
+            position_size_usd=0.10,
+        )
+        trader._cost_dominant_skip_guard(
+            symbol="SERV",
+            skip_reason="edge_low",
+            gross_percent=1.1,
+            cost_total_percent=21.5,
+            source_name="onchain+market",
+            entry_channel="explore",
+            position_size_usd=0.10,
+        )
+        until = float(trader.symbol_cooldowns.get("SERV", 0.0) or 0.0)
+        self.assertGreater(until, now_ts)
 
     def test_anti_choke_dominant_symbol_detection(self) -> None:
         self.patch_cfg(

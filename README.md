@@ -91,3 +91,15 @@ python -m unittest discover -s tests -p "test_*.py" -v
 - Added tuner-aware starvation recovery hooks for non-watch post-filter bottlenecks.
 - Hard anti-scam and hard safety guards remain unchanged.
 - For details see: `docs/MATRIX_RUNTIME_TUNER.md` and `docs/PROJECT_STATE.md`.
+
+## Recent Update: Plan Bridge + Cost-Dominant Guard (2026-03-03)
+- Added early duplicate filtering in `main_local.py` so open positions are removed before post-filter/plan bridge accounting.
+- Added cost-dominant edge guardrails in `trading/auto_trader.py`:
+  - repeated `cost > gross` edge skips trigger temporary symbol cooldown,
+  - non-watch explore micro-size fast-guard and minimum-trade floor controls were added.
+- Expanded tuner decision layer in `tools/matrix_runtime_tuner.py`:
+  - protected keys are filtered before action-budget limiting,
+  - prefilter/edge-loop diagnostics are exposed in `decision_meta`.
+- Hardened matrix watchdog in `tools/matrix_watchdog.py`:
+  - follow-lock to prevent duplicate watchdog workers,
+  - stale restart requires both heartbeat age and runtime activity age.

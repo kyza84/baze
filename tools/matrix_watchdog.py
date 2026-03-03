@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import signal
@@ -34,29 +35,94 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
     os.replace(tmp, path)
 
 
-def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
-
-
-def _pid_alive(pid: int) -> bool:
-    if pid <= 0:
-        return False
+def _try_write_json(path: Path, payload: dict[str, Any]) -> bool:
     try:
-        if os.name == "nt":
-            proc = subprocess.run(
-                ["tasklist", "/FI", f"PID eq {pid}"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            txt = (proc.stdout or "").lower()
-            return proc.returncode == 0 and "python.exe" in txt and str(pid) in txt
-        os.kill(pid, 0)
+        _write_json(path, payload)
         return True
     except Exception:
         return False
+
+
+def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        return
+
+
+def _pid_cmdline_windows(pid: int) -> str:
+    if int(pid) <= 0 or os.name != "nt":
+        return ""
+    try:
+        creationflags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        cmd = (
+            f"$p=Get-CimInstance Win32_Process -Filter \"ProcessId={int(pid)}\" -ErrorAction SilentlyContinue; "
+            'if($p){ [string]$p.CommandLine }'
+        )
+        probe = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", cmd],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            creationflags=creationflags,
+        )
+        return str(probe.stdout or "").strip()
+    except Exception:
+        return ""
+
+
+def _pid_alive(pid: int, *, require_substring: str | None = None) -> bool:
+    if pid <= 0:
+        return False
+    needle = str(require_substring or "").strip().lower()
+    if os.name == "nt":
+        try:
+            creationflags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            probe = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {int(pid)}", "/FO", "CSV", "/NH"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                creationflags=creationflags,
+            )
+            line = str(probe.stdout or "").strip()
+            if not line:
+                return False
+            # tasklist returns a localized INFO line (non-CSV) when PID is missing.
+            if not line.startswith('"'):
+                return False
+            row = next(csv.reader([line]), [])
+            if len(row) < 2:
+                return False
+            pid_cell = str(row[1] or "").replace(",", "").strip()
+            if str(int(pid)) != pid_cell:
+                return False
+            if needle:
+                cmdline = _pid_cmdline_windows(int(pid)).lower()
+                return bool(cmdline and needle in cmdline)
+            return True
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+        alive = True
+    except PermissionError:
+        alive = True
+    except OSError:
+        alive = False
+    except Exception:
+        alive = False
+    if not alive:
+        return False
+    if needle:
+        try:
+            proc_cmdline = Path(f"/proc/{int(pid)}/cmdline").read_text(encoding="utf-8", errors="ignore").lower()
+            return needle in proc_cmdline
+        except Exception:
+            return False
+    return True
 
 
 def _kill_pid(pid: int) -> None:
@@ -118,6 +184,27 @@ def _heartbeat_age_seconds(root: Path, item: dict[str, Any]) -> float | None:
     except Exception:
         return None
     return max(0.0, time.time() - hb_ts)
+
+
+def _runtime_activity_age_seconds(root: Path, item: dict[str, Any]) -> float | None:
+    rel_log_dir = str(item.get("log_dir", "") or "").strip()
+    if not rel_log_dir:
+        return None
+    log_dir = root / rel_log_dir
+    mtimes: list[float] = []
+    for path in (
+        log_dir / "heartbeat.json",
+        log_dir / "app.log",
+        log_dir / "out.log",
+    ):
+        try:
+            if path.exists():
+                mtimes.append(float(path.stat().st_mtime))
+        except Exception:
+            continue
+    if not mtimes:
+        return None
+    return max(0.0, float(time.time()) - max(mtimes))
 
 
 def _file_age_seconds(path: Path) -> float | None:
@@ -217,6 +304,57 @@ def _events_path(root: Path) -> Path:
     return root / "data" / "matrix" / "runs" / "watchdog_events.jsonl"
 
 
+def _lock_path(root: Path) -> Path:
+    return root / "data" / "matrix" / "runs" / "watchdog.lock.json"
+
+
+def _acquire_follow_lock(root: Path) -> tuple[bool, str]:
+    path = _lock_path(root)
+    me = int(os.getpid())
+    prev = _read_json(path)
+    prev_pid = 0
+    try:
+        prev_pid = int(prev.get("pid", 0) or 0)
+    except Exception:
+        prev_pid = 0
+    if prev_pid > 0 and prev_pid != me and _pid_alive(prev_pid, require_substring="matrix_watchdog.py"):
+        return False, f"watchdog_lock_busy pid={prev_pid}"
+    payload = {
+        "pid": me,
+        "owner": "matrix_watchdog.py",
+        "started_at": _now_iso(),
+        "root": str(root),
+    }
+    if not _try_write_json(path, payload):
+        return False, f"watchdog_lock_write_failed path={path}"
+    return True, f"watchdog_lock_acquired pid={me}"
+
+
+def _release_follow_lock(root: Path) -> None:
+    path = _lock_path(root)
+    me = int(os.getpid())
+    prev = _read_json(path)
+    prev_pid = 0
+    try:
+        prev_pid = int(prev.get("pid", 0) or 0)
+    except Exception:
+        prev_pid = 0
+    if prev_pid > 0 and prev_pid != me:
+        return
+    try:
+        if path.exists():
+            path.unlink()
+    except Exception:
+        _try_write_json(
+            path,
+            {
+                "pid": 0,
+                "owner": "matrix_watchdog.py",
+                "released_at": _now_iso(),
+            },
+        )
+
+
 def _scan_once(
     root: Path,
     stale_seconds: int,
@@ -238,15 +376,22 @@ def _scan_once(
     )
     events: list[dict[str, Any]] = []
     changed = False
+    now_iso = _now_iso()
 
     for row in items:
         if not isinstance(row, dict):
             continue
         profile_id = str(row.get("id", "") or "").strip() or "unknown"
         pid = int(row.get("pid", 0) or 0)
-        alive = _pid_alive(pid)
+        alive = _pid_alive(pid, require_substring="main_local.py")
         hb_age = _heartbeat_age_seconds(root, row)
-        stale = alive and (hb_age is not None) and (hb_age >= float(stale_seconds))
+        activity_age = _runtime_activity_age_seconds(root, row)
+        stale = (
+            alive
+            and (hb_age is not None)
+            and (hb_age >= float(stale_seconds))
+            and (activity_age is None or activity_age >= float(stale_seconds))
+        )
         dead = not alive
         now_ts = time.time()
         last_ts = float(last_restarts.get(profile_id, 0.0) or 0.0)
@@ -264,10 +409,11 @@ def _scan_once(
             ok, msg, new_pid = _restart_item(root, row)
             evt = {
                 "ts": now_ts,
-                "timestamp": _now_iso(),
+                "timestamp": now_iso,
                 "id": profile_id,
                 "reason": restart_reason,
                 "heartbeat_age_sec": round(float(hb_age or 0.0), 2),
+                "activity_age_sec": round(float(activity_age or 0.0), 2),
                 "old_pid": pid,
                 "restart_ok": bool(ok),
                 "message": msg,
@@ -285,7 +431,7 @@ def _scan_once(
 
         if watch_tuner and requested_run and _runtime_tuner_known(root, row):
             tuner_pid = _runtime_tuner_lock_pid(root, row)
-            tuner_alive = _pid_alive(tuner_pid) if tuner_pid > 0 else False
+            tuner_alive = _pid_alive(tuner_pid, require_substring="matrix_runtime_tuner.py") if tuner_pid > 0 else False
             tuner_age = _runtime_tuner_log_age_seconds(root, row)
             tuner_stale = (tuner_age is None) or (float(tuner_age) >= float(tuner_stale_seconds))
             tuner_dead = (tuner_pid > 0) and (not tuner_alive)
@@ -303,7 +449,7 @@ def _scan_once(
                     ok, msg, new_pid = _restart_tuner(root, profile_id)
                     evt = {
                         "ts": now_ts,
-                        "timestamp": _now_iso(),
+                        "timestamp": now_iso,
                         "component": "runtime_tuner",
                         "id": profile_id,
                         "reason": tuner_reason,
@@ -318,39 +464,44 @@ def _scan_once(
                     last_tuner_restarts[profile_id] = now_ts
                     changed = True
 
-    if changed:
-        alive_count = 0
-        for row in items:
-            if isinstance(row, dict):
-                pid = int(row.get("pid", 0) or 0)
-                if _pid_alive(pid):
-                    alive_count += 1
+    alive_count = 0
+    for row in items:
+        if isinstance(row, dict):
+            pid = int(row.get("pid", 0) or 0)
+            if _pid_alive(pid, require_substring="main_local.py"):
+                alive_count += 1
+    meta_running = bool(alive_count > 0)
+    meta_alive_count_prev = int(meta.get("alive_count", -1) or -1)
+    meta_running_prev = bool(meta.get("running", False))
+    meta_needs_update = bool(changed) or (meta_running_prev != meta_running) or (meta_alive_count_prev != int(alive_count))
+    if meta_needs_update:
         meta["updated_at"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-        meta["running"] = bool(alive_count > 0)
+        meta["running"] = meta_running
         meta["alive_count"] = int(alive_count)
         meta["items"] = items
-        _write_json(meta_path, meta)
-        _write_json(
-            state_path,
-            {
-                "updated_at": _now_iso(),
-                "last_restarts": last_restarts,
-                "last_tuner_restarts": last_tuner_restarts,
-                "events_tail": (state.get("events_tail", []) if isinstance(state.get("events_tail"), list) else [])[-80:] + events,
-            },
-        )
+        _try_write_json(meta_path, meta)
+
+    prev_events_tail = state.get("events_tail", []) if isinstance(state.get("events_tail"), list) else []
+    state_payload = {
+        "updated_at": now_iso,
+        "last_scan_ts": float(time.time()),
+        "last_restarts": last_restarts,
+        "last_tuner_restarts": last_tuner_restarts,
+        "events_tail": (prev_events_tail + events)[-80:],
+    }
+    _try_write_json(state_path, state_payload)
 
     return {
         "checked_items": len(items),
         "events": events,
-        "changed": changed,
+        "changed": bool(changed or meta_needs_update),
     }
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Matrix watchdog: restart stale profile workers.")
     parser.add_argument("--root", default=".")
-    parser.add_argument("--stale-seconds", type=int, default=180)
+    parser.add_argument("--stale-seconds", type=int, default=360)
     parser.add_argument("--restart-cooldown-seconds", type=int, default=120)
     parser.add_argument("--watch-tuner", action="store_true")
     parser.add_argument("--tuner-stale-seconds", type=int, default=420)
@@ -361,23 +512,30 @@ def main() -> int:
 
     root = Path(args.root).resolve()
     if args.follow:
-        while True:
-            res = _scan_once(
-                root=root,
-                stale_seconds=max(60, int(args.stale_seconds)),
-                restart_cooldown_seconds=max(30, int(args.restart_cooldown_seconds)),
-                watch_tuner=bool(args.watch_tuner),
-                tuner_stale_seconds=max(120, int(args.tuner_stale_seconds)),
-                tuner_restart_cooldown_seconds=max(60, int(args.tuner_restart_cooldown_seconds)),
-            )
-            for evt in res.get("events", []) or []:
-                print(
-                    f"[WATCHDOG] component={evt.get('component', 'main_local')} id={evt.get('id')} "
-                    f"reason={evt.get('reason')} old_pid={evt.get('old_pid')} "
-                    f"new_pid={evt.get('new_pid')} ok={evt.get('restart_ok')} "
-                    f"age={evt.get('heartbeat_age_sec', evt.get('tuner_log_age_sec', 'N/A'))}s"
+        locked, lock_msg = _acquire_follow_lock(root)
+        if not locked:
+            print(f"[WATCHDOG] {lock_msg}")
+            return 0
+        try:
+            while True:
+                res = _scan_once(
+                    root=root,
+                    stale_seconds=max(60, int(args.stale_seconds)),
+                    restart_cooldown_seconds=max(30, int(args.restart_cooldown_seconds)),
+                    watch_tuner=bool(args.watch_tuner),
+                    tuner_stale_seconds=max(120, int(args.tuner_stale_seconds)),
+                    tuner_restart_cooldown_seconds=max(60, int(args.tuner_restart_cooldown_seconds)),
                 )
-            time.sleep(max(10, int(args.loop_seconds)))
+                for evt in res.get("events", []) or []:
+                    print(
+                        f"[WATCHDOG] component={evt.get('component', 'main_local')} id={evt.get('id')} "
+                        f"reason={evt.get('reason')} old_pid={evt.get('old_pid')} "
+                        f"new_pid={evt.get('new_pid')} ok={evt.get('restart_ok')} "
+                        f"age={evt.get('heartbeat_age_sec', evt.get('tuner_log_age_sec', 'N/A'))}s"
+                    )
+                time.sleep(max(10, int(args.loop_seconds)))
+        finally:
+            _release_follow_lock(root)
     else:
         res = _scan_once(
             root=root,

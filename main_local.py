@@ -3035,6 +3035,9 @@ async def run_local_loop() -> None:
                             auto_trader.add_hard_blocklist_entry(token_address)
                             _filter_fail("hard_blocklist", token, f"address={token_address}")
                             continue
+                        if token_address and token_address in auto_trader.open_positions:
+                            _filter_fail("address_or_duplicate", token, "open_duplicate")
+                            continue
                         if token_address:
                             seen_now = time.monotonic()
                             prev_seen = float(heavy_last_seen_ts.get(token_address, 0.0) or 0.0)

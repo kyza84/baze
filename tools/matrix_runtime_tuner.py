@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
 import os
@@ -23,6 +24,10 @@ AUTOTRADE_SKIP_TOKEN_RE = re.compile(r"AutoTrade skip token=([^\s]+)\s+reason=([
 AUTOTRADE_SKIP_DETAIL_RE = re.compile(r"AutoTrade skip token=.* reason=([^\s]+)(?:\s+detail=([^\r\n]+))?")
 AUTOTRADE_BATCH_RE = re.compile(
     r"AutoTrade batch .*selected=(\d+)\s+opened=(\d+)\s+pe=([^\s]+)"
+)
+AUTOTRADE_PREFILTER_RE = re.compile(
+    r"AutoTrade batch (\w+)-prefilter removed=(\d+)\s+missing_addr=(\d+)\s+"
+    r"placeholder_addr=(\d+)\s+open_duplicate=(\d+)\s+blacklist=(\d+)\s+hard_blocklist=(\d+)"
 )
 AUTO_BUY_RE = re.compile(r"AUTO_BUY .*token=([^\s]+)")
 PLAN_SOURCE_NON_WATCH_RE = re.compile(r"PLAN_SOURCE_DIVERSITY .*non_watch_final=(\d+)")
@@ -77,10 +82,14 @@ TUNER_RUNTIME_FALLBACK_KEYS = {
     "MARKET_MODE_STRICT_SCORE",
     "MARKET_MODE_SOFT_SCORE",
     "SAFE_MIN_VOLUME_5M_USD",
+    "SAFE_VOLUME_TWO_TIER_NON_WATCH_SOFT_RATIO",
+    "SAFE_VOLUME_TWO_TIER_NON_WATCH_MAX_PASSES_PER_CYCLE",
     "SAFE_AGE_NON_WATCH_SOFT_RATIO",
     "SAFE_AGE_NON_WATCH_MAX_PASSES_PER_CYCLE",
     "SAFE_CHANGE_5M_NON_WATCH_SOFT_MULT",
     "SAFE_CHANGE_5M_NON_WATCH_MAX_PASSES_PER_CYCLE",
+    "MARKET_MODE_NON_WATCH_SOFT_SCORE_DELTA",
+    "MARKET_MODE_NON_WATCH_SOFT_MAX_PER_CYCLE",
     "MIN_EXPECTED_EDGE_PERCENT",
     "MIN_EXPECTED_EDGE_USD",
     "V2_ROLLING_EDGE_MIN_PERCENT",
@@ -149,10 +158,14 @@ TUNER_MUTABLE_KEYS = {
     "PLAN_MIN_NON_WATCHLIST_PER_BATCH",
     "PROFIT_ENGINE_ENABLED",
     "SAFE_MIN_VOLUME_5M_USD",
+    "SAFE_VOLUME_TWO_TIER_NON_WATCH_SOFT_RATIO",
+    "SAFE_VOLUME_TWO_TIER_NON_WATCH_MAX_PASSES_PER_CYCLE",
     "SAFE_AGE_NON_WATCH_SOFT_RATIO",
     "SAFE_AGE_NON_WATCH_MAX_PASSES_PER_CYCLE",
     "SAFE_CHANGE_5M_NON_WATCH_SOFT_MULT",
     "SAFE_CHANGE_5M_NON_WATCH_MAX_PASSES_PER_CYCLE",
+    "MARKET_MODE_NON_WATCH_SOFT_SCORE_DELTA",
+    "MARKET_MODE_NON_WATCH_SOFT_MAX_PER_CYCLE",
     "SOURCE_ROUTER_BAD_ENTRY_PROBABILITY",
     "SOURCE_ROUTER_MIN_TRADES",
     "SOURCE_ROUTER_SEVERE_ENTRY_PROBABILITY",
@@ -196,6 +209,8 @@ TIGHTEN_FLOW_ESCAPE_SIGNALS = {
     "low_throughput_expand_topn",
     "cooldown_dominant_flow_expand",
     "safe_volume_soft_flow_expand",
+    "safe_volume_non_watch_soft",
+    "score_non_watch_soft",
     "safe_age_non_watch_soft",
     "safe_change_non_watch_soft",
     "blacklist_dominator_shaping",
@@ -213,6 +228,8 @@ HOLD_FLOW_ESCAPE_SIGNALS = {
     "plan_concentration",
     "source_diversity_rebalance",
     "safe_volume_soft_flow_expand",
+    "safe_volume_non_watch_soft",
+    "score_non_watch_soft",
     "safe_age_non_watch_soft",
     "safe_change_non_watch_soft",
     "blacklist_dominator_shaping",
@@ -226,6 +243,10 @@ ROLLBACK_SOURCE_GUARD_KEYS = {
     "V2_SOURCE_QOS_SOURCE_CAPS",
     "V2_SOURCE_QOS_TOPK_PER_CYCLE",
     "V2_SOURCE_QOS_MAX_PER_SYMBOL_PER_CYCLE",
+    "SAFE_VOLUME_TWO_TIER_NON_WATCH_SOFT_RATIO",
+    "SAFE_VOLUME_TWO_TIER_NON_WATCH_MAX_PASSES_PER_CYCLE",
+    "MARKET_MODE_NON_WATCH_SOFT_SCORE_DELTA",
+    "MARKET_MODE_NON_WATCH_SOFT_MAX_PER_CYCLE",
 }
 IDLE_RELAX_SAFE_KEYS = {
     "AUTO_TRADE_TOP_N",
@@ -233,10 +254,14 @@ IDLE_RELAX_SAFE_KEYS = {
     "MARKET_MODE_STRICT_SCORE",
     "MARKET_MODE_SOFT_SCORE",
     "SAFE_MIN_VOLUME_5M_USD",
+    "SAFE_VOLUME_TWO_TIER_NON_WATCH_SOFT_RATIO",
+    "SAFE_VOLUME_TWO_TIER_NON_WATCH_MAX_PASSES_PER_CYCLE",
     "SAFE_AGE_NON_WATCH_SOFT_RATIO",
     "SAFE_AGE_NON_WATCH_MAX_PASSES_PER_CYCLE",
     "SAFE_CHANGE_5M_NON_WATCH_SOFT_MULT",
     "SAFE_CHANGE_5M_NON_WATCH_MAX_PASSES_PER_CYCLE",
+    "MARKET_MODE_NON_WATCH_SOFT_SCORE_DELTA",
+    "MARKET_MODE_NON_WATCH_SOFT_MAX_PER_CYCLE",
     "MIN_EXPECTED_EDGE_PERCENT",
     "MIN_EXPECTED_EDGE_USD",
     "EV_FIRST_ENTRY_MIN_NET_USD",
@@ -259,6 +284,7 @@ PROCESS_PROBE_TIMEOUT_SECONDS = 3
 LOCK_STALE_SECONDS = 900
 LOCK_STALE_TERMINATE_TIMEOUT_SECONDS = 8
 DEAD_PROFILE_HEARTBEAT_MAX_AGE_SECONDS = 90.0
+WATCHDOG_ACTIVE_MAX_AGE_SECONDS = 75.0
 
 _BASE_TO_REASON_CODE: dict[str, str] = {
     "ev_net_low": "PLAN_EV_NET_LOW",
@@ -477,6 +503,8 @@ class WindowMetrics:
     buy_symbol_counts: Counter[str] = field(default_factory=Counter)
     blacklist_detail_reasons: Counter[str] = field(default_factory=Counter)
     cooldown_skip_symbol_counts: Counter[str] = field(default_factory=Counter)
+    prefilter_stage_counts: Counter[str] = field(default_factory=Counter)
+    prefilter_removed_reasons: Counter[str] = field(default_factory=Counter)
     safety_reason_counts: Counter[str] = field(default_factory=Counter)
     source_diversity_non_watch_zero_hits: int = 0
     symbol_concentration_drop_hits: int = 0
@@ -628,15 +656,6 @@ def _heartbeat_recent(root: Path, profile_id: str, *, max_age_seconds: float = 9
 def _pid_is_running(pid: int) -> bool:
     if int(pid) <= 0:
         return False
-    try:
-        os.kill(int(pid), 0)
-        return True
-    except PermissionError:
-        return True
-    except OSError:
-        pass
-    except Exception:
-        pass
     if os.name == "nt":
         try:
             creationflags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
@@ -651,11 +670,25 @@ def _pid_is_running(pid: int) -> bool:
             line = str(probe.stdout or "").strip()
             if not line:
                 return False
-            if "No tasks are running" in line:
+            # Missing PID returns localized INFO text, not a CSV row.
+            if not line.startswith('"'):
                 return False
-            return str(int(pid)) in line
+            row = next(csv.reader([line]), [])
+            if len(row) < 2:
+                return False
+            pid_cell = str(row[1] or "").replace(",", "").strip()
+            return str(int(pid)) == pid_cell
         except Exception:
             return False
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except PermissionError:
+        return True
+    except OSError:
+        pass
+    except Exception:
+        pass
     return False
 
 
@@ -675,6 +708,38 @@ def _runtime_activity_age_seconds(root: Path, profile_id: str) -> float:
     if not mtimes:
         return float("inf")
     return max(0.0, now_ts - max(mtimes))
+
+
+def _watchdog_state_path(root: Path) -> Path:
+    return root / "data" / "matrix" / "runs" / "watchdog_state.json"
+
+
+def _watchdog_last_scan_age_seconds(root: Path) -> float | None:
+    path = _watchdog_state_path(root)
+    if not path.exists():
+        return None
+    now_ts = float(time.time())
+    payload = _read_json_object(path)
+    try:
+        ts = float(payload.get("last_scan_ts", 0.0) or 0.0)
+        if ts > 0.0:
+            return max(0.0, now_ts - ts)
+    except Exception:
+        pass
+    dt = _parse_any_ts(payload.get("updated_at"))
+    if dt is not None:
+        return max(0.0, now_ts - float(dt.timestamp()))
+    try:
+        return max(0.0, now_ts - float(path.stat().st_mtime))
+    except Exception:
+        return None
+
+
+def _watchdog_active(root: Path, *, max_age_seconds: float = WATCHDOG_ACTIVE_MAX_AGE_SECONDS) -> tuple[bool, float | None]:
+    age = _watchdog_last_scan_age_seconds(root)
+    if age is None:
+        return False, None
+    return bool(float(age) <= float(max_age_seconds)), float(age)
 
 
 def _terminate_pid(pid: int, *, timeout_seconds: int = LOCK_STALE_TERMINATE_TIMEOUT_SECONDS) -> bool:
@@ -1025,6 +1090,22 @@ def _read_window_metrics(session_log: Path, window_minutes: int) -> WindowMetric
             metrics.selected_from_batch += int(m.group(1))
             metrics.opened_from_batch += int(m.group(2))
             metrics.pe_reasons[m.group(3)] += 1
+        m = AUTOTRADE_PREFILTER_RE.search(line)
+        if m:
+            stage = str(m.group(1) or "").strip().lower() or "unknown"
+            metrics.prefilter_stage_counts[stage] += 1
+            removed = int(m.group(2) or 0)
+            missing_addr = int(m.group(3) or 0)
+            placeholder_addr = int(m.group(4) or 0)
+            open_duplicate = int(m.group(5) or 0)
+            blacklist = int(m.group(6) or 0)
+            hard_blocklist = int(m.group(7) or 0)
+            metrics.prefilter_removed_reasons["total_removed"] += int(removed)
+            metrics.prefilter_removed_reasons["missing_addr"] += int(missing_addr)
+            metrics.prefilter_removed_reasons["placeholder_addr"] += int(placeholder_addr)
+            metrics.prefilter_removed_reasons["open_duplicate"] += int(open_duplicate)
+            metrics.prefilter_removed_reasons["blacklist"] += int(blacklist)
+            metrics.prefilter_removed_reasons["hard_blocklist"] += int(hard_blocklist)
         m = AUTO_BUY_RE.search(line)
         if m:
             symbol = str(m.group(1) or "").strip()
@@ -1483,6 +1564,80 @@ def _exit_mix_60m(trade_rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _symbol_pnl_60m(trade_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    closes_by_symbol = Counter[str]()
+    wins_by_symbol = Counter[str]()
+    losses_by_symbol = Counter[str]()
+    pnl_by_symbol: dict[str, float] = {}
+    total_loss_abs = 0.0
+    total_win_abs = 0.0
+
+    for row in trade_rows:
+        stage = str(row.get("decision_stage", "") or "").strip().lower()
+        decision = str(row.get("decision", "") or "").strip().lower()
+        if stage != "trade_close" or decision != "close":
+            continue
+        symbol = str(row.get("symbol", "") or "").strip().upper()
+        if not symbol:
+            continue
+        pnl = _safe_float(row.get("pnl_usd", 0.0), 0.0)
+        closes_by_symbol[symbol] += 1
+        pnl_by_symbol[symbol] = float(pnl_by_symbol.get(symbol, 0.0)) + float(pnl)
+        if pnl > 0.0:
+            wins_by_symbol[symbol] += 1
+            total_win_abs += float(pnl)
+        elif pnl < 0.0:
+            losses_by_symbol[symbol] += 1
+            total_loss_abs += abs(float(pnl))
+
+    rows: list[dict[str, Any]] = []
+    for symbol, close_count in closes_by_symbol.items():
+        pnl = float(pnl_by_symbol.get(symbol, 0.0))
+        rows.append(
+            {
+                "symbol": str(symbol),
+                "close_count": int(close_count),
+                "wins": int(wins_by_symbol.get(symbol, 0)),
+                "losses": int(losses_by_symbol.get(symbol, 0)),
+                "pnl_usd": round(float(pnl), 6),
+            }
+        )
+    rows.sort(key=lambda x: (float(x.get("pnl_usd", 0.0)), -int(x.get("close_count", 0))))
+    top_loss_row = rows[0] if rows and float(rows[0].get("pnl_usd", 0.0)) < 0.0 else {}
+    top_win_row = max(rows, key=lambda x: float(x.get("pnl_usd", 0.0)), default={})
+    top_loss_symbol = str(top_loss_row.get("symbol", "") or "")
+    top_loss_pnl = float(top_loss_row.get("pnl_usd", 0.0) or 0.0)
+    top_loss_count = int(top_loss_row.get("close_count", 0) or 0)
+    top_loss_share_abs = (
+        abs(float(top_loss_pnl)) / float(max(1e-9, total_loss_abs))
+        if top_loss_symbol and top_loss_pnl < 0.0
+        else 0.0
+    )
+    top_win_symbol = str(top_win_row.get("symbol", "") or "")
+    top_win_pnl = float(top_win_row.get("pnl_usd", 0.0) or 0.0)
+    top_win_count = int(top_win_row.get("close_count", 0) or 0)
+    top_win_share_abs = (
+        abs(float(top_win_pnl)) / float(max(1e-9, total_win_abs))
+        if top_win_symbol and top_win_pnl > 0.0
+        else 0.0
+    )
+    return {
+        "close_total": int(sum(int(v) for v in closes_by_symbol.values())),
+        "symbol_total": int(len(closes_by_symbol)),
+        "total_loss_abs_usd": round(float(total_loss_abs), 6),
+        "total_win_abs_usd": round(float(total_win_abs), 6),
+        "top_loss_symbol": str(top_loss_symbol),
+        "top_loss_pnl_usd": round(float(top_loss_pnl), 6),
+        "top_loss_close_count": int(top_loss_count),
+        "top_loss_share_abs": round(float(top_loss_share_abs), 6),
+        "top_win_symbol": str(top_win_symbol),
+        "top_win_pnl_usd": round(float(top_win_pnl), 6),
+        "top_win_close_count": int(top_win_count),
+        "top_win_share_abs": round(float(top_win_share_abs), 6),
+        "top_symbols": rows[:10],
+    }
+
+
 def _symbol_churn_15m(trade_rows: list[dict[str, Any]]) -> dict[str, Any]:
     opens = Counter[str]()
     closes = Counter[str]()
@@ -1764,6 +1919,93 @@ def _supply_sanity_15m(
         "plan_attempts_watchlist_15m": int(watch_plan_attempts),
         "plan_attempts_non_watch_15m": int(non_watch_plan_attempts),
         "source_rows": rows[:8],
+    }
+
+
+def _prefilter_15m(metrics: WindowMetrics, funnel_15m: dict[str, Any]) -> dict[str, Any]:
+    post_filters_passed = int(_safe_float((funnel_15m or {}).get("post_filters_passed", (funnel_15m or {}).get("thr", 0)), 0.0))
+    total_removed = int(metrics.prefilter_removed_reasons.get("total_removed", 0) or 0)
+    open_duplicate = int(metrics.prefilter_removed_reasons.get("open_duplicate", 0) or 0)
+    duplicate_share = float(open_duplicate) / float(max(1, total_removed)) if total_removed > 0 else 0.0
+    loss_vs_post_filters = float(total_removed) / float(max(1, post_filters_passed)) if post_filters_passed > 0 else 0.0
+    return {
+        "stage_counts": _to_share_rows(metrics.prefilter_stage_counts, limit=4),
+        "removed": {
+            "total": int(total_removed),
+            "missing_addr": int(metrics.prefilter_removed_reasons.get("missing_addr", 0) or 0),
+            "placeholder_addr": int(metrics.prefilter_removed_reasons.get("placeholder_addr", 0) or 0),
+            "open_duplicate": int(open_duplicate),
+            "blacklist": int(metrics.prefilter_removed_reasons.get("blacklist", 0) or 0),
+            "hard_blocklist": int(metrics.prefilter_removed_reasons.get("hard_blocklist", 0) or 0),
+        },
+        "open_duplicate_share": round(float(duplicate_share), 6),
+        "loss_vs_post_filters_ratio": round(float(loss_vs_post_filters), 6),
+    }
+
+
+def _post_filter_plan_bridge_15m(
+    *,
+    candidate_rows: list[dict[str, Any]],
+    trade_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    post_by_key: dict[str, dict[str, Any]] = {}
+    for idx, row in enumerate(candidate_rows):
+        stage = str(row.get("decision_stage", "") or "").strip().lower()
+        decision = str(row.get("decision", "") or "").strip().lower()
+        if stage != "post_filters" or decision not in {"candidate_pass", "pass", "ok"}:
+            continue
+        key = _row_candidate_key(row, idx)
+        if key in post_by_key:
+            continue
+        post_by_key[key] = row
+
+    plan_keys: set[str] = set()
+    plan_by_source = Counter[str]()
+    for row in trade_rows:
+        stage = str(row.get("decision_stage", "") or "").strip().lower()
+        if stage != "plan_trade":
+            continue
+        cid = str(row.get("candidate_id", "") or "").strip()
+        if cid:
+            plan_keys.add(cid)
+        src = str(row.get("source", "") or row.get("source_mode", "") or "").strip().lower() or "unknown"
+        plan_by_source[src] += 1
+
+    lost_by_source = Counter[str]()
+    pass_by_source = Counter[str]()
+    matched = 0
+    for key, row in post_by_key.items():
+        src = str(row.get("source", "") or row.get("source_mode", "") or "").strip().lower() or "unknown"
+        if key in plan_keys:
+            matched += 1
+            pass_by_source[src] += 1
+        else:
+            lost_by_source[src] += 1
+
+    total_post = int(len(post_by_key))
+    lost_total = int(max(0, total_post - matched))
+    return {
+        "post_filters_total": int(total_post),
+        "plan_attempts_total": int(sum(int(v) for v in plan_by_source.values())),
+        "post_filters_with_plan": int(matched),
+        "lost_before_plan": int(lost_total),
+        "lost_share": round(float(lost_total) / float(max(1, total_post)), 6),
+        "lost_by_source": [
+            {
+                "source": str(src),
+                "count": int(cnt),
+                "share": round(float(cnt) / float(max(1, lost_total)), 6),
+            }
+            for src, cnt in lost_by_source.most_common(6)
+        ],
+        "with_plan_by_source": [
+            {
+                "source": str(src),
+                "count": int(cnt),
+                "share": round(float(cnt) / float(max(1, matched)), 6),
+            }
+            for src, cnt in pass_by_source.most_common(6)
+        ],
     }
 
 
@@ -2639,7 +2881,11 @@ def _apply_action_delta_caps(actions: list[Action], phase: str) -> tuple[list[Ac
     limits: dict[str, tuple[float, bool]] = {
         "MARKET_MODE_STRICT_SCORE": (2.0, True),
         "MARKET_MODE_SOFT_SCORE": (2.0, True),
+        "MARKET_MODE_NON_WATCH_SOFT_SCORE_DELTA": (2.0, True),
+        "MARKET_MODE_NON_WATCH_SOFT_MAX_PER_CYCLE": (1.0, True),
         "SAFE_MIN_VOLUME_5M_USD": (3.0, False),
+        "SAFE_VOLUME_TWO_TIER_NON_WATCH_SOFT_RATIO": (0.08, False),
+        "SAFE_VOLUME_TWO_TIER_NON_WATCH_MAX_PASSES_PER_CYCLE": (2.0, True),
         "SAFE_AGE_NON_WATCH_SOFT_RATIO": (0.08, False),
         "SAFE_AGE_NON_WATCH_MAX_PASSES_PER_CYCLE": (2.0, True),
         "SAFE_CHANGE_5M_NON_WATCH_SOFT_MULT": (0.10, False),
@@ -2689,7 +2935,13 @@ def _apply_action_delta_caps(actions: list[Action], phase: str) -> tuple[list[Ac
     per_source_cap_limit = 60
     if phase == "hold":
         per_source_cap_limit = 30
-        limits = {k: (v[0] / 2.0, v[1]) for k, v in limits.items()}
+        limits = {
+            k: (
+                max(1.0, v[0] / 2.0) if bool(v[1]) else (v[0] / 2.0),
+                v[1],
+            )
+            for k, v in limits.items()
+        }
     out: list[Action] = []
     for action in actions:
         key = str(action.key or "").strip().upper()
@@ -3027,6 +3279,11 @@ def _collect_telemetry_v2(
     run_tag = _pick_run_tag(candidate_rows_15m, trade_rows_15m, profile_id)
     funnel_15m = _funnel_15m(candidate_rows_15m, trade_rows_15m)
     top_reasons_15m = _top_reasons_15m(candidate_rows_15m, trade_rows_15m)
+    prefilter_15m = _prefilter_15m(metrics or WindowMetrics(), funnel_15m)
+    post_filter_plan_bridge_15m = _post_filter_plan_bridge_15m(
+        candidate_rows=candidate_rows_15m,
+        trade_rows=trade_rows_15m,
+    )
     exec_health_15m = _exec_health_15m(trade_rows_15m)
     source_profile_15m = _source_profile_15m(candidate_rows_15m, trade_rows_15m)
     supply_sanity_15m = _supply_sanity_15m(
@@ -3072,6 +3329,8 @@ def _collect_telemetry_v2(
             "trade_decisions_log_file": str(trade_log),
         },
         "funnel_15m": funnel_15m,
+        "prefilter_15m": prefilter_15m,
+        "post_filter_plan_bridge_15m": post_filter_plan_bridge_15m,
         "top_reasons_15m": top_reasons_15m,
         "exec_health_15m": exec_health_15m,
         "source_profile_15m": source_profile_15m,
@@ -3082,6 +3341,7 @@ def _collect_telemetry_v2(
         "ev_forensics_15m": _ev_forensics_15m(trade_rows_15m),
         "symbol_churn_15m": _symbol_churn_15m(trade_rows_15m),
         "exit_mix_60m": _exit_mix_60m(trade_rows_60m),
+        "symbol_pnl_60m": _symbol_pnl_60m(trade_rows_60m),
         "blacklist_forensics_15m": blacklist_forensics,
         "safety_degraded_15m": {
             "total_hits": int(safety_reason_total),
@@ -3497,7 +3757,11 @@ def _action_priority(action: Action) -> int:
         "ENTRY_A_CORE_MIN_TRADE_USD",
         "MARKET_MODE_STRICT_SCORE",
         "MARKET_MODE_SOFT_SCORE",
+        "MARKET_MODE_NON_WATCH_SOFT_SCORE_DELTA",
+        "MARKET_MODE_NON_WATCH_SOFT_MAX_PER_CYCLE",
         "SAFE_MIN_VOLUME_5M_USD",
+        "SAFE_VOLUME_TWO_TIER_NON_WATCH_SOFT_RATIO",
+        "SAFE_VOLUME_TWO_TIER_NON_WATCH_MAX_PASSES_PER_CYCLE",
         "SAFE_AGE_NON_WATCH_SOFT_RATIO",
         "SAFE_AGE_NON_WATCH_MAX_PASSES_PER_CYCLE",
         "SAFE_CHANGE_5M_NON_WATCH_SOFT_MULT",
@@ -3522,6 +3786,10 @@ def _action_priority(action: Action) -> int:
         "PLAN_MAX_WATCHLIST_SHARE",
         "PLAN_MIN_NON_WATCHLIST_PER_BATCH",
         "PLAN_MAX_SINGLE_SOURCE_SHARE",
+        "MARKET_MODE_NON_WATCH_SOFT_SCORE_DELTA",
+        "MARKET_MODE_NON_WATCH_SOFT_MAX_PER_CYCLE",
+        "SAFE_VOLUME_TWO_TIER_NON_WATCH_SOFT_RATIO",
+        "SAFE_VOLUME_TWO_TIER_NON_WATCH_MAX_PASSES_PER_CYCLE",
         "SAFE_AGE_NON_WATCH_SOFT_RATIO",
         "SAFE_AGE_NON_WATCH_MAX_PASSES_PER_CYCLE",
         "SAFE_CHANGE_5M_NON_WATCH_SOFT_MULT",
@@ -3565,6 +3833,7 @@ def _build_actions(
     overrides: dict[str, str],
     mode: ModeSpec,
     telemetry: dict[str, Any] | None = None,
+    protected_keys: set[str] | None = None,
     allow_zero_cooldown: bool = False,
 ) -> list[Action]:
     actions, _, _ = _build_action_plan(
@@ -3572,6 +3841,7 @@ def _build_actions(
         overrides=overrides,
         mode=mode,
         telemetry=telemetry,
+        protected_keys=protected_keys,
         allow_zero_cooldown=allow_zero_cooldown,
     )
     return actions
@@ -3585,6 +3855,7 @@ def _build_action_plan(
     telemetry: dict[str, Any] | None = None,
     runtime_state: RuntimeState | None = None,
     now_ts: float | None = None,
+    protected_keys: set[str] | None = None,
     allow_zero_cooldown: bool = False,
 ) -> tuple[list[Action], list[str], dict[str, Any]]:
     staged = dict(overrides)
@@ -3596,7 +3867,15 @@ def _build_action_plan(
 
     strict = _get_int(staged, "MARKET_MODE_STRICT_SCORE", 60)
     soft = _get_int(staged, "MARKET_MODE_SOFT_SCORE", 52)
+    non_watch_soft_score_delta = _get_int(staged, "MARKET_MODE_NON_WATCH_SOFT_SCORE_DELTA", 8)
+    non_watch_soft_max_per_cycle = _get_int(staged, "MARKET_MODE_NON_WATCH_SOFT_MAX_PER_CYCLE", 2)
     min_vol = _get_float(staged, "SAFE_MIN_VOLUME_5M_USD", 20.0)
+    safe_volume_non_watch_soft_ratio = _get_float(staged, "SAFE_VOLUME_TWO_TIER_NON_WATCH_SOFT_RATIO", 0.55)
+    safe_volume_non_watch_max_passes = _get_int(
+        staged,
+        "SAFE_VOLUME_TWO_TIER_NON_WATCH_MAX_PASSES_PER_CYCLE",
+        2,
+    )
     min_edge_pct = _get_float(staged, "MIN_EXPECTED_EDGE_PERCENT", 0.8)
     min_edge_usd = _get_float(staged, "MIN_EXPECTED_EDGE_USD", 0.010)
     ev_first_min_net_usd = _get_float(staged, "EV_FIRST_ENTRY_MIN_NET_USD", 0.0016)
@@ -3619,7 +3898,6 @@ def _build_action_plan(
     plan_min_non_watchlist = _get_int(staged, "PLAN_MIN_NON_WATCHLIST_PER_BATCH", 1)
     plan_single_source_share = _get_float(staged, "PLAN_MAX_SINGLE_SOURCE_SHARE", 0.50)
     plan_watchlist_share_initial = float(plan_watchlist_share)
-    plan_min_non_watchlist_initial = int(plan_min_non_watchlist)
     plan_single_source_share_initial = float(plan_single_source_share)
     qos_caps = _get_source_cap_map(staged, "V2_SOURCE_QOS_SOURCE_CAPS")
     universe_caps = _get_source_cap_map(staged, "V2_UNIVERSE_SOURCE_CAPS")
@@ -3731,6 +4009,9 @@ def _build_action_plan(
     plan_concentration_15m: dict[str, Any] = {}
     ev_forensics_15m: dict[str, Any] = {}
     blacklist_dominator_15m: dict[str, Any] = {}
+    symbol_pnl_60m: dict[str, Any] = {}
+    prefilter_15m: dict[str, Any] = {}
+    post_filter_plan_bridge_15m: dict[str, Any] = {}
     if isinstance(telemetry, dict):
         top_reasons = telemetry.get("top_reasons_15m", {}) or {}
         if isinstance(top_reasons, dict):
@@ -3767,6 +4048,15 @@ def _build_action_plan(
         ev_raw = telemetry.get("ev_forensics_15m", {}) or {}
         if isinstance(ev_raw, dict):
             ev_forensics_15m = ev_raw
+        pnl60_raw = telemetry.get("symbol_pnl_60m", {}) or {}
+        if isinstance(pnl60_raw, dict):
+            symbol_pnl_60m = pnl60_raw
+        prefilter_raw = telemetry.get("prefilter_15m", {}) or {}
+        if isinstance(prefilter_raw, dict):
+            prefilter_15m = prefilter_raw
+        bridge_raw = telemetry.get("post_filter_plan_bridge_15m", {}) or {}
+        if isinstance(bridge_raw, dict):
+            post_filter_plan_bridge_15m = bridge_raw
 
     quality_skip_total = 0
     for row in quality_skip_rows:
@@ -3784,6 +4074,8 @@ def _build_action_plan(
     funnel_buy_count = int(_safe_float((funnel_15m or {}).get("buy", 0), 0.0))
     plan_attempts_15m = int(_safe_float((plan_concentration_15m or {}).get("plan_attempts", 0), 0.0))
     plan_unique_symbols_15m = int(_safe_float((plan_concentration_15m or {}).get("plan_unique_symbols", 0), 0.0))
+    plan_top_symbol_15m = str((plan_concentration_15m or {}).get("plan_top_symbol", "") or "").strip().upper()
+    plan_top_count_15m = int(_safe_float((plan_concentration_15m or {}).get("plan_top_count", 0), 0.0))
     plan_top_share_15m = _safe_float((plan_concentration_15m or {}).get("plan_top_share", 0.0), 0.0)
     source_top_share_15m = _safe_float((source_profile_15m or {}).get("plan_top_source_share", 0.0), 0.0)
     source_top_name_15m = str((source_profile_15m or {}).get("plan_top_source", "") or "").strip().lower()
@@ -3797,6 +4089,10 @@ def _build_action_plan(
     churn_open_share = _safe_float((churn_15m or {}).get("open_share", 0.0), 0.0)
     churn_flat_share = _safe_float((churn_15m or {}).get("flat_close_share", 0.0), 0.0)
     churn_ttl_seconds = _clamp_int(int(_safe_float((churn_15m or {}).get("ttl_seconds", 0), 0.0)), 120, 3600)
+    top_loss_symbol_60m = str((symbol_pnl_60m or {}).get("top_loss_symbol", "") or "").strip().upper()
+    top_loss_pnl_60m = _safe_float((symbol_pnl_60m or {}).get("top_loss_pnl_usd", 0.0), 0.0)
+    top_loss_close_count_60m = int(_safe_float((symbol_pnl_60m or {}).get("top_loss_close_count", 0), 0.0))
+    top_loss_share_abs_60m = _safe_float((symbol_pnl_60m or {}).get("top_loss_share_abs", 0.0), 0.0)
     supply_non_watch_15m = int(_safe_float((supply_sanity_15m or {}).get("candidate_supply_non_watch_15m", 0), 0.0))
     supply_watch_15m = int(_safe_float((supply_sanity_15m or {}).get("candidate_supply_watchlist_15m", 0), 0.0))
     post_filters_non_watch_15m = int(
@@ -3810,6 +4106,31 @@ def _build_action_plan(
     safety_api_4029_hits_15m = int(_safe_float((safety_degraded_15m or {}).get("api_code_4029_hits", 0), 0.0))
     safety_api_only_15m = bool((safety_degraded_15m or {}).get("api_only", False))
     safety_degraded_mode_15m = str((safety_degraded_15m or {}).get("mode", "normal") or "normal").strip().lower()
+    prefilter_removed_total_15m = int(
+        _safe_float(((prefilter_15m or {}).get("removed") or {}).get("total", 0), 0.0)
+    )
+    prefilter_open_duplicate_15m = int(
+        _safe_float(((prefilter_15m or {}).get("removed") or {}).get("open_duplicate", 0), 0.0)
+    )
+    prefilter_open_duplicate_share_15m = _safe_float((prefilter_15m or {}).get("open_duplicate_share", 0.0), 0.0)
+    bridge_post_filters_total_15m = int(
+        _safe_float((post_filter_plan_bridge_15m or {}).get("post_filters_total", 0), 0.0)
+    )
+    bridge_lost_before_plan_15m = int(
+        _safe_float((post_filter_plan_bridge_15m or {}).get("lost_before_plan", 0), 0.0)
+    )
+    bridge_lost_share_15m = _safe_float((post_filter_plan_bridge_15m or {}).get("lost_share", 0.0), 0.0)
+    bridge_lost_watchlist_15m = 0
+    bridge_lost_non_watch_15m = 0
+    for _row in ((post_filter_plan_bridge_15m or {}).get("lost_by_source") or []):
+        if not isinstance(_row, dict):
+            continue
+        _src = str(_row.get("source", "") or "").strip().lower()
+        _cnt = int(_safe_float(_row.get("count", 0), 0.0))
+        if _src.startswith("watchlist"):
+            bridge_lost_watchlist_15m += _cnt
+        else:
+            bridge_lost_non_watch_15m += _cnt
     cooldown_top_symbol = ""
     cooldown_top_hits = 0
     cooldown_top_share = 0.0
@@ -3827,11 +4148,33 @@ def _build_action_plan(
         and cooldown_top_hits >= max(8, int(cooldown_hits * 0.35))
         and cooldown_top_share >= 0.45
     )
+    loss_symbol_dominant = bool(
+        top_loss_symbol_60m not in {"", "N/A", "UNKNOWN"}
+        and top_loss_close_count_60m >= 3
+        and top_loss_pnl_60m <= -0.012
+        and top_loss_share_abs_60m >= 0.45
+    )
     source_non_watch_actionable_min_15m = max(4, int(plan_attempts_15m // 12))
     source_non_watch_actionable = bool(post_filters_non_watch_15m >= source_non_watch_actionable_min_15m)
+    non_watch_post_filter_ratio_15m = (
+        float(post_filters_non_watch_15m) / float(max(1, supply_non_watch_15m))
+        if supply_non_watch_15m > 0
+        else 0.0
+    )
+    non_watch_plan_ratio_15m = (
+        float(plan_non_watch_15m) / float(max(1, post_filters_non_watch_15m))
+        if post_filters_non_watch_15m > 0
+        else 0.0
+    )
+    # Treat near-zero non-watch post-filter flow as starvation as well.
+    # This avoids deadlock where non-watch is technically non-zero but never reaches plan.
+    source_non_watch_starved_floor_15m = max(
+        0,
+        int(source_non_watch_actionable_min_15m) - 1,
+    )
     non_watch_post_filter_starved = bool(
         supply_non_watch_15m >= max(12, int(metrics.selected_from_batch) // 3)
-        and post_filters_non_watch_15m <= 0
+        and post_filters_non_watch_15m <= source_non_watch_starved_floor_15m
     )
     source_starvation_guard = bool(
         low_throughput
@@ -3841,6 +4184,31 @@ def _build_action_plan(
         and (source_non_watch_actionable or non_watch_post_filter_starved)
         and plan_non_watch_15m <= 0
         and source_non_watch_zero_hits_15m >= max(3, int(plan_attempts_15m // 8))
+    )
+    non_watch_conversion_choke = bool(
+        source_top_name_15m.startswith("watchlist")
+        and source_top_share_15m >= 0.80
+        and supply_non_watch_15m >= max(24, int(metrics.selected_from_batch))
+        and (
+            non_watch_post_filter_ratio_15m <= 0.12
+            or (
+                post_filters_non_watch_15m >= 4
+                and non_watch_plan_ratio_15m <= 0.08
+                and plan_attempts_15m >= 24
+            )
+        )
+        and int(metrics.opened_from_batch) <= 2
+    )
+    edge_low_share_15m = float(edge_low_hits) / float(max(1, plan_attempts_15m))
+    edge_low_symbol_loop = bool(
+        source_top_name_15m.startswith("watchlist")
+        and plan_attempts_15m >= max(8, int(metrics.selected_from_batch) // 2)
+        and plan_unique_symbols_15m <= 2
+        and plan_top_share_15m >= 0.75
+        and edge_low_hits >= max(6, int(plan_attempts_15m * 0.55))
+        and edge_low_share_15m >= 0.60
+        and plan_top_symbol_15m not in {"", "N/A", "UNKNOWN"}
+        and int(metrics.opened_from_batch) <= 1
     )
     if source_starvation_guard:
         # Keep floor guards from re-expanding watchlist while non-watch supply is available.
@@ -4026,7 +4394,7 @@ def _build_action_plan(
             flow_watchlist_share_ceiling,
         )
         plan_min_non_watchlist = _clamp_int(
-            max(plan_min_non_watchlist, plan_min_non_watchlist_initial + 1),
+            max(plan_min_non_watchlist, 2),
             0,
             max(flow_non_watchlist_ceiling, 8),
         )
@@ -4097,6 +4465,191 @@ def _build_action_plan(
             "AUTO_TRADE_TOP_N",
             _to_int_str(top_n),
             "source_starvation_guard topn",
+        )
+
+    if non_watch_conversion_choke:
+        rule_hits["non_watch_conversion_guard"] += 1
+        trace.append(
+            "non_watch_conversion_guard "
+            f"supply_non_watch15={supply_non_watch_15m} post_filter_non_watch15={post_filters_non_watch_15m} "
+            f"plan_non_watch15={plan_non_watch_15m} post_filter_ratio={non_watch_post_filter_ratio_15m:.3f} "
+            f"plan_ratio={non_watch_plan_ratio_15m:.3f} source_top={source_top_name_15m}:{source_top_share_15m:.3f}"
+        )
+        non_watch_soft_score_delta = _clamp_int(non_watch_soft_score_delta + 2, 0, 24)
+        non_watch_soft_max_per_cycle = _clamp_int(non_watch_soft_max_per_cycle + 1, 0, 8)
+        safe_volume_non_watch_soft_ratio = _clamp_float(safe_volume_non_watch_soft_ratio - 0.06, 0.20, 0.95)
+        safe_volume_non_watch_max_passes = _clamp_int(safe_volume_non_watch_max_passes + 1, 0, 10)
+        safe_age_non_watch_soft_ratio = _clamp_float(safe_age_non_watch_soft_ratio - 0.06, 0.25, 1.0)
+        safe_age_non_watch_max_passes = _clamp_int(safe_age_non_watch_max_passes + 1, 0, 10)
+        safe_change_non_watch_soft_mult = _clamp_float(safe_change_non_watch_soft_mult + 0.06, 1.00, 2.20)
+        safe_change_non_watch_max_passes = _clamp_int(safe_change_non_watch_max_passes + 1, 0, 10)
+        plan_watchlist_share = _clamp_float(plan_watchlist_share - 0.05, flow_watchlist_share_floor, 0.35)
+        plan_min_non_watchlist = _clamp_int(plan_min_non_watchlist + 1, 0, max(flow_non_watchlist_ceiling, 8))
+        plan_single_source_share = _clamp_float(plan_single_source_share - 0.04, 0.20, 1.0)
+        novelty_share = _clamp_float(novelty_share + 0.05, 0.05, 0.90)
+        top_n = _clamp_int(top_n + 4, 8, 80)
+        _apply_action(
+            staged,
+            actions,
+            "MARKET_MODE_NON_WATCH_SOFT_SCORE_DELTA",
+            _to_int_str(non_watch_soft_score_delta),
+            "non_watch_conversion_guard score_delta",
+        )
+        _apply_action(
+            staged,
+            actions,
+            "MARKET_MODE_NON_WATCH_SOFT_MAX_PER_CYCLE",
+            _to_int_str(non_watch_soft_max_per_cycle),
+            "non_watch_conversion_guard score_cap",
+        )
+        _apply_action(
+            staged,
+            actions,
+            "SAFE_VOLUME_TWO_TIER_NON_WATCH_SOFT_RATIO",
+            _to_float_str(safe_volume_non_watch_soft_ratio),
+            "non_watch_conversion_guard volume_ratio",
+        )
+        _apply_action(
+            staged,
+            actions,
+            "SAFE_VOLUME_TWO_TIER_NON_WATCH_MAX_PASSES_PER_CYCLE",
+            _to_int_str(safe_volume_non_watch_max_passes),
+            "non_watch_conversion_guard volume_cap",
+        )
+        _apply_action(
+            staged,
+            actions,
+            "SAFE_AGE_NON_WATCH_SOFT_RATIO",
+            _to_float_str(safe_age_non_watch_soft_ratio),
+            "non_watch_conversion_guard age_ratio",
+        )
+        _apply_action(
+            staged,
+            actions,
+            "SAFE_AGE_NON_WATCH_MAX_PASSES_PER_CYCLE",
+            _to_int_str(safe_age_non_watch_max_passes),
+            "non_watch_conversion_guard age_cap",
+        )
+        _apply_action(
+            staged,
+            actions,
+            "SAFE_CHANGE_5M_NON_WATCH_SOFT_MULT",
+            _to_float_str(safe_change_non_watch_soft_mult),
+            "non_watch_conversion_guard change_mult",
+        )
+        _apply_action(
+            staged,
+            actions,
+            "SAFE_CHANGE_5M_NON_WATCH_MAX_PASSES_PER_CYCLE",
+            _to_int_str(safe_change_non_watch_max_passes),
+            "non_watch_conversion_guard change_cap",
+        )
+        _apply_action(
+            staged,
+            actions,
+            "PLAN_MAX_WATCHLIST_SHARE",
+            _to_float_str(plan_watchlist_share),
+            "non_watch_conversion_guard watchlist_share",
+        )
+        _apply_action(
+            staged,
+            actions,
+            "PLAN_MIN_NON_WATCHLIST_PER_BATCH",
+            _to_int_str(plan_min_non_watchlist),
+            "non_watch_conversion_guard non_watch_min",
+        )
+        _apply_action(
+            staged,
+            actions,
+            "PLAN_MAX_SINGLE_SOURCE_SHARE",
+            _to_float_str(plan_single_source_share),
+            "non_watch_conversion_guard single_source_share",
+        )
+        _apply_action(
+            staged,
+            actions,
+            "V2_UNIVERSE_NOVELTY_MIN_SHARE",
+            _to_float_str(novelty_share),
+            "non_watch_conversion_guard novelty",
+        )
+        _apply_action(
+            staged,
+            actions,
+            "AUTO_TRADE_TOP_N",
+            _to_int_str(top_n),
+            "non_watch_conversion_guard topn",
+        )
+        if qos_caps:
+            watch_cap = int(qos_caps.get("watchlist", 0) or 0)
+            if watch_cap > 0:
+                qos_caps["watchlist"] = _clamp_int(watch_cap - 6, flow_qos_watchlist_cap_floor, 600)
+            for src in ("onchain", "onchain+market", "dexscreener", "geckoterminal"):
+                prev = int(qos_caps.get(src, 0) or 0)
+                if prev > 0:
+                    qos_caps[src] = _clamp_int(prev + 3, 1, 600)
+            _apply_action(
+                staged,
+                actions,
+                "V2_SOURCE_QOS_SOURCE_CAPS",
+                _format_source_cap_map(qos_caps),
+                "non_watch_conversion_guard source_qos_caps",
+            )
+        if universe_caps:
+            watch_cap = int(universe_caps.get("watchlist", 0) or 0)
+            if watch_cap > 0:
+                universe_caps["watchlist"] = _clamp_int(watch_cap - 4, flow_universe_watchlist_cap_floor, 600)
+            for src in ("onchain", "onchain+market", "dexscreener", "geckoterminal"):
+                prev = int(universe_caps.get(src, 0) or 0)
+                if prev > 0:
+                    universe_caps[src] = _clamp_int(prev + 2, 1, 600)
+            _apply_action(
+                staged,
+                actions,
+                "V2_UNIVERSE_SOURCE_CAPS",
+                _format_source_cap_map(universe_caps),
+                "non_watch_conversion_guard universe_caps",
+            )
+
+    prefilter_plan_choke = bool(
+        bridge_post_filters_total_15m >= 12
+        and bridge_lost_share_15m >= 0.60
+        and bridge_lost_non_watch_15m >= max(4, int(bridge_lost_before_plan_15m // 3))
+        and prefilter_open_duplicate_15m >= max(8, int(bridge_lost_before_plan_15m // 3))
+    )
+    if prefilter_plan_choke:
+        rule_hits["prefilter_plan_choke"] += 1
+        trace.append(
+            "prefilter_plan_choke "
+            f"post_filters15={bridge_post_filters_total_15m} lost15={bridge_lost_before_plan_15m} "
+            f"lost_non_watch15={bridge_lost_non_watch_15m} open_duplicate15={prefilter_open_duplicate_15m}"
+        )
+        per_symbol_cycle_cap = _clamp_int(
+            per_symbol_cycle_cap - 1,
+            flow_per_symbol_cap_floor,
+            20,
+        )
+        novelty_share = _clamp_float(novelty_share + 0.03, 0.05, 0.90)
+        top_n = _clamp_int(top_n + 2, 8, 80)
+        _apply_action(
+            staged,
+            actions,
+            "V2_SOURCE_QOS_MAX_PER_SYMBOL_PER_CYCLE",
+            _to_int_str(per_symbol_cycle_cap),
+            "prefilter_plan_choke symbol_cap",
+        )
+        _apply_action(
+            staged,
+            actions,
+            "V2_UNIVERSE_NOVELTY_MIN_SHARE",
+            _to_float_str(novelty_share),
+            "prefilter_plan_choke novelty",
+        )
+        _apply_action(
+            staged,
+            actions,
+            "AUTO_TRADE_TOP_N",
+            _to_int_str(top_n),
+            "prefilter_plan_choke topn",
         )
 
     if safety_api_4029_hits_15m > 0:
@@ -4224,6 +4777,50 @@ def _build_action_plan(
                 f"open_share={churn_open_share:.2f} flat_share={churn_flat_share:.2f}"
             )
             rule_hits["churn_lock_activate"] += 1
+        elif edge_low_symbol_loop and plan_top_symbol_15m:
+            ttl_seconds = _clamp_int(max(1200, int(cooldown * 12)), 1200, 3600)
+            lock_until = tick_ts + float(ttl_seconds)
+            if active_lock_symbol == plan_top_symbol_15m:
+                active_lock_until = max(float(active_lock_until), float(lock_until))
+            else:
+                active_lock_symbol = plan_top_symbol_15m
+                active_lock_until = float(lock_until)
+            runtime_state.churn_lock_symbol = str(plan_top_symbol_15m)
+            runtime_state.churn_lock_until_ts = float(active_lock_until)
+            runtime_state.churn_lock_last_reason = (
+                f"edge_low_loop edge_low_hits={edge_low_hits} edge_low_share={edge_low_share_15m:.2f} "
+                f"plan_top_share={plan_top_share_15m:.2f}"
+            )
+            rule_hits["edge_low_symbol_lock"] += 1
+            trace.append(
+                "edge_low_symbol_lock "
+                f"symbol={plan_top_symbol_15m} edge_low_hits={edge_low_hits} "
+                f"edge_low_share={edge_low_share_15m:.2f} plan_top_share={plan_top_share_15m:.2f}"
+            )
+        elif loss_symbol_dominant and top_loss_symbol_60m:
+            ttl_seconds = _clamp_int(
+                max(900, int(abs(float(top_loss_pnl_60m)) * 90000.0)),
+                900,
+                3600,
+            )
+            lock_until = tick_ts + float(ttl_seconds)
+            if active_lock_symbol == top_loss_symbol_60m:
+                active_lock_until = max(float(active_lock_until), float(lock_until))
+            else:
+                active_lock_symbol = top_loss_symbol_60m
+                active_lock_until = float(lock_until)
+            runtime_state.churn_lock_symbol = str(top_loss_symbol_60m)
+            runtime_state.churn_lock_until_ts = float(active_lock_until)
+            runtime_state.churn_lock_last_reason = (
+                f"loss_symbol pnl60={top_loss_pnl_60m:.4f} closes60={top_loss_close_count_60m} "
+                f"share60={top_loss_share_abs_60m:.2f}"
+            )
+            rule_hits["loss_symbol_lock"] += 1
+            trace.append(
+                "loss_symbol_lock "
+                f"symbol={top_loss_symbol_60m} pnl60={top_loss_pnl_60m:.4f} "
+                f"closes60={top_loss_close_count_60m} share60={top_loss_share_abs_60m:.2f}"
+            )
         elif cooldown_symbol_dominant and cooldown_top_symbol:
             ttl_seconds = _clamp_int(
                 max(900, int(cooldown * 10)),
@@ -4278,6 +4875,14 @@ def _build_action_plan(
         if churn_detected and churn_symbol:
             active_lock_symbol = churn_symbol
             active_lock_until = tick_ts + float(max(600, int(churn_ttl_seconds or 0)))
+        elif edge_low_symbol_loop and plan_top_symbol_15m:
+            active_lock_symbol = str(plan_top_symbol_15m)
+            active_lock_until = tick_ts + float(_clamp_int(max(1200, int(cooldown * 12)), 1200, 3600))
+        elif loss_symbol_dominant and top_loss_symbol_60m:
+            active_lock_symbol = str(top_loss_symbol_60m)
+            active_lock_until = tick_ts + float(
+                _clamp_int(max(900, int(abs(float(top_loss_pnl_60m)) * 90000.0)), 900, 3600)
+            )
         elif cooldown_symbol_dominant and cooldown_top_symbol:
             active_lock_symbol = str(cooldown_top_symbol)
             active_lock_until = tick_ts + float(_clamp_int(max(900, int(cooldown * 10)), 900, 3600))
@@ -4989,6 +5594,37 @@ def _build_action_plan(
             trace.append(f"relax_score_min hits={score_min_hits}")
             _apply_action(staged, actions, "MARKET_MODE_STRICT_SCORE", _to_int_str(strict), "score_min_dominant")
             _apply_action(staged, actions, "MARKET_MODE_SOFT_SCORE", _to_int_str(soft), "score_min_dominant")
+            if source_starvation_guard or non_watch_post_filter_starved:
+                non_watch_soft_score_delta = _clamp_int(
+                    non_watch_soft_score_delta + 2,
+                    0,
+                    24,
+                )
+                non_watch_soft_max_per_cycle = _clamp_int(
+                    non_watch_soft_max_per_cycle + 1,
+                    0,
+                    8,
+                )
+                rule_hits["relax_score_non_watch_soft"] += 1
+                trace.append(
+                    "relax_score_non_watch_soft "
+                    f"hits={score_min_hits} supply_non_watch={supply_non_watch_15m} "
+                    f"post_filters_non_watch={post_filters_non_watch_15m}"
+                )
+                _apply_action(
+                    staged,
+                    actions,
+                    "MARKET_MODE_NON_WATCH_SOFT_SCORE_DELTA",
+                    _to_int_str(non_watch_soft_score_delta),
+                    "score_non_watch_soft delta",
+                )
+                _apply_action(
+                    staged,
+                    actions,
+                    "MARKET_MODE_NON_WATCH_SOFT_MAX_PER_CYCLE",
+                    _to_int_str(non_watch_soft_max_per_cycle),
+                    "score_non_watch_soft cap",
+                )
         if safe_volume_hits > 0:
             if volume_soft_choke:
                 rule_hits["safe_volume_soft_flow_expand"] += 1
@@ -5051,6 +5687,37 @@ def _build_action_plan(
                         _to_int_str(plan_min_non_watchlist),
                         "safe_volume_soft_flow_expand non_watch_min",
                     )
+            if source_starvation_guard or non_watch_post_filter_starved:
+                safe_volume_non_watch_soft_ratio = _clamp_float(
+                    safe_volume_non_watch_soft_ratio - 0.05,
+                    0.30,
+                    0.95,
+                )
+                safe_volume_non_watch_max_passes = _clamp_int(
+                    safe_volume_non_watch_max_passes + 1,
+                    0,
+                    8,
+                )
+                rule_hits["relax_safe_volume_non_watch"] += 1
+                trace.append(
+                    "relax_safe_volume_non_watch "
+                    f"hits={safe_volume_hits} supply_non_watch={supply_non_watch_15m} "
+                    f"post_filters_non_watch={post_filters_non_watch_15m}"
+                )
+                _apply_action(
+                    staged,
+                    actions,
+                    "SAFE_VOLUME_TWO_TIER_NON_WATCH_SOFT_RATIO",
+                    _to_float_str(safe_volume_non_watch_soft_ratio),
+                    "safe_volume_non_watch_soft ratio",
+                )
+                _apply_action(
+                    staged,
+                    actions,
+                    "SAFE_VOLUME_TWO_TIER_NON_WATCH_MAX_PASSES_PER_CYCLE",
+                    _to_int_str(safe_volume_non_watch_max_passes),
+                    "safe_volume_non_watch_soft cap",
+                )
             else:
                 min_vol = _clamp_float(min_vol - 1.0, bounds.volume_floor, bounds.volume_ceiling)
                 rule_hits["relax_safe_volume"] += 1
@@ -5736,7 +6403,8 @@ def _build_action_plan(
                 _to_float_str(plan_watchlist_share),
                 "source_starvation_guard watchlist_clamp",
             )
-        guarded_non_watch_min = _clamp_int(max(plan_min_non_watchlist_initial, 2), 0, max(flow_non_watchlist_ceiling, 8))
+        # Do not freeze non-watch quota at startup value: high stale presets can self-lock the plan stage.
+        guarded_non_watch_min = _clamp_int(2, 0, max(flow_non_watchlist_ceiling, 8))
         if plan_min_non_watchlist < guarded_non_watch_min:
             plan_min_non_watchlist = guarded_non_watch_min
             _apply_action(
@@ -5849,6 +6517,35 @@ def _build_action_plan(
             f"blacklist={blacklist_hits} duplicate={address_duplicate_hits} open_rate={open_rate:.3f}"
         )
 
+    prelimit_blocked_actions: list[dict[str, Any]] = []
+    protected = {str(x or "").strip() for x in (protected_keys or set()) if str(x or "").strip()}
+    if actions:
+        prefiltered: list[Action] = []
+        for action in actions:
+            key = str(action.key or "").strip()
+            if not key:
+                continue
+            if key in protected:
+                prelimit_blocked_actions.append(
+                    {
+                        "key": key,
+                        "reason": str(action.reason or ""),
+                        "blocked_by": "protected_key_prelimit",
+                    }
+                )
+                continue
+            if key not in TUNER_MUTABLE_KEYS:
+                prelimit_blocked_actions.append(
+                    {
+                        "key": key,
+                        "reason": str(action.reason or ""),
+                        "blocked_by": "mutable_whitelist_prelimit",
+                    }
+                )
+                continue
+            prefiltered.append(action)
+        actions = prefiltered
+
     coalesced_actions, coalesced_count = _coalesce_actions(actions)
     prioritized = sorted(coalesced_actions, key=_action_priority)
     limited = prioritized[: mode.max_actions_per_tick]
@@ -5882,16 +6579,50 @@ def _build_action_plan(
         "supply_non_watch_15m": int(supply_non_watch_15m),
         "post_filters_non_watch_15m": int(post_filters_non_watch_15m),
         "post_filters_non_watch_min_15m": int(source_non_watch_actionable_min_15m),
+        "post_filters_non_watch_starved_floor_15m": int(source_non_watch_starved_floor_15m),
         "non_watch_actionable": bool(source_non_watch_actionable),
         "non_watch_post_filter_starved": bool(non_watch_post_filter_starved),
         "plan_non_watch_15m": int(plan_non_watch_15m),
         "non_watch_zero_hits_15m": int(source_non_watch_zero_hits_15m),
+    }
+    meta["non_watch_conversion"] = {
+        "active": bool(non_watch_conversion_choke),
+        "post_filter_ratio_15m": round(float(non_watch_post_filter_ratio_15m), 6),
+        "plan_ratio_15m": round(float(non_watch_plan_ratio_15m), 6),
     }
     meta["cooldown_symbol_dominance"] = {
         "active": bool(cooldown_symbol_dominant),
         "symbol": str(cooldown_top_symbol or ""),
         "hits": int(cooldown_top_hits),
         "share": round(float(cooldown_top_share), 6),
+    }
+    meta["symbol_loss_pressure_60m"] = {
+        "active": bool(loss_symbol_dominant),
+        "symbol": str(top_loss_symbol_60m or ""),
+        "pnl_usd": round(float(top_loss_pnl_60m), 6),
+        "close_count": int(top_loss_close_count_60m),
+        "loss_share_abs": round(float(top_loss_share_abs_60m), 6),
+    }
+    meta["edge_low_loop_15m"] = {
+        "active": bool(edge_low_symbol_loop),
+        "symbol": str(plan_top_symbol_15m or ""),
+        "plan_attempts": int(plan_attempts_15m),
+        "plan_top_count": int(plan_top_count_15m),
+        "plan_top_share": round(float(plan_top_share_15m), 6),
+        "edge_low_hits": int(edge_low_hits),
+        "edge_low_share": round(float(edge_low_share_15m), 6),
+        "source_top": str(source_top_name_15m or ""),
+        "source_top_share": round(float(source_top_share_15m), 6),
+    }
+    meta["prefilter_15m"] = {
+        "removed_total": int(prefilter_removed_total_15m),
+        "open_duplicate": int(prefilter_open_duplicate_15m),
+        "open_duplicate_share": round(float(prefilter_open_duplicate_share_15m), 6),
+        "post_filters_total": int(bridge_post_filters_total_15m),
+        "lost_before_plan": int(bridge_lost_before_plan_15m),
+        "lost_share": round(float(bridge_lost_share_15m), 6),
+        "lost_watchlist": int(bridge_lost_watchlist_15m),
+        "lost_non_watch": int(bridge_lost_non_watch_15m),
     }
     meta["safety_degraded_15m"] = {
         "total_hits": int(safety_total_hits_15m),
@@ -5903,6 +6634,9 @@ def _build_action_plan(
         meta["trimmed_actions"] = int(trimmed)
     if coalesced_count > 0:
         meta["coalesced_actions"] = int(coalesced_count)
+    if prelimit_blocked_actions:
+        meta["prelimit_blocked_actions"] = prelimit_blocked_actions
+        meta["prelimit_blocked_actions_count"] = int(len(prelimit_blocked_actions))
     return limited, trace, meta
 
 
@@ -6594,6 +7328,8 @@ def _tick(
         )
         state.restart_history_ts = list(restart_history)
         last_restart_ts = float(now_ts)
+
+    watchdog_owner_active, watchdog_scan_age_seconds = _watchdog_active(root)
     runtime_subset = _active_override_subset(root, profile_id, TUNER_RUNTIME_FALLBACK_KEYS)
     for key, value in runtime_subset.items():
         if key not in overrides or str(overrides.get(key, "")).strip() == "":
@@ -6645,11 +7381,19 @@ def _tick(
     )
     source_non_watch_actionable_min_before = max(4, int(pre_buy_15m // 2))
     source_non_watch_actionable_before = bool(post_filters_non_watch_before >= source_non_watch_actionable_min_before)
+    source_non_watch_starved_floor_before = max(
+        0,
+        int(source_non_watch_actionable_min_before) - 1,
+    )
+    source_non_watch_starved_before = bool(
+        supply_non_watch_before >= max(12, int(metrics.selected_from_batch) // 3)
+        and post_filters_non_watch_before <= source_non_watch_starved_floor_before
+    )
     source_starvation_before = bool(
         source_top_name_before.startswith("watchlist")
         and source_top_share_before >= 0.75
         and supply_non_watch_before >= max(12, int(metrics.selected_from_batch) // 3)
-        and source_non_watch_actionable_before
+        and (source_non_watch_actionable_before or source_non_watch_starved_before)
         and plan_non_watch_before <= 0
         and non_watch_zero_hits_before >= 3
     )
@@ -6681,6 +7425,7 @@ def _tick(
         telemetry=telemetry_before,
         runtime_state=state,
         now_ts=tick_now_ts,
+        protected_keys=protected_keys,
         allow_zero_cooldown=bool(allow_zero_cooldown),
     )
     if warmup_guard_active:
@@ -6717,7 +7462,12 @@ def _tick(
         if str(a.old_value or "").strip() != str(a.new_value or "").strip()
     ]
 
-    blocked_actions = blocked_mutations + blocked_phase + blocked_idle_relax
+    prelimit_blocked_actions = []
+    if isinstance(decision_meta, dict):
+        pre_rows = decision_meta.get("prelimit_blocked_actions", [])
+        if isinstance(pre_rows, list):
+            prelimit_blocked_actions = [x for x in pre_rows if isinstance(x, dict)]
+    blocked_actions = prelimit_blocked_actions + blocked_mutations + blocked_phase + blocked_idle_relax
     rollback_triggered = False
     rollback_reason = ""
     fail_now_for_degrade = bool(
@@ -6902,6 +7652,7 @@ def _tick(
                         and (
                             metrics.open_positions <= 0
                             and restart_allowed
+                            and (not watchdog_owner_active)
                         )
                     )
                     if can_restart:
@@ -6916,7 +7667,10 @@ def _tick(
                             "restart_deferred "
                             f"cooldown_left={round(float(restart_cooldown_left), 2)} "
                             f"restart_budget_left={int(restart_budget_left)} "
-                            f"open_positions={int(metrics.open_positions)} warmup={bool(warmup_guard_active)}"
+                            f"open_positions={int(metrics.open_positions)} "
+                            f"warmup={bool(warmup_guard_active)} "
+                            f"watchdog_owner={bool(watchdog_owner_active)} "
+                            f"watchdog_scan_age={round(float(watchdog_scan_age_seconds or -1.0), 2)}"
                         )
                 elif runtime_patch_sync_ok:
                     apply_state = "written_hot_applied"
@@ -6961,6 +7715,7 @@ def _tick(
                 and (
                     metrics.open_positions <= 0
                     and restart_allowed
+                    and (not watchdog_owner_active)
                 )
             )
             if can_restart:
@@ -6981,35 +7736,46 @@ def _tick(
                     f"open_positions={metrics.open_positions} "
                     f"cooldown_left={round(float(restart_cooldown_left), 2)} "
                     f"restart_budget_left={int(restart_budget_left)} "
-                    f"warmup={bool(warmup_guard_active)}"
+                    f"warmup={bool(warmup_guard_active)} "
+                    f"watchdog_owner={bool(watchdog_owner_active)} "
+                    f"watchdog_scan_age={round(float(watchdog_scan_age_seconds or -1.0), 2)}"
                 )
     if not dry_run and metrics.open_positions <= 0:
         alive = _profile_running(root, profile_id)
         hb_recent = _heartbeat_recent(root, profile_id, max_age_seconds=90.0)
         if (not alive) and (not hb_recent):
-            now_ts = time.time()
-            can_restart, restart_cooldown_left, restart_budget_left = _can_restart(now_ts)
-            restart_tail = ""
-            if can_restart:
-                ok, restart_tail = _run_dead_profile_recovery(root, profile_id)
-                restarted = ok and _profile_running(root, profile_id)
-                if restarted:
-                    _record_restart(now_ts)
-                    if apply_state == "noop":
-                        apply_state = "restart_applied_dead_profile"
+            if watchdog_owner_active:
+                if apply_state == "noop":
+                    apply_state = "dead_profile_wait_watchdog"
+                decision_trace.append(
+                    "dead_profile_recovery_deferred "
+                    f"alive={alive} hb_recent={hb_recent} watchdog_owner={bool(watchdog_owner_active)} "
+                    f"watchdog_scan_age={round(float(watchdog_scan_age_seconds or -1.0), 2)}"
+                )
+            else:
+                now_ts = time.time()
+                can_restart, restart_cooldown_left, restart_budget_left = _can_restart(now_ts)
+                restart_tail = ""
+                if can_restart:
+                    ok, restart_tail = _run_dead_profile_recovery(root, profile_id)
+                    restarted = ok and _profile_running(root, profile_id)
+                    if restarted:
+                        _record_restart(now_ts)
+                        if apply_state == "noop":
+                            apply_state = "restart_applied_dead_profile"
+                    else:
+                        if apply_state == "noop":
+                            apply_state = "restart_failed_dead_profile"
                 else:
                     if apply_state == "noop":
-                        apply_state = "restart_failed_dead_profile"
-            else:
-                if apply_state == "noop":
-                    apply_state = "restart_dead_profile_deferred"
-            decision_trace.append(
-                "dead_profile_recovery "
-                f"alive={alive} hb_recent={hb_recent} can_restart={can_restart} "
-                f"cooldown_left={round(float(restart_cooldown_left), 2)} "
-                f"restart_budget_left={int(restart_budget_left)} "
-                f"detail={str(restart_tail or '-')}"
-            )
+                        apply_state = "restart_dead_profile_deferred"
+                decision_trace.append(
+                    "dead_profile_recovery "
+                    f"alive={alive} hb_recent={hb_recent} can_restart={can_restart} "
+                    f"cooldown_left={round(float(restart_cooldown_left), 2)} "
+                    f"restart_budget_left={int(restart_budget_left)} "
+                    f"detail={str(restart_tail or '-')}"
+                )
 
     if not dry_run and restarted:
         if not _update_active_matrix_overrides(root, profile_id, target_overrides):
@@ -7050,6 +7816,12 @@ def _tick(
         "restart_history_len_hour": int(len(restart_history)),
         "restart_cooldown_seconds": int(max(0, restart_cooldown_seconds)),
         "restart_max_per_hour": int(max(1, restart_max_per_hour)),
+        "watchdog_owner_active": bool(watchdog_owner_active),
+        "watchdog_scan_age_seconds": (
+            round(float(watchdog_scan_age_seconds), 3)
+            if isinstance(watchdog_scan_age_seconds, (int, float))
+            else "N/A"
+        ),
     }
     telemetry_v2["runtime_patch_sync_ok"] = bool(runtime_patch_sync_ok)
     if runtime_patch_sync_detail:

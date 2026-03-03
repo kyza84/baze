@@ -245,3 +245,26 @@ Expected effect:
 
 - Increase `post_filters_pass_non_watch_15m` from zero starvation states.
 - Reduce structural watchlist-only planning without forcing unsafe entries.
+
+## Plan Bridge And Cost-Dominant Recovery (New)
+
+The tuner now explicitly reacts to two additional failure clusters without touching hard anti-scam:
+
+- `prefilter_plan_choke`: high loss between `post_filters` and `plan_attempts` caused by prefilter duplicates/placeholder rows.
+- `cost-dominant edge loop`: repeated `edge_low`/`ev_net_low` windows where expected gross edge is consistently below cost profile.
+
+Supporting behavior:
+
+- action planner applies `protected_keys` filtering before action-budget limits (blocked attempts are written to decision meta),
+- `blocked_actions` now includes `prelimit_blocked_actions`,
+- loop pressure metadata is exposed in `decision_meta`:
+  - `non_watch_conversion`
+  - `prefilter_plan_choke`
+  - `symbol_loss_pressure_60m`
+  - `edge_low_loop_15m`
+
+Expected effect:
+
+- fewer wasted plan slots on non-openable duplicates,
+- clearer split between conversion bottleneck vs economics bottleneck,
+- safer tuning decisions because immutable/protected keys are filtered early and auditable.

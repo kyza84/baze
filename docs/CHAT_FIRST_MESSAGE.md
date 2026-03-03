@@ -52,3 +52,23 @@
   - `source_starvation_guard.non_watch_post_filter_starved`
   - `supply_sanity_15m.post_filters_pass_non_watch_15m`
 - Keep hard anti-scam unchanged: no disabling of honeypot/hard blocklist paths.
+
+## Commit Update 2026-03-03 (Latest)
+- New runtime checks to verify in first diagnostic cut:
+  - `decision_meta.prelimit_blocked_actions_count`
+  - `decision_meta.non_watch_conversion.active`
+  - `decision_meta.prefilter_plan_choke.active`
+  - `decision_meta.symbol_loss_pressure_60m.active`
+  - `decision_meta.edge_low_loop_15m.active`
+- New plan prefilter telemetry in trade decisions:
+  - `decision_stage=plan_select`
+  - `prefilter_removed_total`
+  - `prefilter_removed_by_reason`
+  - `prefilter_removed_by_source`
+- New auto-trader cost-dominant guard controls:
+  - `EDGE_COST_DOMINANT_*`
+  - `EDGE_COST_DOMINANT_NON_WATCH_EXPLORE_*`
+  - `NON_WATCH_EXPLORE_MIN_TRADE_*`
+- Watchdog resilience update:
+  - lock file `data/matrix/runs/watchdog.lock.json`
+  - stale detection now requires heartbeat + runtime activity age.

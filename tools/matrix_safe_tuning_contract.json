@@ -76,6 +76,20 @@
       "sensitivity": "high",
       "importance": "entry_quality"
     },
+    "MARKET_MODE_NON_WATCH_SOFT_SCORE_DELTA": {
+      "type": "int",
+      "min": 0,
+      "max": 24,
+      "sensitivity": "medium",
+      "importance": "entry_quality"
+    },
+    "MARKET_MODE_NON_WATCH_SOFT_MAX_PER_CYCLE": {
+      "type": "int",
+      "min": 0,
+      "max": 8,
+      "sensitivity": "medium",
+      "importance": "flow"
+    },
     "MIN_EXPECTED_EDGE_PERCENT": {
       "type": "float",
       "min": 0.05,
@@ -149,9 +163,23 @@
       "sensitivity": "medium",
       "importance": "entry_quality"
     },
+    "SAFE_VOLUME_TWO_TIER_NON_WATCH_SOFT_RATIO": {
+      "type": "float",
+      "min": 0.20,
+      "max": 0.95,
+      "sensitivity": "medium",
+      "importance": "entry_quality"
+    },
+    "SAFE_VOLUME_TWO_TIER_NON_WATCH_MAX_PASSES_PER_CYCLE": {
+      "type": "int",
+      "min": 0,
+      "max": 8,
+      "sensitivity": "medium",
+      "importance": "flow"
+    },
     "SAFE_AGE_NON_WATCH_SOFT_RATIO": {
       "type": "float",
-      "min": 0.35,
+      "min": 0.25,
       "max": 1.0,
       "sensitivity": "medium",
       "importance": "entry_quality"
@@ -166,7 +194,7 @@
     "SAFE_CHANGE_5M_NON_WATCH_SOFT_MULT": {
       "type": "float",
       "min": 1.0,
-      "max": 1.8,
+      "max": 2.2,
       "sensitivity": "medium",
       "importance": "entry_quality"
     },
