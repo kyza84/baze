@@ -8,6 +8,23 @@ from monitor.watchlist import WatchlistMonitor
 
 
 class WatchlistMonitorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_prune_cached_tokens_removes_blocked_rows(self) -> None:
+        monitor = WatchlistMonitor()
+        monitor._cached_tokens = [
+            {"symbol": "A", "address": "0x1111111111111111111111111111111111111111"},
+            {"symbol": "B", "address": "0x2222222222222222222222222222222222222222"},
+        ]
+        with patch.object(config, "WATCHLIST_PREFILTER_BLOCKED_CACHE_TTL_SECONDS", 600):
+            removed = monitor.prune_cached_tokens(
+                ["0x1111111111111111111111111111111111111111"],
+                reason="test",
+            )
+        await monitor.close()
+        self.assertEqual(removed, 1)
+        symbols = {str(x.get("symbol", "")).upper() for x in monitor._cached_tokens}
+        self.assertEqual(symbols, {"B"})
+        self.assertTrue(monitor._is_prefilter_blocked("0x1111111111111111111111111111111111111111"))
+
     async def test_missing_pair_created_at_uses_fallback_age(self) -> None:
         monitor = WatchlistMonitor()
         fallback_age = 7200
@@ -133,6 +150,78 @@ class WatchlistMonitorTests(unittest.IsolatedAsyncioTestCase):
         await monitor.close()
         symbols = {str(x.get("symbol", "")).upper() for x in rows}
         self.assertEqual(symbols, {"OKX"})
+
+    async def test_fetch_tokens_keeps_previous_cache_when_refresh_empty(self) -> None:
+        monitor = WatchlistMonitor()
+        monitor._cached_tokens = [
+            {
+                "symbol": "KEEP",
+                "address": "0x1111111111111111111111111111111111111111",
+                "liquidity": 220000.0,
+                "volume_5m": 3200.0,
+                "source": "watchlist",
+            }
+        ]
+        monitor._last_refresh_ts = 0.0
+
+        async def fake_refresh() -> list[dict]:
+            return []
+
+        monitor._refresh = fake_refresh  # type: ignore[assignment]
+        with patch.object(config, "WATCHLIST_ENABLED", True), patch.object(config, "WATCHLIST_REFRESH_SECONDS", 60):
+            rows = await monitor.fetch_tokens()
+
+        await monitor.close()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(str(rows[0].get("symbol", "")), "KEEP")
+
+    async def test_fetch_tokens_keeps_previous_cache_when_low_supply_refresh(self) -> None:
+        monitor = WatchlistMonitor()
+        monitor._cached_tokens = [
+            {
+                "symbol": "A",
+                "address": "0x1111111111111111111111111111111111111111",
+                "liquidity": 220000.0,
+                "volume_5m": 3200.0,
+                "source": "watchlist",
+            },
+            {
+                "symbol": "B",
+                "address": "0x2222222222222222222222222222222222222222",
+                "liquidity": 210000.0,
+                "volume_5m": 3000.0,
+                "source": "watchlist",
+            },
+            {
+                "symbol": "C",
+                "address": "0x3333333333333333333333333333333333333333",
+                "liquidity": 205000.0,
+                "volume_5m": 2900.0,
+                "source": "watchlist",
+            },
+        ]
+        monitor._last_refresh_ts = 0.0
+
+        async def fake_refresh() -> list[dict]:
+            return [
+                {
+                    "symbol": "ONLY1",
+                    "address": "0x4444444444444444444444444444444444444444",
+                    "liquidity": 90000.0,
+                    "volume_5m": 800.0,
+                    "source": "watchlist",
+                }
+            ]
+
+        monitor._refresh = fake_refresh  # type: ignore[assignment]
+        with patch.object(config, "WATCHLIST_ENABLED", True), patch.object(config, "WATCHLIST_REFRESH_SECONDS", 60), patch.object(
+            config, "WATCHLIST_CACHE_RETAIN_MIN_COUNT", 3
+        ):
+            rows = await monitor.fetch_tokens()
+
+        await monitor.close()
+        symbols = {str(x.get("symbol", "")) for x in rows}
+        self.assertEqual(symbols, {"A", "B", "C"})
 
 
 if __name__ == "__main__":

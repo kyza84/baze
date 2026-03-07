@@ -1,0 +1,1364 @@
+{
+  "window_utc": [
+    "2026-03-05T19:44:40.983064+00:00",
+    "2026-03-06T19:44:40.983064+00:00"
+  ],
+  "profiles": {
+    "u_station_flow_intake_dryrun_v1": {
+      "candidates": {
+        "rows_total": 20944,
+        "stage_counts": {
+          "filter_fail": 17210,
+          "post_filters": 2520,
+          "flow_metrics": 987,
+          "quality_gate": 227
+        },
+        "top_reasons": [
+          [
+            "FILTER_SAFE_VOLUME",
+            5623
+          ],
+          [
+            "FILTER_PASSED_ALL_FILTERS",
+            2520
+          ],
+          [
+            "FILTER_SAFE_CHANGE_5M",
+            2379
+          ],
+          [
+            "FILTER_SAFE_TRANSIENT_AGE",
+            2233
+          ],
+          [
+            "FILTER_SAFE_CONTRACT",
+            2123
+          ],
+          [
+            "FILTER_SAFE_LIQUIDITY",
+            1936
+          ],
+          [
+            "FILTER_SAFE_TRANSIENT_VOLUME",
+            1095
+          ],
+          [
+            "PRE_BLACKLIST",
+            1065
+          ],
+          [
+            "FLOW_LANE_SPLIT_SUMMARY",
+            987
+          ],
+          [
+            "FILTER_SAFE_TRANSIENT_LIQUIDITY",
+            305
+          ],
+          [
+            "QUALITY_SOURCE_EV_COOLDOWN",
+            192
+          ],
+          [
+            "FILTER_SAFE_TRANSIENT_CHANGE_5M",
+            162
+          ],
+          [
+            "FILTER_SAFE_AGE",
+            158
+          ],
+          [
+            "FILTER_NON_WATCH_SCORE_CYCLE_CAP",
+            87
+          ],
+          [
+            "QUALITY_COOLDOWN_BUCKET",
+            28
+          ],
+          [
+            "FILTER_SAFE_TRANSIENT_AGE_NON_WATCH_CYCLE_CAP",
+            27
+          ],
+          [
+            "PRE_PUMP_HISTORY_BLOCK",
+            8
+          ],
+          [
+            "FILTER_ADDRESS_OR_DUPLICATE",
+            7
+          ],
+          [
+            "QUALITY_PROVISIONAL_CORE_CAP",
+            7
+          ],
+          [
+            "FILTER_HARD_BLOCKLIST",
+            2
+          ]
+        ],
+        "flow_summary_rows": 987,
+        "raw_by_source": {
+          "geckoterminal": 11974,
+          "watchlist": 2676,
+          "dexscreener": 3145,
+          "onchain": 1935
+        },
+        "post_filters_by_source": {
+          "watchlist": 2001,
+          "geckoterminal": 495,
+          "dexscreener": 2,
+          "onchain": 22
+        },
+        "raw_non_watch": 17054,
+        "raw_watchlist": 2676,
+        "post_non_watch": 519,
+        "post_watchlist": 2001,
+        "post_non_watch_pass_rate_pct": 3.043,
+        "post_watchlist_pass_rate_pct": 74.776,
+        "quality_skip_top": [
+          [
+            "QUALITY_SOURCE_EV_COOLDOWN",
+            192
+          ],
+          [
+            "QUALITY_COOLDOWN_BUCKET",
+            28
+          ],
+          [
+            "QUALITY_PROVISIONAL_CORE_CAP",
+            7
+          ]
+        ]
+      },
+      "trade": {
+        "rows_total": 3039,
+        "stage_counts": {
+          "plan_trade": 1334,
+          "trade_open": 138,
+          "plan_select": 851,
+          "trade_close": 137,
+          "plan_prefilter": 536,
+          "trade_partial": 43
+        },
+        "top_reasons": [
+          [
+            "PLAN_SELECTION_SUMMARY",
+            851
+          ],
+          [
+            "PLAN_EV_NET_LOW",
+            818
+          ],
+          [
+            "PLAN_COOLDOWN",
+            474
+          ],
+          [
+            "PLAN_EDGE_LOW",
+            156
+          ],
+          [
+            "PLAN_PLANNED",
+            138
+          ],
+          [
+            "EXEC_BUY_PAPER",
+            138
+          ],
+          [
+            "PLAN_QUARANTINE",
+            94
+          ],
+          [
+            "UNKNOWN_SYMBOL_COOLDOWN",
+            62
+          ],
+          [
+            "EXIT_NO_MOMENTUM",
+            53
+          ],
+          [
+            "PLAN_COST_DOMINANT_EDGE",
+            52
+          ],
+          [
+            "EXIT_TIMEOUT",
+            47
+          ],
+          [
+            "PRE_HONEYPOT_GUARD",
+            34
+          ],
+          [
+            "EXIT_TP1_PARTIAL",
+            29
+          ],
+          [
+            "PLAN_CLUSTER_EV_PROB",
+            25
+          ],
+          [
+            "EXIT_TP2_PARTIAL",
+            14
+          ],
+          [
+            "EXIT_EARLY_RISK",
+            12
+          ],
+          [
+            "EXIT_STOP_LOSS",
+            12
+          ],
+          [
+            "PLAN_PLAN_NON_WATCHLIST_QUOTA",
+            10
+          ],
+          [
+            "PLAN_SOURCE_ROUTE_PROB",
+            7
+          ],
+          [
+            "EXIT_POST_PARTIAL_PROTECT",
+            6
+          ],
+          [
+            "EXIT_TP",
+            5
+          ],
+          [
+            "EXIT_WEAKNESS",
+            2
+          ]
+        ],
+        "plan_by_source": {
+          "watchlist": 1092,
+          "geckoterminal": 239,
+          "onchain": 3
+        },
+        "plan_top_symbols": [
+          [
+            "FAI",
+            91
+          ],
+          [
+            "Paperclip",
+            79
+          ],
+          [
+            "LCLAW",
+            74
+          ],
+          [
+            "MOLT",
+            74
+          ],
+          [
+            "SYND",
+            61
+          ],
+          [
+            "LIZARD",
+            60
+          ],
+          [
+            "GITC",
+            59
+          ],
+          [
+            "CLAWNCH",
+            55
+          ],
+          [
+            "VVV",
+            54
+          ],
+          [
+            "SCOUT",
+            49
+          ],
+          [
+            "ODAI",
+            47
+          ],
+          [
+            "ROOM",
+            44
+          ],
+          [
+            "SOL",
+            41
+          ],
+          [
+            "JUNO",
+            37
+          ],
+          [
+            "USD₮0",
+            32
+          ]
+        ],
+        "open_top_symbols": [
+          [
+            "FAI",
+            39
+          ],
+          [
+            "VVV",
+            23
+          ],
+          [
+            "SOL",
+            17
+          ],
+          [
+            "SYND",
+            10
+          ],
+          [
+            "TIBBIR",
+            6
+          ],
+          [
+            "LIZARD",
+            6
+          ],
+          [
+            "JUNO",
+            5
+          ],
+          [
+            "DEFI.ssi",
+            5
+          ],
+          [
+            "shitcoin",
+            5
+          ],
+          [
+            "REI",
+            2
+          ],
+          [
+            "AICOIN",
+            1
+          ],
+          [
+            "VibeCraft",
+            1
+          ],
+          [
+            "Caine",
+            1
+          ],
+          [
+            "BNKR",
+            1
+          ],
+          [
+            "EDGE",
+            1
+          ]
+        ],
+        "close_reasons": {
+          "EXIT_NO_MOMENTUM": 53,
+          "EXIT_TIMEOUT": 47,
+          "EXIT_EARLY_RISK": 12,
+          "EXIT_TP": 5,
+          "EXIT_STOP_LOSS": 12,
+          "EXIT_POST_PARTIAL_PROTECT": 6,
+          "EXIT_WEAKNESS": 2
+        },
+        "realized_pnl_usd_sum": -0.231329,
+        "close_count": 137,
+        "open_count": 138,
+        "winrate_close_pct": 49.64,
+        "avg_close_pnl_usd": -0.001689,
+        "median_hold_sec": 130,
+        "plan_economics": {
+          "gross_median_pct": 6.399999999999999,
+          "cost_median_pct": 6.35,
+          "size_median_usd": 0.8,
+          "ev_net_median_usd": -0.011104483249503395,
+          "edge_gate_gross_median_pct": 6.399999999999999,
+          "edge_gate_cost_median_pct": 6.35,
+          "edge_gate_size_median_usd": 0.8
+        }
+      },
+      "tuner": {
+        "rows_total": 535,
+        "policy_phase_counts": {
+          "expand": 59,
+          "hold": 248,
+          "tighten": 228
+        },
+        "restarts": 0,
+        "rollbacks": 34,
+        "issues_top": [],
+        "actions_top": [
+          [
+            "unknown",
+            1680
+          ]
+        ],
+        "bottleneck_stage_counts": {
+          "opportunity": 1,
+          "none": 462,
+          "action": 72
+        },
+        "bottleneck_hint_counts": {
+          "discovery_or_filters": 1,
+          "active": 462,
+          "plan_or_policy": 72
+        },
+        "median_opportunity_rate_h": 96.0,
+        "median_action_rate_h": 8.0,
+        "median_execution_open_rate_h": 8.0,
+        "median_selected_15m": null,
+        "source_mix_medians": {
+          "candidate_supply_non_watch_15m": null,
+          "candidate_supply_watchlist_15m": null,
+          "post_filters_pass_non_watch_15m": null,
+          "post_filters_pass_watchlist_15m": null,
+          "plan_attempts_non_watch_15m": null,
+          "plan_attempts_watchlist_15m": null,
+          "source_top_share_15m": null
+        }
+      },
+      "errors": {
+        "counts": {
+          "api_code_4029": 966
+        },
+        "samples": [
+          "2026-03-06 20:37:51,719 [INFO] [u_station_flow_intake_dryrun_v1] __main__: Scanned 14 tokens | High quality: 6 | Alerts sent: 0 | Trade candidates: 1 | Quality out/core/explore/probe: 1/0/1/0 | Opened: 0 | Raw lanes nw/wl=0/6 fallback=1(non_watch_primary_cap) | PostNW: 0 | PlanNW: 0 | Mode: local | ",
+          "2026-03-06 20:38:09,158 [INFO] [u_station_flow_intake_dryrun_v1] __main__: Scanned 21 tokens | High quality: 6 | Alerts sent: 0 | Trade candidates: 2 | Quality out/core/explore/probe: 2/1/1/0 | Opened: 1 | Raw lanes nw/wl=19/7 fallback=1(non_watch_primary_cap) | PostNW: 0 | PlanNW: 0 | Mode: local |",
+          "2026-03-06 20:38:25,285 [INFO] [u_station_flow_intake_dryrun_v1] __main__: Scanned 16 tokens | High quality: 6 | Alerts sent: 0 | Trade candidates: 2 | Quality out/core/explore/probe: 2/0/2/0 | Opened: 0 | Raw lanes nw/wl=0/6 fallback=1(non_watch_primary_cap) | PostNW: 0 | PlanNW: 0 | Mode: local | ",
+          "2026-03-06 20:38:41,150 [INFO] [u_station_flow_intake_dryrun_v1] __main__: Scanned 17 tokens | High quality: 6 | Alerts sent: 0 | Trade candidates: 2 | Quality out/core/explore/probe: 2/0/2/0 | Opened: 0 | Raw lanes nw/wl=1/6 fallback=1(non_watch_primary_cap) | PostNW: 0 | PlanNW: 0 | Mode: local | ",
+          "2026-03-06 20:40:59,065 [INFO] [u_station_flow_intake_dryrun_v1] __main__: Scanned 15 tokens | High quality: 6 | Alerts sent: 0 | Trade candidates: 2 | Quality out/core/explore/probe: 2/0/2/0 | Opened: 0 | Raw lanes nw/wl=0/6 fallback=1(non_watch_primary_cap) | PostNW: 0 | PlanNW: 0 | Mode: local | ",
+          "2026-03-06 20:41:16,843 [INFO] [u_station_flow_intake_dryrun_v1] __main__: Scanned 18 tokens | High quality: 6 | Alerts sent: 0 | Trade candidates: 1 | Quality out/core/explore/probe: 1/1/0/0 | Opened: 0 | Raw lanes nw/wl=6/6 fallback=1(non_watch_primary_cap) | PostNW: 0 | PlanNW: 0 | Mode: local | ",
+          "2026-03-06 20:41:32,720 [INFO] [u_station_flow_intake_dryrun_v1] __main__: Scanned 15 tokens | High quality: 6 | Alerts sent: 0 | Trade candidates: 1 | Quality out/core/explore/probe: 1/1/0/0 | Opened: 0 | Raw lanes nw/wl=1/6 fallback=1(non_watch_primary_cap) | PostNW: 0 | PlanNW: 0 | Mode: local | ",
+          "2026-03-06 20:43:49,608 [INFO] [u_station_flow_intake_dryrun_v1] __main__: Scanned 19 tokens | High quality: 6 | Alerts sent: 0 | Trade candidates: 1 | Quality out/core/explore/probe: 1/1/0/0 | Opened: 0 | Raw lanes nw/wl=1/6 fallback=1(non_watch_primary_cap) | PostNW: 0 | PlanNW: 0 | Mode: local | ",
+          "2026-03-06 20:44:07,001 [INFO] [u_station_flow_intake_dryrun_v1] __main__: Scanned 20 tokens | High quality: 4 | Alerts sent: 0 | Trade candidates: 2 | Quality out/core/explore/probe: 2/1/1/0 | Opened: 1 | Raw lanes nw/wl=10/6 fallback=1(non_watch_primary_cap) | PostNW: 0 | PlanNW: 0 | Mode: local |",
+          "2026-03-06 19:06:08,010 [INFO] [u_station_flow_intake_dryrun_v1] __main__: Scanned 20 tokens | High quality: 8 | Alerts sent: 0 | Trade candidates: 1 | Quality out/core/explore/probe: 1/1/0/0 | Opened: 1 | Raw lanes nw/wl=18/11 fallback=1(non_watch_primary_cap) | PostNW: 0 | PlanNW: 0 | Mode: local ",
+          "2026-03-06 19:06:23,583 [INFO] [u_station_flow_intake_dryrun_v1] __main__: Scanned 18 tokens | High quality: 8 | Alerts sent: 0 | Trade candidates: 1 | Quality out/core/explore/probe: 1/1/0/0 | Opened: 1 | Raw lanes nw/wl=1/10 fallback=1(non_watch_primary_cap) | PostNW: 0 | PlanNW: 0 | Mode: local |",
+          "2026-03-06 19:06:39,013 [INFO] [u_station_flow_intake_dryrun_v1] __main__: Scanned 18 tokens | High quality: 8 | Alerts sent: 0 | Trade candidates: 1 | Quality out/core/explore/probe: 1/1/0/0 | Opened: 0 | Raw lanes nw/wl=1/9 fallback=1(non_watch_primary_cap) | PostNW: 0 | PlanNW: 0 | Mode: local | ",
+          "2026-03-06 19:08:56,523 [INFO] [u_station_flow_intake_dryrun_v1] __main__: Scanned 15 tokens | High quality: 7 | Alerts sent: 0 | Trade candidates: 1 | Quality out/core/explore/probe: 1/1/0/0 | Opened: 1 | Raw lanes nw/wl=0/9 fallback=1(non_watch_primary_cap) | PostNW: 0 | PlanNW: 0 | Mode: local | ",
+          "2026-03-06 19:09:13,727 [INFO] [u_station_flow_intake_dryrun_v1] __main__: Scanned 20 tokens | High quality: 7 | Alerts sent: 0 | Trade candidates: 1 | Quality out/core/explore/probe: 1/1/0/0 | Opened: 0 | Raw lanes nw/wl=18/9 fallback=1(non_watch_primary_cap) | PostNW: 0 | PlanNW: 0 | Mode: local |",
+          "2026-03-06 19:09:29,267 [INFO] [u_station_flow_intake_dryrun_v1] __main__: Scanned 15 tokens | High quality: 7 | Alerts sent: 0 | Trade candidates: 1 | Quality out/core/explore/probe: 1/1/0/0 | Opened: 0 | Raw lanes nw/wl=1/9 fallback=1(non_watch_primary_cap) | PostNW: 0 | PlanNW: 0 | Mode: local | ",
+          "2026-03-06 19:11:46,661 [INFO] [u_station_flow_intake_dryrun_v1] __main__: Scanned 21 tokens | High quality: 9 | Alerts sent: 0 | Trade candidates: 1 | Quality out/core/explore/probe: 1/1/0/0 | Opened: 0 | Raw lanes nw/wl=1/9 fallback=1(non_watch_primary_cap) | PostNW: 0 | PlanNW: 0 | Mode: local | ",
+          "2026-03-06 19:12:03,336 [INFO] [u_station_flow_intake_dryrun_v1] __main__: Scanned 15 tokens | High quality: 5 | Alerts sent: 0 | Trade candidates: 2 | Quality out/core/explore/probe: 2/1/1/0 | Opened: 0 | Raw lanes nw/wl=13/9 fallback=1(non_watch_primary_cap) | PostNW: 0 | PlanNW: 0 | Mode: local |",
+          "2026-03-06 19:12:19,112 [INFO] [u_station_flow_intake_dryrun_v1] __main__: Scanned 20 tokens | High quality: 9 | Alerts sent: 0 | Trade candidates: 2 | Quality out/core/explore/probe: 2/1/1/0 | Opened: 0 | Raw lanes nw/wl=0/9 fallback=1(non_watch_primary_cap) | PostNW: 0 | PlanNW: 0 | Mode: local | ",
+          "2026-03-06 19:12:34,796 [INFO] [u_station_flow_intake_dryrun_v1] __main__: Scanned 20 tokens | High quality: 10 | Alerts sent: 0 | Trade candidates: 2 | Quality out/core/explore/probe: 2/1/1/0 | Opened: 0 | Raw lanes nw/wl=0/9 fallback=1(non_watch_primary_cap) | PostNW: 0 | PlanNW: 0 | Mode: local |",
+          "2026-03-06 19:14:51,305 [INFO] [u_station_flow_intake_dryrun_v1] __main__: Scanned 21 tokens | High quality: 10 | Alerts sent: 0 | Trade candidates: 2 | Quality out/core/explore/probe: 2/1/1/0 | Opened: 0 | Raw lanes nw/wl=2/9 fallback=1(non_watch_primary_cap) | PostNW: 0 | PlanNW: 0 | Mode: local |",
+          "2026-03-06 19:15:08,581 [INFO] [u_station_flow_intake_dryrun_v1] __main__: Scanned 24 tokens | High quality: 13 | Alerts sent: 0 | Trade candidates: 2 | Quality out/core/explore/probe: 2/1/1/0 | Opened: 1 | Raw lanes nw/wl=22/10 fallback=1(non_watch_primary_cap) | PostNW: 0 | PlanNW: 0 | Mode: local",
+          "2026-03-06 19:15:23,712 [INFO] [u_station_flow_intake_dryrun_v1] __main__: Scanned 21 tokens | High quality: 13 | Alerts sent: 1 | Trade candidates: 3 | Quality out/core/explore/probe: 3/1/2/0 | Opened: 0 | Raw lanes nw/wl=0/9 fallback=1(non_watch_primary_cap) | PostNW: 1 | PlanNW: 0 | Mode: local |",
+          "2026-03-06 19:15:39,219 [INFO] [u_station_flow_intake_dryrun_v1] __main__: Scanned 21 tokens | High quality: 13 | Alerts sent: 1 | Trade candidates: 3 | Quality out/core/explore/probe: 3/1/2/0 | Opened: 0 | Raw lanes nw/wl=0/9 fallback=1(non_watch_primary_cap) | PostNW: 1 | PlanNW: 0 | Mode: local |",
+          "2026-03-06 19:17:55,664 [INFO] [u_station_flow_intake_dryrun_v1] __main__: Scanned 18 tokens | High quality: 11 | Alerts sent: 2 | Trade candidates: 4 | Quality out/core/explore/probe: 4/1/3/0 | Opened: 0 | Raw lanes nw/wl=0/9 fallback=1(non_watch_primary_cap) | PostNW: 2 | PlanNW: 1 | Mode: local |",
+          "2026-03-06 19:18:13,074 [INFO] [u_station_flow_intake_dryrun_v1] __main__: Scanned 21 tokens | High quality: 11 | Alerts sent: 1 | Trade candidates: 2 | Quality out/core/explore/probe: 2/1/1/0 | Opened: 0 | Raw lanes nw/wl=19/6 fallback=1(non_watch_primary_cap) | PostNW: 1 | PlanNW: 1 | Mode: local "
+        ]
+      },
+      "gaps": {
+        "candidates": {
+          "count_gt_5m": 3,
+          "max_gap_sec": 464.8,
+          "gaps_gt_5m": [
+            {
+              "from": "2026-03-06T13:37:49.469936+00:00",
+              "to": "2026-03-06T13:45:34.251948+00:00",
+              "gap_sec": 464.8
+            },
+            {
+              "from": "2026-03-06T15:24:10.277579+00:00",
+              "to": "2026-03-06T15:30:33.904497+00:00",
+              "gap_sec": 383.6
+            },
+            {
+              "from": "2026-03-06T17:04:38.283561+00:00",
+              "to": "2026-03-06T17:11:10.176219+00:00",
+              "gap_sec": 391.9
+            }
+          ]
+        },
+        "trade": {
+          "count_gt_5m": 11,
+          "max_gap_sec": 729.3,
+          "gaps_gt_5m": [
+            {
+              "from": "2026-03-06T04:07:07.986798+00:00",
+              "to": "2026-03-06T04:13:51.030935+00:00",
+              "gap_sec": 403.0
+            },
+            {
+              "from": "2026-03-06T07:25:31.005145+00:00",
+              "to": "2026-03-06T07:31:09.326498+00:00",
+              "gap_sec": 338.3
+            },
+            {
+              "from": "2026-03-06T08:01:46.651774+00:00",
+              "to": "2026-03-06T08:08:58.140366+00:00",
+              "gap_sec": 431.5
+            },
+            {
+              "from": "2026-03-06T08:40:30.918329+00:00",
+              "to": "2026-03-06T08:47:40.826477+00:00",
+              "gap_sec": 429.9
+            },
+            {
+              "from": "2026-03-06T09:25:58.724817+00:00",
+              "to": "2026-03-06T09:38:08.043010+00:00",
+              "gap_sec": 729.3
+            },
+            {
+              "from": "2026-03-06T09:47:38.601349+00:00",
+              "to": "2026-03-06T09:52:45.021398+00:00",
+              "gap_sec": 306.4
+            },
+            {
+              "from": "2026-03-06T12:45:56.808203+00:00",
+              "to": "2026-03-06T12:52:13.198534+00:00",
+              "gap_sec": 376.4
+            },
+            {
+              "from": "2026-03-06T13:37:49.467320+00:00",
+              "to": "2026-03-06T13:45:34.435953+00:00",
+              "gap_sec": 465.0
+            },
+            {
+              "from": "2026-03-06T15:24:10.274577+00:00",
+              "to": "2026-03-06T15:30:46.917637+00:00",
+              "gap_sec": 396.6
+            },
+            {
+              "from": "2026-03-06T16:46:07.629569+00:00",
+              "to": "2026-03-06T16:51:15.751265+00:00",
+              "gap_sec": 308.1
+            },
+            {
+              "from": "2026-03-06T17:04:37.925449+00:00",
+              "to": "2026-03-06T17:11:10.220777+00:00",
+              "gap_sec": 392.3
+            }
+          ]
+        },
+        "tuner": {
+          "count_gt_5m": 2,
+          "max_gap_sec": 437.2,
+          "gaps_gt_5m": [
+            {
+              "from": "2026-03-06T15:21:49.496550+00:00",
+              "to": "2026-03-06T15:29:06.684439+00:00",
+              "gap_sec": 437.2
+            },
+            {
+              "from": "2026-03-06T17:04:09.654509+00:00",
+              "to": "2026-03-06T17:11:19.448682+00:00",
+              "gap_sec": 429.8
+            }
+          ]
+        }
+      },
+      "files": {
+        "candidates_exists": true,
+        "trade_exists": true,
+        "tuner_exists": true,
+        "candidates_mtime_utc": "2026-03-06T19:44:06.999368+00:00",
+        "trade_mtime_utc": "2026-03-06T19:44:06.718531+00:00",
+        "tuner_mtime_utc": "2026-03-06T19:43:43.339913+00:00"
+      }
+    },
+    "u_station_diag_no_tuner_relax": {
+      "candidates": {
+        "rows_total": 5014,
+        "stage_counts": {
+          "post_filters": 4152,
+          "filter_fail": 189,
+          "quality_gate": 673
+        },
+        "top_reasons": [
+          [
+            "FILTER_PASSED_ALL_FILTERS",
+            4152
+          ],
+          [
+            "QUALITY_SOURCE_EV_COOLDOWN",
+            562
+          ],
+          [
+            "QUALITY_SOURCE_BUDGET",
+            111
+          ],
+          [
+            "FILTER_SAFE_AGE",
+            61
+          ],
+          [
+            "FILTER_SAFE_VOLUME",
+            43
+          ],
+          [
+            "FILTER_SAFE_LIQUIDITY",
+            39
+          ],
+          [
+            "FILTER_SAFE_CONTRACT",
+            26
+          ],
+          [
+            "FILTER_SAFE_CHANGE_5M",
+            20
+          ]
+        ],
+        "flow_summary_rows": 0,
+        "raw_by_source": {
+          "geckoterminal": 169,
+          "dexscreener": 26,
+          "watchlist": 4004,
+          "onchain": 142
+        },
+        "post_filters_by_source": {
+          "geckoterminal": 83,
+          "dexscreener": 26,
+          "watchlist": 4000,
+          "onchain": 43
+        },
+        "raw_non_watch": 337,
+        "raw_watchlist": 4004,
+        "post_non_watch": 152,
+        "post_watchlist": 4000,
+        "post_non_watch_pass_rate_pct": 45.104,
+        "post_watchlist_pass_rate_pct": 99.9,
+        "quality_skip_top": [
+          [
+            "QUALITY_SOURCE_EV_COOLDOWN",
+            562
+          ],
+          [
+            "QUALITY_SOURCE_BUDGET",
+            111
+          ]
+        ]
+      },
+      "trade": {
+        "rows_total": 2858,
+        "stage_counts": {
+          "plan_trade": 1274,
+          "trade_open": 32,
+          "plan_select": 660,
+          "trade_close": 31,
+          "plan_prefilter": 858,
+          "trade_partial": 3
+        },
+        "top_reasons": [
+          [
+            "PLAN_EV_NET_LOW",
+            1166
+          ],
+          [
+            "PLAN_COOLDOWN",
+            858
+          ],
+          [
+            "UNKNOWN_SELECTION_SUMMARY",
+            336
+          ],
+          [
+            "PLAN_SELECTION_SUMMARY",
+            324
+          ],
+          [
+            "PLAN_SOURCE_ROUTE_PROB",
+            52
+          ],
+          [
+            "PLAN_PLANNED",
+            32
+          ],
+          [
+            "EXEC_BUY_PAPER",
+            32
+          ],
+          [
+            "EXIT_NO_MOMENTUM",
+            17
+          ],
+          [
+            "PLAN_QUARANTINE",
+            16
+          ],
+          [
+            "EXIT_TIMEOUT",
+            12
+          ],
+          [
+            "PLAN_PLAN_NON_WATCHLIST_QUOTA",
+            5
+          ],
+          [
+            "PLAN_EDGE_LOW",
+            3
+          ],
+          [
+            "EXIT_TP1_PARTIAL",
+            2
+          ],
+          [
+            "EXIT_EARLY_RISK",
+            1
+          ],
+          [
+            "EXIT_TP2_PARTIAL",
+            1
+          ],
+          [
+            "EXIT_STOP_LOSS",
+            1
+          ]
+        ],
+        "plan_by_source": {
+          "geckoterminal": 11,
+          "watchlist": 1256,
+          "dexscreener": 3,
+          "onchain": 4
+        },
+        "plan_top_symbols": [
+          [
+            "CLAWNCH",
+            107
+          ],
+          [
+            "ODAI",
+            105
+          ],
+          [
+            "JUNO",
+            101
+          ],
+          [
+            "FAI",
+            100
+          ],
+          [
+            "SCOUT",
+            97
+          ],
+          [
+            "MOLT",
+            92
+          ],
+          [
+            "Paperclip",
+            89
+          ],
+          [
+            "SOL",
+            81
+          ],
+          [
+            "EARENDEL",
+            72
+          ],
+          [
+            "BNKR",
+            68
+          ],
+          [
+            "EDGE",
+            57
+          ],
+          [
+            "KTA",
+            46
+          ],
+          [
+            "VVV",
+            41
+          ],
+          [
+            "CLAWD",
+            38
+          ],
+          [
+            "TIBBIR",
+            30
+          ]
+        ],
+        "open_top_symbols": [
+          [
+            "FAI",
+            8
+          ],
+          [
+            "SOL",
+            8
+          ],
+          [
+            "VVV",
+            7
+          ],
+          [
+            "EDGE",
+            3
+          ],
+          [
+            "BNKR",
+            3
+          ],
+          [
+            "JUNO",
+            2
+          ],
+          [
+            "KTA",
+            1
+          ]
+        ],
+        "close_reasons": {
+          "EXIT_EARLY_RISK": 1,
+          "EXIT_TIMEOUT": 12,
+          "EXIT_NO_MOMENTUM": 17,
+          "EXIT_STOP_LOSS": 1
+        },
+        "realized_pnl_usd_sum": -0.092265,
+        "close_count": 31,
+        "open_count": 32,
+        "winrate_close_pct": 35.48,
+        "avg_close_pnl_usd": -0.002976,
+        "median_hold_sec": 162,
+        "plan_economics": {
+          "gross_median_pct": 6.399999999999999,
+          "cost_median_pct": 6.35,
+          "size_median_usd": 0.8,
+          "ev_net_median_usd": -0.00968412201316386,
+          "edge_gate_gross_median_pct": 6.399999999999999,
+          "edge_gate_cost_median_pct": 6.35,
+          "edge_gate_size_median_usd": 0.8
+        }
+      },
+      "tuner": {
+        "rows_total": 0,
+        "policy_phase_counts": {},
+        "restarts": 0,
+        "rollbacks": 0,
+        "issues_top": [],
+        "actions_top": [],
+        "bottleneck_stage_counts": {},
+        "bottleneck_hint_counts": {},
+        "median_opportunity_rate_h": null,
+        "median_action_rate_h": null,
+        "median_execution_open_rate_h": null,
+        "median_selected_15m": null,
+        "source_mix_medians": {
+          "candidate_supply_non_watch_15m": null,
+          "candidate_supply_watchlist_15m": null,
+          "post_filters_pass_non_watch_15m": null,
+          "post_filters_pass_watchlist_15m": null,
+          "plan_attempts_non_watch_15m": null,
+          "plan_attempts_watchlist_15m": null,
+          "source_top_share_15m": null
+        }
+      },
+      "errors": {
+        "counts": {
+          "api_code_4029": 1352
+        },
+        "samples": [
+          "2026-03-06 02:14:09,871 [INFO] [u_station_diag_no_tuner_relax] __main__: Scanned 8 tokens | High quality: 6 | Alerts sent: 3 | Trade candidates: 8 | Quality out/core/explore/probe: 8/1/7/0 | Opened: 0 | Mode: local | Source: onchain+market | Policy: raw=OK/effective=OK(healthy | route=allow_all) | R",
+          "2026-03-06 02:14:25,057 [INFO] [u_station_diag_no_tuner_relax] __main__: Scanned 5 tokens | High quality: 5 | Alerts sent: 0 | Trade candidates: 5 | Quality out/core/explore/probe: 4/1/3/0 | Opened: 0 | Mode: local | Source: onchain+market | Policy: raw=OK/effective=OK(healthy | route=allow_all) | R",
+          "2026-03-06 02:14:39,831 [INFO] [u_station_diag_no_tuner_relax] __main__: Scanned 6 tokens | High quality: 6 | Alerts sent: 1 | Trade candidates: 6 | Quality out/core/explore/probe: 3/1/2/0 | Opened: 0 | Mode: local | Source: onchain+market | Policy: raw=OK/effective=OK(healthy | route=allow_all) | R",
+          "2026-03-06 02:14:54,707 [INFO] [u_station_diag_no_tuner_relax] __main__: Scanned 5 tokens | High quality: 5 | Alerts sent: 0 | Trade candidates: 5 | Quality out/core/explore/probe: 2/1/1/0 | Opened: 0 | Mode: local | Source: onchain+market | Policy: raw=OK/effective=OK(healthy | route=allow_all) | R",
+          "2026-03-06 02:15:11,268 [INFO] [u_station_diag_no_tuner_relax] __main__: Scanned 7 tokens | High quality: 6 | Alerts sent: 1 | Trade candidates: 7 | Quality out/core/explore/probe: 2/1/1/0 | Opened: 0 | Mode: local | Source: onchain+market | Policy: raw=OK/effective=OK(healthy | route=allow_all) | R",
+          "2026-03-06 02:15:26,035 [INFO] [u_station_diag_no_tuner_relax] __main__: Scanned 7 tokens | High quality: 6 | Alerts sent: 1 | Trade candidates: 7 | Quality out/core/explore/probe: 5/1/4/0 | Opened: 0 | Mode: local | Source: onchain+market | Policy: raw=OK/effective=OK(healthy | route=allow_all) | R",
+          "2026-03-06 02:15:40,947 [INFO] [u_station_diag_no_tuner_relax] __main__: Scanned 6 tokens | High quality: 6 | Alerts sent: 0 | Trade candidates: 6 | Quality out/core/explore/probe: 4/1/3/0 | Opened: 0 | Mode: local | Source: onchain+market | Policy: raw=OK/effective=OK(healthy | route=allow_all) | R",
+          "2026-03-06 02:15:55,969 [INFO] [u_station_diag_no_tuner_relax] __main__: Scanned 6 tokens | High quality: 6 | Alerts sent: 0 | Trade candidates: 6 | Quality out/core/explore/probe: 4/1/3/0 | Opened: 0 | Mode: local | Source: onchain+market | Policy: raw=OK/effective=OK(healthy | route=allow_all) | R",
+          "2026-03-06 02:16:12,798 [INFO] [u_station_diag_no_tuner_relax] __main__: Scanned 6 tokens | High quality: 6 | Alerts sent: 0 | Trade candidates: 6 | Quality out/core/explore/probe: 6/1/5/0 | Opened: 0 | Mode: local | Source: onchain+market | Policy: raw=OK/effective=OK(healthy | route=allow_all) | R",
+          "2026-03-06 02:16:28,261 [INFO] [u_station_diag_no_tuner_relax] __main__: Scanned 8 tokens | High quality: 6 | Alerts sent: 0 | Trade candidates: 6 | Quality out/core/explore/probe: 4/1/3/0 | Opened: 0 | Mode: local | Source: onchain+market | Policy: raw=OK/effective=OK(healthy | route=allow_all) | R",
+          "2026-03-06 02:16:43,310 [INFO] [u_station_diag_no_tuner_relax] __main__: Scanned 8 tokens | High quality: 6 | Alerts sent: 0 | Trade candidates: 6 | Quality out/core/explore/probe: 4/1/3/0 | Opened: 0 | Mode: local | Source: onchain+market | Policy: raw=OK/effective=OK(healthy | route=allow_all) | R",
+          "2026-03-06 02:16:58,074 [INFO] [u_station_diag_no_tuner_relax] __main__: Scanned 7 tokens | High quality: 6 | Alerts sent: 0 | Trade candidates: 6 | Quality out/core/explore/probe: 2/1/1/0 | Opened: 0 | Mode: local | Source: onchain+market | Policy: raw=OK/effective=OK(healthy | route=allow_all) | R",
+          "2026-03-06 02:17:14,689 [INFO] [u_station_diag_no_tuner_relax] __main__: Scanned 4 tokens | High quality: 4 | Alerts sent: 0 | Trade candidates: 4 | Quality out/core/explore/probe: 1/0/1/0 | Opened: 0 | Mode: local | Source: onchain+market | Policy: raw=OK/effective=OK(healthy | route=allow_all) | R",
+          "2026-03-06 02:17:29,327 [INFO] [u_station_diag_no_tuner_relax] __main__: Scanned 4 tokens | High quality: 4 | Alerts sent: 0 | Trade candidates: 4 | Quality out/core/explore/probe: 3/0/3/0 | Opened: 0 | Mode: local | Source: onchain+market | Policy: raw=OK/effective=OK(healthy | route=allow_all) | R",
+          "2026-03-06 02:17:44,295 [INFO] [u_station_diag_no_tuner_relax] __main__: Scanned 4 tokens | High quality: 4 | Alerts sent: 0 | Trade candidates: 4 | Quality out/core/explore/probe: 2/0/2/0 | Opened: 0 | Mode: local | Source: onchain+market | Policy: raw=OK/effective=OK(healthy | route=allow_all) | R",
+          "2026-03-06 02:17:58,978 [INFO] [u_station_diag_no_tuner_relax] __main__: Scanned 6 tokens | High quality: 4 | Alerts sent: 2 | Trade candidates: 6 | Quality out/core/explore/probe: 4/0/4/0 | Opened: 0 | Mode: local | Source: onchain+market | Policy: raw=OK/effective=OK(healthy | route=allow_all) | R",
+          "2026-03-06 02:18:14,820 [INFO] [u_station_diag_no_tuner_relax] __main__: Scanned 6 tokens | High quality: 6 | Alerts sent: 0 | Trade candidates: 6 | Quality out/core/explore/probe: 4/1/3/0 | Opened: 1 | Mode: local | Source: onchain+market | Policy: raw=OK/effective=OK(healthy | route=allow_all) | R",
+          "2026-03-06 02:18:29,954 [INFO] [u_station_diag_no_tuner_relax] __main__: Scanned 6 tokens | High quality: 6 | Alerts sent: 1 | Trade candidates: 6 | Quality out/core/explore/probe: 2/1/1/0 | Opened: 0 | Mode: local | Source: onchain+market | Policy: raw=OK/effective=OK(healthy | route=allow_all) | R",
+          "2026-03-06 02:18:44,773 [INFO] [u_station_diag_no_tuner_relax] __main__: Scanned 6 tokens | High quality: 5 | Alerts sent: 0 | Trade candidates: 5 | Quality out/core/explore/probe: 3/1/2/0 | Opened: 0 | Mode: local | Source: onchain+market | Policy: raw=OK/effective=OK(healthy | route=allow_all) | R",
+          "2026-03-06 02:19:00,447 [INFO] [u_station_diag_no_tuner_relax] __main__: Scanned 6 tokens | High quality: 5 | Alerts sent: 0 | Trade candidates: 5 | Quality out/core/explore/probe: 3/1/2/0 | Opened: 0 | Mode: local | Source: onchain+market | Policy: raw=OK/effective=OK(healthy | route=allow_all) | R",
+          "2026-03-06 02:19:16,834 [INFO] [u_station_diag_no_tuner_relax] __main__: Scanned 9 tokens | High quality: 7 | Alerts sent: 2 | Trade candidates: 8 | Quality out/core/explore/probe: 5/1/4/0 | Opened: 0 | Mode: local | Source: onchain+market | Policy: raw=OK/effective=OK(healthy | route=allow_all) | R",
+          "2026-03-06 02:19:32,518 [INFO] [u_station_diag_no_tuner_relax] __main__: Scanned 9 tokens | High quality: 6 | Alerts sent: 1 | Trade candidates: 7 | Quality out/core/explore/probe: 2/1/1/0 | Opened: 0 | Mode: local | Source: onchain+market | Policy: raw=OK/effective=OK(healthy | route=allow_all) | R",
+          "2026-03-06 02:19:37,252 [INFO] [u_station_diag_no_tuner_relax] __main__: Scanned 7 tokens | High quality: 7 | Alerts sent: 1 | Trade candidates: 7 | Quality out/core/explore/probe: 4/1/3/0 | Opened: 0 | Mode: local | Source: onchain+market | Policy: raw=OK/effective=OK(healthy | route=allow_all) | R",
+          "2026-03-06 02:19:41,741 [INFO] [u_station_diag_no_tuner_relax] __main__: Scanned 6 tokens | High quality: 6 | Alerts sent: 0 | Trade candidates: 6 | Quality out/core/explore/probe: 2/1/1/0 | Opened: 0 | Mode: local | Source: onchain+market | Policy: raw=OK/effective=OK(healthy | route=allow_all) | R",
+          "2026-03-06 02:19:46,222 [INFO] [u_station_diag_no_tuner_relax] __main__: Scanned 6 tokens | High quality: 6 | Alerts sent: 0 | Trade candidates: 6 | Quality out/core/explore/probe: 4/1/3/0 | Opened: 0 | Mode: local | Source: onchain+market | Policy: raw=OK/effective=OK(healthy | route=allow_all) | R"
+        ]
+      },
+      "gaps": {
+        "candidates": {
+          "count_gt_5m": 0,
+          "max_gap_sec": 0,
+          "gaps_gt_5m": []
+        },
+        "trade": {
+          "count_gt_5m": 0,
+          "max_gap_sec": 0,
+          "gaps_gt_5m": []
+        },
+        "tuner": {
+          "count_gt_5m": 0,
+          "max_gap_sec": 0,
+          "gaps_gt_5m": []
+        }
+      },
+      "files": {
+        "candidates_exists": true,
+        "trade_exists": true,
+        "tuner_exists": false,
+        "candidates_mtime_utc": "2026-03-06T01:32:56.461585+00:00",
+        "trade_mtime_utc": "2026-03-06T01:32:56.497900+00:00",
+        "tuner_mtime_utc": null
+      }
+    },
+    "u_station_ab_night_autotune_v2": {
+      "candidates": {
+        "rows_total": 6342,
+        "stage_counts": {
+          "post_filters": 3610,
+          "quality_gate": 879,
+          "filter_fail": 1853
+        },
+        "top_reasons": [
+          [
+            "FILTER_PASSED_ALL_FILTERS",
+            3610
+          ],
+          [
+            "FILTER_SOURCE_QOS_CAP",
+            1195
+          ],
+          [
+            "QUALITY_SOURCE_BUDGET",
+            786
+          ],
+          [
+            "FILTER_SCORE_MIN",
+            237
+          ],
+          [
+            "FILTER_SAFE_AGE",
+            136
+          ],
+          [
+            "FILTER_SAFE_CHANGE_5M",
+            124
+          ],
+          [
+            "FILTER_SAFE_VOLUME",
+            98
+          ],
+          [
+            "QUALITY_SOURCE_EV_COOLDOWN",
+            89
+          ],
+          [
+            "FILTER_SAFE_LIQUIDITY",
+            31
+          ],
+          [
+            "FILTER_SAFE_CONTRACT",
+            29
+          ],
+          [
+            "QUALITY_PROVISIONAL_CORE_CAP",
+            4
+          ],
+          [
+            "FILTER_HARD_BLOCKLIST",
+            2
+          ],
+          [
+            "FILTER_SOURCE_QOS_SYMBOL_CAP",
+            1
+          ]
+        ],
+        "flow_summary_rows": 0,
+        "raw_by_source": {
+          "watchlist": 4833,
+          "onchain": 375,
+          "geckoterminal": 251,
+          "dexscreener": 4
+        },
+        "post_filters_by_source": {
+          "watchlist": 3527,
+          "geckoterminal": 71,
+          "onchain": 8,
+          "dexscreener": 4
+        },
+        "raw_non_watch": 630,
+        "raw_watchlist": 4833,
+        "post_non_watch": 83,
+        "post_watchlist": 3527,
+        "post_non_watch_pass_rate_pct": 13.175,
+        "post_watchlist_pass_rate_pct": 72.977,
+        "quality_skip_top": [
+          [
+            "QUALITY_SOURCE_BUDGET",
+            786
+          ],
+          [
+            "QUALITY_SOURCE_EV_COOLDOWN",
+            89
+          ],
+          [
+            "QUALITY_PROVISIONAL_CORE_CAP",
+            4
+          ]
+        ]
+      },
+      "trade": {
+        "rows_total": 3509,
+        "stage_counts": {
+          "plan_prefilter": 1116,
+          "plan_trade": 1473,
+          "plan_select": 844,
+          "trade_close": 34,
+          "trade_open": 33,
+          "trade_partial": 9
+        },
+        "top_reasons": [
+          [
+            "PLAN_EV_NET_LOW",
+            1051
+          ],
+          [
+            "PLAN_COOLDOWN",
+            1010
+          ],
+          [
+            "UNKNOWN_SELECTION_SUMMARY",
+            844
+          ],
+          [
+            "PLAN_DISABLED_OR_LIMITS",
+            159
+          ],
+          [
+            "UNKNOWN_SYMBOL_COOLDOWN",
+            106
+          ],
+          [
+            "PLAN_SOURCE_ROUTE_PROB",
+            89
+          ],
+          [
+            "PLAN_MIN_TRADE_SIZE",
+            83
+          ],
+          [
+            "PLAN_PLANNED",
+            33
+          ],
+          [
+            "EXEC_BUY_PAPER",
+            33
+          ],
+          [
+            "PLAN_EDGE_LOW",
+            30
+          ],
+          [
+            "PRE_HONEYPOT_GUARD",
+            17
+          ],
+          [
+            "EXIT_NO_MOMENTUM",
+            15
+          ],
+          [
+            "EXIT_TIMEOUT",
+            13
+          ],
+          [
+            "EXIT_TP1_PARTIAL",
+            6
+          ],
+          [
+            "PLAN_QUARANTINE",
+            5
+          ],
+          [
+            "PLAN_COST_DOMINANT_EDGE",
+            3
+          ],
+          [
+            "EXIT_STOP_LOSS",
+            3
+          ],
+          [
+            "EXIT_TP2_PARTIAL",
+            3
+          ],
+          [
+            "PLAN_SYMBOL_FATIGUE_CAP",
+            2
+          ],
+          [
+            "PLAN_CLUSTER_EV_PROB",
+            1
+          ],
+          [
+            "EXIT_WEAKNESS",
+            1
+          ],
+          [
+            "EXIT_POST_PARTIAL_PROTECT",
+            1
+          ],
+          [
+            "EXIT_PROFIT_LOCK",
+            1
+          ]
+        ],
+        "plan_by_source": {
+          "watchlist": 1462,
+          "geckoterminal": 6,
+          "onchain": 2,
+          "dexscreener": 3
+        },
+        "plan_top_symbols": [
+          [
+            "SOL",
+            203
+          ],
+          [
+            "GITC",
+            181
+          ],
+          [
+            "OPENPAW",
+            120
+          ],
+          [
+            "JUNO",
+            105
+          ],
+          [
+            "KTA",
+            103
+          ],
+          [
+            "BNKR",
+            99
+          ],
+          [
+            "VVV",
+            81
+          ],
+          [
+            "ODAI",
+            74
+          ],
+          [
+            "Paperclip",
+            55
+          ],
+          [
+            "FAI",
+            54
+          ],
+          [
+            "EDGE",
+            46
+          ],
+          [
+            "BRETT",
+            37
+          ],
+          [
+            "VEE",
+            35
+          ],
+          [
+            "McClaw",
+            35
+          ],
+          [
+            "EARENDEL",
+            34
+          ]
+        ],
+        "open_top_symbols": [
+          [
+            "FAI",
+            11
+          ],
+          [
+            "SOL",
+            10
+          ],
+          [
+            "VVV",
+            6
+          ],
+          [
+            "REI",
+            2
+          ],
+          [
+            "CRICKET",
+            1
+          ],
+          [
+            "SAIRI",
+            1
+          ],
+          [
+            "JUNO",
+            1
+          ],
+          [
+            "BNKR",
+            1
+          ]
+        ],
+        "close_reasons": {
+          "EXIT_TIMEOUT": 13,
+          "EXIT_NO_MOMENTUM": 15,
+          "EXIT_STOP_LOSS": 3,
+          "EXIT_WEAKNESS": 1,
+          "EXIT_POST_PARTIAL_PROTECT": 1,
+          "EXIT_PROFIT_LOCK": 1
+        },
+        "realized_pnl_usd_sum": -0.226792,
+        "close_count": 34,
+        "open_count": 33,
+        "winrate_close_pct": 47.06,
+        "avg_close_pnl_usd": -0.00667,
+        "median_hold_sec": 164.0,
+        "plan_economics": {
+          "gross_median_pct": 3.2,
+          "cost_median_pct": 5.308,
+          "size_median_usd": 1.15,
+          "ev_net_median_usd": -0.009921859835180841,
+          "edge_gate_gross_median_pct": 3.2,
+          "edge_gate_cost_median_pct": 5.308,
+          "edge_gate_size_median_usd": 1.25
+        }
+      },
+      "tuner": {
+        "rows_total": 87,
+        "policy_phase_counts": {
+          "expand": 52,
+          "tighten": 35
+        },
+        "restarts": 0,
+        "rollbacks": 5,
+        "issues_top": [],
+        "actions_top": [
+          [
+            "unknown",
+            140
+          ]
+        ],
+        "bottleneck_stage_counts": {
+          "action": 8,
+          "none": 79
+        },
+        "bottleneck_hint_counts": {
+          "plan_or_policy": 8,
+          "active": 79
+        },
+        "median_opportunity_rate_h": 936.0,
+        "median_action_rate_h": 8.0,
+        "median_execution_open_rate_h": 8.0,
+        "median_selected_15m": null,
+        "source_mix_medians": {
+          "candidate_supply_non_watch_15m": null,
+          "candidate_supply_watchlist_15m": null,
+          "post_filters_pass_non_watch_15m": null,
+          "post_filters_pass_watchlist_15m": null,
+          "plan_attempts_non_watch_15m": null,
+          "plan_attempts_watchlist_15m": null,
+          "source_top_share_15m": null
+        }
+      },
+      "errors": {
+        "counts": {
+          "api_code_4029": 2106,
+          "internet": 2,
+          "error": 34
+        },
+        "samples": [
+          "2026-03-05 23:52:50,080 [INFO] [u_station_ab_night_autotune_v2] __main__: Scanned 4 tokens | High quality: 3 | Alerts sent: 0 | Trade candidates: 3 | Quality out/core/explore/probe: 3/1/2/0 | Opened: 0 | Mode: local | Source: onchain+market | Policy: raw=OK/effective=OK(healthy | route=allow_all) | ",
+          "2026-03-05 23:53:06,540 [INFO] [u_station_ab_night_autotune_v2] __main__: Scanned 4 tokens | High quality: 3 | Alerts sent: 1 | Trade candidates: 4 | Quality out/core/explore/probe: 4/1/3/0 | Opened: 0 | Mode: local | Source: onchain+market | Policy: raw=OK/effective=OK(healthy | route=allow_all) | ",
+          "2026-03-05 23:53:21,756 [INFO] [u_station_ab_night_autotune_v2] __main__: Scanned 3 tokens | High quality: 3 | Alerts sent: 0 | Trade candidates: 3 | Quality out/core/explore/probe: 3/1/2/0 | Opened: 0 | Mode: local | Source: onchain+market | Policy: raw=OK/effective=OK(healthy | route=allow_all) | ",
+          "2026-03-05 23:53:36,826 [INFO] [u_station_ab_night_autotune_v2] __main__: Scanned 3 tokens | High quality: 3 | Alerts sent: 0 | Trade candidates: 3 | Quality out/core/explore/probe: 3/1/2/0 | Opened: 0 | Mode: local | Source: onchain+market | Policy: raw=OK/effective=OK(healthy | route=allow_all) | ",
+          "2026-03-05 23:53:51,940 [INFO] [u_station_ab_night_autotune_v2] __main__: Scanned 3 tokens | High quality: 3 | Alerts sent: 0 | Trade candidates: 3 | Quality out/core/explore/probe: 3/1/2/0 | Opened: 0 | Mode: local | Source: onchain+market | Policy: raw=OK/effective=OK(healthy | route=allow_all) | ",
+          "2026-03-05 23:54:09,188 [INFO] [u_station_ab_night_autotune_v2] __main__: Scanned 4 tokens | High quality: 4 | Alerts sent: 0 | Trade candidates: 4 | Quality out/core/explore/probe: 4/1/3/0 | Opened: 0 | Mode: local | Source: onchain+market | Policy: raw=OK/effective=OK(healthy | route=allow_all) | ",
+          "2026-03-05 23:54:24,481 [INFO] [u_station_ab_night_autotune_v2] __main__: Scanned 6 tokens | High quality: 4 | Alerts sent: 1 | Trade candidates: 5 | Quality out/core/explore/probe: 5/1/4/0 | Opened: 0 | Mode: local | Source: onchain+market | Policy: raw=OK/effective=OK(healthy | route=allow_all) | ",
+          "2026-03-05 23:54:39,485 [INFO] [u_station_ab_night_autotune_v2] __main__: Scanned 4 tokens | High quality: 4 | Alerts sent: 0 | Trade candidates: 4 | Quality out/core/explore/probe: 4/1/3/0 | Opened: 0 | Mode: local | Source: onchain+market | Policy: raw=OK/effective=OK(healthy | route=allow_all) | ",
+          "2026-03-05 23:54:54,519 [INFO] [u_station_ab_night_autotune_v2] __main__: Scanned 5 tokens | High quality: 4 | Alerts sent: 0 | Trade candidates: 4 | Quality out/core/explore/probe: 4/1/3/0 | Opened: 0 | Mode: local | Source: onchain+market | Policy: raw=OK/effective=OK(healthy | route=allow_all) | ",
+          "2026-03-05 23:55:11,382 [INFO] [u_station_ab_night_autotune_v2] __main__: Scanned 4 tokens | High quality: 4 | Alerts sent: 0 | Trade candidates: 4 | Quality out/core/explore/probe: 4/1/3/0 | Opened: 0 | Mode: local | Source: onchain+market | Policy: raw=OK/effective=OK(healthy | route=allow_all) | ",
+          "2026-03-05 23:55:26,497 [INFO] [u_station_ab_night_autotune_v2] __main__: Scanned 4 tokens | High quality: 4 | Alerts sent: 0 | Trade candidates: 4 | Quality out/core/explore/probe: 4/1/3/0 | Opened: 0 | Mode: local | Source: onchain+market | Policy: raw=OK/effective=OK(healthy | route=allow_all) | ",
+          "2026-03-05 23:55:41,927 [INFO] [u_station_ab_night_autotune_v2] __main__: Scanned 6 tokens | High quality: 4 | Alerts sent: 0 | Trade candidates: 4 | Quality out/core/explore/probe: 4/1/3/0 | Opened: 0 | Mode: local | Source: onchain+market | Policy: raw=OK/effective=OK(healthy | route=allow_all) | ",
+          "2026-03-05 23:55:56,938 [INFO] [u_station_ab_night_autotune_v2] __main__: Scanned 4 tokens | High quality: 4 | Alerts sent: 0 | Trade candidates: 4 | Quality out/core/explore/probe: 4/1/3/0 | Opened: 0 | Mode: local | Source: onchain+market | Policy: raw=OK/effective=OK(healthy | route=allow_all) | ",
+          "2026-03-05 23:56:13,657 [INFO] [u_station_ab_night_autotune_v2] __main__: Scanned 4 tokens | High quality: 3 | Alerts sent: 0 | Trade candidates: 3 | Quality out/core/explore/probe: 3/1/2/0 | Opened: 0 | Mode: local | Source: onchain+market | Policy: raw=OK/effective=OK(healthy | route=allow_all) | ",
+          "2026-03-05 23:56:28,858 [INFO] [u_station_ab_night_autotune_v2] __main__: Scanned 4 tokens | High quality: 3 | Alerts sent: 0 | Trade candidates: 3 | Quality out/core/explore/probe: 3/1/2/0 | Opened: 0 | Mode: local | Source: onchain+market | Policy: raw=OK/effective=OK(healthy | route=allow_all) | ",
+          "2026-03-05 23:56:43,917 [INFO] [u_station_ab_night_autotune_v2] __main__: Scanned 3 tokens | High quality: 3 | Alerts sent: 0 | Trade candidates: 3 | Quality out/core/explore/probe: 3/1/2/0 | Opened: 0 | Mode: local | Source: onchain+market | Policy: raw=OK/effective=OK(healthy | route=allow_all) | ",
+          "2026-03-05 23:56:58,914 [INFO] [u_station_ab_night_autotune_v2] __main__: Scanned 4 tokens | High quality: 3 | Alerts sent: 1 | Trade candidates: 4 | Quality out/core/explore/probe: 4/1/3/0 | Opened: 0 | Mode: local | Source: onchain+market | Policy: raw=OK/effective=OK(healthy | route=allow_all) | ",
+          "2026-03-05 23:57:15,642 [INFO] [u_station_ab_night_autotune_v2] __main__: Scanned 3 tokens | High quality: 3 | Alerts sent: 0 | Trade candidates: 3 | Quality out/core/explore/probe: 3/1/2/0 | Opened: 0 | Mode: local | Source: onchain+market | Policy: raw=OK/effective=OK(healthy | route=allow_all) | ",
+          "2026-03-05 23:57:31,191 [INFO] [u_station_ab_night_autotune_v2] __main__: Scanned 3 tokens | High quality: 3 | Alerts sent: 0 | Trade candidates: 3 | Quality out/core/explore/probe: 3/1/2/0 | Opened: 0 | Mode: local | Source: onchain+market | Policy: raw=OK/effective=OK(healthy | route=allow_all) | ",
+          "2026-03-05 23:57:46,434 [INFO] [u_station_ab_night_autotune_v2] __main__: Scanned 3 tokens | High quality: 3 | Alerts sent: 0 | Trade candidates: 3 | Quality out/core/explore/probe: 3/1/2/0 | Opened: 0 | Mode: local | Source: onchain+market | Policy: raw=OK/effective=OK(healthy | route=allow_all) | ",
+          "2026-03-05 23:58:01,452 [INFO] [u_station_ab_night_autotune_v2] __main__: Scanned 3 tokens | High quality: 3 | Alerts sent: 0 | Trade candidates: 3 | Quality out/core/explore/probe: 3/1/2/0 | Opened: 0 | Mode: local | Source: onchain+market | Policy: raw=OK/effective=OK(healthy | route=allow_all) | ",
+          "2026-03-05 23:58:18,291 [INFO] [u_station_ab_night_autotune_v2] __main__: Scanned 5 tokens | High quality: 4 | Alerts sent: 1 | Trade candidates: 4 | Quality out/core/explore/probe: 4/1/3/0 | Opened: 0 | Mode: local | Source: onchain+market | Policy: raw=OK/effective=OK(healthy | route=allow_all) | ",
+          "2026-03-05 23:58:33,414 [INFO] [u_station_ab_night_autotune_v2] __main__: Scanned 3 tokens | High quality: 3 | Alerts sent: 0 | Trade candidates: 3 | Quality out/core/explore/probe: 3/1/2/0 | Opened: 0 | Mode: local | Source: onchain+market | Policy: raw=OK/effective=OK(healthy | route=allow_all) | ",
+          "2026-03-05 23:58:48,411 [INFO] [u_station_ab_night_autotune_v2] __main__: Scanned 3 tokens | High quality: 3 | Alerts sent: 0 | Trade candidates: 3 | Quality out/core/explore/probe: 3/1/2/0 | Opened: 0 | Mode: local | Source: onchain+market | Policy: raw=OK/effective=OK(healthy | route=allow_all) | ",
+          "2026-03-05 23:59:03,515 [INFO] [u_station_ab_night_autotune_v2] __main__: Scanned 3 tokens | High quality: 3 | Alerts sent: 0 | Trade candidates: 3 | Quality out/core/explore/probe: 3/1/2/0 | Opened: 0 | Mode: local | Source: onchain+market | Policy: raw=OK/effective=OK(healthy | route=allow_all) | "
+        ]
+      },
+      "gaps": {
+        "candidates": {
+          "count_gt_5m": 1,
+          "max_gap_sec": 400.0,
+          "gaps_gt_5m": [
+            {
+              "from": "2026-03-05T21:57:19.629002+00:00",
+              "to": "2026-03-05T22:03:59.639796+00:00",
+              "gap_sec": 400.0
+            }
+          ]
+        },
+        "trade": {
+          "count_gt_5m": 1,
+          "max_gap_sec": 400.1,
+          "gaps_gt_5m": [
+            {
+              "from": "2026-03-05T21:57:19.646590+00:00",
+              "to": "2026-03-05T22:03:59.719904+00:00",
+              "gap_sec": 400.1
+            }
+          ]
+        },
+        "tuner": {
+          "count_gt_5m": 2,
+          "max_gap_sec": 449.9,
+          "gaps_gt_5m": [
+            {
+              "from": "2026-03-05T20:43:14.087455+00:00",
+              "to": "2026-03-05T20:48:17.051611+00:00",
+              "gap_sec": 303.0
+            },
+            {
+              "from": "2026-03-05T21:55:15.845343+00:00",
+              "to": "2026-03-05T22:02:45.736720+00:00",
+              "gap_sec": 449.9
+            }
+          ]
+        }
+      },
+      "files": {
+        "candidates_exists": true,
+        "trade_exists": true,
+        "tuner_exists": true,
+        "candidates_mtime_utc": "2026-03-05T23:23:58.833899+00:00",
+        "trade_mtime_utc": "2026-03-05T23:23:58.842901+00:00",
+        "tuner_mtime_utc": "2026-03-05T23:24:42.029695+00:00"
+      }
+    }
+  },
+  "generated_at_utc": "2026-03-06T19:44:40.983064+00:00"
+}

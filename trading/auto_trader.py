@@ -87,6 +87,8 @@ class PaperPosition:
     cluster_ev_samples: float = 0.0
     trace_id: str = ""
     position_id: str = ""
+    canary_checked: bool = False
+    canary_due_ts: float = 0.0
 
 
 class AutoTrader:
@@ -162,6 +164,9 @@ class AutoTrader:
         self._last_guard_log_ts = 0.0
         self._live_sell_failures = 0
         self._honeypot_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._honeypot_transient_hits_by_token: dict[str, list[float]] = {}
+        self._post_entry_rug_hits_by_token: dict[str, list[float]] = {}
+        self._pre_entry_rug_hits_by_token: dict[str, list[float]] = {}
         self.recovery_queue: list[str] = []
         self.recovery_untracked: dict[str, int] = {}
         self._recovery_attempts: dict[str, int] = {}
@@ -174,6 +179,7 @@ class AutoTrader:
         self._recent_open_sources: list[tuple[float, str]] = []
         self._recent_batch_open_timestamps: list[float] = []
         self._edge_cost_dominant_hits_by_symbol: dict[str, list[float]] = {}
+        self._edge_loop_hits_by_symbol: dict[str, list[float]] = {}
         self._new_token_pause_until_ts = 0.0
         self._quarantine_rows: dict[str, dict[str, float | int]] = {}
         self._verified_sell_tokens: set[str] = set()
@@ -312,6 +318,112 @@ class AutoTrader:
                 continue
             self._blacklist_add(addr, "hard_blocklist:config", ttl_seconds=90 * 24 * 3600)
 
+    def _register_contract_risk_hard_block(self, token_address: str, detail: str) -> None:
+        if not bool(getattr(config, "ENTRY_CONTRACT_RISK_HARD_BLOCK_ENABLED", True)):
+            return
+        addr = normalize_address(token_address)
+        if self._is_placeholder_token_address(addr):
+            return
+        ttl = max(
+            3600,
+            int(getattr(config, "ENTRY_CONTRACT_RISK_HARD_BLOCK_TTL_SECONDS", 30 * 24 * 3600) or (30 * 24 * 3600)),
+        )
+        reason = f"hard_contract_risk:{self._short_error_text(detail)}"
+        self._blacklist_add(addr, reason, ttl_seconds=ttl)
+
+    def _record_pre_entry_rug_hit(self, token_address: str) -> tuple[int, bool]:
+        addr = normalize_address(token_address)
+        if self._is_placeholder_token_address(addr):
+            return 0, False
+        hit_window = max(
+            30,
+            int(getattr(config, "ENTRY_PRE_RUG_HIT_WINDOW_SECONDS", 300) or 300),
+        )
+        hits_to_blacklist = max(
+            1,
+            int(getattr(config, "ENTRY_PRE_RUG_HITS_TO_BLACKLIST", 2) or 2),
+        )
+        now_ts = datetime.now(timezone.utc).timestamp()
+        cutoff_ts = now_ts - float(hit_window)
+        rows = [
+            float(ts)
+            for ts in (self._pre_entry_rug_hits_by_token.get(addr) or [])
+            if float(ts) >= cutoff_ts
+        ]
+        rows.append(float(now_ts))
+        self._pre_entry_rug_hits_by_token[addr] = rows
+        hit_count = len(rows)
+        triggered = hit_count >= hits_to_blacklist
+        if triggered:
+            self._pre_entry_rug_hits_by_token[addr] = [float(now_ts)]
+        return hit_count, triggered
+
+    def _pre_entry_anti_rug_gate(self, token_data: dict[str, Any], *, token_address: str) -> tuple[bool, str]:
+        if not bool(getattr(config, "ENTRY_PRE_RUG_GUARD_ENABLED", True)):
+            return True, "disabled"
+        addr = normalize_address(token_address)
+        if self._is_placeholder_token_address(addr):
+            return True, "missing_address"
+        fail_reason = ""
+        detail = ""
+
+        spread_bps = self._extract_optional_float(
+            token_data,
+            ["spread_bps", "spread_basis_points", "pool_spread_bps"],
+        )
+        if spread_bps is None:
+            spread_pct = self._extract_optional_float(token_data, ["spread_percent", "spread_pct"])
+            if spread_pct is not None:
+                spread_bps = float(spread_pct) * 100.0
+        max_spread_bps = max(0.0, float(getattr(config, "ENTRY_PRE_RUG_MAX_SPREAD_BPS", 180.0) or 180.0))
+        if spread_bps is not None and float(spread_bps) > max_spread_bps:
+            fail_reason = "pre_rug_spread"
+            detail = f"{float(spread_bps):.1f}>{max_spread_bps:.1f}"
+
+        source_div_pct = self._extract_optional_float(
+            token_data,
+            [
+                "source_divergence_percent",
+                "price_source_divergence_percent",
+                "source_price_dispersion_percent",
+            ],
+        )
+        max_source_div = max(
+            0.0,
+            float(getattr(config, "ENTRY_PRE_RUG_MAX_SOURCE_DIVERGENCE_PCT", 2.0) or 2.0),
+        )
+        if (not fail_reason) and source_div_pct is not None and float(source_div_pct) > max_source_div:
+            fail_reason = "pre_rug_source_divergence"
+            detail = f"{float(source_div_pct):.3f}>{max_source_div:.3f}"
+
+        if not fail_reason:
+            row = self._quarantine_rows.get(addr)
+            if isinstance(row, dict):
+                prev_liq = max(1e-9, float(row.get("last_liq", 0.0) or 0.0))
+                cur_liq = max(0.0, float(token_data.get("liquidity") or 0.0))
+                if prev_liq > 0.0 and cur_liq > 0.0:
+                    liq_ratio = cur_liq / prev_liq
+                    min_ratio = max(
+                        0.0,
+                        min(1.0, float(getattr(config, "ENTRY_PRE_RUG_MIN_LIQUIDITY_RATIO", 0.45) or 0.45)),
+                    )
+                    if float(liq_ratio) < float(min_ratio):
+                        fail_reason = "pre_rug_liquidity_drop"
+                        detail = f"{float(liq_ratio):.3f}<{float(min_ratio):.3f}"
+
+        if not fail_reason:
+            self._pre_entry_rug_hits_by_token.pop(addr, None)
+            return True, "ok"
+
+        hit_count, triggered = self._record_pre_entry_rug_hit(addr)
+        if triggered:
+            ttl = max(
+                300,
+                int(getattr(config, "ENTRY_PRE_RUG_BLACKLIST_TTL_SECONDS", 21600) or 21600),
+            )
+            self._blacklist_add(addr, f"pre_rug_guard:{fail_reason}:{detail}", ttl_seconds=ttl)
+        return False, f"{fail_reason}:{detail} hits={hit_count}"
+
     @staticmethod
     def _is_transient_safety_reason(reason: str) -> bool:
         key = str(reason or "").strip().lower()
@@ -345,8 +457,11 @@ class AutoTrader:
             return False
         hard_prefixes = (
             "hard_blocklist:",
+            "hard_contract_risk:",
             "honeypot_guard:",
             "safety_guard:risky_contract_flags",
+            "pre_rug_guard:",
+            "rug_guard:",
             "abandoned:",
             "unsupported_sell_route:",
             "unstable_route:",
@@ -518,7 +633,7 @@ class AutoTrader:
             return "unknown"
         if key.startswith("honeypot_guard:"):
             return "honeypot"
-        if key.startswith("hard_blocklist:"):
+        if key.startswith("hard_blocklist:") or key.startswith("hard_contract_risk:") or key.startswith("pre_rug_guard:"):
             return "safety"
         if ("safety_source_transient:" in key) or ("safety_fail_transient:" in key):
             return "unknown"
@@ -545,6 +660,12 @@ class AutoTrader:
             return max(base_ttl, max(3600, tuned))
         if key.startswith("hard_blocklist:"):
             return max(base_ttl, 30 * 24 * 3600)
+        if key.startswith("hard_contract_risk:"):
+            tuned = int(getattr(config, "ENTRY_CONTRACT_RISK_HARD_BLOCK_TTL_SECONDS", 30 * 24 * 3600) or (30 * 24 * 3600))
+            return max(base_ttl, max(3600, tuned))
+        if key.startswith("pre_rug_guard:"):
+            tuned = int(getattr(config, "ENTRY_PRE_RUG_BLACKLIST_TTL_SECONDS", 21600) or 21600)
+            return max(300, min(base_ttl, tuned))
         if ("safety_source_transient:" in key) or ("safety_fail_transient:" in key):
             tuned = int(getattr(config, "AUTOTRADE_BLACKLIST_TRANSIENT_SAFETY_TTL_SECONDS", 900) or 900)
             return min(base_ttl, max(300, tuned))
@@ -585,6 +706,183 @@ class AutoTrader:
             self._short_error_text(reason),
             int(max(0, until_ts - now_ts)),
         )
+
+    def _clear_honeypot_transient_hits(self, token_address: str) -> None:
+        addr = normalize_address(token_address)
+        if not addr:
+            return
+        hits = getattr(self, "_honeypot_transient_hits_by_token", None)
+        if not isinstance(hits, dict):
+            return
+        hits.pop(addr, None)
+
+    def _record_honeypot_transient_hit(self, token_address: str, detail: str) -> None:
+        addr = normalize_address(token_address)
+        if self._is_placeholder_token_address(addr):
+            return
+        hits_map = getattr(self, "_honeypot_transient_hits_by_token", None)
+        if not isinstance(hits_map, dict):
+            hits_map = {}
+            self._honeypot_transient_hits_by_token = hits_map
+        hits_to_blacklist = max(
+            0,
+            int(getattr(config, "HONEYPOT_TRANSIENT_HITS_TO_BLACKLIST", 3) or 3),
+        )
+        if hits_to_blacklist <= 0:
+            return
+        window_seconds = max(
+            60,
+            int(getattr(config, "HONEYPOT_TRANSIENT_HIT_WINDOW_SECONDS", 900) or 900),
+        )
+        now_ts = datetime.now(timezone.utc).timestamp()
+        cutoff_ts = now_ts - float(window_seconds)
+        rows = [
+            float(ts)
+            for ts in (hits_map.get(addr) or [])
+            if float(ts) >= cutoff_ts
+        ]
+        rows.append(float(now_ts))
+        hits_map[addr] = rows
+        hit_count = len(rows)
+        if hit_count < hits_to_blacklist:
+            return
+        ttl_seconds = max(
+            300,
+            int(getattr(config, "HONEYPOT_TRANSIENT_BLACKLIST_TTL_SECONDS", 3600) or 3600),
+        )
+        reason = f"honeypot_guard_transient_loop:{self._short_error_text(detail)}"
+        self._blacklist_add(addr, reason, ttl_seconds=ttl_seconds)
+        hits_map[addr] = [float(now_ts)]
+        logger.warning(
+            "HONEYPOT_TRANSIENT_LOOP_BLACKLIST token=%s hits=%s/%s window=%ss ttl=%ss detail=%s",
+            addr,
+            hit_count,
+            hits_to_blacklist,
+            window_seconds,
+            ttl_seconds,
+            self._short_error_text(detail),
+        )
+
+    def _clear_post_entry_rug_hits(self, token_address: str) -> None:
+        addr = normalize_address(token_address)
+        if not addr:
+            return
+        hits = getattr(self, "_post_entry_rug_hits_by_token", None)
+        if not isinstance(hits, dict):
+            return
+        hits.pop(addr, None)
+
+    def _record_post_entry_rug_hit(self, token_address: str) -> tuple[int, bool]:
+        addr = normalize_address(token_address)
+        if self._is_placeholder_token_address(addr):
+            return 0, False
+        hits_map = getattr(self, "_post_entry_rug_hits_by_token", None)
+        if not isinstance(hits_map, dict):
+            hits_map = {}
+            self._post_entry_rug_hits_by_token = hits_map
+        hit_window = max(
+            10,
+            int(getattr(config, "POST_ENTRY_RUG_HIT_WINDOW_SECONDS", 120) or 120),
+        )
+        hits_to_trigger = max(
+            1,
+            int(getattr(config, "POST_ENTRY_RUG_HITS_TO_TRIGGER", 2) or 2),
+        )
+        now_ts = datetime.now(timezone.utc).timestamp()
+        cutoff_ts = now_ts - float(hit_window)
+        rows = [float(ts) for ts in (hits_map.get(addr) or []) if float(ts) >= cutoff_ts]
+        rows.append(float(now_ts))
+        hits_map[addr] = rows
+        hit_count = len(rows)
+        triggered = hit_count >= hits_to_trigger
+        if triggered:
+            hits_map[addr] = [float(now_ts)]
+        return hit_count, triggered
+
+    def _post_entry_rug_guard_triggered(
+        self,
+        *,
+        position: PaperPosition,
+        current_liquidity_usd: float,
+        age_seconds: int,
+    ) -> tuple[bool, str]:
+        if not bool(getattr(config, "POST_ENTRY_RUG_GUARD_ENABLED", True)):
+            return False, ""
+        if int(age_seconds) < int(getattr(config, "POST_ENTRY_RUG_MIN_AGE_SECONDS", 20) or 20):
+            return False, ""
+        current_liq = max(0.0, float(current_liquidity_usd or 0.0))
+        if current_liq <= 0.0:
+            return False, ""
+        entry_liq = max(0.0, float(getattr(position, "liquidity_usd", 0.0) or 0.0))
+        min_entry_liq = max(
+            0.0,
+            float(getattr(config, "POST_ENTRY_RUG_MIN_ENTRY_LIQUIDITY_USD", 10000.0) or 10000.0),
+        )
+        min_current_liq = max(
+            0.0,
+            float(getattr(config, "POST_ENTRY_RUG_MIN_CURRENT_LIQUIDITY_USD", 2500.0) or 2500.0),
+        )
+        max_ratio = max(
+            0.0,
+            min(1.0, float(getattr(config, "POST_ENTRY_RUG_MAX_LIQUIDITY_RATIO", 0.20) or 0.20)),
+        )
+        if entry_liq < min_entry_liq:
+            return False, ""
+        ratio = current_liq / max(entry_liq, 1e-9)
+        collapse = (ratio <= max_ratio) and (current_liq <= min_current_liq)
+        if not collapse:
+            self._clear_post_entry_rug_hits(position.token_address)
+            return False, ""
+        hit_count, triggered = self._record_post_entry_rug_hit(position.token_address)
+        detail = (
+            f"entry_liq={entry_liq:.2f} current_liq={current_liq:.2f} "
+            f"ratio={ratio:.4f} cap={max_ratio:.4f} hits={hit_count}"
+        )
+        return bool(triggered), detail
+
+    async def _maybe_run_proof_sell_canary(self, position: PaperPosition, *, age_seconds: int) -> tuple[bool, str]:
+        if not bool(getattr(config, "PROOF_SELL_CANARY_ENABLED", True)):
+            return False, ""
+        if not self._is_live_mode():
+            return False, ""
+        if bool(getattr(position, "canary_checked", False)):
+            return False, ""
+        if self._is_token_sell_verified(position.token_address):
+            position.canary_checked = True
+            return False, "already_verified"
+
+        delay_seconds = max(5, int(getattr(config, "PROOF_SELL_CANARY_DELAY_SECONDS", 30) or 30))
+        due_ts = float(getattr(position, "canary_due_ts", 0.0) or 0.0)
+        if due_ts <= 0.0:
+            due_ts = float(position.opened_at.timestamp()) + float(delay_seconds)
+            position.canary_due_ts = float(due_ts)
+        if float(age_seconds) < float(delay_seconds):
+            return False, "pending_delay"
+
+        position.canary_checked = True
+        if self.live_executor is None:
+            return True, "no_executor"
+
+        frac = max(
+            0.01,
+            min(1.0, float(getattr(config, "PROOF_SELL_CANARY_SELL_FRACTION", 0.20) or 0.20)),
+        )
+        amount_raw = max(1, int(max(0, int(position.token_amount_raw or 0)) * float(frac)))
+        ok, reason = await asyncio.to_thread(
+            self.live_executor.is_sell_route_supported_raw,
+            position.token_address,
+            int(amount_raw),
+        )
+        if ok:
+            self._mark_token_sell_verified(position.token_address)
+            logger.info(
+                "PROOF_SELL_CANARY pass token=%s address=%s amount_raw=%s",
+                position.symbol,
+                position.token_address,
+                int(amount_raw),
+            )
+            return False, "pass"
+        return True, str(reason or "unsupported_sell_route")
 
     def _rebuild_verified_sell_tokens(self) -> None:
         out: set[str] = set()
@@ -788,7 +1086,14 @@ class AutoTrader:
 
         if config.SAFE_TEST_MODE:
             if float(token_data.get("liquidity") or 0) < float(config.SAFE_MIN_LIQUIDITY_USD):
-                return False, "safe_min_liquidity"
+                liquidity_soft_ok = bool(token_data.get("_safe_liquidity_soft_pass", False))
+                if not (
+                    is_non_watch_source
+                    and source_key.startswith("onchain")
+                    and bool(getattr(config, "SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_SOFT_ENABLED", True))
+                    and liquidity_soft_ok
+                ):
+                    return False, "safe_min_liquidity"
             if float(token_data.get("volume_5m") or 0) < float(config.SAFE_MIN_VOLUME_5M_USD):
                 volume_soft_ok = bool(token_data.get("_safe_volume_soft_pass", False))
                 if not (
@@ -814,13 +1119,48 @@ class AutoTrader:
                 ):
                     return False, "safe_max_price_change_5m"
             if config.SAFE_REQUIRE_CONTRACT_SAFE and not is_contract_safe:
-                return False, "safe_contract"
+                contract_soft_ok = bool(token_data.get("_safe_contract_soft_pass", False))
+                if not (
+                    is_non_watch_source
+                    and bool(getattr(config, "LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_ENABLED", True))
+                    and contract_soft_ok
+                ):
+                    return False, "safe_contract"
             required_risk = str(config.SAFE_REQUIRE_RISK_LEVEL).upper()
             rank = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
             if rank.get(risk_level, 2) > rank.get(required_risk, 1):
                 return False, "safe_risk"
             if warning_flags > int(config.SAFE_MAX_WARNING_FLAGS):
                 return False, "safe_warnings"
+            if bool(getattr(config, "LOCAL_ANTISCAM_TRANSIENT_STRICT_ENABLED", False)):
+                if safety_source in {"transient_fallback", "cache_transient", "fallback"}:
+                    age_s = int(token_data.get("age_seconds") or 0)
+                    liq_u = float(token_data.get("liquidity") or 0.0)
+                    vol5_u = float(token_data.get("volume_5m") or 0.0)
+                    abs5 = abs(float(token_data.get("price_change_5m") or 0.0))
+                    min_age_s = int(getattr(config, "LOCAL_ANTISCAM_TRANSIENT_MIN_AGE_SECONDS", 900) or 900)
+                    min_liq_u = float(getattr(config, "LOCAL_ANTISCAM_TRANSIENT_MIN_LIQUIDITY_USD", 25000.0) or 25000.0)
+                    min_vol5_u = float(
+                        getattr(config, "LOCAL_ANTISCAM_TRANSIENT_MIN_VOLUME_5M_USD", 1500.0) or 1500.0
+                    )
+                    max_abs5 = float(getattr(config, "LOCAL_ANTISCAM_TRANSIENT_MAX_ABS_CHANGE_5M", 15.0) or 15.0)
+                    if age_s < min_age_s:
+                        transient_age_soft_ok = bool(token_data.get("_safe_transient_age_soft_pass", False))
+                        if not (
+                            is_non_watch_source
+                            and bool(getattr(config, "LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_AGE_SOFT_ENABLED", True))
+                            and transient_age_soft_ok
+                        ):
+                            return False, "safe_transient_age"
+                    if liq_u < min_liq_u:
+                        return False, "safe_transient_liquidity"
+                    if vol5_u < min_vol5_u:
+                        return False, "safe_transient_volume"
+                    if abs5 > max_abs5:
+                        return False, "safe_transient_change_5m"
+                    if bool(getattr(config, "LOCAL_ANTISCAM_TRANSIENT_BLOCK_SOFT_CHANGE_PASS", True)):
+                        if bool(token_data.get("_safe_change_soft_pass", False)):
+                            return False, "safe_transient_soft_change"
 
         min_holders = max(0, int(getattr(config, "SAFE_MIN_HOLDERS", 0) or 0))
         if min_holders > 0:
@@ -837,9 +1177,32 @@ class AutoTrader:
 
         return True, "ok"
 
-    def _quarantine_gate(self, token_data: dict[str, Any], *, candidate_id: str, token_address: str) -> tuple[bool, str]:
-        if (not self._is_live_mode()) or (not bool(getattr(config, "ENTRY_QUARANTINE_ENABLED", True))):
+    def _non_watch_explore_ev_guard(
+        self,
+        *,
+        source_is_watchlist: bool,
+        entry_channel: str,
+        ev_expected_net_usd: float,
+    ) -> tuple[bool, str]:
+        if source_is_watchlist:
+            return True, "watchlist_source"
+        if str(entry_channel or "").strip().lower() != "explore":
+            return True, "not_explore"
+        if not bool(getattr(config, "NON_WATCH_EXPLORE_REQUIRE_POSITIVE_EV", True)):
             return True, "disabled"
+        min_ev = float(getattr(config, "NON_WATCH_EXPLORE_MIN_EV_NET_USD", 0.0) or 0.0)
+        if float(ev_expected_net_usd) < float(min_ev):
+            return False, f"ev_expected_net:{float(ev_expected_net_usd):.6f}<{float(min_ev):.6f}"
+        return True, "ok"
+
+    def _quarantine_gate(self, token_data: dict[str, Any], *, candidate_id: str, token_address: str) -> tuple[bool, str]:
+        if not bool(getattr(config, "ENTRY_QUARANTINE_ENABLED", True)):
+            return True, "disabled"
+        if not self._is_live_mode():
+            source_key = self._token_source_key(token_data)
+            allow_in_paper_non_watch = bool(getattr(config, "ENTRY_QUARANTINE_IN_PAPER_NON_WATCH", True))
+            if not (allow_in_paper_non_watch and self._is_non_watch_source(source_key)):
+                return True, "paper_disabled"
         if self._is_token_sell_verified(token_address):
             return True, "verified_token"
 
@@ -1119,6 +1482,7 @@ class AutoTrader:
         *,
         source_name: str,
         batch_has_non_watchlist: bool,
+        token_data: dict[str, Any] | None = None,
     ) -> tuple[bool, str]:
         if not bool(getattr(config, "PLAN_NON_WATCHLIST_QUOTA_ENABLED", True)):
             return False, ""
@@ -1127,9 +1491,54 @@ class AutoTrader:
         min_non_watch = max(0, int(getattr(config, "PLAN_MIN_NON_WATCHLIST_PER_BATCH", 1) or 1))
         if min_non_watch <= 0:
             return False, ""
+        use_actionable_window = bool(
+            getattr(config, "PLAN_NON_WATCHLIST_QUOTA_USE_ACTIONABLE_WINDOW", True)
+        )
+        actionable_min_rows = max(
+            1,
+            int(getattr(config, "PLAN_NON_WATCHLIST_QUOTA_ACTIONABLE_MIN_ROWS", 2) or 2),
+        )
         window_seconds = max(300, int(getattr(config, "PLAN_NON_WATCHLIST_QUOTA_WINDOW_SECONDS", 900) or 900))
         min_opens = max(2, int(getattr(config, "PLAN_NON_WATCHLIST_QUOTA_MIN_OPENS", 4) or 4))
         enforce_empty_batch = bool(getattr(config, "PLAN_NON_WATCHLIST_QUOTA_ENFORCE_EMPTY_BATCH", True))
+
+        # Phase B path: prioritize actionable (post-filter plan-batch) source mix.
+        # This avoids decisioning by historical opens-only window.
+        if use_actionable_window and isinstance(token_data, dict):
+            actionable_non_watch = int(token_data.get("_plan_actionable_non_watch", -1) or -1)
+            actionable_watch = int(token_data.get("_plan_actionable_watch", -1) or -1)
+            selected_non_watch = int(token_data.get("_plan_selected_non_watch", 0) or 0)
+            selected_watch = int(token_data.get("_plan_selected_watch", 0) or 0)
+            actionable_total = int(max(0, actionable_non_watch) + max(0, actionable_watch))
+            actionable_present = (
+                actionable_non_watch >= 0
+                and actionable_watch >= 0
+                and actionable_total >= actionable_min_rows
+            )
+            if actionable_present:
+                actionable_dominant_non_watch = int(actionable_non_watch) > int(actionable_watch)
+                if not bool(batch_has_non_watchlist):
+                    if enforce_empty_batch and int(actionable_non_watch) > 0:
+                        detail = (
+                            "plan_non_watchlist_quota "
+                            f"mode=actionable_window source={str(source_name or '-')} "
+                            f"actionable_non_watch={int(actionable_non_watch)}/{int(actionable_total)} "
+                            f"selected_non_watch={int(selected_non_watch)}/{int(selected_non_watch + selected_watch)} "
+                            f"min_non_watch={int(min_non_watch)} enforce_empty_batch=True"
+                        )
+                        return True, detail
+                    return False, ""
+                if actionable_dominant_non_watch and int(selected_non_watch) < int(selected_watch):
+                    detail = (
+                        "plan_non_watchlist_quota "
+                        f"mode=actionable_window source={str(source_name or '-')} "
+                        f"actionable_non_watch={int(actionable_non_watch)}/{int(actionable_total)} "
+                        f"selected_non_watch={int(selected_non_watch)} selected_watch={int(selected_watch)} "
+                        f"min_non_watch={int(min_non_watch)}"
+                    )
+                    return True, detail
+                return False, ""
+
         if not bool(batch_has_non_watchlist):
             if not enforce_empty_batch:
                 return False, ""
@@ -1390,27 +1799,81 @@ class AutoTrader:
             reason,
         )
 
-    def _cost_dominant_skip_guard(
+    def _prefilter_cooldown_block_reason(
         self,
         *,
+        token_address: str,
         symbol: str,
-        skip_reason: str,
-        gross_percent: float,
-        cost_total_percent: float,
+    ) -> tuple[str, str]:
+        normalized = normalize_address(token_address)
+        symbol_key = self._symbol_key(symbol)
+        if not normalized or not symbol_key:
+            return "", ""
+
+        now_ts = datetime.now(timezone.utc).timestamp()
+        anti_choke = self._anti_choke_active()
+        anti_choke_dominant_symbol, anti_choke_dominant_detail = self._anti_choke_symbol_dominant(
+            symbol=symbol_key,
+        )
+
+        token_cooldowns = getattr(self, "token_cooldowns", {}) or {}
+        token_cooldown_reasons = getattr(self, "token_cooldown_reasons", {}) or {}
+        cooldown_until = float(token_cooldowns.get(normalized, 0.0) or 0.0)
+        if cooldown_until > now_ts:
+            cooldown_left = int(max(1, cooldown_until - now_ts))
+            cooldown_reason = str(token_cooldown_reasons.get(normalized, "") or "").strip().lower()
+            is_transient_safety_cooldown = cooldown_reason.startswith("transient_safety:")
+            allow_transient_bypass = bool(
+                getattr(config, "ANTI_CHOKE_ALLOW_TRANSIENT_SAFETY_COOLDOWN_BYPASS", False)
+            )
+            bypass_max_seconds = max(
+                0,
+                int(getattr(config, "ANTI_CHOKE_BYPASS_TOKEN_COOLDOWN_MAX_SECONDS", 180) or 180),
+            )
+            allow_token_cooldown_bypass = (
+                anti_choke
+                and bool(getattr(config, "ANTI_CHOKE_ALLOW_TOKEN_COOLDOWN_BYPASS", True))
+                and (allow_transient_bypass or (not is_transient_safety_cooldown))
+                and (not anti_choke_dominant_symbol)
+                and cooldown_left <= bypass_max_seconds
+            )
+            if not allow_token_cooldown_bypass:
+                detail = f"token_cooldown_left_{cooldown_left}s"
+                if anti_choke and anti_choke_dominant_symbol and anti_choke_dominant_detail:
+                    detail = f"{detail}|{anti_choke_dominant_detail}"
+                return "cooldown", detail
+
+        symbol_cd_left = self._symbol_cooldown_left_seconds(symbol_key)
+        if symbol_cd_left > 0:
+            bypass_max_seconds = max(
+                0,
+                int(getattr(config, "ANTI_CHOKE_BYPASS_SYMBOL_COOLDOWN_MAX_SECONDS", 600) or 600),
+            )
+            allow_symbol_cooldown_bypass = (
+                anti_choke
+                and bool(getattr(config, "ANTI_CHOKE_ALLOW_SYMBOL_COOLDOWN_BYPASS", True))
+                and (not anti_choke_dominant_symbol)
+                and int(symbol_cd_left) <= int(bypass_max_seconds)
+            )
+            if not allow_symbol_cooldown_bypass:
+                detail = f"symbol_cooldown_left_{int(symbol_cd_left)}s"
+                if anti_choke and anti_choke_dominant_symbol and anti_choke_dominant_detail:
+                    detail = f"{detail}|{anti_choke_dominant_detail}"
+                return "symbol_cooldown", detail
+
+        return "", ""
+
+    def _cost_dominant_guard_profile(
+        self,
+        *,
         source_name: str = "",
         entry_channel: str = "",
         position_size_usd: float | None = None,
-    ) -> None:
-        if not bool(getattr(config, "EDGE_COST_DOMINANT_GUARD_ENABLED", True)):
-            return
-        key = self._symbol_key(symbol)
-        if not key:
-            return
+    ) -> dict[str, float | int]:
         source_key = str(source_name or "").strip().lower()
         channel_key = str(entry_channel or "").strip().lower()
         is_non_watch_source = bool(source_key) and (not source_key.startswith("watchlist"))
-        gross = float(gross_percent or 0.0)
-        cost = float(cost_total_percent or 0.0)
+        size_ref = max(0.0, float(position_size_usd or 0.0))
         min_gross = max(0.0, float(getattr(config, "EDGE_COST_DOMINANT_MIN_GROSS_PERCENT", 2.0) or 2.0))
         min_cost = max(0.0, float(getattr(config, "EDGE_COST_DOMINANT_MIN_COST_PERCENT", 6.0) or 6.0))
         min_delta = max(0.0, float(getattr(config, "EDGE_COST_DOMINANT_MIN_DELTA_PERCENT", 2.0) or 2.0))
@@ -1435,7 +1898,6 @@ class AutoTrader:
                 0.0,
                 float(getattr(config, "EDGE_COST_DOMINANT_NON_WATCH_EXPLORE_MAX_SIZE_USD", 0.30) or 0.30),
             )
-            size_ref = max(0.0, float(position_size_usd or 0.0))
             if size_ref <= max_size_usd:
                 min_gross = min(
                     min_gross,
@@ -1485,9 +1947,114 @@ class AutoTrader:
                         or 1800
                     ),
                 )
-        if gross < min_gross or cost < min_cost or (cost - gross) < min_delta:
+        return {
+            "min_gross": float(min_gross),
+            "min_cost": float(min_cost),
+            "min_delta": float(min_delta),
+            "window_seconds": int(window_seconds),
+            "hits_to_cooldown": int(hits_to_cooldown),
+            "cooldown_seconds": int(cooldown_seconds),
+        }
+
+    def _is_cost_dominant_skip(
+        self,
+        *,
+        gross_percent: float,
+        cost_total_percent: float,
+        source_name: str = "",
+        entry_channel: str = "",
+        position_size_usd: float | None = None,
+    ) -> bool:
+        if not bool(getattr(config, "EDGE_COST_DOMINANT_GUARD_ENABLED", True)):
+            return False
+        profile = self._cost_dominant_guard_profile(
+            source_name=source_name,
+            entry_channel=entry_channel,
+            position_size_usd=position_size_usd,
+        )
+        gross = float(gross_percent or 0.0)
+        cost = float(cost_total_percent or 0.0)
+        if bool(getattr(config, "EDGE_COST_DOMINANT_ALLOW_NEGATIVE_GROSS", True)):
+            neg_gross_max = float(getattr(config, "EDGE_COST_DOMINANT_NEGATIVE_GROSS_MAX_PERCENT", 0.0) or 0.0)
+            neg_cost_min = max(
+                0.0,
+                float(getattr(config, "EDGE_COST_DOMINANT_NEGATIVE_GROSS_MIN_COST_PERCENT", 4.0) or 4.0),
+            )
+            if gross <= neg_gross_max and cost >= neg_cost_min:
+                return True
+        return (
+            gross >= float(profile.get("min_gross", 0.0))
+            and cost >= float(profile.get("min_cost", 0.0))
+            and (cost - gross) >= float(profile.get("min_delta", 0.0))
+        )
+
+    def _cost_dominant_skip_guard(
+        self,
+        *,
+        symbol: str,
+        skip_reason: str,
+        gross_percent: float,
+        cost_total_percent: float,
+        source_name: str = "",
+        entry_channel: str = "",
+        position_size_usd: float | None = None,
+    ) -> None:
+        if not bool(getattr(config, "EDGE_COST_DOMINANT_GUARD_ENABLED", True)):
+            return
+        key = self._symbol_key(symbol)
+        if not key:
+            return
+        profile = self._cost_dominant_guard_profile(
+            source_name=source_name,
+            entry_channel=entry_channel,
+            position_size_usd=position_size_usd,
+        )
+        gross = float(gross_percent or 0.0)
+        cost = float(cost_total_percent or 0.0)
+        negative_gross_match = False
+        if bool(getattr(config, "EDGE_COST_DOMINANT_ALLOW_NEGATIVE_GROSS", True)):
+            neg_gross_max = float(getattr(config, "EDGE_COST_DOMINANT_NEGATIVE_GROSS_MAX_PERCENT", 0.0) or 0.0)
+            neg_cost_min = max(
+                0.0,
+                float(getattr(config, "EDGE_COST_DOMINANT_NEGATIVE_GROSS_MIN_COST_PERCENT", 4.0) or 4.0),
+            )
+            negative_gross_match = bool(gross <= neg_gross_max and cost >= neg_cost_min)
+        if (
+            (not negative_gross_match)
+            and (
+                gross < float(profile.get("min_gross", 0.0))
+                or cost < float(profile.get("min_cost", 0.0))
+                or (cost - gross) < float(profile.get("min_delta", 0.0))
+            )
+        ):
             return
         now_ts = datetime.now(timezone.utc).timestamp()
+        short_ttl_enabled = bool(getattr(config, "EDGE_COST_DOMINANT_SHORT_TTL_ENABLED", True))
+        short_ttl_seconds = max(
+            0,
+            int(getattr(config, "EDGE_COST_DOMINANT_SHORT_TTL_SECONDS", 180) or 180),
+        )
+        short_ttl_min_delta = max(
+            0.0,
+            float(getattr(config, "EDGE_COST_DOMINANT_SHORT_TTL_MIN_DELTA_PERCENT", 4.0) or 4.0),
+        )
+        short_ttl_min_cost = max(
+            0.0,
+            float(getattr(config, "EDGE_COST_DOMINANT_SHORT_TTL_MIN_COST_PERCENT", 8.0) or 8.0),
+        )
+        if (
+            short_ttl_enabled
+            and str(skip_reason or "").strip().lower() == "cost_dominant_edge"
+            and short_ttl_seconds > 0
+            and cost >= short_ttl_min_cost
+            and (cost - gross) >= short_ttl_min_delta
+        ):
+            cur_until = float((getattr(self, "symbol_cooldowns", {}) or {}).get(key, 0.0) or 0.0)
+            if cur_until < (now_ts + float(short_ttl_seconds) - 1.0):
+                self._set_symbol_cooldown(key, short_ttl_seconds, "cost_dominant_short_ttl")
+        window_seconds = int(profile.get("window_seconds", 1800) or 1800)
+        hits_to_cooldown = int(profile.get("hits_to_cooldown", 3) or 3)
+        cooldown_seconds = int(profile.get("cooldown_seconds", 900) or 900)
         cutoff_ts = now_ts - float(window_seconds)
         rows = [
             float(ts)
@@ -1512,6 +2079,61 @@ class AutoTrader:
             cost,
             cooldown_seconds,
             window_seconds,
+        )
+
+    def _edge_skip_loop_guard(
+        self,
+        *,
+        symbol: str,
+        skip_reason: str,
+        source_name: str = "",
+    ) -> None:
+        if not bool(getattr(config, "EDGE_LOW_LOOP_GUARD_ENABLED", True)):
+            return
+        reason = str(skip_reason or "").strip().lower()
+        if reason not in {"edge_low", "edge_usd_low", "negative_edge", "ev_net_low"}:
+            return
+        key = self._symbol_key(symbol)
+        if not key:
+            return
+        source_key = str(source_name or "").strip().lower()
+        if bool(getattr(config, "EDGE_LOW_LOOP_ONLY_WATCHLIST", True)) and (not source_key.startswith("watchlist")):
+            return
+        now_ts = datetime.now(timezone.utc).timestamp()
+        window_seconds = max(
+            120,
+            int(getattr(config, "EDGE_LOW_LOOP_HIT_WINDOW_SECONDS", 900) or 900),
+        )
+        hits_to_cooldown = max(
+            2,
+            int(getattr(config, "EDGE_LOW_LOOP_HITS_TO_COOLDOWN", 4) or 4),
+        )
+        cooldown_seconds = max(
+            60,
+            int(getattr(config, "EDGE_LOW_LOOP_SYMBOL_COOLDOWN_SECONDS", 600) or 600),
+        )
+        cutoff_ts = now_ts - float(window_seconds)
+        rows = [
+            float(ts)
+            for ts in (self._edge_loop_hits_by_symbol.get(key) or [])
+            if float(ts) >= cutoff_ts
+        ]
+        rows.append(float(now_ts))
+        self._edge_loop_hits_by_symbol[key] = rows
+        hit_count = len(rows)
+        if hit_count < hits_to_cooldown:
+            return
+        self._set_symbol_cooldown(key, cooldown_seconds, "edge_low_loop")
+        self._edge_loop_hits_by_symbol[key] = [float(now_ts)]
+        logger.info(
+            "EDGE_LOW_LOOP_COOLDOWN symbol=%s reason=%s hits=%s/%s cooldown=%ss window=%ss source=%s",
+            key,
+            reason,
+            hit_count,
+            hits_to_cooldown,
+            cooldown_seconds,
+            window_seconds,
+            source_key or "unknown",
         )
 
     def _symbol_window_metrics(self, symbol: str) -> dict[str, float | int]:
@@ -1937,6 +2559,48 @@ class AutoTrader:
         impact = (max(0.0, float(position_size_usd)) / liq) * 100.0
         max_impact = max(0.05, float(getattr(config, "PAPER_MAX_ENTRY_IMPACT_PERCENT", 1.20) or 1.20))
         return bool(impact <= max_impact), float(impact)
+
+    def _paper_roundtrip_proof(
+        self,
+        *,
+        token_data: dict[str, Any],
+        cost_profile: dict[str, float],
+    ) -> tuple[bool, str, float]:
+        if not bool(getattr(config, "PAPER_ROUNDTRIP_CHECK_ENABLED", True)):
+            return True, "disabled", 1.0
+        base_cost_pct = max(0.0, float((cost_profile or {}).get("total_percent", 0.0) or 0.0))
+        spread_cost_pct = 0.0
+        if bool(getattr(config, "PAPER_ROUNDTRIP_INCLUDE_SPREAD_BPS", True)):
+            spread_bps = self._extract_optional_float(
+                token_data,
+                ["spread_bps", "spread_basis_points", "pool_spread_bps"],
+            )
+            if spread_bps is None:
+                spread_pct = self._extract_optional_float(token_data, ["spread_percent", "spread_pct"])
+                if spread_pct is not None:
+                    spread_bps = float(spread_pct) * 100.0
+            if spread_bps is not None and float(spread_bps) > 0.0:
+                spread_cost_pct = max(0.0, float(spread_bps) / 100.0)
+        total_loss_pct = max(0.0, base_cost_pct + spread_cost_pct)
+        ratio = max(0.0, 1.0 - (total_loss_pct / 100.0))
+        min_ratio_cfg = max(
+            0.0,
+            min(1.0, float(getattr(config, "PAPER_ROUNDTRIP_MIN_RETURN_RATIO", 0.80) or 0.80)),
+        )
+        max_loss_pct = max(
+            0.0,
+            min(99.0, float(getattr(config, "PAPER_ROUNDTRIP_MAX_LOSS_PERCENT", 12.0) or 12.0)),
+        )
+        min_ratio_loss = max(0.0, 1.0 - (max_loss_pct / 100.0))
+        min_ratio = max(float(min_ratio_cfg), float(min_ratio_loss))
+        if float(ratio) < float(min_ratio):
+            return (
+                False,
+                f"paper_roundtrip_ratio:{float(ratio):.3f}<{float(min_ratio):.3f}"
+                f" loss={total_loss_pct:.2f}% cost={base_cost_pct:.2f}% spread={spread_cost_pct:.2f}%",
+                float(ratio),
+            )
+        return True, "ok", float(ratio)
 
     def _prune_core_probe_window(self, window_seconds: int | None = None) -> None:
         ts = list(getattr(self, "_core_probe_open_timestamps", []) or [])
@@ -2437,11 +3101,236 @@ class AutoTrader:
             return f"sym:{sym}"
         return f"obj:{id(token)}"
 
+    def _shape_prefilter_source_mix_rows(
+        self,
+        rows: list[tuple[dict[str, Any], dict[str, Any]]],
+        *,
+        stage: str,
+    ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+        if not rows:
+            return rows
+        if not bool(getattr(config, "PLAN_PREFILTER_SOURCE_SHAPE_ENABLED", True)):
+            return rows
+        max_watch_share = _safe_float(getattr(config, "PLAN_PREFILTER_MAX_WATCHLIST_SHARE", 0.80), 0.80)
+        max_watch_share = max(0.0, min(1.0, float(max_watch_share)))
+        min_non_watch = max(
+            0,
+            int(getattr(config, "PLAN_PREFILTER_MIN_NON_WATCH_ROWS", 2) or 2),
+        )
+        max_watch_per_non_watch = max(
+            0,
+            int(getattr(config, "PLAN_PREFILTER_MAX_WATCH_PER_NON_WATCH", 5) or 5),
+        )
+        watch_rows: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        non_watch_rows: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        for token, score in rows:
+            src = self._token_source_key(token)
+            if self._is_watchlist_source(src):
+                watch_rows.append((token, score))
+            else:
+                non_watch_rows.append((token, score))
+        if (not watch_rows) or (not non_watch_rows):
+            return rows
+        total = len(rows)
+        watch_limit = int(math.floor(float(total) * float(max_watch_share)))
+        if max_watch_share > 0.0 and watch_limit <= 0:
+            watch_limit = 1
+        watch_limit = min(len(watch_rows), max(0, int(watch_limit)))
+        non_watch_floor = min(len(non_watch_rows), max(0, int(min_non_watch)))
+        watch_limit = min(int(watch_limit), max(0, int(total) - int(non_watch_floor)))
+        if non_watch_rows and max_watch_per_non_watch > 0:
+            watch_ratio_cap = int(len(non_watch_rows) * int(max_watch_per_non_watch))
+            watch_limit = min(int(watch_limit), max(0, int(watch_ratio_cap)))
+        if watch_limit >= len(watch_rows):
+            return rows
+        watch_sorted = sorted(
+            watch_rows,
+            key=lambda row: (
+                int((row[1] or {}).get("score", 0) or 0),
+                float((row[0] or {}).get("liquidity") or 0.0),
+                float((row[0] or {}).get("volume_5m") or 0.0),
+            ),
+            reverse=True,
+        )
+        keep_watch = set()
+        for token, _score in watch_sorted[:watch_limit]:
+            keep_watch.add(self._batch_candidate_key(token))
+        shaped: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        dropped = 0
+        for token, score in rows:
+            src = self._token_source_key(token)
+            if (not self._is_watchlist_source(src)) or (self._batch_candidate_key(token) in keep_watch):
+                shaped.append((token, score))
+            else:
+                dropped += 1
+        if dropped <= 0:
+            return rows
+        logger.info(
+            (
+                "PLAN_PREFILTER_SOURCE_SHAPE stage=%s in=%s out=%s dropped_watch=%s "
+                "watch_in=%s non_watch_in=%s watch_limit=%s non_watch_floor=%s "
+                "max_watch_share=%.2f watch_per_non_watch=%s"
+            ),
+            str(stage or "unknown"),
+            len(rows),
+            len(shaped),
+            dropped,
+            len(watch_rows),
+            len(non_watch_rows),
+            int(watch_limit),
+            int(non_watch_floor),
+            float(max_watch_share),
+            int(max_watch_per_non_watch),
+        )
+        return shaped
+
+    def _shape_watchlist_symbol_cooldown_rows(
+        self,
+        rows: list[tuple[dict[str, Any], dict[str, Any]]],
+        *,
+        stage: str,
+    ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+        if not rows:
+            return rows
+        if not bool(getattr(config, "PLAN_WATCHLIST_SYMBOL_COOLDOWN_SHAPE_ENABLED", True)):
+            return rows
+
+        max_share = _safe_float(
+            getattr(config, "PLAN_WATCHLIST_SYMBOL_COOLDOWN_MAX_SHARE", 0.25),
+            0.25,
+        )
+        max_share = max(0.0, min(1.0, float(max_share)))
+        min_keep = max(
+            0,
+            int(getattr(config, "PLAN_WATCHLIST_SYMBOL_COOLDOWN_MIN_KEEP", 1) or 1),
+        )
+
+        passthrough: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        watchlist_cooldown: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        non_watch_passthrough = 0
+        for token, score in rows:
+            src = self._token_source_key(token)
+            if not self._is_watchlist_source(src):
+                passthrough.append((token, score))
+                non_watch_passthrough += 1
+                continue
+            symbol = str((token or {}).get("symbol", "") or "").strip()
+            if not symbol:
+                passthrough.append((token, score))
+                continue
+            if int(self._symbol_cooldown_left_seconds(symbol)) > 0:
+                watchlist_cooldown.append((token, score))
+            else:
+                passthrough.append((token, score))
+
+        if not watchlist_cooldown:
+            return rows
+
+        keep_limit = int(math.floor(float(len(rows)) * float(max_share)))
+        if max_share > 0.0 and keep_limit <= 0:
+            keep_limit = 1
+        keep_limit = max(int(min_keep), int(keep_limit))
+        if not passthrough:
+            keep_limit = max(int(keep_limit), 1)
+        max_keep_non_watch = max(
+            0,
+            int(getattr(config, "PLAN_WATCHLIST_SYMBOL_COOLDOWN_MAX_KEEP_WHEN_NON_WATCH", 2) or 2),
+        )
+        if non_watch_passthrough > 0:
+            if max_keep_non_watch > 0:
+                keep_limit = min(int(keep_limit), int(max_keep_non_watch))
+            else:
+                keep_limit = 0
+        keep_limit = min(int(keep_limit), len(watchlist_cooldown))
+        if keep_limit >= len(watchlist_cooldown):
+            return rows
+
+        watchlist_cooldown.sort(
+            key=lambda row: (
+                int((row[1] or {}).get("score", 0) or 0),
+                float((row[0] or {}).get("liquidity") or 0.0),
+                float((row[0] or {}).get("volume_5m") or 0.0),
+            ),
+            reverse=True,
+        )
+        kept = watchlist_cooldown[: int(max(0, keep_limit))]
+        dropped = watchlist_cooldown[int(max(0, keep_limit)) :]
+        shaped = list(passthrough) + list(kept)
+
+        top_drop_symbols: dict[str, int] = {}
+        for token, _score in dropped:
+            sym = str((token or {}).get("symbol", "N/A") or "N/A").strip().upper() or "N/A"
+            top_drop_symbols[sym] = int(top_drop_symbols.get(sym, 0)) + 1
+        top_rows = sorted(top_drop_symbols.items(), key=lambda kv: kv[1], reverse=True)[:4]
+        top_rows_s = ",".join(f"{sym}:{cnt}" for sym, cnt in top_rows) if top_rows else "-"
+        logger.info(
+            (
+                "PLAN_WATCHLIST_SYMBOL_COOLDOWN_SHAPE stage=%s in=%s kept=%s dropped=%s "
+                "keep_limit=%s max_share=%.2f min_keep=%s non_watch_pass=%s "
+                "max_keep_non_watch=%s top_drop=%s"
+            ),
+            str(stage or "unknown"),
+            len(rows),
+            len(shaped),
+            len(dropped),
+            int(keep_limit),
+            float(max_share),
+            int(min_keep),
+            int(non_watch_passthrough),
+            int(max_keep_non_watch),
+            top_rows_s,
+        )
+        return shaped
+
+    def _signal_allows_plan(
+        self,
+        token_data: dict[str, Any],
+        score_data: dict[str, Any],
+    ) -> tuple[bool, str, int, str]:
+        recommendation = str(score_data.get("recommendation", "SKIP") or "SKIP").strip().upper()
+        score = int(score_data.get("score", 0) or 0)
+        strict_min = int(getattr(config, "MIN_TOKEN_SCORE", 0) or 0)
+        if recommendation == "BUY" and score >= strict_min:
+            return True, recommendation, score, "default_buy_signal"
+
+        bridge_enabled = bool(getattr(config, "PLAN_NON_WATCH_BRIDGE_ENABLED", True))
+        bridge_allow_hold = bool(getattr(config, "PLAN_NON_WATCH_BRIDGE_ALLOW_HOLD", True))
+        bridge_flag = bool((token_data or {}).get("_plan_bridge_non_watch", False))
+        bridge_row_min_score = int(
+            max(
+                0,
+                min(
+                    int(strict_min),
+                    int((token_data or {}).get("_plan_bridge_min_score", strict_min) or strict_min),
+                ),
+            )
+        )
+        bridge_min_score = max(
+            0,
+            int(getattr(config, "PLAN_NON_WATCH_BRIDGE_MIN_SCORE", max(0, strict_min - 12)) or max(0, strict_min - 12)),
+        )
+        if bridge_row_min_score > 0:
+            bridge_min_score = min(int(bridge_min_score), int(bridge_row_min_score))
+        source_key = self._token_source_key(token_data)
+        bridge_source_ok = self._is_non_watch_source(source_key)
+        bridge_reco_ok = recommendation in {"BUY", "HOLD"} if bridge_allow_hold else recommendation == "BUY"
+        if (
+            bridge_enabled
+            and bridge_flag
+            and bridge_source_ok
+            and bridge_reco_ok
+            and score >= bridge_min_score
+        ):
+            return True, recommendation, score, "non_watch_bridge_signal"
+
+        return False, recommendation, score, "signal"
+
     def _rebalance_plan_batch_sources(
         self,
         *,
         selected: list[tuple[dict[str, Any], dict[str, Any]]],
         eligible: list[tuple[dict[str, Any], dict[str, Any]]],
+        window_non_watch_supply: int | None = None,
     ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
         if not selected:
             return selected
@@ -2458,6 +3347,19 @@ class AutoTrader:
         max_watch_share = max(0.00, min(1.00, float(max_watch_share)))
         min_non_watch = max(0, int(getattr(config, "PLAN_MIN_NON_WATCHLIST_PER_BATCH", 1) or 1))
         min_non_watch = min(min_non_watch, budget)
+        strict_non_watch_priority = bool(
+            getattr(config, "PLAN_STRICT_NON_WATCH_PRIORITY_ENABLED", True)
+        ) and (not bool(getattr(config, "FLOW_LEGACY_ROLLBACK_MODE", False)))
+        actionable_non_watch_priority = bool(
+            getattr(config, "PLAN_ACTIONABLE_NON_WATCH_PRIORITY_ENABLED", True)
+        ) and (not bool(getattr(config, "FLOW_LEGACY_ROLLBACK_MODE", False)))
+        actionable_non_watch_min_rows = max(
+            1,
+            int(getattr(config, "PLAN_ACTIONABLE_NON_WATCH_PRIORITY_MIN_ROWS", 4) or 4),
+        )
+        forbid_watch_bypass_with_window_supply = bool(
+            getattr(config, "PLAN_FORBID_WATCH_BYPASS_WITH_NON_WATCH_SUPPLY", True)
+        ) and (not bool(getattr(config, "FLOW_LEGACY_ROLLBACK_MODE", False)))
 
         max_per_source = max(1, int(math.floor(float(budget) * float(max_single_share))))
         max_watch = int(math.floor(float(budget) * float(max_watch_share)))
@@ -2474,6 +3376,33 @@ class AutoTrader:
                 continue
             pool_seen.add(key)
             pool.append((token_data, score_data))
+        pool_non_watch_available = sum(
+            1 for token_data, _score_data in pool if self._is_non_watch_source(self._token_source_key(token_data))
+        )
+        pool_watch_available = max(0, int(len(pool)) - int(pool_non_watch_available))
+        if window_non_watch_supply is None:
+            window_non_watch_supply_count = int(pool_non_watch_available)
+        else:
+            window_non_watch_supply_count = max(0, int(window_non_watch_supply or 0))
+        window_has_non_watch_supply = bool(window_non_watch_supply_count > 0)
+        actionable_non_watch_dominant = bool(
+            actionable_non_watch_priority
+            and (int(len(pool)) >= int(actionable_non_watch_min_rows))
+            and (int(pool_non_watch_available) > int(pool_watch_available))
+        )
+        if actionable_non_watch_dominant:
+            strict_non_watch_priority = True
+        target_non_watch_count = int(min_non_watch)
+        if actionable_non_watch_dominant:
+            target_non_watch_count = max(int(target_non_watch_count), int(math.ceil(float(budget) / 2.0)))
+        target_non_watch_count = max(
+            0,
+            min(
+                int(target_non_watch_count),
+                int(budget),
+                int(pool_non_watch_available),
+            ),
+        )
 
         picked: list[tuple[dict[str, Any], dict[str, Any]]] = []
         picked_keys: set[str] = set()
@@ -2508,31 +3437,102 @@ class AutoTrader:
                 non_watch_count += 1
             return True
 
-        # Pass 1: reserve capacity for non-watchlist symbols if available.
-        if min_non_watch > 0:
+        if strict_non_watch_priority:
+            # Pass 1 (strict mode): fill non-watch first.
             for item in pool:
-                if non_watch_count >= min_non_watch:
+                if len(picked) >= budget:
+                    break
+                if target_non_watch_count > 0 and non_watch_count >= target_non_watch_count:
                     break
                 src = self._token_source_key(item[0])
                 if self._is_watchlist_source(src):
                     continue
-                _try_add(item, enforce_watch_cap=True, enforce_source_cap=True)
+                _try_add(item, enforce_watch_cap=False, enforce_source_cap=False)
+        else:
+            # Legacy pass: reserve only minimal non-watch quota.
+            if min_non_watch > 0:
+                for item in pool:
+                    if non_watch_count >= min_non_watch:
+                        break
+                    src = self._token_source_key(item[0])
+                    if self._is_watchlist_source(src):
+                        continue
+                    # Reserve non-watch capacity first; strict per-source cap is relaxed here on purpose.
+                    _try_add(item, enforce_watch_cap=True, enforce_source_cap=False)
 
-        # Pass 2: normal strict fill under caps.
+        # Pass 2: strict fill.
         for item in pool:
             if len(picked) >= budget:
                 break
+            src = self._token_source_key(item[0])
+            if strict_non_watch_priority and (not self._is_watchlist_source(src)):
+                continue
             _try_add(item, enforce_watch_cap=True, enforce_source_cap=True)
 
-        # Pass 3: relax per-source cap (keep watchlist cap) to avoid empty batches.
+        # Pass 3: relax per-source cap (keep watchlist cap).
         if len(picked) < budget:
             for item in pool:
                 if len(picked) >= budget:
                     break
+                src = self._token_source_key(item[0])
+                if strict_non_watch_priority and (not self._is_watchlist_source(src)):
+                    continue
                 _try_add(item, enforce_watch_cap=True, enforce_source_cap=False)
 
-        # Pass 4: final fallback fill (do not return empty if market is thin).
-        allow_watch_cap_bypass = bool(getattr(config, "PLAN_SOURCE_DIVERSITY_ALLOW_WATCHLIST_CAP_BYPASS", False))
+        # Pass 4: final fallback fill (do not return empty/underfilled when non-watch supply is exhausted).
+        allow_watch_cap_bypass_cfg = bool(getattr(config, "PLAN_SOURCE_DIVERSITY_ALLOW_WATCHLIST_CAP_BYPASS", False))
+        remaining_non_watch_candidates = 0
+        if min_non_watch > 0 and non_watch_count < min_non_watch:
+            for token_data, _score_data in pool:
+                src = self._token_source_key(token_data)
+                if self._is_watchlist_source(src):
+                    continue
+                if self._batch_candidate_key(token_data) in picked_keys:
+                    continue
+                remaining_non_watch_candidates += 1
+        non_watch_shortfall_unfillable = bool(
+            min_non_watch > 0
+            and non_watch_count < min_non_watch
+            and remaining_non_watch_candidates <= 0
+        )
+        allow_watch_cap_bypass_base = bool(
+            allow_watch_cap_bypass_cfg
+            or (
+                min_non_watch > 0
+                and (
+                    pool_non_watch_available <= 0
+                    or non_watch_shortfall_unfillable
+                )
+            )
+        )
+        allow_watch_cap_bypass = bool(allow_watch_cap_bypass_base)
+        if (
+            allow_watch_cap_bypass
+            and forbid_watch_bypass_with_window_supply
+            and window_has_non_watch_supply
+        ):
+            allow_watch_cap_bypass = False
+            logger.info(
+                (
+                    "PLAN_SOURCE_DIVERSITY watch_cap_bypass_blocked reason=window_non_watch_supply "
+                    "window_non_watch=%s pool_non_watch=%s min_non_watch=%s non_watch_final=%s"
+                ),
+                int(window_non_watch_supply_count),
+                int(pool_non_watch_available),
+                int(min_non_watch),
+                int(non_watch_count),
+            )
+        if (
+            allow_watch_cap_bypass
+            and (not allow_watch_cap_bypass_cfg)
+            and non_watch_shortfall_unfillable
+        ):
+            logger.info(
+                "PLAN_SOURCE_DIVERSITY watch_cap_bypass reason=non_watch_exhausted non_watch=%s/%s budget=%s",
+                int(non_watch_count),
+                int(min_non_watch),
+                int(budget),
+            )
         if len(picked) < budget:
             for item in pool:
                 if len(picked) >= budget:
@@ -2542,6 +3542,69 @@ class AutoTrader:
                     enforce_watch_cap=not allow_watch_cap_bypass,
                     enforce_source_cap=False,
                 )
+
+        # Last-resort non-watch rescue: ensure at least one non-watch attempt when available.
+        if min_non_watch > 0 and non_watch_count <= 0 and pool_non_watch_available > 0 and picked:
+            best_non_watch: tuple[dict[str, Any], dict[str, Any]] | None = None
+            for token_data, score_data in pool:
+                src = self._token_source_key(token_data)
+                if self._is_watchlist_source(src):
+                    continue
+                if self._batch_candidate_key(token_data) in picked_keys:
+                    continue
+                if best_non_watch is None:
+                    best_non_watch = (token_data, score_data)
+                    continue
+                lhs = (
+                    int((score_data or {}).get("score", 0) or 0),
+                    float((token_data or {}).get("liquidity") or 0.0),
+                    float((token_data or {}).get("volume_5m") or 0.0),
+                )
+                rhs = (
+                    int((best_non_watch[1] or {}).get("score", 0) or 0),
+                    float((best_non_watch[0] or {}).get("liquidity") or 0.0),
+                    float((best_non_watch[0] or {}).get("volume_5m") or 0.0),
+                )
+                if lhs > rhs:
+                    best_non_watch = (token_data, score_data)
+            if best_non_watch is not None:
+                replace_idx = -1
+                replace_score = None
+                for idx, (token_data, score_data) in enumerate(picked):
+                    src = self._token_source_key(token_data)
+                    if not self._is_watchlist_source(src):
+                        continue
+                    score_key = (
+                        int((score_data or {}).get("score", 0) or 0),
+                        float((token_data or {}).get("liquidity") or 0.0),
+                        float((token_data or {}).get("volume_5m") or 0.0),
+                    )
+                    if replace_idx < 0 or (replace_score is not None and score_key < replace_score):
+                        replace_idx = idx
+                        replace_score = score_key
+                    elif replace_score is None:
+                        replace_score = score_key
+                if replace_idx >= 0:
+                    old_token, _old_score = picked[replace_idx]
+                    old_key = self._batch_candidate_key(old_token)
+                    old_src = self._token_source_key(old_token)
+                    new_token, _new_score = best_non_watch
+                    new_key = self._batch_candidate_key(new_token)
+                    new_src = self._token_source_key(new_token)
+                    picked[replace_idx] = best_non_watch
+                    picked_keys.discard(old_key)
+                    picked_keys.add(new_key)
+                    source_counts[old_src] = max(0, int(source_counts.get(old_src, 0)) - 1)
+                    if source_counts.get(old_src, 0) <= 0:
+                        source_counts.pop(old_src, None)
+                    source_counts[new_src] = int(source_counts.get(new_src, 0)) + 1
+                    watch_count = max(0, int(watch_count) - 1)
+                    non_watch_count = int(non_watch_count) + 1
+                    logger.info(
+                        "PLAN_SOURCE_DIVERSITY rescue_non_watch replaced_watch=1 non_watch_final=%s budget=%s",
+                        int(non_watch_count),
+                        int(budget),
+                    )
 
         if not picked:
             return selected
@@ -2559,7 +3622,9 @@ class AutoTrader:
             logger.info(
                 (
                     "PLAN_SOURCE_DIVERSITY budget=%s old=%s new=%s watch_cap=%s source_cap=%s "
-                    "min_non_watch=%s non_watch_final=%s watch_cap_bypass=%s"
+                    "min_non_watch=%s non_watch_final=%s watch_cap_bypass=%s strict_non_watch_first=%s "
+                    "window_non_watch_supply=%s actionable_non_watch=%s actionable_watch=%s "
+                    "actionable_non_watch_dominant=%s target_non_watch=%s"
                 ),
                 budget,
                 old_hist,
@@ -2569,6 +3634,12 @@ class AutoTrader:
                 min_non_watch,
                 non_watch_count,
                 bool(allow_watch_cap_bypass),
+                bool(strict_non_watch_priority),
+                int(window_non_watch_supply_count),
+                int(pool_non_watch_available),
+                int(pool_watch_available),
+                bool(actionable_non_watch_dominant),
+                int(target_non_watch_count),
             )
 
         return picked
@@ -2902,6 +3973,20 @@ class AutoTrader:
             if kept:
                 edge_hits_next[key] = kept
         self._edge_cost_dominant_hits_by_symbol = edge_hits_next
+        edge_loop_window_seconds = max(
+            120,
+            int(getattr(config, "EDGE_LOW_LOOP_HIT_WINDOW_SECONDS", 900) or 900),
+        )
+        edge_loop_cutoff = now_ts - float(edge_loop_window_seconds)
+        edge_loop_next: dict[str, list[float]] = {}
+        for symbol_key, rows in list((self._edge_loop_hits_by_symbol or {}).items()):
+            key = str(symbol_key or "").strip().upper()
+            if not key:
+                continue
+            kept = [float(ts) for ts in (rows or []) if float(ts) >= edge_loop_cutoff]
+            if kept:
+                edge_loop_next[key] = kept
+        self._edge_loop_hits_by_symbol = edge_loop_next
         self._prune_symbol_open_window(max(300, int(getattr(config, "SYMBOL_CONCENTRATION_WINDOW_SECONDS", 3600) or 3600)))
         self._prune_daily_tx_window()
         current_day = self._current_day_id()
@@ -3193,12 +4278,163 @@ class AutoTrader:
             return 0
 
         # Base path: BUY recommendations above configured threshold.
-        eligible = [
-            (token, score)
-            for token, score in candidates
-            if str(score.get("recommendation", "SKIP")) == "BUY"
-            and int(score.get("score", 0)) >= int(config.MIN_TOKEN_SCORE)
-        ]
+        strict_min_score = int(getattr(config, "MIN_TOKEN_SCORE", 0) or 0)
+        non_watch_min_score = max(
+            0,
+            min(
+                int(strict_min_score),
+                int(getattr(config, "PLAN_NON_WATCH_MIN_SCORE", strict_min_score) or strict_min_score),
+            ),
+        )
+        eligible: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        eligible_non_watch_count = 0
+        for token, score in candidates:
+            recommendation = str((score or {}).get("recommendation", "SKIP") or "SKIP").strip().upper()
+            score_value = int((score or {}).get("score", 0) or 0)
+            source_key = self._token_source_key(token)
+            is_non_watch = self._is_non_watch_source(source_key)
+            min_score = int(non_watch_min_score) if is_non_watch else int(strict_min_score)
+            if recommendation == "BUY" and score_value >= min_score:
+                eligible.append((token, score))
+                if is_non_watch:
+                    eligible_non_watch_count += 1
+
+        # Bridge non-watch rows into plan when BUY set is watchlist-only.
+        bridge_enabled = bool(getattr(config, "PLAN_NON_WATCH_BRIDGE_ENABLED", True))
+        bridge_allow_hold = bool(getattr(config, "PLAN_NON_WATCH_BRIDGE_ALLOW_HOLD", True))
+        bridge_min_score = max(
+            0,
+            min(
+                int(strict_min_score),
+                int(getattr(config, "PLAN_NON_WATCH_BRIDGE_MIN_SCORE", max(0, strict_min_score - 12)) or max(0, strict_min_score - 12)),
+            ),
+        )
+        bridge_max_per_batch = max(
+            0,
+            int(getattr(config, "PLAN_NON_WATCH_BRIDGE_MAX_PER_BATCH", 4) or 4),
+        )
+        bridge_min_per_batch = max(
+            0,
+            int(getattr(config, "PLAN_NON_WATCH_BRIDGE_MIN_PER_BATCH", 2) or 2),
+        )
+        bridge_probe_min_score = max(
+            0,
+            min(
+                int(strict_min_score),
+                int(
+                    getattr(
+                        config,
+                        "PLAN_NON_WATCH_BRIDGE_PROBE_MIN_SCORE",
+                        max(0, strict_min_score - 35),
+                    )
+                    or max(0, strict_min_score - 35)
+                ),
+            ),
+        )
+        bridge_post_prefilter_enabled = bool(
+            getattr(config, "PLAN_NON_WATCH_BRIDGE_POST_PREFILTER_ENABLED", True)
+        )
+        bridge_post_prefilter_max_per_batch = max(
+            0,
+            int(
+                getattr(
+                    config,
+                    "PLAN_NON_WATCH_BRIDGE_POST_PREFILTER_MAX_PER_BATCH",
+                    bridge_max_per_batch,
+                )
+                or bridge_max_per_batch
+            ),
+        )
+
+        mode_hint = str(getattr(config, "AUTO_TRADE_ENTRY_MODE", "single") or "single").strip().lower()
+        if mode_hint not in {"single", "all", "top_n"}:
+            mode_hint = "single"
+        if mode_hint == "single":
+            bridge_batch_budget_hint = 1
+        elif mode_hint == "top_n":
+            bridge_batch_budget_hint = max(1, int(getattr(config, "AUTO_TRADE_TOP_N", 1) or 1))
+        else:
+            bridge_batch_budget_hint = max(1, int(len(candidates)))
+        bridge_target_non_watch = min(
+            max(0, int(bridge_min_per_batch)),
+            max(1, int(bridge_batch_budget_hint)),
+        )
+
+        def _count_non_watch_rows(rows: list[tuple[dict[str, Any], dict[str, Any]]]) -> int:
+            return sum(
+                1
+                for token_data, _score_data in rows
+                if self._is_non_watch_source(self._token_source_key(token_data))
+            )
+        window_non_watch_supply = int(_count_non_watch_rows(candidates))
+
+        def _collect_non_watch_bridge_rows(
+            *,
+            existing_rows: list[tuple[dict[str, Any], dict[str, Any]]],
+            max_rows: int,
+        ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+            if max_rows <= 0:
+                return []
+            existing_keys = {self._batch_candidate_key(token) for token, _ in existing_rows}
+            bridge_rows: list[tuple[dict[str, Any], dict[str, Any]]] = []
+            for token, score in candidates:
+                source_key = self._token_source_key(token)
+                if not self._is_non_watch_source(source_key):
+                    continue
+                recommendation = str((score or {}).get("recommendation", "SKIP") or "SKIP").strip().upper()
+                if recommendation != "BUY" and (not bridge_allow_hold or recommendation != "HOLD"):
+                    continue
+                score_value = int((score or {}).get("score", 0) or 0)
+                score_floor = int(bridge_min_score)
+                if bool((token or {}).get("_non_watch_score_probe_pass", False)):
+                    score_floor = min(int(score_floor), int(bridge_probe_min_score))
+                if score_value < int(score_floor):
+                    continue
+                key = self._batch_candidate_key(token)
+                if key in existing_keys:
+                    continue
+                token["_plan_bridge_non_watch"] = True
+                token["_plan_bridge_reason"] = "non_watch_bridge"
+                token["_plan_bridge_min_score"] = int(score_floor)
+                bridge_rows.append((token, score))
+                existing_keys.add(key)
+            if bridge_rows:
+                bridge_rows.sort(
+                    key=lambda row: (
+                        int((row[1] or {}).get("score", 0) or 0),
+                        float((row[0] or {}).get("liquidity") or 0.0),
+                        float((row[0] or {}).get("volume_5m") or 0.0),
+                    ),
+                    reverse=True,
+                )
+                bridge_rows = bridge_rows[: int(max_rows)]
+            return bridge_rows
+
+        if (
+            bridge_enabled
+            and bridge_max_per_batch > 0
+            and bridge_target_non_watch > 0
+            and eligible_non_watch_count < bridge_target_non_watch
+        ):
+            bridge_need = max(0, int(bridge_target_non_watch) - int(eligible_non_watch_count))
+            bridge_rows = _collect_non_watch_bridge_rows(
+                existing_rows=eligible,
+                max_rows=min(int(bridge_max_per_batch), int(bridge_need)),
+            )
+            if bridge_rows:
+                eligible.extend(bridge_rows)
+                logger.info(
+                    (
+                        "PLAN_NON_WATCH_BRIDGE injected=%s min_score=%s probe_min=%s allow_hold=%s "
+                        "base_non_watch=%s target_non_watch=%s"
+                    ),
+                    len(bridge_rows),
+                    int(bridge_min_score),
+                    int(bridge_probe_min_score),
+                    bool(bridge_allow_hold),
+                    int(eligible_non_watch_count),
+                    int(bridge_target_non_watch),
+                )
         prefilter_removed_total = 0
         prefilter_removed_rows = 0
         prefilter_removed_by_reason: dict[str, int] = {}
@@ -3274,6 +4510,8 @@ class AutoTrader:
             removed_open_duplicate = 0
             removed_blacklist = 0
             removed_hard_blocklist = 0
+            removed_token_cooldown = 0
+            removed_symbol_cooldown = 0
             out: list[tuple[dict[str, Any], dict[str, Any]]] = []
             for token, score in rows:
                 token_address = normalize_address(str((token or {}).get("address", "") or ""))
@@ -3338,6 +4576,23 @@ class AutoTrader:
                         self._blacklist_add(token_address, "hard_blocklist:config", ttl_seconds=90 * 24 * 3600)
                         logger.warning("AutoTrade skip token=%s reason=hard_blocklist address=%s", symbol, token_address)
                     continue
+                cooldown_reason, cooldown_detail = self._prefilter_cooldown_block_reason(
+                    token_address=token_address,
+                    symbol=symbol,
+                )
+                if cooldown_reason:
+                    if cooldown_reason == "symbol_cooldown":
+                        removed_symbol_cooldown += 1
+                    else:
+                        removed_token_cooldown += 1
+                    _record_prefilter_skip(
+                        token=token,
+                        score=score,
+                        stage=stage,
+                        reason=cooldown_reason,
+                        detail=cooldown_detail,
+                    )
+                    continue
                 out.append((token, score))
 
             total_removed = (
@@ -3346,12 +4601,15 @@ class AutoTrader:
                 + removed_open_duplicate
                 + removed_blacklist
                 + removed_hard_blocklist
+                + removed_token_cooldown
+                + removed_symbol_cooldown
             )
             if total_removed > 0:
                 logger.info(
                     (
                         "AutoTrade batch %s-prefilter removed=%s missing_addr=%s "
-                        "placeholder_addr=%s open_duplicate=%s blacklist=%s hard_blocklist=%s"
+                        "placeholder_addr=%s open_duplicate=%s blacklist=%s hard_blocklist=%s "
+                        "token_cooldown=%s symbol_cooldown=%s"
                     ),
                     stage,
                     total_removed,
@@ -3360,11 +4618,72 @@ class AutoTrader:
                     removed_open_duplicate,
                     removed_blacklist,
                     removed_hard_blocklist,
+                    removed_token_cooldown,
+                    removed_symbol_cooldown,
                 )
             return out
 
         if eligible:
+            eligible = self._shape_prefilter_source_mix_rows(
+                eligible,
+                stage="pre_prefilter",
+            )
+            eligible = self._shape_watchlist_symbol_cooldown_rows(
+                eligible,
+                stage="pre_prefilter",
+            )
             eligible = _prefilter_eligible(eligible, stage="pre")
+        # Retry non-watch bridge after prefilter so one soft non-watch BUY/HOLD row
+        # can survive when initial non-watch BUY was removed by duplicate/cooldown.
+        if (
+            bridge_enabled
+            and bridge_post_prefilter_enabled
+            and bridge_post_prefilter_max_per_batch > 0
+            and eligible
+        ):
+            non_watch_after_prefilter = _count_non_watch_rows(eligible)
+            bridge_need_post = max(0, int(bridge_target_non_watch) - int(non_watch_after_prefilter))
+            if bridge_need_post > 0:
+                bridge_rows = _collect_non_watch_bridge_rows(
+                    existing_rows=eligible,
+                    max_rows=max(
+                        int(bridge_need_post),
+                        max(int(bridge_post_prefilter_max_per_batch) * 4, int(bridge_post_prefilter_max_per_batch)),
+                    ),
+                )
+                if bridge_rows:
+                    bridge_rows = _prefilter_eligible(bridge_rows, stage="bridge")
+                    if bridge_rows:
+                        bridge_rows.sort(
+                            key=lambda row: (
+                                int((row[1] or {}).get("score", 0) or 0),
+                                float((row[0] or {}).get("liquidity") or 0.0),
+                                float((row[0] or {}).get("volume_5m") or 0.0),
+                            ),
+                            reverse=True,
+                        )
+                        bridge_rows = bridge_rows[: int(max(bridge_need_post, bridge_post_prefilter_max_per_batch))]
+                        eligible.extend(bridge_rows)
+                        eligible = self._shape_prefilter_source_mix_rows(
+                            eligible,
+                            stage="bridge_prefilter",
+                        )
+                        eligible = self._shape_watchlist_symbol_cooldown_rows(
+                            eligible,
+                            stage="bridge_prefilter",
+                        )
+                        logger.info(
+                            (
+                                "PLAN_NON_WATCH_BRIDGE post_prefilter_injected=%s min_score=%s probe_min=%s "
+                                "allow_hold=%s target_non_watch=%s before_non_watch=%s"
+                            ),
+                            len(bridge_rows),
+                            int(bridge_min_score),
+                            int(bridge_probe_min_score),
+                            bool(bridge_allow_hold),
+                            int(bridge_target_non_watch),
+                            int(non_watch_after_prefilter),
+                        )
         # Underflow fallback (matrix tuning mode): if there are no BUY candidates in cycle,
         # allow HOLD candidates with a separate floor to keep exploration alive.
         if (not eligible) and bool(getattr(config, "PLAN_UNDERFLOW_ALLOW_HOLD", False)):
@@ -3428,7 +4747,10 @@ class AutoTrader:
                 if str((token or {}).get("_entry_channel", "core") or "core").strip().lower() == "core"
             ]
         selected = selected[: max(1, int(dynamic_cap))]
-        selected = self._rebalance_plan_batch_sources(selected=selected, eligible=eligible)
+        selected = self._rebalance_plan_batch_sources(
+            selected=selected,
+            eligible=eligible,
+        )
         base_selected = list(selected)
 
         # Burst governor: avoid correlated packet opens in one cycle/window.
@@ -3516,7 +4838,25 @@ class AutoTrader:
                         break
                 selected = picked
 
+        # Re-apply source rebalance on actual attempt pool (after burst shaping),
+        # so non-watch rows keep plan slots when watchlist candidates are mostly cooling down.
+        if selected:
+            selected = self._rebalance_plan_batch_sources(
+                selected=selected,
+                eligible=eligible,
+            )
+
         opened = 0
+        actionable_non_watch = int(_count_non_watch_rows(eligible))
+        actionable_watch = max(0, int(len(eligible)) - int(actionable_non_watch))
+        selected_non_watch = int(
+            sum(
+                1
+                for token_data, _score_data in selected
+                if not self._is_watchlist_source(self._token_source_key(token_data))
+            )
+        )
+        selected_watch = max(0, int(len(selected)) - int(selected_non_watch))
         batch_has_non_watchlist = any(
             not self._is_watchlist_source(self._token_source_key(token_data))
             for token_data, _ in selected
@@ -3526,6 +4866,10 @@ class AutoTrader:
                 break
             try:
                 token_data["_plan_batch_has_non_watchlist"] = bool(batch_has_non_watchlist)
+                token_data["_plan_actionable_non_watch"] = int(actionable_non_watch)
+                token_data["_plan_actionable_watch"] = int(actionable_watch)
+                token_data["_plan_selected_non_watch"] = int(selected_non_watch)
+                token_data["_plan_selected_watch"] = int(selected_watch)
             except Exception:
                 pass
             pos = await self.plan_trade(token_data, score_data)
@@ -3745,9 +5089,8 @@ class AutoTrader:
             logger.warning("KILL_SWITCH active path=%s", config.KILL_SWITCH_FILE)
             return None
 
-        recommendation = str(score_data.get("recommendation", "SKIP"))
-        score = int(score_data.get("score", 0))
-        if recommendation != "BUY" or score < int(config.MIN_TOKEN_SCORE):
+        signal_ok, recommendation, score, signal_path = self._signal_allows_plan(token_data, score_data)
+        if not signal_ok:
             self._bump_skip_reason("signal")
             logger.info(
                 "AutoTrade skip token=%s reason=signal recommendation=%s score=%s",
@@ -3756,6 +5099,14 @@ class AutoTrader:
                 score,
             )
             return None
+        if signal_path == "non_watch_bridge_signal":
+            logger.info(
+                "AutoTrade signal token=%s path=non_watch_bridge recommendation=%s score=%s min=%s",
+                symbol,
+                recommendation,
+                score,
+                int(getattr(config, "PLAN_NON_WATCH_BRIDGE_MIN_SCORE", max(0, int(config.MIN_TOKEN_SCORE) - 12))),
+            )
 
         raw_token_address = str(token_data.get("address", "") or "")
         token_address = normalize_address(raw_token_address)
@@ -3818,6 +5169,7 @@ class AutoTrader:
         non_watch_quota_blocked, non_watch_quota_detail = self._plan_non_watchlist_quota_blocked(
             source_name=source_name,
             batch_has_non_watchlist=batch_has_non_watchlist,
+            token_data=token_data,
         )
         if non_watch_quota_blocked:
             self._bump_skip_reason("plan_non_watchlist_quota")
@@ -4029,6 +5381,60 @@ class AutoTrader:
                     or loss_share_w > float(getattr(config, "SYMBOL_EV_MAX_LOSS_SHARE", 0.60) or 0.60)
                 )
                 if bad_ev:
+                    if (
+                        bool(getattr(config, "SYMBOL_EV_BAD_NON_WATCH_FORCE_SKIP_ENABLED", True))
+                        and self._is_non_watch_source(source_name)
+                    ):
+                        force_min_trades = max(
+                            1,
+                            int(getattr(config, "SYMBOL_EV_BAD_NON_WATCH_FORCE_SKIP_MIN_TRADES", 4) or 4),
+                        )
+                        force_loss_share = max(
+                            0.0,
+                            min(
+                                1.0,
+                                float(
+                                    getattr(
+                                        config,
+                                        "SYMBOL_EV_BAD_NON_WATCH_FORCE_SKIP_MAX_LOSS_SHARE",
+                                        0.62,
+                                    )
+                                    or 0.62
+                                ),
+                            ),
+                        )
+                        force_avg_pnl_max = float(
+                            getattr(
+                                config,
+                                "SYMBOL_EV_BAD_NON_WATCH_FORCE_SKIP_MAX_AVG_PNL_USD",
+                                -0.0005,
+                            )
+                            or -0.0005
+                        )
+                        if (
+                            int(trades_w) >= int(force_min_trades)
+                            and float(loss_share_w) >= float(force_loss_share)
+                            and float(avg_pnl_w) <= float(force_avg_pnl_max)
+                        ):
+                            self._bump_skip_reason("symbol_ev_bad_non_watch")
+                            cooldown = max(
+                                int(getattr(config, "SYMBOL_EV_BAD_COOLDOWN_SECONDS", 0) or 0),
+                                int(getattr(config, "SYMBOL_FATIGUE_COOLDOWN_SECONDS", 0) or 0),
+                            )
+                            self._set_symbol_cooldown(symbol_upper, cooldown, "bad_ev_non_watch")
+                            logger.info(
+                                "AutoTrade skip token=%s reason=symbol_ev_bad_non_watch source=%s trades=%s avg=%.5f loss_share=%.2f "
+                                "thresholds[min_trades=%s avg<=%.5f loss_share>=%.2f]",
+                                symbol,
+                                source_name or "-",
+                                trades_w,
+                                avg_pnl_w,
+                                loss_share_w,
+                                force_min_trades,
+                                force_avg_pnl_max,
+                                force_loss_share,
+                            )
+                            return None
                     bad_action = str(getattr(config, "SYMBOL_EV_BAD_ACTION", "skip") or "skip").strip().lower()
                     if bool(getattr(config, "SYMBOL_EV_BAD_TO_STRICT_ONLY", True)) and entry_tier != "A":
                         if anti_choke and bool(getattr(config, "ANTI_CHOKE_ALLOW_SYMBOL_STRICT_BYPASS", True)):
@@ -4121,7 +5527,9 @@ class AutoTrader:
             )
             guard_reason_s = str(guard_reason or "")
             if guard_reason_s.startswith("risky_contract_flags:"):
-                self._blacklist_add(token_address, f"safety_guard:{self._short_error_text(guard_reason)}")
+                short_reason = self._short_error_text(guard_reason)
+                self._blacklist_add(token_address, f"safety_guard:{short_reason}")
+                self._register_contract_risk_hard_block(token_address, short_reason)
             elif self._is_transient_safety_reason(guard_reason_s):
                 self._apply_transient_safety_cooldown(token_address, guard_reason_s)
                 if bool(getattr(config, "ENTRY_TRANSIENT_SAFETY_TO_BLACKLIST", False)):
@@ -4145,6 +5553,15 @@ class AutoTrader:
                 symbol,
                 ("source_divergence" if reason_l.startswith("source_divergence") else "quarantine"),
                 self._short_error_text(quarantine_reason),
+            )
+            return None
+        pre_rug_ok, pre_rug_reason = self._pre_entry_anti_rug_gate(token_data, token_address=token_address)
+        if not pre_rug_ok:
+            self._bump_skip_reason("pre_rug_guard")
+            logger.info(
+                "AutoTrade skip token=%s reason=pre_rug_guard detail=%s",
+                symbol,
+                self._short_error_text(pre_rug_reason),
             )
             return None
         cluster_key = self._token_cluster_key(
@@ -4379,6 +5796,13 @@ class AutoTrader:
 
         expected_edge_percent = self._estimate_edge_percent(score, tp, sl, cost_profile["total_percent"], risk_level)
         edge_percent_for_decision = float(expected_edge_percent) * float(regime_edge_mult)
+        edge_dbg = self._edge_debug_components(
+            score=score,
+            tp_percent=tp,
+            sl_percent=sl,
+            total_cost_percent=float(cost_profile["total_percent"]),
+            risk_level=risk_level,
+        )
         expected_edge_usd = float(position_size_usd) * float(edge_percent_for_decision) / 100.0
         ev_snapshot = self._ev_expected_snapshot(
             market_mode=market_mode,
@@ -4491,6 +5915,54 @@ class AutoTrader:
                     edge_percent_for_decision = float(expected_edge_percent) * float(regime_edge_mult)
 
         min_trade_usd = max(0.01, float(getattr(config, "MIN_TRADE_USD", 0.25) or 0.25))
+        if (not self._is_live_mode()) and bool(getattr(config, "PAPER_VIABLE_SIZE_GUARD_ENABLED", True)):
+            floor_usd = max(
+                min_trade_usd,
+                float(getattr(config, "PAPER_TRADE_SIZE_MIN_USD", min_trade_usd) or min_trade_usd),
+                float(getattr(config, "PAPER_VIABLE_SIZE_MIN_USD", 0.80) or 0.80),
+            )
+            gas_mult = max(
+                0.0,
+                float(getattr(config, "PAPER_VIABLE_SIZE_GAS_MULT_FLOOR", 12.0) or 12.0),
+            )
+            gas_usd = max(0.0, float(cost_profile.get("gas_usd", 0.0) or 0.0))
+            if gas_usd > 0.0 and gas_mult > 0.0:
+                floor_usd = max(floor_usd, gas_usd * gas_mult)
+            viable_cap_usd = max(
+                float(floor_usd),
+                float(
+                    getattr(
+                        config,
+                        "PAPER_VIABLE_SIZE_MAX_USD",
+                        getattr(config, "PAPER_TRADE_SIZE_MAX_USD", floor_usd),
+                    )
+                    or getattr(config, "PAPER_TRADE_SIZE_MAX_USD", floor_usd)
+                ),
+            )
+            floor_usd = min(floor_usd, viable_cap_usd)
+            available_usd = float(self._available_balance_usd())
+            if max_buy_weth > 0:
+                floor_usd = min(floor_usd, float(cap_usd))
+            floor_usd = min(floor_usd, available_usd)
+            if floor_usd >= min_trade_usd and floor_usd > position_size_usd:
+                prev_size = float(position_size_usd)
+                position_size_usd = float(floor_usd)
+                cost_profile = self._estimate_cost_profile(
+                    liquidity_usd,
+                    risk_level,
+                    score,
+                    position_size_usd=position_size_usd,
+                )
+                expected_edge_percent = self._estimate_edge_percent(score, tp, sl, cost_profile["total_percent"], risk_level)
+                edge_percent_for_decision = float(expected_edge_percent) * float(regime_edge_mult)
+                logger.info(
+                    "AutoTrade adjust token=%s reason=paper_viable_size_floor size=$%.2f->$%.2f floor=$%.2f gas=$%.4f",
+                    symbol,
+                    prev_size,
+                    position_size_usd,
+                    floor_usd,
+                    gas_usd,
+                )
         if (
             bool(getattr(config, "NON_WATCH_EXPLORE_MIN_TRADE_FLOOR_ENABLED", True))
             and (entry_channel == "explore")
@@ -4572,6 +6044,65 @@ class AutoTrader:
             logger.info("AutoTrade skip token=%s reason=low_balance", symbol)
             return None
 
+        edge_dbg = self._edge_debug_components(
+            score=score,
+            tp_percent=tp,
+            sl_percent=sl,
+            total_cost_percent=float(cost_profile["total_percent"]),
+            risk_level=risk_level,
+        )
+        if bool(getattr(config, "PLAN_NEGATIVE_EDGE_PRECHECK_ENABLED", True)):
+            gross_pct_precheck = float(edge_dbg.get("gross_percent", 0.0) or 0.0)
+            cost_pct_precheck = float(cost_profile.get("total_percent", 0.0) or 0.0)
+            max_gross_precheck = float(getattr(config, "PLAN_NEGATIVE_EDGE_PRECHECK_MAX_GROSS_PERCENT", 0.0) or 0.0)
+            min_cost_precheck = max(
+                0.0,
+                float(getattr(config, "PLAN_NEGATIVE_EDGE_PRECHECK_MIN_COST_PERCENT", 3.0) or 3.0),
+            )
+            if gross_pct_precheck <= max_gross_precheck and cost_pct_precheck >= min_cost_precheck:
+                cost_dominant_skip = self._is_cost_dominant_skip(
+                    gross_percent=gross_pct_precheck,
+                    cost_total_percent=cost_pct_precheck,
+                    source_name=source_name,
+                    entry_channel=entry_channel,
+                    position_size_usd=float(position_size_usd),
+                )
+                skip_reason = "cost_dominant_edge" if cost_dominant_skip else "negative_edge"
+                self._bump_skip_reason_ext(
+                    skip_reason,
+                    extra={
+                        "precheck": "negative_gross_before_edge_gate",
+                        "gross_percent": float(gross_pct_precheck),
+                        "cost_total_percent": float(cost_pct_precheck),
+                        "position_size_usd": float(position_size_usd),
+                        "expected_edge_percent": float(expected_edge_percent),
+                        "edge_percent_for_decision": float(edge_percent_for_decision),
+                    },
+                )
+                logger.info(
+                    "AutoTrade skip token=%s reason=%s precheck=negative_gross gross=%.2f%% costs=%.2f%% size=$%.2f",
+                    symbol,
+                    skip_reason,
+                    gross_pct_precheck,
+                    cost_pct_precheck,
+                    position_size_usd,
+                )
+                self._cost_dominant_skip_guard(
+                    symbol=symbol,
+                    skip_reason=skip_reason,
+                    gross_percent=float(gross_pct_precheck),
+                    cost_total_percent=float(cost_pct_precheck),
+                    source_name=source_name,
+                    entry_channel=entry_channel,
+                    position_size_usd=float(position_size_usd),
+                )
+                self._edge_skip_loop_guard(
+                    symbol=symbol,
+                    skip_reason=skip_reason,
+                    source_name=source_name,
+                )
+                return None
+
         expected_edge_usd = float(position_size_usd) * float(edge_percent_for_decision) / 100.0
         core_probe_eligible = (
             bool(getattr(config, "EV_FIRST_ENTRY_CORE_PROBE_ENABLED", True))
@@ -4584,9 +6115,47 @@ class AutoTrader:
         probe_tail = ""
         core_probe_budget_used = 0
         core_probe_budget_cap = max(0, int(getattr(config, "EV_FIRST_ENTRY_CORE_PROBE_MAX_OPENS", 1) or 1))
+        ev_expected_net_current = float(ev_snapshot.get("expected_net_usd", 0.0) or 0.0)
+        non_watch_ev_ok, non_watch_ev_detail = self._non_watch_explore_ev_guard(
+            source_is_watchlist=source_is_watchlist,
+            entry_channel=entry_channel,
+            ev_expected_net_usd=ev_expected_net_current,
+        )
+        if not non_watch_ev_ok:
+            self._bump_skip_reason_ext(
+                "ev_net_low",
+                extra={
+                    "guard": "non_watch_explore_positive_ev",
+                    "detail": str(non_watch_ev_detail),
+                    "ev_expected_net_usd": float(ev_expected_net_current),
+                    "position_size_usd": float(position_size_usd),
+                    "expected_edge_percent": float(expected_edge_percent),
+                    "edge_percent_for_decision": float(edge_percent_for_decision),
+                    "gross_percent": float(edge_dbg.get("gross_percent", 0.0) or 0.0),
+                    "cost_total_percent": float(cost_profile.get("total_percent", 0.0) or 0.0),
+                    "cost_buy_percent": float(cost_profile.get("buy_percent", 0.0) or 0.0),
+                    "cost_sell_percent": float(cost_profile.get("sell_percent", 0.0) or 0.0),
+                    "cost_gas_usd": float(cost_profile.get("gas_usd", 0.0) or 0.0),
+                },
+            )
+            logger.info(
+                "AutoTrade skip token=%s reason=ev_net_low guard=non_watch_explore_positive_ev detail=%s",
+                symbol,
+                str(non_watch_ev_detail),
+            )
+            self._cost_dominant_skip_guard(
+                symbol=symbol,
+                skip_reason="ev_net_low",
+                gross_percent=float(edge_dbg.get("gross_percent", 0.0) or 0.0),
+                cost_total_percent=float(cost_profile.get("total_percent", 0.0) or 0.0),
+                source_name=source_name,
+                entry_channel=entry_channel,
+                position_size_usd=float(position_size_usd),
+            )
+            return None
         if bool(getattr(config, "EV_FIRST_ENTRY_ENABLED", True)):
             ev_samples = float(ev_snapshot.get("samples", 0.0) or 0.0)
-            ev_expected_net = float(ev_snapshot.get("expected_net_usd", 0.0) or 0.0)
+            ev_expected_net = float(ev_expected_net_current)
             ev_min = float(getattr(config, "EV_FIRST_ENTRY_MIN_NET_USD", 0.0010) or 0.0010)
             if mm == "RED":
                 ev_min *= float(getattr(config, "EV_FIRST_ENTRY_MIN_NET_USD_RED_MULT", 1.20) or 1.20)
@@ -4724,13 +6293,6 @@ class AutoTrader:
                     "core_probe_detail": str(core_probe_detail),
                 }
             )
-        edge_dbg = self._edge_debug_components(
-            score=score,
-            tp_percent=tp,
-            sl_percent=sl,
-            total_cost_percent=float(cost_profile["total_percent"]),
-            risk_level=risk_level,
-        )
         if config.EDGE_FILTER_ENABLED:
             mode = str(getattr(config, "EDGE_FILTER_MODE", "usd") or "usd").strip().lower()
             min_edge_pct = (
@@ -4763,6 +6325,109 @@ class AutoTrader:
                 min_factor = max(0.10, min(1.0, float(getattr(config, "ENTRY_SMALL_SIZE_EDGE_RELAX_MIN_FACTOR", 0.50) or 0.50)))
                 size_factor = max(min_factor, min(1.0, float(position_size_usd) / nominal_size))
                 min_edge_usd *= float(size_factor)
+
+            # Non-watch paper explore fallback:
+            # if edge is blocked mostly by fixed gas share, attempt one conservative
+            # size-up (within caps) before final edge reject.
+            if (
+                bool(getattr(config, "NON_WATCH_EDGE_SIZE_RECOVERY_ENABLED", True))
+                and (not source_is_watchlist)
+                and entry_channel == "explore"
+                and (not self._is_live_mode())
+            ):
+                recovery_min_gross = float(
+                    getattr(config, "NON_WATCH_EDGE_SIZE_RECOVERY_MIN_GROSS_PERCENT", 1.0) or 1.0
+                )
+                recovery_min_cost_delta = float(
+                    getattr(config, "NON_WATCH_EDGE_SIZE_RECOVERY_MIN_COST_DELTA_PERCENT", 0.30) or 0.30
+                )
+                recovery_max_usd_cfg = max(
+                    0.10,
+                    float(
+                        getattr(
+                            config,
+                            "NON_WATCH_EDGE_SIZE_RECOVERY_MAX_USD",
+                            getattr(config, "PAPER_TRADE_SIZE_MAX_USD", 1.20),
+                        )
+                        or getattr(config, "PAPER_TRADE_SIZE_MAX_USD", 1.20)
+                    ),
+                )
+                cur_size = max(0.10, float(position_size_usd))
+                gas_usd = max(0.0, float(cost_profile.get("gas_usd", 0.0) or 0.0))
+                gross_pct = float(edge_dbg.get("gross_percent", 0.0) or 0.0)
+                total_cost_pct = max(0.0, float(cost_profile.get("total_percent", 0.0) or 0.0))
+                gas_pct = (gas_usd / cur_size * 100.0) if cur_size > 0.0 else 0.0
+                non_gas_pct = max(0.0, total_cost_pct - gas_pct)
+                target_pct = float(min_edge_pct if mode in {"percent", "both"} else 0.0)
+                target_usd = float(min_edge_usd if mode in {"usd", "both"} else 0.0)
+
+                denom_pct = gross_pct - non_gas_pct - target_pct
+                req_size_by_pct = None
+                if mode in {"percent", "both"} and gas_usd > 0.0 and denom_pct > 0.0:
+                    req_size_by_pct = (gas_usd * 100.0) / max(1e-9, denom_pct)
+
+                a_usd = (gross_pct - non_gas_pct) / 100.0
+                req_size_by_usd = None
+                if mode in {"usd", "both"} and a_usd > 0.0:
+                    req_size_by_usd = (target_usd + gas_usd) / max(1e-9, a_usd)
+
+                required_size = float(cur_size)
+                if req_size_by_pct is not None:
+                    required_size = max(required_size, float(req_size_by_pct))
+                if req_size_by_usd is not None:
+                    required_size = max(required_size, float(req_size_by_usd))
+
+                max_recovery_size = float(recovery_max_usd_cfg)
+                max_recovery_size = min(max_recovery_size, float(self._available_balance_usd()))
+                if max_buy_weth > 0:
+                    max_recovery_size = min(max_recovery_size, float(cap_usd))
+
+                # Apply only when gross is positive enough and cost pressure is the blocker.
+                if (
+                    gross_pct >= recovery_min_gross
+                    and (total_cost_pct - gross_pct) >= recovery_min_cost_delta
+                    and required_size > (cur_size + 0.01)
+                    and required_size <= max_recovery_size
+                ):
+                    prev_size = float(position_size_usd)
+                    position_size_usd = float(required_size)
+                    cost_profile = self._estimate_cost_profile(
+                        liquidity_usd,
+                        risk_level,
+                        score,
+                        position_size_usd=position_size_usd,
+                    )
+                    expected_edge_percent = self._estimate_edge_percent(
+                        score,
+                        tp,
+                        sl,
+                        cost_profile["total_percent"],
+                        risk_level,
+                    )
+                    edge_percent_for_decision = float(expected_edge_percent) * float(regime_edge_mult)
+                    expected_edge_usd = float(position_size_usd) * float(edge_percent_for_decision) / 100.0
+                    edge_dbg = self._edge_debug_components(
+                        score=score,
+                        tp_percent=tp,
+                        sl_percent=sl,
+                        total_cost_percent=float(cost_profile["total_percent"]),
+                        risk_level=risk_level,
+                    )
+                    logger.info(
+                        (
+                            "AutoTrade adjust token=%s reason=non_watch_edge_size_recovery "
+                            "size=$%.2f->$%.2f req=$%.2f max=$%.2f gross=%.2f%% costs=%.2f%% min_pct=%.2f%% min_usd=$%.3f"
+                        ),
+                        symbol,
+                        prev_size,
+                        position_size_usd,
+                        required_size,
+                        max_recovery_size,
+                        gross_pct,
+                        total_cost_pct,
+                        min_edge_pct,
+                        min_edge_usd,
+                    )
             edge_min_pct_effective = float(min_edge_pct)
             edge_min_usd_effective = float(min_edge_usd)
             pct_ok = edge_percent_for_decision >= float(edge_min_pct_effective)
@@ -4827,8 +6492,16 @@ class AutoTrader:
                             f"base_pct={min_edge_pct:.4f} base_usd={min_edge_usd:.5f} budget={probe_used}/{probe_cap}"
                         )
             if mode == "percent" and not pct_ok:
+                cost_dominant_skip = self._is_cost_dominant_skip(
+                    gross_percent=float(edge_dbg.get("gross_percent", 0.0) or 0.0),
+                    cost_total_percent=float(cost_profile.get("total_percent", 0.0) or 0.0),
+                    source_name=source_name,
+                    entry_channel=entry_channel,
+                    position_size_usd=float(position_size_usd),
+                )
+                skip_reason = "cost_dominant_edge" if cost_dominant_skip else "negative_edge"
                 self._bump_skip_reason_ext(
-                    "negative_edge",
+                    skip_reason,
                     extra={
                         "mode": str(mode),
                         "edge_percent_for_decision": float(edge_percent_for_decision),
@@ -4847,11 +6520,13 @@ class AutoTrader:
                         "core_probe_budget_used": int(core_probe_budget_used),
                         "core_probe_budget_cap": int(core_probe_budget_cap),
                         "core_probe_detail": str(core_probe_detail or ""),
+                        "cost_dominant_edge": bool(cost_dominant_skip),
                     },
                 )
                 logger.info(
-                    "AutoTrade skip token=%s reason=negative_edge edge=%.2f%% raw=%.2f%% mult=%.2f min=%.2f%% probe_min=%.2f%% edge_usd=$%.3f size=$%.2f gross=%.2f%% costs=%.2f%% pwin=%.2f probe=%s budget=%s/%s",
+                    "AutoTrade skip token=%s reason=%s edge=%.2f%% raw=%.2f%% mult=%.2f min=%.2f%% probe_min=%.2f%% edge_usd=$%.3f size=$%.2f gross=%.2f%% costs=%.2f%% pwin=%.2f probe=%s budget=%s/%s",
                     symbol,
+                    skip_reason,
                     edge_percent_for_decision,
                     expected_edge_percent,
                     regime_edge_mult,
@@ -4868,17 +6543,30 @@ class AutoTrader:
                 )
                 self._cost_dominant_skip_guard(
                     symbol=symbol,
-                    skip_reason="negative_edge",
+                    skip_reason=skip_reason,
                     gross_percent=float(edge_dbg.get("gross_percent", 0.0) or 0.0),
                     cost_total_percent=float(cost_profile.get("total_percent", 0.0) or 0.0),
                     source_name=source_name,
                     entry_channel=entry_channel,
                     position_size_usd=float(position_size_usd),
+                )
+                self._edge_skip_loop_guard(
+                    symbol=symbol,
+                    skip_reason=skip_reason,
+                    source_name=source_name,
                 )
                 return None
             if mode == "usd" and not usd_ok:
+                cost_dominant_skip = self._is_cost_dominant_skip(
+                    gross_percent=float(edge_dbg.get("gross_percent", 0.0) or 0.0),
+                    cost_total_percent=float(cost_profile.get("total_percent", 0.0) or 0.0),
+                    source_name=source_name,
+                    entry_channel=entry_channel,
+                    position_size_usd=float(position_size_usd),
+                )
+                skip_reason = "cost_dominant_edge" if cost_dominant_skip else "edge_usd_low"
                 self._bump_skip_reason_ext(
-                    "edge_usd_low",
+                    skip_reason,
                     extra={
                         "mode": str(mode),
                         "edge_percent_for_decision": float(edge_percent_for_decision),
@@ -4897,11 +6585,13 @@ class AutoTrader:
                         "core_probe_budget_used": int(core_probe_budget_used),
                         "core_probe_budget_cap": int(core_probe_budget_cap),
                         "core_probe_detail": str(core_probe_detail or ""),
+                        "cost_dominant_edge": bool(cost_dominant_skip),
                     },
                 )
                 logger.info(
-                    "AutoTrade skip token=%s reason=edge_usd_low edge_usd=$%.3f min=$%.3f probe_min=$%.3f edge=%.2f%% raw=%.2f%% mult=%.2f size=$%.2f gross=%.2f%% costs=%.2f%% pwin=%.2f probe=%s budget=%s/%s",
+                    "AutoTrade skip token=%s reason=%s edge_usd=$%.3f min=$%.3f probe_min=$%.3f edge=%.2f%% raw=%.2f%% mult=%.2f size=$%.2f gross=%.2f%% costs=%.2f%% pwin=%.2f probe=%s budget=%s/%s",
                     symbol,
+                    skip_reason,
                     expected_edge_usd,
                     min_edge_usd,
                     edge_min_usd_effective,
@@ -4918,17 +6608,30 @@ class AutoTrader:
                 )
                 self._cost_dominant_skip_guard(
                     symbol=symbol,
-                    skip_reason="edge_usd_low",
+                    skip_reason=skip_reason,
                     gross_percent=float(edge_dbg.get("gross_percent", 0.0) or 0.0),
                     cost_total_percent=float(cost_profile.get("total_percent", 0.0) or 0.0),
                     source_name=source_name,
                     entry_channel=entry_channel,
                     position_size_usd=float(position_size_usd),
                 )
+                self._edge_skip_loop_guard(
+                    symbol=symbol,
+                    skip_reason=skip_reason,
+                    source_name=source_name,
+                )
                 return None
             if mode == "both" and not (pct_ok and usd_ok):
+                cost_dominant_skip = self._is_cost_dominant_skip(
+                    gross_percent=float(edge_dbg.get("gross_percent", 0.0) or 0.0),
+                    cost_total_percent=float(cost_profile.get("total_percent", 0.0) or 0.0),
+                    source_name=source_name,
+                    entry_channel=entry_channel,
+                    position_size_usd=float(position_size_usd),
+                )
+                skip_reason = "cost_dominant_edge" if cost_dominant_skip else "edge_low"
                 self._bump_skip_reason_ext(
-                    "edge_low",
+                    skip_reason,
                     extra={
                         "mode": str(mode),
                         "edge_percent_for_decision": float(edge_percent_for_decision),
@@ -4949,11 +6652,13 @@ class AutoTrader:
                         "core_probe_budget_used": int(core_probe_budget_used),
                         "core_probe_budget_cap": int(core_probe_budget_cap),
                         "core_probe_detail": str(core_probe_detail or ""),
+                        "cost_dominant_edge": bool(cost_dominant_skip),
                     },
                 )
                 logger.info(
-                    "AutoTrade skip token=%s reason=edge_low mode=both edge=%.2f%% raw=%.2f%% mult=%.2f min=%.2f%% probe_min=%.2f%% edge_usd=$%.3f min_usd=$%.3f probe_min_usd=$%.3f size=$%.2f gross=%.2f%% costs=%.2f%% pwin=%.2f probe=%s budget=%s/%s",
+                    "AutoTrade skip token=%s reason=%s mode=both edge=%.2f%% raw=%.2f%% mult=%.2f min=%.2f%% probe_min=%.2f%% edge_usd=$%.3f min_usd=$%.3f probe_min_usd=$%.3f size=$%.2f gross=%.2f%% costs=%.2f%% pwin=%.2f probe=%s budget=%s/%s",
                     symbol,
+                    skip_reason,
                     edge_percent_for_decision,
                     expected_edge_percent,
                     regime_edge_mult,
@@ -4972,12 +6677,17 @@ class AutoTrader:
                 )
                 self._cost_dominant_skip_guard(
                     symbol=symbol,
-                    skip_reason="edge_low",
+                    skip_reason=skip_reason,
                     gross_percent=float(edge_dbg.get("gross_percent", 0.0) or 0.0),
                     cost_total_percent=float(cost_profile.get("total_percent", 0.0) or 0.0),
                     source_name=source_name,
                     entry_channel=entry_channel,
                     position_size_usd=float(position_size_usd),
+                )
+                self._edge_skip_loop_guard(
+                    symbol=symbol,
+                    skip_reason=skip_reason,
+                    source_name=source_name,
                 )
                 return None
 
@@ -5065,6 +6775,8 @@ class AutoTrader:
         apply_honeypot_guard = self._is_live_mode() or bool(getattr(config, "HONEYPOT_GUARD_IN_PAPER", True))
         if apply_honeypot_guard:
             hp_ok, hp_detail = await self._honeypot_guard_passes(token_address)
+            if hp_ok:
+                self._clear_honeypot_transient_hits(token_address)
             if not hp_ok:
                 self._bump_skip_reason("honeypot_guard")
                 hp_detail_short = self._short_error_text(hp_detail)
@@ -5078,6 +6790,7 @@ class AutoTrader:
                 if self._is_transient_honeypot_reason(hp_reason):
                     # Fail-closed still skips the trade, but avoid poisoning paper blacklist on API-side outages.
                     self._apply_transient_safety_cooldown(token_address, f"honeypot_guard_transient:{hp_detail_short}")
+                    self._record_honeypot_transient_hit(token_address, hp_detail_short)
                     if bool(getattr(config, "HONEYPOT_TRANSIENT_TO_BLACKLIST", False)):
                         self._blacklist_add(token_address, f"honeypot_guard_transient:{hp_detail_short}")
                 else:
@@ -5099,6 +6812,21 @@ class AutoTrader:
                     float(liquidity_usd),
                     float(position_size_usd),
                 )
+                return None
+            rt_ok, rt_detail, rt_ratio = self._paper_roundtrip_proof(
+                token_data=token_data,
+                cost_profile=cost_profile,
+            )
+            if not rt_ok:
+                self._bump_skip_reason("roundtrip_ratio")
+                logger.info(
+                    "AutoTrade skip token=%s reason=roundtrip_ratio ratio=%.3f detail=%s",
+                    symbol,
+                    float(rt_ratio),
+                    self._short_error_text(rt_detail),
+                )
+                if bool(getattr(config, "PAPER_ROUNDTRIP_TO_BLACKLIST", True)):
+                    self._blacklist_add(token_address, f"roundtrip_ratio:{float(rt_ratio):.3f}")
                 return None
 
         if self._is_live_mode():
@@ -5316,6 +7044,9 @@ class AutoTrader:
                 symbol=symbol,
                 opened_at=opened_at,
             )
+            canary_enabled_live = bool(getattr(config, "PROOF_SELL_CANARY_ENABLED", True))
+            canary_delay = max(5, int(getattr(config, "PROOF_SELL_CANARY_DELAY_SECONDS", 30) or 30))
+            canary_due_ts = float(opened_at.timestamp()) + float(canary_delay) if canary_enabled_live else 0.0
             pos = PaperPosition(
                 token_address=token_address,
                 candidate_id=candidate_id,
@@ -5355,6 +7086,8 @@ class AutoTrader:
                 cluster_ev_samples=float(cluster_route.get("samples", 0.0) or 0.0),
                 trace_id=trace_id,
                 position_id=position_id,
+                canary_checked=(not canary_enabled_live) or self._is_token_sell_verified(token_address),
+                canary_due_ts=float(canary_due_ts),
             )
             self._set_open_position(pos)
             self.total_plans += 1
@@ -5467,6 +7200,8 @@ class AutoTrader:
             cluster_ev_samples=float(cluster_route.get("samples", 0.0) or 0.0),
             trace_id=trace_id,
             position_id=position_id,
+            canary_checked=True,
+            canary_due_ts=0.0,
         )
 
         self._set_open_position(pos)
@@ -5959,20 +7694,24 @@ class AutoTrader:
 
         state_dirty = False
         addresses = list(self.open_positions.keys())
-        updates = await asyncio.gather(*[self._fetch_current_price(address) for address in addresses])
+        updates = await asyncio.gather(*[self._fetch_current_market_snapshot(address) for address in addresses])
         update_map: dict[str, float] = {}
+        update_liq_map: dict[str, float] = {}
         for update in updates:
             if not update:
                 continue
-            address, price_usd = update
+            address, price_usd, liquidity_usd = update
             if price_usd > 0:
                 update_map[address] = price_usd
+            if liquidity_usd > 0:
+                update_liq_map[address] = liquidity_usd
 
         for address in addresses:
             position = self.open_positions.get(address)
             if not position:
                 continue
             price_usd = float(update_map.get(address, 0.0) or 0.0)
+            current_liquidity_usd = float(update_liq_map.get(address, 0.0) or 0.0)
             has_price_update = price_usd > 0 and self._accept_price_update(position, price_usd)
             if has_price_update:
                 position.current_price_usd = price_usd
@@ -6009,7 +7748,51 @@ class AutoTrader:
                 else None
             )
 
-            if has_price_update and position.pnl_percent >= position.take_profit_percent:
+            canary_triggered, canary_detail = await self._maybe_run_proof_sell_canary(position, age_seconds=age_seconds)
+            rug_guard_triggered, rug_guard_detail = self._post_entry_rug_guard_triggered(
+                position=position,
+                current_liquidity_usd=current_liquidity_usd,
+                age_seconds=age_seconds,
+            )
+
+            if canary_triggered:
+                should_close = True
+                close_reason = "PROOF_SELL_FAIL"
+                ttl_seconds = max(
+                    300,
+                    int(getattr(config, "PROOF_SELL_CANARY_BLACKLIST_TTL_SECONDS", 21600) or 21600),
+                )
+                self._blacklist_add(
+                    position.token_address,
+                    f"proof_sell_fail:{self._short_error_text(canary_detail)}",
+                    ttl_seconds=ttl_seconds,
+                )
+                self._pause_new_tokens_after_sell_fail(f"proof_sell_canary:{canary_detail}")
+                logger.warning(
+                    "PROOF_SELL_CANARY fail token=%s address=%s detail=%s",
+                    position.symbol,
+                    position.token_address,
+                    self._short_error_text(canary_detail),
+                )
+            elif rug_guard_triggered:
+                should_close = True
+                close_reason = "RUG_GUARD"
+                ttl_seconds = max(
+                    300,
+                    int(getattr(config, "POST_ENTRY_RUG_BLACKLIST_TTL_SECONDS", 21600) or 21600),
+                )
+                self._blacklist_add(
+                    position.token_address,
+                    f"rug_guard:{self._short_error_text(rug_guard_detail)}",
+                    ttl_seconds=ttl_seconds,
+                )
+                logger.warning(
+                    "RUG_GUARD_TRIGGER token=%s address=%s detail=%s",
+                    position.symbol,
+                    position.token_address,
+                    rug_guard_detail,
+                )
+            elif has_price_update and position.pnl_percent >= position.take_profit_percent:
                 should_close = True
                 close_reason = "TP"
             elif has_price_update and self._asym_pre_partial_should_exit(
@@ -6804,7 +8587,7 @@ class AutoTrader:
         self._paper_summary_prev_losses = int(self.total_losses)
         self._paper_summary_prev_realized_usd = float(self.realized_pnl_usd)
 
-    async def _fetch_current_price(self, token_address: str) -> tuple[str, float] | None:
+    async def _fetch_current_market_snapshot(self, token_address: str) -> tuple[str, float, float] | None:
         token_address = normalize_address(token_address)
         if not token_address:
             return None
@@ -6821,21 +8604,34 @@ class AutoTrader:
         pairs = data.get("pairs", []) or []
         best_liq = -1.0
         best_price = 0.0
+        best_price_liq = -1.0
         for pair in pairs:
             if str(pair.get("chainId", "")).lower() != str(config.CHAIN_ID).lower():
                 continue
             liq = float((pair.get("liquidity") or {}).get("usd") or 0)
+            if liq > best_liq:
+                best_liq = liq
             price = float(pair.get("priceUsd") or 0)
             if (not math.isfinite(price)) or price <= 0:
                 continue
             if price > float(getattr(config, "PAPER_PRICE_MAX_ABSOLUTE_USD", 1_000_000.0) or 1_000_000.0):
                 continue
-            if liq > best_liq:
-                best_liq = liq
+            # Prefer price from the most liquid valid-price pair.
+            if liq >= best_price_liq:
+                best_price_liq = liq
                 best_price = price
-        if best_price <= 0:
+        if best_liq < 0:
             return None
-        return token_address, best_price
+        return token_address, max(0.0, best_price), max(0.0, best_liq)
+
+    async def _fetch_current_price(self, token_address: str) -> tuple[str, float] | None:
+        snap = await self._fetch_current_market_snapshot(token_address)
+        if not snap:
+            return None
+        address, price_usd, _liquidity_usd = snap
+        if price_usd <= 0:
+            return None
+        return address, price_usd
 
     async def _resolve_weth_price_usd(self, token_data: dict[str, Any]) -> float:
         direct = float(token_data.get("weth_price_usd") or 0.0)
@@ -7095,6 +8891,9 @@ class AutoTrader:
         self.token_cooldown_strikes.clear()
         self.symbol_cooldowns.clear()
         self._edge_cost_dominant_hits_by_symbol.clear()
+        self._edge_loop_hits_by_symbol.clear()
+        self._post_entry_rug_hits_by_token.clear()
+        self._pre_entry_rug_hits_by_token.clear()
         self.trade_open_timestamps.clear()
         self._recent_open_symbols.clear()
         self._recent_open_sources.clear()
@@ -7908,6 +9707,8 @@ class AutoTrader:
             "cluster_ev_avg_net_usd": pos.cluster_ev_avg_net_usd,
             "cluster_ev_loss_share": pos.cluster_ev_loss_share,
             "cluster_ev_samples": pos.cluster_ev_samples,
+            "canary_checked": bool(pos.canary_checked),
+            "canary_due_ts": float(pos.canary_due_ts),
         }
 
     @staticmethod
@@ -7999,6 +9800,8 @@ class AutoTrader:
                 cluster_ev_avg_net_usd=float(row.get("cluster_ev_avg_net_usd", 0.0) or 0.0),
                 cluster_ev_loss_share=float(row.get("cluster_ev_loss_share", 0.0) or 0.0),
                 cluster_ev_samples=float(row.get("cluster_ev_samples", 0.0) or 0.0),
+                canary_checked=bool(row.get("canary_checked", False)),
+                canary_due_ts=float(row.get("canary_due_ts", 0.0) or 0.0),
             )
         except Exception:
             return None

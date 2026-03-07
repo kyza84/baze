@@ -1,12 +1,100 @@
 # PROJECT_STATE
 
 ## Snapshot
-- Updated: 2026-03-03
+- Updated: 2026-03-07
 - Repo: d:\earnforme\solana-alert-bot
 - Remote: https://github.com/kyza84/baze
 - Branch: main
-- Active profile: u_station_ab_night_autotune_v2
-- Last validated runtime: matrix+tuner+watchdog running, no runtime exceptions, primary bottleneck remains plan-stage economics (edge/cost/cooldown).
+- Active profile: u_station_flow_intake_dryrun_v1
+- Last validated runtime: matrix+tuner+watchdog running; runtime hot-apply lock guard prevents stale patch override after restart.
+
+## Latest Update (2026-03-07, Runtime Hot-Apply lock/stale guard)
+- `main_local.py`
+  - Added `RUNTIME_TUNER_HOT_APPLY_REQUIRE_ACTIVE_LOCK` gate (default `true`):
+    - runtime overrides from `runtime_tuner_runtime_overrides.json` are applied only when tuner lock is active and allowed to control local controllers.
+  - Added stale patch protection:
+    - patch payload timestamp older than runtime startup is ignored (`stale_patch_ignored`).
+  - Added profile validation:
+    - patch payload `profile_id` must match current `run_tag` (`profile_mismatch:*` otherwise).
+  - Updated loop call path to pass lock state into hot-apply routine.
+- Validation result:
+  - active preset values stay intact after restart in dry-run tuner mode (`control_local_controllers=false`).
+  - old runtime patch payload no longer overwrites fresh preset/active overrides.
+
+## Latest Update (2026-03-06, Anti-Scam hardening + tuner safety lock)
+- `main_local.py`
+  - Added rolling `anti_scam_pump_history` memory and pre-entry hard block `safe_pump_history`.
+  - New guard blocks young tokens with recent extreme 5m pump history even if current point-in-time snapshot is already cooled down.
+  - Optional auto-blacklist escalation on pump-history hit (`pre_rug_guard:pump_history:*`).
+- `config.py`
+  - Added pump-history controls:
+    - `LOCAL_ANTISCAM_PUMP_HISTORY_ENABLED`
+    - `LOCAL_ANTISCAM_PUMP_HISTORY_WINDOW_SECONDS`
+    - `LOCAL_ANTISCAM_PUMP_HISTORY_BLOCK_MAX_ABS_CHANGE_5M`
+    - `LOCAL_ANTISCAM_PUMP_HISTORY_BLOCK_MAX_AGE_SECONDS`
+    - `LOCAL_ANTISCAM_PUMP_HISTORY_ONLY_NON_WATCH`
+    - `LOCAL_ANTISCAM_PUMP_HISTORY_TO_BLACKLIST`
+    - `LOCAL_ANTISCAM_PUMP_HISTORY_BLACKLIST_TTL_SECONDS`
+- `utils/log_contracts.py`
+  - Added reason mapping/taxonomy:
+    - `safe_pump_history -> PRE_PUMP_HISTORY_BLOCK`
+- `tools/matrix_runtime_tuner.py`
+  - Added hard-protected key/prefix guard in mutation filter:
+    - blocks any tuner action touching `LOCAL_ANTISCAM_*`, `ENTRY_PRE_RUG_*`, `POST_ENTRY_RUG_*`, `TOKEN_SAFETY_*`, `HONEYPOT_*`.
+  - Added explicit immutable safety keys to hard-protected set (`SAFE_REQUIRE_*`, `ENTRY_FAIL_CLOSED_ON_SAFETY_GAP`, etc.).
+- `tools/matrix_safe_tuning_contract.json`
+  - Expanded `protected_keys` with local anti-scam/rug/honeypot/token-safety keys so contract-layer tuning cannot override these controls.
+- Tests:
+  - `tests/test_log_contracts.py`: added `safe_pump_history` mapping test.
+  - `tests/test_matrix_runtime_tuner.py`: added hard-protected key enforcement test.
+  - Verified:
+    - `python -m unittest tests.test_matrix_runtime_tuner tests.test_log_contracts tests.test_autotrader_safety_guards`
+    - `Ran 142 tests ... OK`
+
+## Latest Update (2026-03-06, Phase C tuner alignment)
+- `tools/matrix_runtime_tuner.py`
+  - Hold-phase escape expanded to allow lane-recovery actions for:
+    - `non_watch_conversion_guard`
+    - `prefilter_plan_choke`
+  - Added pre-risk roundtrip close-floor control:
+    - `pre_risk_roundtrip_min_closes_15m`
+  - Pre-risk roundtrip-only condition is now tracked explicitly (`pre_risk_roundtrip_only`).
+  - Added rollback/degrade arbitration:
+    - ignore roundtrip-only degrade increments when non-watch conversion is already improving in-window.
+  - Extended policy telemetry:
+    - `pre_risk_roundtrip_only`
+    - `pre_risk_roundtrip_guard_active`
+- `tests/test_matrix_runtime_tuner.py`
+  - Added hold-phase escape test for `non_watch_conversion_guard`.
+  - Added roundtrip pre-risk close-floor test.
+  - Added target policy default parse assertion for `pre_risk_roundtrip_min_closes_15m`.
+
+## Latest Update (2026-03-06, Post-Entry Anti-Rug Guard)
+- `trading/auto_trader.py`
+  - Added post-entry dynamic liquidity-collapse guard for open positions:
+    - `RUG_GUARD` close trigger when current liquidity collapses vs entry liquidity (ratio + absolute floor).
+    - consecutive-hit gating (`POST_ENTRY_RUG_HITS_TO_TRIGGER`) to avoid single-tick false positives.
+    - guard auto-blacklists token on trigger with configurable TTL.
+  - Added market snapshot fetch path for open-position processing:
+    - `_fetch_current_market_snapshot()` returns both `price` and `liquidity`.
+    - `_fetch_current_price()` kept as compatibility wrapper.
+  - Blacklist hard-block classification now includes `rug_guard:` reasons in paper hard-only mode.
+- `config.py`
+  - Added configurable post-entry anti-rug keys:
+    - `POST_ENTRY_RUG_GUARD_ENABLED`
+    - `POST_ENTRY_RUG_MIN_AGE_SECONDS`
+    - `POST_ENTRY_RUG_MIN_ENTRY_LIQUIDITY_USD`
+    - `POST_ENTRY_RUG_MIN_CURRENT_LIQUIDITY_USD`
+    - `POST_ENTRY_RUG_MAX_LIQUIDITY_RATIO`
+    - `POST_ENTRY_RUG_HIT_WINDOW_SECONDS`
+    - `POST_ENTRY_RUG_HITS_TO_TRIGGER`
+    - `POST_ENTRY_RUG_BLACKLIST_TTL_SECONDS`
+- `utils/log_contracts.py`
+  - Added explicit reason mapping/taxonomy for `EXIT_RUG_GUARD`.
+- `tests/test_autotrader_safety_guards.py`
+  - Added tests:
+    - rug guard triggers only after configured consecutive hits.
+    - rug guard hit state resets when liquidity recovers.
 
 ## Documentation Update (2026-03-03, logging/transfer)
 - Added `docs/LOGGING_REFERENCE.md`:

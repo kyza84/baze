@@ -69,6 +69,7 @@ _RUNTIME_TUNER_PATCH_STATE: dict[str, Any] = {
     "last_error": "",
     "applied_keys": [],
 }
+_RUNTIME_PROCESS_START_TS = float(time.time())
 _RUNTIME_TUNER_RELOAD_PREFIX_MAP: dict[str, str] = {
     "V2_UNIVERSE_": "universe",
     "V2_SOURCE_QOS_": "source_qos",
@@ -84,6 +85,28 @@ _RUNTIME_TUNER_RELOAD_PREFIX_MAP: dict[str, str] = {
 _RUNTIME_TUNER_RELOAD_EXACT_MAP: dict[str, str] = {
     "PROFIT_ENGINE_ENABLED": "kpi_loop",
 }
+_SWALLOWED_ERROR_TS: dict[str, float] = {}
+
+
+def _log_swallowed_error(
+    key: str,
+    message: str,
+    *,
+    level: int = logging.WARNING,
+    interval_seconds: float = 60.0,
+) -> None:
+    """Emit throttled logs for non-fatal exceptions that previously were silent."""
+    try:
+        now_ts = float(time.time())
+        token = str(key or "unknown").strip().lower() or "unknown"
+        last_ts = float(_SWALLOWED_ERROR_TS.get(token, 0.0) or 0.0)
+        if (now_ts - last_ts) < max(1.0, float(interval_seconds)):
+            return
+        _SWALLOWED_ERROR_TS[token] = now_ts
+        logger.log(level, "%s", str(message or "").strip() or token, exc_info=True)
+    except Exception:
+        # Logging failures must never affect runtime.
+        return
 
 
 def _should_manage_single_pid_file() -> bool:
@@ -98,7 +121,7 @@ def _write_single_pid_file() -> None:
         with open(PID_FILE, "w", encoding="ascii") as f:
             f.write(str(os.getpid()))
     except Exception:
-        pass
+        _log_swallowed_error("pid_file_write", f"PID_FILE_WRITE_FAILED path={PID_FILE}", level=logging.DEBUG)
 
 
 def _clear_single_pid_file() -> None:
@@ -111,7 +134,7 @@ def _clear_single_pid_file() -> None:
             if raw.isdigit() and int(raw) == os.getpid():
                 os.remove(PID_FILE)
     except Exception:
-        pass
+        _log_swallowed_error("pid_file_clear", f"PID_FILE_CLEAR_FAILED path={PID_FILE}", level=logging.DEBUG)
 
 
 def _graceful_stop_file_path() -> str:
@@ -127,6 +150,7 @@ def _graceful_stop_requested() -> bool:
     try:
         return os.path.exists(_graceful_stop_file_path())
     except Exception:
+        _log_swallowed_error("graceful_stop_exists", "GRACEFUL_STOP_CHECK_FAILED", level=logging.DEBUG)
         return False
 
 
@@ -179,29 +203,42 @@ def _clear_graceful_stop_flag() -> None:
         if os.path.exists(path):
             os.remove(path)
     except Exception:
-        pass
+        _log_swallowed_error("graceful_stop_clear", "GRACEFUL_STOP_CLEAR_FAILED", level=logging.WARNING)
 
 
 def _write_heartbeat(*, stage: str, cycle_index: int, open_trades: int = 0, detail: str = "") -> None:
-    try:
-        payload = {
-            "run_tag": RUN_TAG,
-            "pid": int(os.getpid()),
-            "ts": float(time.time()),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "stage": str(stage or "").strip() or "loop",
-            "cycle_index": int(cycle_index),
-            "open_trades": int(max(0, int(open_trades))),
-            "detail": str(detail or "").strip(),
-        }
-        os.makedirs(os.path.dirname(HEARTBEAT_FILE), exist_ok=True)
-        tmp = HEARTBEAT_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False)
-        os.replace(tmp, HEARTBEAT_FILE)
-    except Exception:
-        # Heartbeat must never break runtime loop.
-        pass
+    payload = {
+        "run_tag": RUN_TAG,
+        "pid": int(os.getpid()),
+        "ts": float(time.time()),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "stage": str(stage or "").strip() or "loop",
+        "cycle_index": int(cycle_index),
+        "open_trades": int(max(0, int(open_trades))),
+        "detail": str(detail or "").strip(),
+    }
+    retries = max(1, int(os.getenv("HEARTBEAT_WRITE_RETRIES", "4") or 4))
+    retry_sleep = max(0.01, float(os.getenv("HEARTBEAT_WRITE_RETRY_SLEEP_SECONDS", "0.05") or 0.05))
+    last_exc: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            os.makedirs(os.path.dirname(HEARTBEAT_FILE), exist_ok=True)
+            tmp = HEARTBEAT_FILE + f".tmp.{os.getpid()}.{attempt}"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False)
+            os.replace(tmp, HEARTBEAT_FILE)
+            return
+        except Exception as exc:
+            last_exc = exc
+            if attempt < retries:
+                time.sleep(retry_sleep)
+            continue
+    # Heartbeat must never break runtime loop.
+    _log_swallowed_error(
+        "heartbeat_write",
+        f"HEARTBEAT_WRITE_FAILED retries={retries} err={type(last_exc).__name__ if last_exc else 'unknown'}",
+        level=logging.WARNING,
+    )
 
 
 def _pid_is_alive(pid: int) -> bool:
@@ -268,7 +305,7 @@ def _write_json_atomic(path: str, payload: dict[str, Any]) -> None:
             f.write("\n")
         os.replace(tmp, path)
     except Exception:
-        pass
+        _log_swallowed_error("json_atomic_write", f"JSON_ATOMIC_WRITE_FAILED path={path}", level=logging.WARNING)
 
 
 def _clear_startup_exit_report() -> None:
@@ -277,7 +314,7 @@ def _clear_startup_exit_report() -> None:
         if os.path.exists(path):
             os.remove(path)
     except Exception:
-        pass
+        _log_swallowed_error("startup_exit_clear", f"STARTUP_EXIT_CLEAR_FAILED path={path}", level=logging.DEBUG)
 
 
 def _write_startup_exit_report(*, reason: str, detail: str = "", extra: dict[str, Any] | None = None) -> None:
@@ -418,10 +455,13 @@ def _coerce_runtime_override_value(*, key: str, raw: Any) -> Any:
         return text
 
 
-def _runtime_tuner_apply_runtime_overrides(*, run_tag: str) -> tuple[bool, int, str]:
+def _runtime_tuner_apply_runtime_overrides(*, run_tag: str, lock_active: bool = False) -> tuple[bool, int, str]:
     if not bool(getattr(config, "RUNTIME_TUNER_HOT_APPLY_ENABLED", True)):
         _RUNTIME_TUNER_PATCH_STATE["applied_keys"] = []
         return False, 0, "disabled"
+    if bool(getattr(config, "RUNTIME_TUNER_HOT_APPLY_REQUIRE_ACTIVE_LOCK", True)) and not bool(lock_active):
+        _RUNTIME_TUNER_PATCH_STATE["applied_keys"] = []
+        return False, 0, "lock_inactive"
     patch_path = _runtime_tuner_patch_file(run_tag)
     if not patch_path or not os.path.exists(patch_path):
         _RUNTIME_TUNER_PATCH_STATE["applied_keys"] = []
@@ -449,6 +489,23 @@ def _runtime_tuner_apply_runtime_overrides(*, run_tag: str) -> tuple[bool, int, 
     if not isinstance(overrides_raw, dict):
         _RUNTIME_TUNER_PATCH_STATE["applied_keys"] = []
         return False, 0, "error:invalid_payload"
+    payload_profile = str(payload.get("profile_id", "") or "").strip()
+    if payload_profile and payload_profile != str(run_tag):
+        _RUNTIME_TUNER_PATCH_STATE["checked_mtime"] = mtime
+        _RUNTIME_TUNER_PATCH_STATE["applied_keys"] = []
+        return False, 0, f"profile_mismatch:{payload_profile}"
+    payload_ts_raw = str(payload.get("ts", "") or payload.get("timestamp", "") or "").strip()
+    payload_ts = 0.0
+    if payload_ts_raw:
+        try:
+            payload_ts = float(datetime.fromisoformat(payload_ts_raw.replace("Z", "+00:00")).timestamp())
+        except Exception:
+            payload_ts = 0.0
+    startup_grace = max(0.0, float(getattr(config, "RUNTIME_TUNER_HOT_APPLY_STARTUP_GRACE_SECONDS", 3.0) or 3.0))
+    if payload_ts > 0.0 and payload_ts < (_RUNTIME_PROCESS_START_TS - startup_grace):
+        _RUNTIME_TUNER_PATCH_STATE["checked_mtime"] = mtime
+        _RUNTIME_TUNER_PATCH_STATE["applied_keys"] = []
+        return False, 0, "stale_patch_ignored"
 
     normalized = {str(k): str(v) for k, v in overrides_raw.items()}
     payload_hash = hashlib.sha256(
@@ -500,14 +557,27 @@ def _runtime_tuner_control_active(*, run_tag: str) -> bool:
 
     active = False
     pid = 0
+    pid_alive = False
+    controls_local = True
     lock_path = _runtime_tuner_lock_file(run_tag)
     if lock_path and os.path.exists(lock_path):
         try:
             with open(lock_path, "r", encoding="utf-8") as f:
                 payload = json.load(f)
             pid = int(payload.get("pid", 0) or 0)
-            active = _pid_is_alive(pid)
-            if (not active) and bool(getattr(config, "RUNTIME_TUNER_PRUNE_STALE_LOCK", True)):
+            # Backward-compatible contract:
+            # - old lock files without `control_local_controllers` keep default=True
+            # - dry-run lock files can set `control_local_controllers=false`
+            if isinstance(payload, dict):
+                if "control_local_controllers" in payload:
+                    controls_local = bool(payload.get("control_local_controllers"))
+                else:
+                    mode = str(payload.get("lock_mode", "") or "").strip().lower()
+                    if mode in {"dry_run", "observe", "advisory"}:
+                        controls_local = False
+            pid_alive = _pid_is_alive(pid)
+            active = bool(pid_alive and controls_local)
+            if (not pid_alive) and bool(getattr(config, "RUNTIME_TUNER_PRUNE_STALE_LOCK", True)):
                 stale_after = max(
                     10.0,
                     float(getattr(config, "RUNTIME_TUNER_STALE_LOCK_SECONDS", 120) or 120),
@@ -529,10 +599,14 @@ def _runtime_tuner_control_active(*, run_tag: str) -> bool:
         except Exception:
             active = False
             pid = 0
+            pid_alive = False
+            controls_local = True
 
     _RUNTIME_TUNER_LOCK_STATE["checked_at"] = now_ts
     _RUNTIME_TUNER_LOCK_STATE["active"] = bool(active)
     _RUNTIME_TUNER_LOCK_STATE["pid"] = int(pid or 0)
+    _RUNTIME_TUNER_LOCK_STATE["pid_alive"] = bool(pid_alive)
+    _RUNTIME_TUNER_LOCK_STATE["controls_local"] = bool(controls_local)
     return bool(active)
 
 
@@ -2589,6 +2663,7 @@ async def run_local_loop() -> None:
     heavy_last_liquidity: dict[str, float] = {}
     heavy_last_volume_5m: dict[str, float] = {}
     heavy_last_seen_ts: dict[str, float] = {}
+    anti_scam_pump_history: dict[str, dict[str, float]] = {}
     safe_volume_probe_state: dict[str, dict[str, float | int]] = {}
     filter_fail_reasons_session: dict[str, int] = {}
     adaptive_filters = AdaptiveFilterController()
@@ -2653,7 +2728,10 @@ async def run_local_loop() -> None:
                         RUN_TAG,
                     )
                 runtime_tuner_lock_prev = bool(runtime_tuner_lock_active)
-            hot_applied, hot_count, hot_detail = _runtime_tuner_apply_runtime_overrides(run_tag=RUN_TAG)
+            hot_applied, hot_count, hot_detail = _runtime_tuner_apply_runtime_overrides(
+                run_tag=RUN_TAG,
+                lock_active=runtime_tuner_lock_active,
+            )
             if hot_applied:
                 logger.warning(
                     "RUNTIME_TUNER_HOT_APPLY run_tag=%s keys=%s details=%s",
@@ -2767,17 +2845,278 @@ async def run_local_loop() -> None:
                             tokens = await dex_monitor.fetch_new_tokens()
                 else:
                     tokens = await dex_monitor.fetch_new_tokens()
+                market_tokens: list[dict[str, Any]] = list(tokens or [])
+                raw_non_watch_cycle = int(len(market_tokens))
+                raw_watchlist_cycle = 0
+                watchlist_fallback_used_cycle = False
+                watchlist_fallback_reason_cycle = "watchlist_disabled_or_empty"
+                flow_legacy_rollback_mode = bool(getattr(config, "FLOW_LEGACY_ROLLBACK_MODE", False))
 
                 # Stability flow: dynamic watchlist tokens (vetted) in parallel to new-pairs sources.
                 if bool(getattr(config, "WATCHLIST_ENABLED", False)):
                     try:
                         wl = await watchlist_monitor.fetch_tokens()
                         if wl:
-                            tokens = _merge_token_streams(tokens or [], wl)
-                            if wl:
-                                logger.info("WATCHLIST merged count=%s", len(wl))
+                            wl_prefilter_drop_reasons: dict[str, int] = {}
+                            wl_prefilter_samples: dict[str, list[str]] = {}
+                            wl_filtered: list[dict[str, Any]] = []
+                            wl_blocked_drop_addresses: set[str] = set()
+                            for wl_token in wl:
+                                token_row = dict(wl_token or {})
+                                token_address = normalize_address(token_row.get("address", ""))
+                                symbol = str(token_row.get("symbol", "N/A") or "N/A")
+                                drop_reason = ""
+                                if not token_address:
+                                    drop_reason = "missing_address"
+                                if (not drop_reason) and bool(
+                                    getattr(config, "WATCHLIST_PREFILTER_BLOCKED_ENABLED", True)
+                                ):
+                                    blocked, _blocked_reason = auto_trader.blacklist_status(token_address)
+                                    if blocked:
+                                        drop_reason = "blacklist"
+                                        if token_address:
+                                            wl_blocked_drop_addresses.add(token_address)
+                                    elif auto_trader.is_hard_blocked(token_address, symbol=symbol):
+                                        auto_trader.add_hard_blocklist_entry(token_address)
+                                        drop_reason = "hard_blocklist"
+                                        if token_address:
+                                            wl_blocked_drop_addresses.add(token_address)
+                                if (
+                                    (not drop_reason)
+                                    and bool(getattr(config, "WATCHLIST_PREFILTER_OPEN_DUP_ENABLED", True))
+                                    and token_address
+                                    and token_address in auto_trader.open_positions
+                                ):
+                                    drop_reason = "open_duplicate"
+                                if drop_reason:
+                                    key = str(drop_reason or "unknown").strip().lower() or "unknown"
+                                    wl_prefilter_drop_reasons[key] = int(wl_prefilter_drop_reasons.get(key, 0)) + 1
+                                    samples = wl_prefilter_samples.setdefault(key, [])
+                                    if len(samples) < 3 and symbol not in samples:
+                                        samples.append(symbol)
+                                    continue
+                                wl_filtered.append(token_row)
+                            dropped_total = int(len(wl) - len(wl_filtered))
+                            if dropped_total > 0:
+                                logger.info(
+                                    "WATCHLIST_PREFILTER dropped=%s reasons=%s samples=%s",
+                                    dropped_total,
+                                    dict(sorted(wl_prefilter_drop_reasons.items())),
+                                    {
+                                        str(k): list(v)
+                                        for k, v in sorted(wl_prefilter_samples.items(), key=lambda item: item[0])
+                                    },
+                                )
+                            wl = wl_filtered
+                            if (
+                                wl_blocked_drop_addresses
+                                and bool(
+                                    getattr(
+                                        config,
+                                        "WATCHLIST_PREFILTER_BLACKLIST_CACHE_PRUNE_ENABLED",
+                                        True,
+                                    )
+                                )
+                            ):
+                                try:
+                                    pruned = int(
+                                        watchlist_monitor.prune_cached_tokens(
+                                            wl_blocked_drop_addresses,
+                                            reason="prefilter_blacklist",
+                                        )
+                                    )
+                                    if pruned > 0:
+                                        logger.info(
+                                            "WATCHLIST_PREFILTER cache_prune blocked_removed=%s",
+                                            pruned,
+                                        )
+                                except Exception:
+                                    logger.exception("WATCHLIST_PREFILTER cache_prune failed")
+                        if wl:
+                            def _is_watch_source(row: dict[str, Any]) -> bool:
+                                src = str((row or {}).get("source", "") or "").strip().lower()
+                                return src.startswith("watchlist")
+
+                            def _non_watch_count(rows: list[dict[str, Any]]) -> int:
+                                return int(
+                                    sum(
+                                        1
+                                        for row in (rows or [])
+                                        if (not _is_watch_source(row))
+                                    )
+                                )
+
+                            raw_non_watch_cycle = int(_non_watch_count(market_tokens))
+                            raw_watchlist_cycle = int(len(wl))
+                            if flow_legacy_rollback_mode:
+                                watchlist_fallback_used_cycle = bool(raw_watchlist_cycle > 0)
+                                watchlist_fallback_reason_cycle = "legacy_merge"
+                                logger.warning(
+                                    "FLOW_ROLLBACK_MODE active=1 raw_non_watch=%s raw_watchlist=%s",
+                                    int(raw_non_watch_cycle),
+                                    int(raw_watchlist_cycle),
+                                )
+
+                            if (not flow_legacy_rollback_mode) and bool(getattr(config, "RAW_SOURCE_REBALANCE_ENABLED", True)):
+                                target_non_watch = max(
+                                    0,
+                                    int(getattr(config, "RAW_SOURCE_REBALANCE_MIN_NON_WATCH", 12) or 12),
+                                )
+                                extra_rounds = max(
+                                    0,
+                                    int(getattr(config, "RAW_SOURCE_REBALANCE_EXTRA_FETCH_ROUNDS", 2) or 2),
+                                )
+                                non_watch_before = _non_watch_count(market_tokens)
+                                if non_watch_before < target_non_watch and extra_rounds > 0:
+                                    added_total = 0
+                                    used_rounds = 0
+                                    for _ in range(extra_rounds):
+                                        used_rounds += 1
+                                        if hasattr(dex_monitor, "fetch_low_flow_boost_tokens"):
+                                            extra_tokens = await dex_monitor.fetch_low_flow_boost_tokens()
+                                        else:
+                                            extra_tokens = await dex_monitor.fetch_new_tokens()
+                                        if extra_tokens:
+                                            before_len = int(len(market_tokens))
+                                            market_tokens = _merge_token_streams(market_tokens, extra_tokens)
+                                            added_total += max(0, int(len(market_tokens)) - before_len)
+                                        if _non_watch_count(market_tokens) >= target_non_watch:
+                                            break
+                                    non_watch_after = _non_watch_count(market_tokens)
+                                    logger.info(
+                                        "RAW_SOURCE_REBALANCE non_watch=%s->%s added=%s rounds=%s target=%s",
+                                        int(non_watch_before),
+                                        int(non_watch_after),
+                                        int(added_total),
+                                        int(used_rounds),
+                                        int(target_non_watch),
+                                    )
+
+                            max_watch_share = max(
+                                0.0,
+                                min(
+                                    0.95,
+                                    float(
+                                        getattr(
+                                            config,
+                                            "RAW_SOURCE_REBALANCE_WATCHLIST_MAX_SHARE",
+                                            0.25,
+                                        )
+                                        or 0.25
+                                    ),
+                                ),
+                            )
+                            watch_floor = max(
+                                0,
+                                int(getattr(config, "RAW_SOURCE_REBALANCE_WATCHLIST_FLOOR", 2) or 2),
+                            )
+                            non_watch_total = _non_watch_count(market_tokens)
+                            if (not flow_legacy_rollback_mode) and non_watch_total > 0 and 0.0 < max_watch_share < 1.0:
+                                max_watch_allowed = int(
+                                    (float(non_watch_total) * float(max_watch_share))
+                                    / max(0.05, float(1.0 - max_watch_share))
+                                )
+                                max_watch_allowed = max(int(watch_floor), int(max_watch_allowed))
+                                if int(len(wl)) > int(max_watch_allowed):
+                                    wl_sorted = sorted(
+                                        wl,
+                                        key=lambda row: (
+                                            float((row or {}).get("score") or 0.0),
+                                            float((row or {}).get("liquidity") or 0.0),
+                                            float((row or {}).get("volume_5m") or 0.0),
+                                        ),
+                                        reverse=True,
+                                    )
+                                    wl_before = int(len(wl))
+                                    wl = wl_sorted[: int(max_watch_allowed)]
+                                    logger.info(
+                                        "RAW_SOURCE_REBALANCE watch_trimmed=%s->%s non_watch=%s max_share=%.2f",
+                                        int(wl_before),
+                                        int(len(wl)),
+                                        int(non_watch_total),
+                                        float(max_watch_share),
+                                    )
+
+                            lane_split_enabled = (not flow_legacy_rollback_mode) and bool(
+                                getattr(config, "RAW_LANE_SPLIT_ENABLED", True)
+                            )
+                            if lane_split_enabled and wl:
+                                lane_non_watch_min = max(
+                                    0,
+                                    int(getattr(config, "RAW_LANE_SPLIT_NON_WATCH_PRIMARY_MIN", 4) or 4),
+                                )
+                                lane_watch_fallback_max = max(
+                                    0,
+                                    int(getattr(config, "RAW_LANE_SPLIT_WATCH_FALLBACK_MAX", 2) or 2),
+                                )
+                                lane_watch_when_empty = max(
+                                    0,
+                                    int(getattr(config, "RAW_LANE_SPLIT_WATCH_FALLBACK_WHEN_EMPTY", 6) or 6),
+                                )
+                                non_watch_after = _non_watch_count(market_tokens)
+                                wl_sorted_for_lane = sorted(
+                                    wl,
+                                    key=lambda row: (
+                                        float((row or {}).get("score") or 0.0),
+                                        float((row or {}).get("liquidity") or 0.0),
+                                        float((row or {}).get("volume_5m") or 0.0),
+                                    ),
+                                    reverse=True,
+                                )
+                                if int(non_watch_after) >= int(lane_non_watch_min):
+                                    wl_before_lane = int(len(wl_sorted_for_lane))
+                                    wl = wl_sorted_for_lane[: int(lane_watch_fallback_max)]
+                                    watchlist_fallback_used_cycle = bool(len(wl) > 0)
+                                    watchlist_fallback_reason_cycle = (
+                                        "non_watch_primary_cap"
+                                        if watchlist_fallback_used_cycle
+                                        else "none"
+                                    )
+                                    logger.info(
+                                        "RAW_LANE_SPLIT mode=non_watch_primary non_watch=%s wl=%s->%s fallback_max=%s",
+                                        int(non_watch_after),
+                                        int(wl_before_lane),
+                                        int(len(wl)),
+                                        int(lane_watch_fallback_max),
+                                    )
+                                elif int(non_watch_after) <= 0:
+                                    wl_before_lane = int(len(wl_sorted_for_lane))
+                                    wl = wl_sorted_for_lane[: int(lane_watch_when_empty)]
+                                    watchlist_fallback_used_cycle = bool(len(wl) > 0)
+                                    watchlist_fallback_reason_cycle = (
+                                        "non_watch_empty"
+                                        if watchlist_fallback_used_cycle
+                                        else "none"
+                                    )
+                                    logger.info(
+                                        "RAW_LANE_SPLIT mode=watch_fallback_only non_watch=%s wl=%s->%s empty_cap=%s",
+                                        int(non_watch_after),
+                                        int(wl_before_lane),
+                                        int(len(wl)),
+                                        int(lane_watch_when_empty),
+                                    )
+                            elif not flow_legacy_rollback_mode:
+                                watchlist_fallback_used_cycle = bool(len(wl) > 0)
+                                watchlist_fallback_reason_cycle = (
+                                    "watchlist_merge"
+                                    if watchlist_fallback_used_cycle
+                                    else "none"
+                                )
+
+                            tokens = _merge_token_streams(market_tokens, wl)
+                            logger.info(
+                                "WATCHLIST merged count=%s market_non_watch=%s market_total=%s",
+                                int(len(wl)),
+                                int(_non_watch_count(market_tokens)),
+                                int(len(market_tokens)),
+                            )
+                        else:
+                            tokens = list(market_tokens)
                     except Exception as exc:
                         logger.warning("WATCHLIST fetch failed: %s", exc)
+                        tokens = list(market_tokens)
+                else:
+                    tokens = list(market_tokens)
                 if tokens:
                     before_universe = len(tokens)
                     tokens = v2_universe.filter_tokens(tokens or [])
@@ -2838,6 +3177,14 @@ async def run_local_loop() -> None:
                     ]
                     for a in expired_probe:
                         safe_volume_probe_state.pop(a, None)
+                if anti_scam_pump_history:
+                    expired_pump = [
+                        a
+                        for a, row in anti_scam_pump_history.items()
+                        if float((row or {}).get("until", 0.0) or 0.0) <= now_mono
+                    ]
+                    for a in expired_pump:
+                        anti_scam_pump_history.pop(a, None)
                 if tokens or source_qos_dropped:
                     cycle_filter_fails: dict[str, int] = {}
                     mode_profile = _market_mode_entry_profile(market_regime_current)
@@ -2889,7 +3236,64 @@ async def run_local_loop() -> None:
                         0,
                         int(getattr(config, "SAFE_VOLUME_TWO_TIER_NON_WATCH_MAX_PASSES_PER_CYCLE", 2) or 2),
                     )
+                    non_watch_volume_probe_gecko_soft_cap_mult = max(
+                        1.00,
+                        min(
+                            5.00,
+                            float(
+                                getattr(
+                                    config,
+                                    "SAFE_VOLUME_TWO_TIER_NON_WATCH_GECKO_SOFT_CAP_MULT",
+                                    2.0,
+                                )
+                                or 2.0
+                            ),
+                        ),
+                    )
                     non_watch_volume_probe_used_cycle = 0
+                    non_watch_onchain_liquidity_soft_enabled = bool(
+                        getattr(config, "SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_SOFT_ENABLED", True)
+                    )
+                    non_watch_onchain_liquidity_soft_ratio = max(
+                        0.20,
+                        min(
+                            1.00,
+                            float(
+                                getattr(
+                                    config,
+                                    "SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_SOFT_RATIO",
+                                    0.70,
+                                )
+                                or 0.70
+                            ),
+                        ),
+                    )
+                    non_watch_onchain_liquidity_soft_min_volume_mult = max(
+                        0.10,
+                        min(
+                            2.50,
+                            float(
+                                getattr(
+                                    config,
+                                    "SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_MIN_VOLUME_5M_MULT",
+                                    0.60,
+                                )
+                                or 0.60
+                            ),
+                        ),
+                    )
+                    non_watch_onchain_liquidity_soft_max_per_cycle = max(
+                        0,
+                        int(
+                            getattr(
+                                config,
+                                "SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_MAX_PASSES_PER_CYCLE",
+                                2,
+                            )
+                            or 2
+                        ),
+                    )
+                    non_watch_onchain_liquidity_soft_used_cycle = 0
                     non_watch_age_soft_enabled = bool(
                         getattr(config, "SAFE_AGE_NON_WATCH_SOFT_ENABLED", True)
                     )
@@ -2952,6 +3356,170 @@ async def run_local_loop() -> None:
                         int(getattr(config, "SAFE_CHANGE_5M_NON_WATCH_MAX_PASSES_PER_CYCLE", 2) or 2),
                     )
                     non_watch_change_soft_used_cycle = 0
+                    non_watch_transient_age_soft_enabled = bool(
+                        getattr(config, "LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_AGE_SOFT_ENABLED", True)
+                    )
+                    non_watch_transient_age_soft_min_seconds = max(
+                        0,
+                        int(
+                            getattr(
+                                config,
+                                "LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_AGE_SOFT_MIN_SECONDS",
+                                240,
+                            )
+                            or 240
+                        ),
+                    )
+                    non_watch_transient_age_soft_min_liquidity = max(
+                        float(getattr(config, "SAFE_MIN_LIQUIDITY_USD", 0.0) or 0.0),
+                        float(
+                            getattr(
+                                config,
+                                "LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_AGE_SOFT_MIN_LIQUIDITY_USD",
+                                12000.0,
+                            )
+                            or 12000.0
+                        ),
+                    )
+                    non_watch_transient_age_soft_min_volume_5m = max(
+                        float(getattr(config, "SAFE_MIN_VOLUME_5M_USD", 0.0) or 0.0),
+                        float(
+                            getattr(
+                                config,
+                                "LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_AGE_SOFT_MIN_VOLUME_5M_USD",
+                                200.0,
+                            )
+                            or 200.0
+                        ),
+                    )
+                    non_watch_transient_age_soft_min_score = max(
+                        0,
+                        int(
+                            getattr(
+                                config,
+                                "LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_AGE_SOFT_MIN_SCORE",
+                                45,
+                            )
+                            or 45
+                        ),
+                    )
+                    non_watch_transient_age_soft_max_per_cycle = max(
+                        0,
+                        int(
+                            getattr(
+                                config,
+                                "LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_AGE_SOFT_MAX_PASSES_PER_CYCLE",
+                                4,
+                            )
+                            or 4
+                        ),
+                    )
+                    non_watch_transient_age_soft_used_cycle = 0
+                    non_watch_transient_contract_soft_enabled = bool(
+                        getattr(config, "LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_ENABLED", True)
+                    )
+                    non_watch_transient_contract_soft_min_age_seconds = max(
+                        0,
+                        int(
+                            getattr(
+                                config,
+                                "LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_MIN_AGE_SECONDS",
+                                240,
+                            )
+                            or 240
+                        ),
+                    )
+                    non_watch_transient_contract_soft_min_liquidity = max(
+                        float(getattr(config, "SAFE_MIN_LIQUIDITY_USD", 0.0) or 0.0),
+                        float(
+                            getattr(
+                                config,
+                                "LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_MIN_LIQUIDITY_USD",
+                                10000.0,
+                            )
+                            or 10000.0
+                        ),
+                    )
+                    non_watch_transient_contract_soft_min_volume_5m = max(
+                        float(getattr(config, "SAFE_MIN_VOLUME_5M_USD", 0.0) or 0.0),
+                        float(
+                            getattr(
+                                config,
+                                "LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_MIN_VOLUME_5M_USD",
+                                150.0,
+                            )
+                            or 150.0
+                        ),
+                    )
+                    non_watch_transient_contract_soft_min_score = max(
+                        0,
+                        int(
+                            getattr(
+                                config,
+                                "LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_MIN_SCORE",
+                                45,
+                            )
+                            or 45
+                        ),
+                    )
+                    non_watch_transient_contract_soft_max_per_cycle = max(
+                        0,
+                        int(
+                            getattr(
+                                config,
+                                "LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_MAX_PASSES_PER_CYCLE",
+                                3,
+                            )
+                            or 3
+                        ),
+                    )
+                    non_watch_transient_contract_soft_used_cycle = 0
+                    anti_scam_pump_history_enabled = bool(
+                        getattr(config, "LOCAL_ANTISCAM_PUMP_HISTORY_ENABLED", True)
+                    )
+                    anti_scam_pump_history_window_seconds = max(
+                        60,
+                        int(getattr(config, "LOCAL_ANTISCAM_PUMP_HISTORY_WINDOW_SECONDS", 1800) or 1800),
+                    )
+                    anti_scam_pump_history_block_max_abs_change = max(
+                        0.0,
+                        float(
+                            getattr(
+                                config,
+                                "LOCAL_ANTISCAM_PUMP_HISTORY_BLOCK_MAX_ABS_CHANGE_5M",
+                                80.0,
+                            )
+                            or 80.0
+                        ),
+                    )
+                    anti_scam_pump_history_block_max_age_seconds = max(
+                        0,
+                        int(
+                            getattr(
+                                config,
+                                "LOCAL_ANTISCAM_PUMP_HISTORY_BLOCK_MAX_AGE_SECONDS",
+                                1800,
+                            )
+                            or 1800
+                        ),
+                    )
+                    anti_scam_pump_history_only_non_watch = bool(
+                        getattr(config, "LOCAL_ANTISCAM_PUMP_HISTORY_ONLY_NON_WATCH", True)
+                    )
+                    anti_scam_pump_history_to_blacklist = bool(
+                        getattr(config, "LOCAL_ANTISCAM_PUMP_HISTORY_TO_BLACKLIST", True)
+                    )
+                    anti_scam_pump_history_blacklist_ttl = max(
+                        300,
+                        int(
+                            getattr(
+                                config,
+                                "LOCAL_ANTISCAM_PUMP_HISTORY_BLACKLIST_TTL_SECONDS",
+                                21600,
+                            )
+                            or 21600
+                        ),
+                    )
                     soft_selected_cycle = 0
                     excluded_symbols_cycle = _excluded_trade_symbols()
                     excluded_keywords_cycle = _excluded_trade_symbol_keywords()
@@ -3026,6 +3594,19 @@ async def run_local_loop() -> None:
                             _filter_fail("duplicate_address", token, "cycle_dedup")
                             continue
                         cycle_seen_addresses.add(token_address)
+                        token_abs_change_5m_now = abs(float(token.get("price_change_5m") or 0.0))
+                        if anti_scam_pump_history_enabled and token_address:
+                            prev_row = anti_scam_pump_history.get(token_address) or {}
+                            prev_until = float(prev_row.get("until", 0.0) or 0.0)
+                            prev_max = float(prev_row.get("max_abs5m", 0.0) or 0.0)
+                            if prev_until <= now_mono:
+                                prev_max = 0.0
+                            new_max = max(float(prev_max), float(token_abs_change_5m_now))
+                            anti_scam_pump_history[token_address] = {
+                                "max_abs5m": float(new_max),
+                                "until": float(now_mono + float(anti_scam_pump_history_window_seconds)),
+                            }
+                            token["_anti_scam_pump_history_max_abs5m"] = float(new_max)
                         blk_blocked, blk_reason = auto_trader.blacklist_status(token_address)
                         if blk_blocked:
                             _filter_fail("blacklist", token, str(blk_reason or "blacklisted"))
@@ -3142,11 +3723,77 @@ async def run_local_loop() -> None:
                             continue
 
                         if config.SAFE_TEST_MODE:
-                            if float(token.get("liquidity") or 0) < float(config.SAFE_MIN_LIQUIDITY_USD):
-                                _filter_fail("safe_liquidity", token)
-                                continue
-                            safe_volume_floor = float(config.SAFE_MIN_VOLUME_5M_USD) * max(0.1, float(regime_volume_mult))
+                            safe_liquidity_floor = float(config.SAFE_MIN_LIQUIDITY_USD)
+                            safe_volume_floor = float(config.SAFE_MIN_VOLUME_5M_USD) * max(
+                                0.1,
+                                float(regime_volume_mult),
+                            )
+                            token_liquidity_now = float(token.get("liquidity") or 0.0)
                             token_volume_5m = float(token.get("volume_5m") or 0.0)
+                            if token_liquidity_now < safe_liquidity_floor:
+                                liquidity_soft_passed = False
+                                if (
+                                    is_non_watch_source
+                                    and non_watch_onchain_liquidity_soft_enabled
+                                    and source_name.startswith("onchain")
+                                ):
+                                    relaxed_liquidity_floor = float(safe_liquidity_floor) * float(
+                                        non_watch_onchain_liquidity_soft_ratio
+                                    )
+                                    relaxed_min_volume_5m = float(safe_volume_floor) * float(
+                                        non_watch_onchain_liquidity_soft_min_volume_mult
+                                    )
+                                    if (
+                                        token_liquidity_now >= relaxed_liquidity_floor
+                                        and token_volume_5m >= relaxed_min_volume_5m
+                                    ):
+                                        if (
+                                            non_watch_onchain_liquidity_soft_max_per_cycle > 0
+                                            and non_watch_onchain_liquidity_soft_used_cycle
+                                            >= non_watch_onchain_liquidity_soft_max_per_cycle
+                                        ):
+                                            _filter_fail(
+                                                "safe_liquidity_non_watch_cycle_cap",
+                                                token,
+                                                (
+                                                    f"liq={token_liquidity_now:.0f}/{safe_liquidity_floor:.0f} "
+                                                    f"relaxed={relaxed_liquidity_floor:.0f} "
+                                                    f"used={non_watch_onchain_liquidity_soft_used_cycle}/"
+                                                    f"{non_watch_onchain_liquidity_soft_max_per_cycle}"
+                                                ),
+                                            )
+                                            continue
+                                        if non_watch_onchain_liquidity_soft_max_per_cycle > 0:
+                                            non_watch_onchain_liquidity_soft_used_cycle += 1
+                                        liquidity_soft_passed = True
+                                        token["_safe_liquidity_soft_pass"] = True
+                                        token["_safe_liquidity_soft_detail"] = (
+                                            f"liq={token_liquidity_now:.0f}/{safe_liquidity_floor:.0f} "
+                                            f"relaxed={relaxed_liquidity_floor:.0f} "
+                                            f"vol5m={token_volume_5m:.0f}/{relaxed_min_volume_5m:.0f} "
+                                            f"used={non_watch_onchain_liquidity_soft_used_cycle}/"
+                                            f"{non_watch_onchain_liquidity_soft_max_per_cycle}"
+                                        )
+                                        logger.info(
+                                            "NON_WATCH_SAFE_LIQUIDITY_SOFT_PASS token=%s liq=%.0f/%.0f relaxed=%.0f "
+                                            "vol5m=%.0f/%.0f used=%s/%s source=%s",
+                                            token.get("symbol", "N/A"),
+                                            token_liquidity_now,
+                                            safe_liquidity_floor,
+                                            relaxed_liquidity_floor,
+                                            token_volume_5m,
+                                            relaxed_min_volume_5m,
+                                            non_watch_onchain_liquidity_soft_used_cycle,
+                                            non_watch_onchain_liquidity_soft_max_per_cycle,
+                                            source_name or "unknown",
+                                        )
+                                if not liquidity_soft_passed:
+                                    _filter_fail(
+                                        "safe_liquidity",
+                                        token,
+                                        f"liq={token_liquidity_now:.0f} min={safe_liquidity_floor:.0f}",
+                                    )
+                                    continue
                             if token_volume_5m < safe_volume_floor:
                                 soft_enabled = bool(getattr(config, "SAFE_VOLUME_TWO_TIER_ENABLED", False))
                                 soft_ratio = max(
@@ -3199,21 +3846,36 @@ async def run_local_loop() -> None:
                                         "until": float(now_mono + float(probe_ttl_seconds)),
                                     }
                                     if probe_hits >= stable_cycles_required:
+                                        non_watch_volume_cycle_cap = int(non_watch_volume_probe_max_per_cycle)
                                         if (
                                             is_non_watch_source
+                                            and source_name.startswith("gecko")
                                             and non_watch_volume_probe_max_per_cycle > 0
-                                            and non_watch_volume_probe_used_cycle >= non_watch_volume_probe_max_per_cycle
+                                        ):
+                                            non_watch_volume_cycle_cap = max(
+                                                int(non_watch_volume_probe_max_per_cycle),
+                                                int(
+                                                    round(
+                                                        float(non_watch_volume_probe_max_per_cycle)
+                                                        * float(non_watch_volume_probe_gecko_soft_cap_mult)
+                                                    )
+                                                ),
+                                            )
+                                        if (
+                                            is_non_watch_source
+                                            and non_watch_volume_cycle_cap > 0
+                                            and non_watch_volume_probe_used_cycle >= non_watch_volume_cycle_cap
                                         ):
                                             _filter_fail(
                                                 "safe_volume_non_watch_cycle_cap",
                                                 token,
                                                 (
                                                     f"vol5m={token_volume_5m:.0f}/{safe_volume_floor:.0f} "
-                                                    f"used={non_watch_volume_probe_used_cycle}/{non_watch_volume_probe_max_per_cycle}"
+                                                    f"used={non_watch_volume_probe_used_cycle}/{non_watch_volume_cycle_cap}"
                                                 ),
                                             )
                                             continue
-                                        if is_non_watch_source and non_watch_volume_probe_max_per_cycle > 0:
+                                        if is_non_watch_source and non_watch_volume_cycle_cap > 0:
                                             non_watch_volume_probe_used_cycle += 1
                                         token["_safe_volume_soft_pass"] = True
                                         token["_safe_volume_soft_detail"] = (
@@ -3235,7 +3897,7 @@ async def run_local_loop() -> None:
                                                 "NON_WATCH_VOLUME_PROBE_PASS token=%s used=%s/%s source=%s",
                                                 token.get("symbol", "N/A"),
                                                 non_watch_volume_probe_used_cycle,
-                                                non_watch_volume_probe_max_per_cycle,
+                                                non_watch_volume_cycle_cap,
                                                 source_name or "unknown",
                                             )
                                     else:
@@ -3422,7 +4084,9 @@ async def run_local_loop() -> None:
                             continue
                         safety = await checker.check_token_safety(
                             token.get("address", ""),
-                            token.get("liquidity", 0),
+                            liquidity=token.get("liquidity", 0),
+                            volume_5m=token.get("volume_5m", 0),
+                            age_seconds=token.get("age_seconds", 0),
                         )
                         if heavy_ttl > 0 and token_address:
                             heavy_seen_until[token_address] = time.monotonic() + float(heavy_ttl)
@@ -3437,15 +4101,15 @@ async def run_local_loop() -> None:
                         token["is_contract_safe"] = bool((safety or {}).get("is_safe", False))
 
                         if config.SAFE_TEST_MODE:
+                            safety_source = str((safety or {}).get("source", "") or "").strip().lower()
                             if bool(getattr(config, "ENTRY_FAIL_CLOSED_ON_SAFETY_GAP", True)):
-                                safety_source = str((safety or {}).get("source", "") or "").strip().lower()
                                 allowed_sources = set(getattr(config, "ENTRY_ALLOWED_SAFETY_SOURCES", ["goplus"]) or ["goplus"])
                                 if (not safety_source) or (safety_source not in allowed_sources):
                                     _filter_fail("safe_source", token, f"source={safety_source or 'missing'}")
                                     continue
                                 fail_reason = str((safety or {}).get("fail_reason", "") or "").strip()
                                 if fail_reason:
-                                    is_transient_source = safety_source in {"transient_fallback", "cache_transient"}
+                                    is_transient_source = safety_source in {"transient_fallback", "cache_transient", "fallback"}
                                     transient_mode = bool(getattr(config, "TOKEN_SAFETY_TRANSIENT_DEGRADED_ENABLED", True))
                                     if (not is_transient_source) or (not transient_mode):
                                         _filter_fail("safe_fail_reason", token, fail_reason)
@@ -3461,8 +4125,105 @@ async def run_local_loop() -> None:
                                     _filter_fail("safe_risky_flags", token, ",".join(risky_flags))
                                     continue
                             if config.SAFE_REQUIRE_CONTRACT_SAFE and not bool(token.get("is_contract_safe", False)):
-                                _filter_fail("safe_contract", token)
-                                continue
+                                contract_soft_passed = False
+                                if (
+                                    is_non_watch_source
+                                    and non_watch_transient_contract_soft_enabled
+                                    and safety_source in {"transient_fallback", "cache_transient", "fallback"}
+                                ):
+                                    age_s = int(token.get("age_seconds") or 0)
+                                    liq_u = float(token.get("liquidity") or 0.0)
+                                    vol5_u = float(token.get("volume_5m") or 0.0)
+                                    abs5_u = abs(float(token.get("price_change_5m") or 0.0))
+                                    risk_soft = str(token.get("risk_level", "HIGH")).upper()
+                                    warning_soft = int(token.get("warning_flags") or 0)
+                                    require_low_risk = bool(
+                                        getattr(
+                                            config,
+                                            "LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_REQUIRE_LOW_RISK",
+                                            True,
+                                        )
+                                    )
+                                    allowed_risks = {"LOW"} if require_low_risk else {"LOW", "MEDIUM"}
+                                    warning_soft_max = max(
+                                        0,
+                                        int(
+                                            getattr(
+                                                config,
+                                                "LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_MAX_WARNING_FLAGS",
+                                                0,
+                                            )
+                                            or 0
+                                        ),
+                                    )
+                                    abs5_soft_max = max(
+                                        0.0,
+                                        float(
+                                            getattr(
+                                                config,
+                                                "LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_MAX_ABS_CHANGE_5M",
+                                                10.0,
+                                            )
+                                            or 10.0
+                                        ),
+                                    )
+                                    if (
+                                        age_s >= non_watch_transient_contract_soft_min_age_seconds
+                                        and liq_u >= non_watch_transient_contract_soft_min_liquidity
+                                        and vol5_u >= non_watch_transient_contract_soft_min_volume_5m
+                                        and int(score_now) >= non_watch_transient_contract_soft_min_score
+                                        and risk_soft in allowed_risks
+                                        and warning_soft <= warning_soft_max
+                                        and abs5_u <= abs5_soft_max
+                                    ):
+                                        if (
+                                            non_watch_transient_contract_soft_max_per_cycle > 0
+                                            and non_watch_transient_contract_soft_used_cycle
+                                            >= non_watch_transient_contract_soft_max_per_cycle
+                                        ):
+                                            _filter_fail(
+                                                "safe_contract_non_watch_cycle_cap",
+                                                token,
+                                                (
+                                                    f"used={non_watch_transient_contract_soft_used_cycle}/"
+                                                    f"{non_watch_transient_contract_soft_max_per_cycle}"
+                                                ),
+                                            )
+                                            continue
+                                        if non_watch_transient_contract_soft_max_per_cycle > 0:
+                                            non_watch_transient_contract_soft_used_cycle += 1
+                                        contract_soft_passed = True
+                                        token["_safe_contract_soft_pass"] = True
+                                        token["_safe_contract_soft_detail"] = (
+                                            f"age={age_s} liq={liq_u:.0f} vol5m={vol5_u:.0f} score={int(score_now)} "
+                                            f"risk={risk_soft} warnings={warning_soft}/{warning_soft_max} "
+                                            f"abs5m={abs5_u:.2f}/{abs5_soft_max:.2f} "
+                                            f"used={non_watch_transient_contract_soft_used_cycle}/"
+                                            f"{non_watch_transient_contract_soft_max_per_cycle}"
+                                        )
+                                        logger.info(
+                                            "NON_WATCH_SAFE_CONTRACT_SOFT_PASS token=%s age=%s liq=%.0f/%.0f "
+                                            "vol5m=%.0f/%.0f score=%s/%s risk=%s warn=%s/%s abs5m=%.2f/%.2f used=%s/%s source=%s",
+                                            token.get("symbol", "N/A"),
+                                            age_s,
+                                            liq_u,
+                                            non_watch_transient_contract_soft_min_liquidity,
+                                            vol5_u,
+                                            non_watch_transient_contract_soft_min_volume_5m,
+                                            int(score_now),
+                                            non_watch_transient_contract_soft_min_score,
+                                            risk_soft,
+                                            warning_soft,
+                                            warning_soft_max,
+                                            abs5_u,
+                                            abs5_soft_max,
+                                            non_watch_transient_contract_soft_used_cycle,
+                                            non_watch_transient_contract_soft_max_per_cycle,
+                                            source_name or "unknown",
+                                        )
+                                if not contract_soft_passed:
+                                    _filter_fail("safe_contract", token)
+                                    continue
                             required_risk = str(config.SAFE_REQUIRE_RISK_LEVEL).upper()
                             risk = str(token.get("risk_level", "HIGH")).upper()
                             rank = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
@@ -3472,6 +4233,189 @@ async def run_local_loop() -> None:
                             if int(token.get("warning_flags") or 0) > int(config.SAFE_MAX_WARNING_FLAGS):
                                 _filter_fail("safe_warnings", token)
                                 continue
+                            if bool(getattr(config, "LOCAL_ANTISCAM_NON_WATCH_FAST_PUMP_BLOCK_ENABLED", True)):
+                                if is_non_watch_source:
+                                    age_s = int(token.get("age_seconds") or 0)
+                                    abs5 = abs(float(token.get("price_change_5m") or 0.0))
+                                    fast_max_age = max(
+                                        0,
+                                        int(
+                                            getattr(
+                                                config,
+                                                "LOCAL_ANTISCAM_NON_WATCH_FAST_PUMP_MAX_AGE_SECONDS",
+                                                1200,
+                                            )
+                                            or 1200
+                                        ),
+                                    )
+                                    fast_max_abs5 = max(
+                                        0.0,
+                                        float(
+                                            getattr(
+                                                config,
+                                                "LOCAL_ANTISCAM_NON_WATCH_FAST_PUMP_MAX_ABS_CHANGE_5M",
+                                                18.0,
+                                            )
+                                            or 18.0
+                                        ),
+                                    )
+                                    if age_s > 0 and age_s <= fast_max_age and abs5 >= fast_max_abs5:
+                                        _filter_fail(
+                                            "safe_non_watch_fast_pump",
+                                            token,
+                                            f"age={age_s}/{fast_max_age} abs5m={abs5:.2f}/{fast_max_abs5:.2f}",
+                                        )
+                                        if token_address and bool(
+                                            getattr(
+                                                config,
+                                                "LOCAL_ANTISCAM_NON_WATCH_FAST_PUMP_TO_BLACKLIST",
+                                                True,
+                                            )
+                                        ):
+                                            try:
+                                                auto_trader._blacklist_add(
+                                                    token_address,
+                                                    f"pre_rug_guard:fast_pump:abs5m={abs5:.2f}",
+                                                    ttl_seconds=max(
+                                                        300,
+                                                        int(
+                                                            getattr(
+                                                                config,
+                                                                "LOCAL_ANTISCAM_NON_WATCH_FAST_PUMP_BLACKLIST_TTL_SECONDS",
+                                                                21600,
+                                                            )
+                                                            or 21600
+                                                        ),
+                                                    ),
+                                                )
+                                            except Exception as exc:
+                                                logger.exception(
+                                                    "LOCAL_ANTISCAM_FAST_PUMP_BLACKLIST_FAILED token=%s err=%s",
+                                                    token.get("symbol", "N/A"),
+                                                    exc,
+                                                )
+                                        continue
+                            if bool(getattr(config, "LOCAL_ANTISCAM_TRANSIENT_STRICT_ENABLED", False)):
+                                if safety_source in {"transient_fallback", "cache_transient", "fallback"}:
+                                    age_s = int(token.get("age_seconds") or 0)
+                                    liq_u = float(token.get("liquidity") or 0.0)
+                                    vol5_u = float(token.get("volume_5m") or 0.0)
+                                    abs5 = abs(float(token.get("price_change_5m") or 0.0))
+                                    min_age_s = int(getattr(config, "LOCAL_ANTISCAM_TRANSIENT_MIN_AGE_SECONDS", 900) or 900)
+                                    min_liq_u = float(
+                                        getattr(config, "LOCAL_ANTISCAM_TRANSIENT_MIN_LIQUIDITY_USD", 25000.0) or 25000.0
+                                    )
+                                    min_vol5_u = float(
+                                        getattr(config, "LOCAL_ANTISCAM_TRANSIENT_MIN_VOLUME_5M_USD", 1500.0) or 1500.0
+                                    )
+                                    max_abs5 = float(
+                                        getattr(config, "LOCAL_ANTISCAM_TRANSIENT_MAX_ABS_CHANGE_5M", 15.0) or 15.0
+                                    )
+                                    if age_s < min_age_s:
+                                        age_soft_passed = False
+                                        if (
+                                            is_non_watch_source
+                                            and non_watch_transient_age_soft_enabled
+                                            and age_s >= non_watch_transient_age_soft_min_seconds
+                                            and liq_u >= non_watch_transient_age_soft_min_liquidity
+                                            and vol5_u >= non_watch_transient_age_soft_min_volume_5m
+                                            and int(score_now) >= non_watch_transient_age_soft_min_score
+                                        ):
+                                            if (
+                                                non_watch_transient_age_soft_max_per_cycle > 0
+                                                and non_watch_transient_age_soft_used_cycle
+                                                >= non_watch_transient_age_soft_max_per_cycle
+                                            ):
+                                                _filter_fail(
+                                                    "safe_transient_age_non_watch_cycle_cap",
+                                                    token,
+                                                    (
+                                                        f"age={age_s}/{min_age_s} "
+                                                        f"used={non_watch_transient_age_soft_used_cycle}/"
+                                                        f"{non_watch_transient_age_soft_max_per_cycle}"
+                                                    ),
+                                                )
+                                                continue
+                                            if non_watch_transient_age_soft_max_per_cycle > 0:
+                                                non_watch_transient_age_soft_used_cycle += 1
+                                            age_soft_passed = True
+                                            token["_safe_transient_age_soft_pass"] = True
+                                            token["_safe_transient_age_soft_detail"] = (
+                                                f"age={age_s}/{min_age_s} "
+                                                f"relaxed={non_watch_transient_age_soft_min_seconds} "
+                                                f"liq={liq_u:.0f}/{non_watch_transient_age_soft_min_liquidity:.0f} "
+                                                f"vol5m={vol5_u:.0f}/{non_watch_transient_age_soft_min_volume_5m:.0f} "
+                                                f"score={int(score_now)}/{non_watch_transient_age_soft_min_score} "
+                                                f"used={non_watch_transient_age_soft_used_cycle}/"
+                                                f"{non_watch_transient_age_soft_max_per_cycle}"
+                                            )
+                                            logger.info(
+                                                "NON_WATCH_SAFE_TRANSIENT_AGE_SOFT_PASS token=%s age=%s/%s "
+                                                "relaxed=%s liq=%.0f/%.0f vol5m=%.0f/%.0f score=%s/%s used=%s/%s source=%s",
+                                                token.get("symbol", "N/A"),
+                                                age_s,
+                                                min_age_s,
+                                                non_watch_transient_age_soft_min_seconds,
+                                                liq_u,
+                                                non_watch_transient_age_soft_min_liquidity,
+                                                vol5_u,
+                                                non_watch_transient_age_soft_min_volume_5m,
+                                                int(score_now),
+                                                non_watch_transient_age_soft_min_score,
+                                                non_watch_transient_age_soft_used_cycle,
+                                                non_watch_transient_age_soft_max_per_cycle,
+                                                source_name or "unknown",
+                                            )
+                                        if not age_soft_passed:
+                                            _filter_fail("safe_transient_age", token, f"age={age_s} min={min_age_s}")
+                                            continue
+                                    if liq_u < min_liq_u:
+                                        _filter_fail("safe_transient_liquidity", token, f"liq={liq_u:.0f} min={min_liq_u:.0f}")
+                                        continue
+                                    if vol5_u < min_vol5_u:
+                                        _filter_fail("safe_transient_volume", token, f"vol5m={vol5_u:.0f} min={min_vol5_u:.0f}")
+                                        continue
+                                    if abs5 > max_abs5:
+                                        _filter_fail("safe_transient_change_5m", token, f"abs5m={abs5:.2f} max={max_abs5:.2f}")
+                                        continue
+                                    if bool(getattr(config, "LOCAL_ANTISCAM_TRANSIENT_BLOCK_SOFT_CHANGE_PASS", True)):
+                                        if bool(token.get("_safe_change_soft_pass", False)):
+                                            _filter_fail("safe_transient_soft_change", token, "soft_change_pass_blocked")
+                                            continue
+                            if anti_scam_pump_history_enabled:
+                                apply_pump_guard = (not anti_scam_pump_history_only_non_watch) or is_non_watch_source
+                                if apply_pump_guard:
+                                    age_s = int(token.get("age_seconds") or 0)
+                                    if age_s <= anti_scam_pump_history_block_max_age_seconds:
+                                        abs5_now = abs(float(token.get("price_change_5m") or 0.0))
+                                        abs5_max_recent = float(
+                                            token.get("_anti_scam_pump_history_max_abs5m", abs5_now) or abs5_now
+                                        )
+                                        if abs5_max_recent >= anti_scam_pump_history_block_max_abs_change:
+                                            _filter_fail(
+                                                "safe_pump_history",
+                                                token,
+                                                (
+                                                    f"max_abs5m_recent={abs5_max_recent:.2f} "
+                                                    f"threshold={anti_scam_pump_history_block_max_abs_change:.2f} "
+                                                    f"age={age_s} max_age={anti_scam_pump_history_block_max_age_seconds} "
+                                                    f"window={anti_scam_pump_history_window_seconds}s"
+                                                ),
+                                            )
+                                            if anti_scam_pump_history_to_blacklist and token_address:
+                                                try:
+                                                    auto_trader._blacklist_add(
+                                                        token_address,
+                                                        f"pre_rug_guard:pump_history:max_abs5m={abs5_max_recent:.2f}",
+                                                        ttl_seconds=anti_scam_pump_history_blacklist_ttl,
+                                                    )
+                                                except Exception:
+                                                    logger.exception(
+                                                        "LOCAL_ANTISCAM_PUMP_HISTORY blacklist failed token=%s address=%s",
+                                                        token.get("symbol", "N/A"),
+                                                        token_address,
+                                                    )
+                                            continue
 
                         token["_regime_edge_mult"] = float(regime_edge_mult)
                         token["_regime_size_mult"] = float(regime_size_mult)
@@ -3822,6 +4766,20 @@ async def run_local_loop() -> None:
                 auto_stats = auto_trader.get_stats()
                 skip_reasons_cycle = auto_trader.pop_skip_reason_counts_window()
                 source_flow_cycle = auto_trader.pop_source_flow_window()
+                post_filters_non_watch_cycle = int(
+                    sum(
+                        1
+                        for token_data, _score_data in (trade_candidates or [])
+                        if not str((token_data or {}).get("source", "")).strip().lower().startswith("watchlist")
+                    )
+                )
+                plan_non_watch_cycle = int(
+                    sum(
+                        int((row or {}).get("plan_attempts", 0) or 0)
+                        for src, row in (source_flow_cycle or {}).items()
+                        if not str(src or "").strip().lower().startswith("watchlist")
+                    )
+                )
                 candidate_count_cycle = len(candidates_quality)
                 adaptive_filters.record_cycle(
                     candidates=candidate_count_cycle,
@@ -3859,6 +4817,25 @@ async def run_local_loop() -> None:
                     source_flow=source_flow_cycle,
                 )
                 source_qos_snapshot = v2_source_qos.snapshot()
+                candidate_writer.write(
+                    {
+                        "ts": time.time(),
+                        "cycle_index": cycle_index,
+                        "source_mode": source_mode,
+                        "source": "mixed",
+                        "decision_stage": "flow_metrics",
+                        "decision": "summary",
+                        "reason": "lane_split_summary",
+                        "symbol": "FLOW",
+                        "score": 0,
+                        "raw_non_watch": int(raw_non_watch_cycle),
+                        "raw_watchlist": int(raw_watchlist_cycle),
+                        "post_filters_non_watch": int(post_filters_non_watch_cycle),
+                        "plan_non_watch": int(plan_non_watch_cycle),
+                        "watchlist_fallback_used": bool(watchlist_fallback_used_cycle),
+                        "fallback_reason": str(watchlist_fallback_reason_cycle or "none"),
+                    }
+                )
                 v2_rolling_edge.record_cycle(
                     candidates=candidate_count_cycle,
                     opened=opened_trades,
@@ -4023,6 +5000,7 @@ async def run_local_loop() -> None:
                     (
                         "Scanned %s tokens | High quality: %s | Alerts sent: %s | Trade candidates: %s | "
                         "Quality out/core/explore/probe: %s/%s/%s/%s | Opened: %s | "
+                        "Raw lanes nw/wl=%s/%s fallback=%s(%s) | PostNW: %s | PlanNW: %s | "
                         "Mode: local | Source: %s | Policy: raw=%s/effective=%s(%s) | Regime: %s(%s) | "
                         "Safety: checked=%s fail_closed=%s reasons=%s | FiltersTop(session): %s | Dedup: heavy_skip=%s override=%s | "
                         "V2Budget: %s/%s | SourceQoS: %s | Ingest: %s | Sources: %s | Tasks: %s | RSS: %.1fMB | CycleAvg: %.2fs"
@@ -4036,6 +5014,12 @@ async def run_local_loop() -> None:
                     int(quality_gate_meta.get("explore_out", 0) or 0),
                     int(quality_gate_meta.get("probe_out", 0) or 0),
                     opened_trades,
+                    int(raw_non_watch_cycle),
+                    int(raw_watchlist_cycle),
+                    int(1 if watchlist_fallback_used_cycle else 0),
+                    str(watchlist_fallback_reason_cycle or "none"),
+                    int(post_filters_non_watch_cycle),
+                    int(plan_non_watch_cycle),
                     source_mode,
                     policy_state,
                     policy_effective_mode,
@@ -4056,6 +5040,15 @@ async def run_local_loop() -> None:
                     active_tasks,
                     rss_mb,
                     (sum(cycle_times) / len(cycle_times)) if cycle_times else 0.0,
+                )
+                logger.info(
+                    "FLOW_LANE_METRICS raw_non_watch=%s raw_watchlist=%s post_filters_non_watch=%s plan_non_watch=%s watchlist_fallback_used=%s fallback_reason=%s",
+                    int(raw_non_watch_cycle),
+                    int(raw_watchlist_cycle),
+                    int(post_filters_non_watch_cycle),
+                    int(plan_non_watch_cycle),
+                    int(1 if watchlist_fallback_used_cycle else 0),
+                    str(watchlist_fallback_reason_cycle or "none"),
                 )
             except Exception:
                 _write_heartbeat(stage="cycle_error", cycle_index=cycle_index, open_trades=len(auto_trader.open_positions))

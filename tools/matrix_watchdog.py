@@ -6,10 +6,19 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+# Allow direct `python tools/matrix_watchdog.py ...` execution to import project modules.
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_PROJECT_ROOT = _SCRIPT_DIR.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+from utils.state_file import atomic_write_json, state_file_lock
 
 
 def _now_iso() -> str:
@@ -29,17 +38,26 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with tmp.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
+    with state_file_lock(str(path), timeout_seconds=2.5, poll_seconds=0.05):
+        atomic_write_json(
+            str(path),
+            payload,
+            encoding="utf-8",
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=False,
+        )
 
 
 def _try_write_json(path: Path, payload: dict[str, Any]) -> bool:
     try:
         _write_json(path, payload)
         return True
-    except Exception:
+    except Exception as exc:
+        try:
+            print(f"[WATCHDOG] active_matrix_merge_failed err={exc}")
+        except Exception:
+            pass
         return False
 
 
@@ -229,6 +247,21 @@ def _runtime_tuner_lock_pid(root: Path, item: dict[str, Any]) -> int:
         return 0
 
 
+def _runtime_tuner_log_dir(root: Path, profile_id: str, rel_log_dir: str = "") -> Path:
+    rel = str(rel_log_dir or "").strip()
+    if rel:
+        return root / rel
+    return root / "logs" / "matrix" / str(profile_id or "").strip()
+
+
+def _runtime_tuner_lock_path(root: Path, profile_id: str, rel_log_dir: str = "") -> Path:
+    return _runtime_tuner_log_dir(root, profile_id, rel_log_dir) / "runtime_tuner.lock.json"
+
+
+def _runtime_tuner_jsonl_path(root: Path, profile_id: str, rel_log_dir: str = "") -> Path:
+    return _runtime_tuner_log_dir(root, profile_id, rel_log_dir) / "runtime_tuner.jsonl"
+
+
 def _runtime_tuner_log_age_seconds(root: Path, item: dict[str, Any]) -> float | None:
     rel_log_dir = str(item.get("log_dir", "") or "").strip()
     if not rel_log_dir:
@@ -245,13 +278,40 @@ def _runtime_tuner_known(root: Path, item: dict[str, Any]) -> bool:
     return bool((log_dir / "runtime_tuner.jsonl").exists() or (log_dir / "runtime_tuner.lock.json").exists())
 
 
-def _restart_tuner(root: Path, profile_id: str) -> tuple[bool, str, int]:
+def _restart_tuner(root: Path, profile_id: str, rel_log_dir: str = "") -> tuple[bool, str, int]:
     py = _python_path(root)
     if not py.exists():
         return False, f"python not found: {py}", 0
     script = root / "tools" / "matrix_runtime_tuner.py"
     if not script.exists():
         return False, f"script not found: {script}", 0
+    log_dir_rel = str(rel_log_dir or "").strip() or f"logs/matrix/{profile_id}"
+
+    def _verify_tuner_started(spawn_pid: int) -> tuple[bool, str]:
+        if int(spawn_pid) <= 0:
+            return False, "spawn_pid_invalid"
+        lock_path = _runtime_tuner_lock_path(root, profile_id, log_dir_rel)
+        log_path = _runtime_tuner_jsonl_path(root, profile_id, log_dir_rel)
+        # Guard against false-positive spawn: process must stay alive and acquire profile lock.
+        deadline = float(time.time()) + 18.0
+        while float(time.time()) < deadline:
+            alive = _pid_alive(int(spawn_pid), require_substring="matrix_runtime_tuner.py")
+            if not alive:
+                return False, "spawned_not_alive"
+            lock_payload = _read_json(lock_path)
+            try:
+                lock_pid = int(lock_payload.get("pid", 0) or 0)
+            except Exception:
+                lock_pid = 0
+            if lock_pid == int(spawn_pid):
+                log_age = _file_age_seconds(log_path)
+                detail = "lock_acquired"
+                if log_age is not None:
+                    detail = f"{detail} log_age={round(float(log_age), 2)}"
+                return True, detail
+            time.sleep(0.6)
+        return False, "lock_not_acquired"
+
     try:
         env = os.environ.copy()
         env["PYTHONIOENCODING"] = "utf-8"
@@ -275,6 +335,10 @@ def _restart_tuner(root: Path, profile_id: str) -> tuple[bool, str, int]:
                 "600",
                 "--interval-seconds",
                 "120",
+                "--lock-acquire-timeout-seconds",
+                "45",
+                "--lock-acquire-poll-seconds",
+                "1.0",
             ],
             cwd=str(root),
             env=env,
@@ -287,7 +351,10 @@ def _restart_tuner(root: Path, profile_id: str) -> tuple[bool, str, int]:
         pid = int(proc.pid or 0)
         if pid <= 0:
             return False, "spawn failed", 0
-        return True, "restarted", pid
+        ok, verify_msg = _verify_tuner_started(pid)
+        if not ok:
+            return False, verify_msg, pid
+        return True, f"restarted {verify_msg}", pid
     except Exception as exc:
         return False, str(exc), 0
 
@@ -306,6 +373,72 @@ def _events_path(root: Path) -> Path:
 
 def _lock_path(root: Path) -> Path:
     return root / "data" / "matrix" / "runs" / "watchdog.lock.json"
+
+
+def _merge_runtime_meta_update(root: Path, items_snapshot: list[dict[str, Any]], alive_count: int) -> bool:
+    path = _meta_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    updates: dict[str, dict[str, Any]] = {}
+    for row in items_snapshot:
+        if not isinstance(row, dict):
+            continue
+        rid = str(row.get("id", "") or "").strip()
+        if not rid:
+            continue
+        updates[rid] = {
+            "pid": row.get("pid", None),
+            "status": str(row.get("status", "") or "").strip() or "unknown",
+        }
+    if not updates:
+        return False
+    try:
+        with state_file_lock(str(path), timeout_seconds=2.5, poll_seconds=0.05):
+            payload: dict[str, Any] = {}
+            if path.exists():
+                try:
+                    raw = json.loads(path.read_text(encoding="utf-8"))
+                    if isinstance(raw, dict):
+                        payload = raw
+                except Exception:
+                    payload = {}
+            items = payload.get("items") if isinstance(payload.get("items"), list) else []
+            changed = False
+            for row in items:
+                if not isinstance(row, dict):
+                    continue
+                rid = str(row.get("id", "") or "").strip()
+                if not rid or rid not in updates:
+                    continue
+                next_pid = updates[rid].get("pid", None)
+                next_status = updates[rid].get("status", "unknown")
+                if row.get("pid", None) != next_pid:
+                    row["pid"] = next_pid
+                    changed = True
+                if str(row.get("status", "") or "") != str(next_status):
+                    row["status"] = str(next_status)
+                    changed = True
+            running_next = bool(int(alive_count) > 0)
+            if bool(payload.get("running", False)) != running_next:
+                payload["running"] = running_next
+                changed = True
+            if int(payload.get("alive_count", -1) or -1) != int(alive_count):
+                payload["alive_count"] = int(alive_count)
+                changed = True
+            if not changed:
+                return False
+            payload["updated_at"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+            payload["items"] = items
+            atomic_write_json(
+                str(path),
+                payload,
+                encoding="utf-8",
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=False,
+            )
+            return True
+    except Exception:
+        return False
 
 
 def _acquire_follow_lock(root: Path) -> tuple[bool, str]:
@@ -446,7 +579,7 @@ def _scan_once(
                 if tuner_cooldown_left <= 0.0:
                     if tuner_pid > 0 and tuner_alive:
                         _kill_pid(tuner_pid)
-                    ok, msg, new_pid = _restart_tuner(root, profile_id)
+                    ok, msg, new_pid = _restart_tuner(root, profile_id, str(row.get("log_dir", "") or ""))
                     evt = {
                         "ts": now_ts,
                         "timestamp": now_iso,
@@ -475,11 +608,7 @@ def _scan_once(
     meta_running_prev = bool(meta.get("running", False))
     meta_needs_update = bool(changed) or (meta_running_prev != meta_running) or (meta_alive_count_prev != int(alive_count))
     if meta_needs_update:
-        meta["updated_at"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-        meta["running"] = meta_running
-        meta["alive_count"] = int(alive_count)
-        meta["items"] = items
-        _try_write_json(meta_path, meta)
+        _merge_runtime_meta_update(root, items, alive_count)
 
     prev_events_tail = state.get("events_tail", []) if isinstance(state.get("events_tail"), list) else []
     state_payload = {

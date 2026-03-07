@@ -56,6 +56,93 @@ class LogContractsTests(unittest.TestCase):
         self.assertEqual(row["decision_stage"], "alert")
         self.assertEqual(row["decision"], "emit")
 
+    def test_trade_event_maps_cost_dominant_edge_to_plan_reason(self) -> None:
+        row = log_contracts.trade_decision_event(
+            {
+                "candidate_id": "cand-3",
+                "decision_stage": "plan_trade",
+                "decision": "skip",
+                "reason": "cost_dominant_edge",
+                "symbol": "DDD",
+            },
+            run_tag="mx_d",
+        )
+        self.assertEqual(row["reason_code"], "PLAN_COST_DOMINANT_EDGE")
+        self.assertEqual(row["reason_category"], "plan")
+        self.assertEqual(row["reason_severity"], "INFO")
+
+    def test_trade_event_rewrites_unknown_reason_code_when_reason_is_known(self) -> None:
+        row = log_contracts.trade_decision_event(
+            {
+                "candidate_id": "cand-4",
+                "decision_stage": "plan_select",
+                "decision": "summary",
+                "reason": "selection_summary",
+                "reason_code": "UNKNOWN_SELECTION_SUMMARY",
+                "symbol": "EEE",
+            },
+            run_tag="mx_e",
+        )
+        self.assertEqual(row["reason_code"], "PLAN_SELECTION_SUMMARY")
+        self.assertEqual(row["reason_category"], "plan")
+
+    def test_candidate_flow_metrics_reason_code_is_mapped(self) -> None:
+        row = log_contracts.candidate_decision_event(
+            {
+                "candidate_id": "cand-flow-1",
+                "decision_stage": "flow_metrics",
+                "decision": "summary",
+                "reason": "lane_split_summary",
+                "symbol": "FLOW",
+            },
+            run_tag="mx_flow",
+        )
+        self.assertEqual(row["reason_code"], "FLOW_LANE_SPLIT_SUMMARY")
+        self.assertEqual(row["reason_category"], "flow")
+        self.assertEqual(row["reason_severity"], "INFO")
+
+    def test_pre_rug_guard_reason_is_mapped(self) -> None:
+        row = log_contracts.candidate_decision_event(
+            {
+                "candidate_id": "cand-rug-1",
+                "decision_stage": "plan_trade",
+                "decision": "skip",
+                "reason": "pre_rug_guard",
+                "symbol": "RUG",
+            },
+            run_tag="mx_rug",
+        )
+        self.assertEqual(row["reason_code"], "PRE_RUG_GUARD")
+        self.assertEqual(row["reason_category"], "precheck")
+
+    def test_safe_pump_history_reason_is_mapped(self) -> None:
+        row = log_contracts.candidate_decision_event(
+            {
+                "candidate_id": "cand-pump-1",
+                "decision_stage": "filter_fail",
+                "decision": "skip",
+                "reason": "safe_pump_history",
+                "symbol": "PUMP",
+            },
+            run_tag="mx_pump",
+        )
+        self.assertEqual(row["reason_code"], "PRE_PUMP_HISTORY_BLOCK")
+        self.assertEqual(row["reason_category"], "precheck")
+
+    def test_proof_sell_fail_exit_reason_is_mapped(self) -> None:
+        row = log_contracts.trade_decision_event(
+            {
+                "candidate_id": "cand-proof-1",
+                "decision_stage": "trade_close",
+                "decision": "close",
+                "reason": "PROOF_SELL_FAIL",
+                "symbol": "PSF",
+            },
+            run_tag="mx_proof",
+        )
+        self.assertEqual(row["reason_code"], "EXIT_PROOF_SELL_FAIL")
+        self.assertEqual(row["reason_category"], "exit")
+
 
 if __name__ == "__main__":
     unittest.main()

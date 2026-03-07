@@ -6,6 +6,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
+import config
 from config import (
     CHAIN_ID,
     CHAIN_NAME,
@@ -36,6 +37,51 @@ logger = logging.getLogger(__name__)
 class DexScreenerMonitor:
     def __init__(self) -> None:
         self.seen_tokens: dict[str, float] = {}
+        self._low_flow_last_boost_ts = 0.0
+        self._low_flow_trigger_tokens = max(
+            4,
+            int(getattr(config, "NON_WATCH_LOW_FLOW_TRIGGER_TOKENS", 20) or 20),
+        )
+        self._low_flow_boost_interval_seconds = max(
+            5.0,
+            float(
+                getattr(
+                    config,
+                    "NON_WATCH_LOW_FLOW_BOOST_INTERVAL_SECONDS",
+                    30.0,
+                )
+                or 30.0
+            ),
+        )
+        self._low_flow_relaxed_age_cap_seconds = max(
+            int(TOKEN_AGE_MAX),
+            int(
+                getattr(
+                    config,
+                    "NON_WATCH_LOW_FLOW_RELAXED_AGE_CAP_SECONDS",
+                    2592000,
+                )
+                or 2592000
+            ),
+        )
+        self._low_flow_relaxed_min_liquidity_usd = max(
+            500.0,
+            float(
+                getattr(
+                    config,
+                    "NON_WATCH_LOW_FLOW_RELAXED_MIN_LIQUIDITY_USD",
+                    max(500.0, float(MIN_LIQUIDITY) * 0.40),
+                )
+                or max(500.0, float(MIN_LIQUIDITY) * 0.40)
+            ),
+        )
+        self._low_flow_gecko_pages = max(
+            0,
+            int(getattr(config, "NON_WATCH_LOW_FLOW_GECKO_PAGES", 2) or 2),
+        )
+        self._low_flow_include_boosts = bool(
+            getattr(config, "NON_WATCH_LOW_FLOW_INCLUDE_DEX_BOOSTS", True)
+        )
         self._headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -141,11 +187,87 @@ class DexScreenerMonitor:
         if isinstance(boost_tokens, Exception):
             logger.warning("Boost source failed: %s", boost_tokens)
             boost_tokens = []
-        return self._merge_tokens(dex_tokens, gecko_tokens, boost_tokens)
+        merged = self._merge_tokens(dex_tokens, gecko_tokens, boost_tokens)
+        merged = await self._apply_low_flow_boost(merged)
+        return merged
 
-    async def _fetch_from_dexscreener(self) -> list[dict[str, Any]]:
+    async def fetch_low_flow_boost_tokens(self) -> list[dict[str, Any]]:
+        """
+        Force one low-flow discovery pull for non-watch sources.
+        Used by raw-source rebalance when base discovery lane is sparse.
+        """
+        self._prune_seen_tokens()
+        return await self._apply_low_flow_boost([], force=True)
+
+    async def _apply_low_flow_boost(
+        self,
+        base_tokens: list[dict[str, Any]],
+        *,
+        force: bool = False,
+    ) -> list[dict[str, Any]]:
+        if (not force) and int(len(base_tokens)) >= int(self._low_flow_trigger_tokens):
+            return list(base_tokens)
+        now_ts = time.monotonic()
+        if (not force) and (now_ts - float(self._low_flow_last_boost_ts)) < float(self._low_flow_boost_interval_seconds):
+            return list(base_tokens)
+        self._low_flow_last_boost_ts = now_ts
+        try:
+            relaxed_dex = await self._fetch_from_dexscreener(
+                ignore_seen=True,
+                age_max_seconds=int(self._low_flow_relaxed_age_cap_seconds),
+                min_liquidity_usd=float(self._low_flow_relaxed_min_liquidity_usd),
+            )
+            relaxed_gecko: list[dict[str, Any]] = []
+            if int(self._low_flow_gecko_pages) > 0:
+                relaxed_gecko = await self._fetch_from_geckoterminal_api(
+                    pages=int(self._low_flow_gecko_pages),
+                    ignore_seen=True,
+                    age_max_seconds=int(self._low_flow_relaxed_age_cap_seconds),
+                    min_liquidity_usd=float(self._low_flow_relaxed_min_liquidity_usd),
+                )
+            relaxed_boosts: list[dict[str, Any]] = []
+            if self._low_flow_include_boosts and DEX_BOOSTS_SOURCE_ENABLED and DEX_BOOSTS_MAX_TOKENS > 0:
+                relaxed_boosts = await self._fetch_from_dex_boosts()
+
+            out = self._merge_tokens(base_tokens, relaxed_dex, relaxed_gecko, relaxed_boosts)
+            added = max(0, int(len(out)) - int(len(base_tokens)))
+            logger.info(
+                (
+                    "NON_WATCH_LOW_FLOW_BOOST base=%s added=%s total=%s "
+                    "dex=%s gecko=%s boosts=%s age_cap=%ss min_liq=%.0f force=%s"
+                ),
+                int(len(base_tokens)),
+                int(added),
+                int(len(out)),
+                int(len(relaxed_dex)),
+                int(len(relaxed_gecko)),
+                int(len(relaxed_boosts)),
+                int(self._low_flow_relaxed_age_cap_seconds),
+                float(self._low_flow_relaxed_min_liquidity_usd),
+                int(1 if force else 0),
+            )
+            return out
+        except Exception as exc:
+            logger.warning("NON_WATCH_LOW_FLOW_BOOST failed: %s", exc)
+            return list(base_tokens)
+
+    async def _fetch_from_dexscreener(
+        self,
+        *,
+        ignore_seen: bool = False,
+        age_max_seconds: int | None = None,
+        min_liquidity_usd: float | None = None,
+    ) -> list[dict[str, Any]]:
         queries = DEX_SEARCH_QUERIES or [DEX_SEARCH_QUERY]
-        tasks = [self._fetch_dex_query(query) for query in queries]
+        tasks = [
+            self._fetch_dex_query(
+                query,
+                ignore_seen=bool(ignore_seen),
+                age_max_seconds=age_max_seconds,
+                min_liquidity_usd=min_liquidity_usd,
+            )
+            for query in queries
+        ]
         result_sets = await asyncio.gather(*tasks, return_exceptions=True)
         merged: list[dict[str, Any]] = []
         for rows in result_sets:
@@ -155,13 +277,25 @@ class DexScreenerMonitor:
             merged.extend(rows)
         return merged
 
-    async def _fetch_dex_query(self, query: str) -> list[dict[str, Any]]:
+    async def _fetch_dex_query(
+        self,
+        query: str,
+        *,
+        ignore_seen: bool = False,
+        age_max_seconds: int | None = None,
+        min_liquidity_usd: float | None = None,
+    ) -> list[dict[str, Any]]:
         url = f"{DEXSCREENER_API}/search?q={query}"
         data = await self._fetch_json(url, source="dexscreener")
         if not isinstance(data, dict):
             return []
         pairs = data.get("pairs", [])
-        return self._filter_dex_pairs(pairs)
+        return self._filter_dex_pairs(
+            pairs,
+            ignore_seen=bool(ignore_seen),
+            age_max_seconds=age_max_seconds,
+            min_liquidity_usd=min_liquidity_usd,
+        )
 
     async def _ensure_gecko_ingest_started(self) -> None:
         task = self._gecko_ingest_task
@@ -263,10 +397,23 @@ class DexScreenerMonitor:
             self._gecko_drained_count += 1
         return out
 
-    async def _fetch_from_geckoterminal_api(self) -> list[dict[str, Any]]:
+    async def _fetch_from_geckoterminal_api(
+        self,
+        *,
+        pages: int | None = None,
+        ignore_seen: bool = False,
+        age_max_seconds: int | None = None,
+        min_liquidity_usd: float | None = None,
+    ) -> list[dict[str, Any]]:
         all_tokens: list[dict[str, Any]] = []
-        for page in range(1, GECKO_NEW_POOLS_PAGES + 1):
-            page_tokens = await self._fetch_gecko_page(page)
+        pages_to_fetch = max(1, int(pages if pages is not None else GECKO_NEW_POOLS_PAGES))
+        for page in range(1, pages_to_fetch + 1):
+            page_tokens = await self._fetch_gecko_page(
+                page,
+                ignore_seen=bool(ignore_seen),
+                age_max_seconds=age_max_seconds,
+                min_liquidity_usd=min_liquidity_usd,
+            )
             if not page_tokens:
                 if page == 1:
                     return []
@@ -274,7 +421,14 @@ class DexScreenerMonitor:
             all_tokens.extend(page_tokens)
         return all_tokens
 
-    async def _fetch_gecko_page(self, page: int) -> list[dict[str, Any]]:
+    async def _fetch_gecko_page(
+        self,
+        page: int,
+        *,
+        ignore_seen: bool = False,
+        age_max_seconds: int | None = None,
+        min_liquidity_usd: float | None = None,
+    ) -> list[dict[str, Any]]:
         gecko_url = (
             f"https://api.geckoterminal.com/api/v2/networks/{GECKO_NETWORK}/new_pools"
             f"?page={page}&include=base_token"
@@ -284,7 +438,13 @@ class DexScreenerMonitor:
             return []
         pools = data.get("data", [])
         included = data.get("included", [])
-        return self._filter_gecko_pools(pools, included)
+        return self._filter_gecko_pools(
+            pools,
+            included,
+            ignore_seen=bool(ignore_seen),
+            age_max_seconds=age_max_seconds,
+            min_liquidity_usd=min_liquidity_usd,
+        )
 
     async def _fetch_from_dex_boosts(self) -> list[dict[str, Any]]:
         url = "https://api.dexscreener.com/token-boosts/latest/v1"
@@ -369,7 +529,14 @@ class DexScreenerMonitor:
                     by_address[address] = token
         return list(by_address.values())
 
-    def _filter_dex_pairs(self, pairs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _filter_dex_pairs(
+        self,
+        pairs: list[dict[str, Any]],
+        *,
+        ignore_seen: bool = False,
+        age_max_seconds: int | None = None,
+        min_liquidity_usd: float | None = None,
+    ) -> list[dict[str, Any]]:
         filtered: list[dict[str, Any]] = []
 
         for pair in pairs:
@@ -387,14 +554,29 @@ class DexScreenerMonitor:
                 continue
 
             created_at = datetime.fromtimestamp(created_ms / 1000, tz=timezone.utc)
-            if not self._passes_filters(address, liquidity_usd, created_at):
+            if not self._passes_filters(
+                address,
+                liquidity_usd,
+                created_at,
+                ignore_seen=bool(ignore_seen),
+                age_max_seconds=age_max_seconds,
+                min_liquidity_usd=min_liquidity_usd,
+            ):
                 continue
 
             filtered.append(self._format_token_data(pair, created_at))
 
         return filtered
 
-    def _filter_gecko_pools(self, pools: list[dict[str, Any]], included: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _filter_gecko_pools(
+        self,
+        pools: list[dict[str, Any]],
+        included: list[dict[str, Any]],
+        *,
+        ignore_seen: bool = False,
+        age_max_seconds: int | None = None,
+        min_liquidity_usd: float | None = None,
+    ) -> list[dict[str, Any]]:
         filtered: list[dict[str, Any]] = []
         token_map = self._build_gecko_token_map(included)
 
@@ -416,7 +598,14 @@ class DexScreenerMonitor:
             if not created_at:
                 continue
 
-            if not self._passes_filters(address, liquidity_usd, created_at):
+            if not self._passes_filters(
+                address,
+                liquidity_usd,
+                created_at,
+                ignore_seen=bool(ignore_seen),
+                age_max_seconds=age_max_seconds,
+                min_liquidity_usd=min_liquidity_usd,
+            ):
                 continue
 
             now = datetime.now(timezone.utc)
@@ -446,19 +635,30 @@ class DexScreenerMonitor:
 
         return filtered
 
-    def _passes_filters(self, address: str, liquidity_usd: float, created_at: datetime) -> bool:
+    def _passes_filters(
+        self,
+        address: str,
+        liquidity_usd: float,
+        created_at: datetime,
+        *,
+        ignore_seen: bool = False,
+        age_max_seconds: int | None = None,
+        min_liquidity_usd: float | None = None,
+    ) -> bool:
         address = normalize_address(address)
         if not address:
             return False
-        if address in self.seen_tokens:
+        if (not bool(ignore_seen)) and address in self.seen_tokens:
             return False
 
-        if liquidity_usd < MIN_LIQUIDITY:
+        liq_min = max(0.0, float(min_liquidity_usd if min_liquidity_usd is not None else MIN_LIQUIDITY))
+        if liquidity_usd < liq_min:
             return False
 
         now = datetime.now(timezone.utc)
         age_seconds = (now - created_at).total_seconds()
-        if age_seconds > TOKEN_AGE_MAX:
+        age_cap = max(60, int(age_max_seconds if age_max_seconds is not None else TOKEN_AGE_MAX))
+        if age_seconds > age_cap:
             return False
 
         self.seen_tokens[address] = now.timestamp()

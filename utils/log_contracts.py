@@ -16,6 +16,7 @@ SCHEMA_LOCAL_ALERT = "local_alert.v1"
 _STAGE_PREFIX: dict[str, str] = {
     "filter_fail": "FILTER",
     "post_filters": "FILTER",
+    "flow_metrics": "FLOW",
     "quality_gate": "QUALITY",
     "plan_trade": "PLAN",
     "trade_open": "EXEC",
@@ -28,8 +29,10 @@ _STAGE_PREFIX: dict[str, str] = {
 _REASON_CODE_OVERRIDES: dict[str, str] = {
     "ev_net_low": "PLAN_EV_NET_LOW",
     "edge_low": "PLAN_EDGE_LOW",
+    "cost_dominant_edge": "PLAN_COST_DOMINANT_EDGE",
     "cooldown": "PLAN_COOLDOWN",
     "cooldown_left": "PLAN_COOLDOWN",
+    "selection_summary": "PLAN_SELECTION_SUMMARY",
     "top1_open_share_15m": "PLAN_TOP1_OPEN_SHARE_15M",
     "symbol_concentration": "PLAN_SYMBOL_CONCENTRATION",
     "source_budget": "QUALITY_SOURCE_BUDGET",
@@ -40,41 +43,71 @@ _REASON_CODE_OVERRIDES: dict[str, str] = {
     "safe_source": "PRE_SAFE_SOURCE",
     "source_disabled": "PRE_SOURCE_DISABLED",
     "watchlist_strict_guard": "PRE_WATCHLIST_STRICT_GUARD",
+    "pre_rug_guard": "PRE_RUG_GUARD",
+    "hard_contract_risk": "PRE_HARD_CONTRACT_RISK",
     "safe_age": "FILTER_SAFE_AGE",
     "safe_liquidity": "FILTER_SAFE_LIQUIDITY",
     "safe_volume": "FILTER_SAFE_VOLUME",
     "safe_change_5m": "FILTER_SAFE_CHANGE_5M",
+    "safe_pump_history": "PRE_PUMP_HISTORY_BLOCK",
     "score_min": "FILTER_SCORE_MIN",
     "safety_budget": "FILTER_SAFETY_BUDGET",
     "source_qos_symbol_cap": "FILTER_SOURCE_QOS_SYMBOL_CAP",
     "excluded_base_token": "FILTER_EXCLUDED_BASE_TOKEN",
     "address_or_duplicate": "FILTER_ADDRESS_OR_DUPLICATE",
+    "lane_split_summary": "FLOW_LANE_SPLIT_SUMMARY",
+    "watchlist_fallback_used": "FLOW_WATCHLIST_FALLBACK_USED",
     "buy_paper": "EXEC_BUY_PAPER",
     "buy_live": "EXEC_BUY_LIVE",
     "sell_fail": "EXEC_SELL_FAIL",
     "buy_fail": "EXEC_BUY_FAIL",
     "unsupported_live_route": "EXEC_UNSUPPORTED_LIVE_ROUTE",
+    "roundtrip_quote_failed": "EXEC_ROUNDTRIP_QUOTE_FAILED",
     "roundtrip_ratio": "EXEC_ROUNDTRIP_RATIO",
     "kill_switch_active": "POLICY_KILL_SWITCH_ACTIVE",
+    "proof_sell_fail": "EXIT_PROOF_SELL_FAIL",
     "no_momentum": "EXIT_NO_MOMENTUM",
     "timeout": "EXIT_TIMEOUT",
     "sl": "EXIT_STOP_LOSS",
     "weakness": "EXIT_WEAKNESS",
+    "rug_guard": "EXIT_RUG_GUARD",
 }
 
 REASON_CODE_TAXONOMY: dict[str, dict[str, str]] = {
     "PLAN_EV_NET_LOW": {"severity": "INFO", "category": "plan", "title": "Expected net edge below threshold"},
     "PLAN_EDGE_LOW": {"severity": "INFO", "category": "plan", "title": "Expected edge below threshold"},
+    "PLAN_COST_DOMINANT_EDGE": {"severity": "INFO", "category": "plan", "title": "Costs dominate expected edge"},
     "PLAN_COOLDOWN": {"severity": "INFO", "category": "plan", "title": "Cooldown active"},
+    "PLAN_SELECTION_SUMMARY": {"severity": "INFO", "category": "plan", "title": "Batch selection summary"},
     "PRE_BLACKLIST": {"severity": "WARN", "category": "precheck", "title": "Token blocked by blacklist"},
     "PRE_HONEYPOT_GUARD": {"severity": "WARN", "category": "precheck", "title": "Honeypot guard blocked token"},
+    "PRE_RUG_GUARD": {"severity": "WARN", "category": "precheck", "title": "Pre-entry anti-rug guard blocked token"},
+    "PRE_PUMP_HISTORY_BLOCK": {
+        "severity": "WARN",
+        "category": "precheck",
+        "title": "Blocked by recent pump-history anti-scam guard",
+    },
+    "PRE_HARD_CONTRACT_RISK": {
+        "severity": "WARN",
+        "category": "precheck",
+        "title": "Contract risk registry blocked token",
+    },
     "FILTER_SAFE_VOLUME": {"severity": "INFO", "category": "filter", "title": "Volume below safety floor"},
     "FILTER_SAFE_AGE": {"severity": "INFO", "category": "filter", "title": "Age below safety floor"},
     "FILTER_SCORE_MIN": {"severity": "INFO", "category": "filter", "title": "Score below minimum"},
+    "FLOW_LANE_SPLIT_SUMMARY": {"severity": "INFO", "category": "flow", "title": "Lane split flow summary"},
+    "FLOW_WATCHLIST_FALLBACK_USED": {
+        "severity": "INFO",
+        "category": "flow",
+        "title": "Watchlist fallback used in lane split",
+    },
     "EXEC_BUY_PAPER": {"severity": "INFO", "category": "execute", "title": "Paper buy opened"},
     "EXEC_BUY_LIVE": {"severity": "INFO", "category": "execute", "title": "Live buy opened"},
+    "EXEC_ROUNDTRIP_QUOTE_FAILED": {"severity": "WARN", "category": "execute", "title": "Roundtrip quote failed"},
     "EXIT_TIMEOUT": {"severity": "INFO", "category": "exit", "title": "Closed by timeout"},
     "EXIT_STOP_LOSS": {"severity": "WARN", "category": "exit", "title": "Closed by stop loss"},
+    "EXIT_RUG_GUARD": {"severity": "WARN", "category": "exit", "title": "Closed by post-entry rug guard"},
+    "EXIT_PROOF_SELL_FAIL": {"severity": "WARN", "category": "exit", "title": "Closed by proof-sell canary fail"},
 }
 
 
@@ -178,6 +211,21 @@ def reason_code_meta(code: str) -> dict[str, str]:
     }
 
 
+def _resolved_reason_code(payload: dict[str, Any]) -> str:
+    existing = str(payload.get("reason_code", "") or "").strip().upper()
+    computed = reason_code_for_event(
+        reason=payload.get("reason", ""),
+        decision_stage=payload.get("decision_stage", ""),
+        decision=payload.get("decision", ""),
+    )
+    if not existing:
+        return computed
+    if existing == "UNKNOWN" or existing.startswith("UNKNOWN_"):
+        if computed and not computed.startswith("UNKNOWN"):
+            return computed
+    return existing
+
+
 def _digest_seed(*parts: Any) -> str:
     seed = "|".join(str(p or "").strip() for p in parts)
     return hashlib.sha1(seed.encode("utf-8", errors="ignore")).hexdigest()
@@ -271,14 +319,7 @@ def candidate_decision_event(event: dict[str, Any], *, run_tag: str = "") -> dic
     payload["market_regime"] = str(payload.get("market_regime", payload.get("market_mode", "")) or "")
     payload["market_mode"] = str(payload.get("market_mode", payload.get("market_regime", "")) or "")
     payload["source"] = str(payload.get("source", payload.get("source_mode", "")) or "")
-    payload["reason_code"] = str(
-        payload.get("reason_code", "")
-        or reason_code_for_event(
-            reason=payload.get("reason", ""),
-            decision_stage=payload.get("decision_stage", ""),
-            decision=payload.get("decision", ""),
-        )
-    ).strip().upper()
+    payload["reason_code"] = str(_resolved_reason_code(payload)).strip().upper()
     meta = reason_code_meta(payload["reason_code"])
     payload["reason_severity"] = str(payload.get("reason_severity", meta.get("severity", "INFO")) or "INFO")
     payload["reason_category"] = str(payload.get("reason_category", meta.get("category", "unknown")) or "unknown")
@@ -321,14 +362,7 @@ def trade_decision_event(event: dict[str, Any], *, run_tag: str = "") -> dict[st
             payload["type"] = "close"
         elif stage_norm == "trade_partial":
             payload["type"] = "partial"
-    payload["reason_code"] = str(
-        payload.get("reason_code", "")
-        or reason_code_for_event(
-            reason=payload.get("reason", ""),
-            decision_stage=payload.get("decision_stage", ""),
-            decision=payload.get("decision", ""),
-        )
-    ).strip().upper()
+    payload["reason_code"] = str(_resolved_reason_code(payload)).strip().upper()
     meta = reason_code_meta(payload["reason_code"])
     payload["reason_severity"] = str(payload.get("reason_severity", meta.get("severity", "INFO")) or "INFO")
     payload["reason_category"] = str(payload.get("reason_category", meta.get("category", "unknown")) or "unknown")
@@ -363,14 +397,7 @@ def local_alert_event(event: dict[str, Any], *, run_tag: str = "") -> dict[str, 
     payload["reason"] = str(payload.get("reason", "") or "").strip()
     if not payload["reason"]:
         payload["reason"] = f"recommendation_{str(payload.get('recommendation', 'info')).strip().lower() or 'info'}"
-    payload["reason_code"] = str(
-        payload.get("reason_code", "")
-        or reason_code_for_event(
-            reason=payload.get("reason", ""),
-            decision_stage=payload.get("decision_stage", ""),
-            decision=payload.get("decision", ""),
-        )
-    ).strip().upper()
+    payload["reason_code"] = str(_resolved_reason_code(payload)).strip().upper()
     meta = reason_code_meta(payload["reason_code"])
     payload["reason_severity"] = str(payload.get("reason_severity", meta.get("severity", "INFO")) or "INFO")
     payload["reason_category"] = str(payload.get("reason_category", meta.get("category", "unknown")) or "unknown")

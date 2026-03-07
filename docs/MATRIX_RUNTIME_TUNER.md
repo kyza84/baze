@@ -23,7 +23,12 @@ It analyzes the latest session log window and applies small preset changes throu
 - Only allowed keys are changed (validated with `matrix_preset_guard`).
 - Runtime mutable whitelist is enforced in tuner code; out-of-scope keys are blocked and logged.
 - Protected/safety keys are blocked before validation (attempts are recorded in `blocked_actions`).
+- Hard safety families are immutable even if accidentally added to mutable/action logic:
+  - `LOCAL_ANTISCAM_*`, `ENTRY_PRE_RUG_*`, `POST_ENTRY_RUG_*`, `TOKEN_SAFETY_*`, `HONEYPOT_*`.
 - Hot-apply channel updates runtime config without restart for hot-safe keys.
+- Runtime hot-apply is accepted only when tuner lock is active and controls local controllers (`control_local_controllers=true`).
+- Stale runtime patch payloads (older than current runtime startup) are ignored by `main_local.py`.
+- Runtime patch payload must match current profile (`profile_id == run_tag`) before apply.
 - Restart is requested only for keys marked as restart-required by tuner config.
 - Preset restarts are done only when `open=0` from latest `PAPER_SUMMARY`.
 - Restart cooldown is enforced (`--restart-cooldown-seconds`).
@@ -54,6 +59,7 @@ Target policy knobs (CLI or JSON file via `--target-policy-file`):
 - `pre_risk_buy_fail_rate_15m`
 - `pre_risk_sell_fail_rate_15m`
 - `pre_risk_roundtrip_loss_median_pct_15m`
+- `pre_risk_roundtrip_min_closes_15m`
 - `tail_loss_min_closes_60m`
 - `tail_loss_ratio_max`
 - `rollback_degrade_streak`
@@ -268,3 +274,16 @@ Expected effect:
 - fewer wasted plan slots on non-openable duplicates,
 - clearer split between conversion bottleneck vs economics bottleneck,
 - safer tuning decisions because immutable/protected keys are filtered early and auditable.
+
+## Phase C Stabilization (New)
+
+- Hold-phase escape now permits lane-recovery actions for:
+  - `non_watch_conversion_guard`
+  - `prefilter_plan_choke`
+- Pre-risk roundtrip gate now requires minimum closes (`pre_risk_roundtrip_min_closes_15m`) before it can trigger pre-risk tighten.
+- Degrade/rollback streak logic now ignores roundtrip-only pre-risk pressure while non-watch conversion is already improving in-window.
+
+Expected effect:
+
+- Fewer false rollbacks while non-watch lane is recovering.
+- Less phase deadlock in `hold` with actionable non-watch conversion signals.

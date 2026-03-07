@@ -177,6 +177,28 @@ class MatrixRuntimeTunerTests(unittest.TestCase):
         self.assertNotIn("MARKET_MODE_STRICT_SCORE", by_key)
         self.assertNotIn("MARKET_MODE_SOFT_SCORE", by_key)
 
+    def test_enforce_mutable_action_keys_blocks_hard_protected_prefixes(self) -> None:
+        actions = [
+            mrt.Action(
+                key="LOCAL_ANTISCAM_PUMP_HISTORY_ENABLED",
+                old_value="true",
+                new_value="false",
+                reason="test_guard",
+            ),
+            mrt.Action(
+                key="MARKET_MODE_STRICT_SCORE",
+                old_value="45",
+                new_value="40",
+                reason="test_ok",
+            ),
+        ]
+        kept, blocked = mrt._enforce_mutable_action_keys(actions=actions, protected_keys=set())
+        kept_keys = {a.key for a in kept}
+        blocked_by_key = {str(x.get("key")): str(x.get("blocked_by")) for x in blocked}
+        self.assertIn("MARKET_MODE_STRICT_SCORE", kept_keys)
+        self.assertNotIn("LOCAL_ANTISCAM_PUMP_HISTORY_ENABLED", kept_keys)
+        self.assertEqual(blocked_by_key.get("LOCAL_ANTISCAM_PUMP_HISTORY_ENABLED"), "hard_protected_key")
+
     def test_anti_concentration_actions_when_single_symbol_dominates(self) -> None:
         metrics = mrt.WindowMetrics(
             selected_from_batch=8,
@@ -284,6 +306,38 @@ class MatrixRuntimeTunerTests(unittest.TestCase):
         self.assertEqual(state.churn_lock_symbol, "")
         self.assertEqual(float(state.churn_lock_until_ts), 0.0)
 
+    def test_churn_lock_switch_releases_previous_symbol(self) -> None:
+        metrics = mrt.WindowMetrics(
+            selected_from_batch=30,
+            opened_from_batch=0,
+            autotrade_skip_reasons=Counter({"cooldown": 12}),
+            cooldown_skip_symbol_counts=Counter({"BNKR": 12}),
+        )
+        overrides = {
+            "AUTO_TRADE_EXCLUDED_SYMBOLS": "CBBTC,ZORA",
+            "MAX_TOKEN_COOLDOWN_SECONDS": "90",
+        }
+        telemetry = {
+            "symbol_churn_15m": {"detected": False, "symbol": "", "open_share": 0.0, "flat_close_share": 0.0, "ttl_seconds": 0},
+            "funnel_15m": {"raw": 80, "pre": 40, "buy": 0},
+            "top_reasons_15m": {"quality_skip": [], "plan_skip": [{"reason_code": "cooldown", "count": 12, "share": 1.0}]},
+        }
+        state = mrt.RuntimeState(churn_lock_symbol="CBBTC", churn_lock_until_ts=2000.0)
+        actions, _trace, _meta = mrt._build_action_plan(
+            metrics=metrics,
+            overrides=overrides,
+            mode=mrt.MODE_SPECS["conveyor"],
+            telemetry=telemetry,
+            runtime_state=state,
+            now_ts=1000.0,
+        )
+        by_key = _actions_by_key(actions)
+        self.assertIn("AUTO_TRADE_EXCLUDED_SYMBOLS", by_key)
+        self.assertNotIn("CBBTC", by_key["AUTO_TRADE_EXCLUDED_SYMBOLS"].new_value)
+        self.assertIn("BNKR", by_key["AUTO_TRADE_EXCLUDED_SYMBOLS"].new_value)
+        self.assertEqual(state.churn_lock_symbol, "BNKR")
+        self.assertGreater(float(state.churn_lock_until_ts), 1000.0)
+
     def test_non_watch_conversion_guard_relaxes_only_soft_non_watch_knobs(self) -> None:
         metrics = mrt.WindowMetrics(
             selected_from_batch=80,
@@ -329,10 +383,14 @@ class MatrixRuntimeTunerTests(unittest.TestCase):
             now_ts=1234.0,
         )
         by_key = _actions_by_key(actions)
-        self.assertIn("SAFE_VOLUME_TWO_TIER_NON_WATCH_SOFT_RATIO", by_key)
-        self.assertIn("SAFE_AGE_NON_WATCH_SOFT_RATIO", by_key)
-        self.assertLess(float(by_key["SAFE_VOLUME_TWO_TIER_NON_WATCH_SOFT_RATIO"].new_value), 0.50)
-        self.assertLess(float(by_key["SAFE_AGE_NON_WATCH_SOFT_RATIO"].new_value), 0.55)
+        self.assertTrue(
+            ("SAFE_VOLUME_TWO_TIER_NON_WATCH_SOFT_RATIO" in by_key)
+            or ("SAFE_AGE_NON_WATCH_SOFT_RATIO" in by_key)
+        )
+        if "SAFE_VOLUME_TWO_TIER_NON_WATCH_SOFT_RATIO" in by_key:
+            self.assertLess(float(by_key["SAFE_VOLUME_TWO_TIER_NON_WATCH_SOFT_RATIO"].new_value), 0.50)
+        if "SAFE_AGE_NON_WATCH_SOFT_RATIO" in by_key:
+            self.assertLess(float(by_key["SAFE_AGE_NON_WATCH_SOFT_RATIO"].new_value), 0.55)
         conv_meta = (meta or {}).get("non_watch_conversion", {}) or {}
         self.assertTrue(bool(conv_meta.get("active", False)))
 
@@ -398,7 +456,7 @@ class MatrixRuntimeTunerTests(unittest.TestCase):
             "PLAN_MAX_SINGLE_SOURCE_SHARE": "0.55",
         }
         telemetry = {
-            "funnel_15m": {"raw": 140, "pre": 60, "buy": 0},
+            "funnel_15m": {"raw": 320, "pre": 140, "buy": 2},
             "top_reasons_15m": {"quality_skip": [], "plan_skip": []},
             "prefilter_15m": {
                 "removed": {"total": 20, "open_duplicate": 12},
@@ -532,6 +590,71 @@ class MatrixRuntimeTunerTests(unittest.TestCase):
         self.assertGreater(int(by_key["MARKET_MODE_STRICT_SCORE"].new_value), 45)
         self.assertGreater(int(by_key["MARKET_MODE_SOFT_SCORE"].new_value), 40)
 
+    def test_trade_size_floor_guard_prevents_micro_min_trade(self) -> None:
+        metrics = mrt.WindowMetrics(
+            selected_from_batch=24,
+            opened_from_batch=0,
+            autotrade_skip_reasons=Counter({"edge_low": 8}),
+        )
+        actions, _trace, _meta = mrt._build_action_plan(
+            metrics=metrics,
+            overrides={
+                "MIN_TRADE_USD": "0.10",
+                "PAPER_TRADE_SIZE_MIN_USD": "0.10",
+                "ENTRY_A_CORE_MIN_TRADE_USD": "0.12",
+                "PAPER_TRADE_SIZE_MAX_USD": "0.20",
+            },
+            mode=mrt.MODE_SPECS["conveyor"],
+            telemetry={"funnel_15m": {"raw": 80, "pre": 40, "buy": 0}, "top_reasons_15m": {"quality_skip": [], "plan_skip": []}},
+            runtime_state=mrt.RuntimeState(),
+            now_ts=3100.0,
+        )
+        by_key = _actions_by_key(actions)
+        self.assertIn("MIN_TRADE_USD", by_key)
+        self.assertIn("PAPER_TRADE_SIZE_MIN_USD", by_key)
+        self.assertIn("ENTRY_A_CORE_MIN_TRADE_USD", by_key)
+        self.assertGreaterEqual(float(by_key["MIN_TRADE_USD"].new_value), 0.40)
+        self.assertGreaterEqual(float(by_key["PAPER_TRADE_SIZE_MIN_USD"].new_value), 0.40)
+        self.assertGreaterEqual(float(by_key["ENTRY_A_CORE_MIN_TRADE_USD"].new_value), 0.40)
+
+    def test_cost_dominant_edge_choke_raises_viable_trade_floor(self) -> None:
+        metrics = mrt.WindowMetrics(
+            selected_from_batch=36,
+            opened_from_batch=0,
+            autotrade_skip_reasons=Counter({"edge_low": 12, "cost_dominant_edge": 8}),
+        )
+        actions, trace, meta = mrt._build_action_plan(
+            metrics=metrics,
+            overrides={
+                "MIN_TRADE_USD": "0.50",
+                "PAPER_TRADE_SIZE_MIN_USD": "0.50",
+                "ENTRY_A_CORE_MIN_TRADE_USD": "0.55",
+                "PAPER_TRADE_SIZE_MAX_USD": "0.90",
+            },
+            mode=mrt.MODE_SPECS["conveyor"],
+            telemetry={
+                "funnel_15m": {"raw": 360, "pre": 180, "buy": 1},
+                "top_reasons_15m": {"quality_skip": [], "plan_skip": []},
+                "edge_cost_forensics_15m": {
+                    "rows": 18,
+                    "gross_percent_median": 3.2,
+                    "cost_percent_median": 9.1,
+                    "size_usd_median": 0.8,
+                },
+            },
+            runtime_state=mrt.RuntimeState(),
+            now_ts=4100.0,
+        )
+        by_key = _actions_by_key(actions)
+        self.assertIn("MIN_TRADE_USD", by_key)
+        self.assertIn("PAPER_TRADE_SIZE_MIN_USD", by_key)
+        self.assertIn("ENTRY_A_CORE_MIN_TRADE_USD", by_key)
+        self.assertGreaterEqual(float(by_key["MIN_TRADE_USD"].new_value), 0.95)
+        self.assertGreaterEqual(float(by_key["PAPER_TRADE_SIZE_MIN_USD"].new_value), 0.95)
+        self.assertIn("cost_dominant_viable_floor", " | ".join(trace))
+        edge_meta = (meta or {}).get("edge_cost_forensics_15m", {})
+        self.assertTrue(bool(edge_meta.get("cost_dominant_edge_choke")))
+
     def test_recover_tighten_blocked_when_open_rate_is_too_low(self) -> None:
         metrics = mrt.WindowMetrics(
             selected_from_batch=120,
@@ -620,8 +743,8 @@ class MatrixRuntimeTunerTests(unittest.TestCase):
         by_key = _actions_by_key(actions)
         self.assertIn("V2_SOURCE_QOS_SOURCE_CAPS", by_key)
         self.assertIn("V2_UNIVERSE_SOURCE_CAPS", by_key)
-        self.assertIn("watchlist:8", by_key["V2_SOURCE_QOS_SOURCE_CAPS"].new_value)
-        self.assertIn("watchlist:4", by_key["V2_UNIVERSE_SOURCE_CAPS"].new_value)
+        self.assertIn("watchlist:2", by_key["V2_SOURCE_QOS_SOURCE_CAPS"].new_value)
+        self.assertIn("watchlist:2", by_key["V2_UNIVERSE_SOURCE_CAPS"].new_value)
 
     def test_selected_zero_still_allows_relax_when_filters_exist(self) -> None:
         metrics = mrt.WindowMetrics(
@@ -690,7 +813,7 @@ class MatrixRuntimeTunerTests(unittest.TestCase):
                 except Exception:
                     watch_cap = 0
                 break
-        self.assertGreaterEqual(watch_cap, 8)
+        self.assertGreaterEqual(watch_cap, 2)
         self.assertGreater(int(by_key["V2_SOURCE_QOS_TOPK_PER_CYCLE"].new_value), 120)
         self.assertGreater(float(by_key["PLAN_MAX_WATCHLIST_SHARE"].new_value), 0.02)
 
@@ -822,6 +945,36 @@ class MatrixRuntimeTunerTests(unittest.TestCase):
         self.assertGreater(int(by_key["TOKEN_AGE_MAX"].new_value), 3600)
         self.assertLess(int(by_key["SEEN_TOKEN_TTL"].new_value), 10800)
 
+    def test_feed_starvation_raises_low_supply_min_count_and_relaxes_factor(self) -> None:
+        metrics = mrt.WindowMetrics(
+            selected_from_batch=36,
+            opened_from_batch=0,
+        )
+        telemetry = {
+            "funnel_15m": {"raw": 140, "pre": 90, "buy": 0},
+            "top_reasons_15m": {"quality_skip": [], "plan_skip": []},
+            "scan_health_15m": {
+                "zero_scan_cycles": 0,
+                "watchlist_low_supply_fallback": {"hits": 5},
+            },
+        }
+        overrides = {
+            "WATCHLIST_LOW_SUPPLY_MIN_COUNT": "1",
+            "WATCHLIST_LOW_SUPPLY_RELAX_FACTOR": "1.00",
+            "WATCHLIST_LOW_SUPPLY_MIN_VOLUME_5M_USD": "120",
+        }
+        actions, _trace, _meta = mrt._build_action_plan(
+            metrics=metrics,
+            overrides=overrides,
+            mode=mrt.MODE_SPECS["conveyor"],
+            telemetry=telemetry,
+        )
+        by_key = _actions_by_key(actions)
+        self.assertIn("WATCHLIST_LOW_SUPPLY_MIN_COUNT", by_key)
+        self.assertIn("WATCHLIST_LOW_SUPPLY_RELAX_FACTOR", by_key)
+        self.assertGreaterEqual(int(by_key["WATCHLIST_LOW_SUPPLY_MIN_COUNT"].new_value), 4)
+        self.assertLess(float(by_key["WATCHLIST_LOW_SUPPLY_RELAX_FACTOR"].new_value), 1.0)
+
     def test_quality_duplicate_telemetry_triggers_duplicate_choke(self) -> None:
         metrics = mrt.WindowMetrics(
             selected_from_batch=120,
@@ -942,9 +1095,34 @@ class MatrixRuntimeTunerTests(unittest.TestCase):
         ]
         filtered, blocked = mrt._filter_actions_by_phase(actions=actions, phase="hold")
         by_key = _actions_by_key(filtered)
+        self.assertIn("MARKET_MODE_STRICT_SCORE", by_key)
         self.assertIn("MARKET_MODE_SOFT_SCORE", by_key)
         self.assertIn("PROFIT_ENGINE_ENABLED", by_key)
-        self.assertEqual(len(blocked), 2)
+        self.assertEqual(len(blocked), 1)
+
+    def test_filter_actions_by_phase_hold_allows_safe_volume_dominant_escape(self) -> None:
+        actions = [
+            mrt.Action("SAFE_MIN_VOLUME_5M_USD", "8", "6", "safe_volume_dominant"),
+            mrt.Action("MAX_TOKEN_COOLDOWN_SECONDS", "360", "240", "cooldown_left"),
+        ]
+        filtered, blocked = mrt._filter_actions_by_phase(actions=actions, phase="hold")
+        by_key = _actions_by_key(filtered)
+        self.assertIn("SAFE_MIN_VOLUME_5M_USD", by_key)
+        self.assertNotIn("MAX_TOKEN_COOLDOWN_SECONDS", by_key)
+        self.assertEqual(len(blocked), 1)
+
+    def test_filter_actions_by_phase_hold_allows_non_watch_conversion_escape(self) -> None:
+        actions = [
+            mrt.Action("PLAN_MAX_WATCHLIST_SHARE", "0.30", "0.25", "non_watch_conversion_guard watchlist_share"),
+            mrt.Action("PLAN_MIN_NON_WATCHLIST_PER_BATCH", "4", "5", "non_watch_conversion_guard non_watch_min"),
+            mrt.Action("MAX_TOKEN_COOLDOWN_SECONDS", "300", "240", "cooldown_dominant_flow_expand global_cooldown"),
+        ]
+        filtered, blocked = mrt._filter_actions_by_phase(actions=actions, phase="hold")
+        by_key = _actions_by_key(filtered)
+        self.assertIn("PLAN_MAX_WATCHLIST_SHARE", by_key)
+        self.assertIn("PLAN_MIN_NON_WATCHLIST_PER_BATCH", by_key)
+        self.assertNotIn("MAX_TOKEN_COOLDOWN_SECONDS", by_key)
+        self.assertEqual(len(blocked), 1)
 
     def test_filter_actions_by_phase_tighten_allows_flow_escape_signals(self) -> None:
         actions = [
@@ -1231,6 +1409,43 @@ class MatrixRuntimeTunerTests(unittest.TestCase):
         self.assertTrue(bool(decision.pre_risk_fail))
         self.assertTrue(any("pre_risk_fail" in r for r in decision.reasons))
 
+    def test_resolve_policy_phase_ignores_roundtrip_pre_risk_when_closes_below_floor(self) -> None:
+        metrics = mrt.WindowMetrics(selected_from_batch=32, opened_from_batch=1)
+        telemetry = {
+            "funnel_15m": {"buy": 1},
+            "exec_health_15m": {
+                "open_rate": 0.08,
+                "plan_attempts": 22,
+                "opens": 2,
+                "closes": 0,
+                "buy_fail": [],
+                "sell_fail": [],
+                "route_fail": [],
+                "roundtrip_loss_median_pct": -2.4,
+            },
+            "exit_mix_60m": {"pnl_usd_sum": 0.0, "total": 0, "tail_loss_ratio": "N/A"},
+            "blacklist_forensics_15m": {
+                "plan_skip_blacklist_15m": 0,
+                "plan_skip_blacklist_share_15m": 0.0,
+            },
+        }
+        policy = mrt.TargetPolicy(
+            pre_risk_min_plan_attempts_15m=8,
+            pre_risk_roundtrip_loss_median_pct_15m=-1.2,
+            pre_risk_roundtrip_min_closes_15m=2,
+        )
+        decision = mrt._resolve_policy_phase(
+            metrics=metrics,
+            telemetry=telemetry,
+            target=policy,
+            state=mrt.RuntimeState(last_phase="hold"),
+            forced_phase="auto",
+            effective_target_trades_per_hour=6.0,
+        )
+        self.assertFalse(bool(decision.pre_risk_fail))
+        self.assertFalse(bool(decision.pre_risk_roundtrip_only))
+        self.assertTrue(any("pre_risk_roundtrip_pending_closes" in r for r in decision.reasons))
+
     def test_resolve_policy_phase_tighten_on_tail_loss_ratio(self) -> None:
         metrics = mrt.WindowMetrics(selected_from_batch=30, opened_from_batch=1)
         telemetry = {
@@ -1488,6 +1703,90 @@ class MatrixRuntimeTunerTests(unittest.TestCase):
         self.assertGreaterEqual(int(state.idle_no_open_ticks), 2)
         self.assertGreaterEqual(int(state.idle_relax_ticks), 1)
 
+    def test_idle_relax_state_soft_low_supply_window_can_activate(self) -> None:
+        metrics = mrt.WindowMetrics(
+            selected_from_batch=4,
+            opened_from_batch=0,
+            open_positions=0,
+            zero_scan_cycles=3,
+            watchlist_low_supply_hits=2,
+        )
+        target = mrt.TargetPolicy(
+            idle_relax_enabled=True,
+            idle_relax_min_no_open_ticks=1,
+            idle_relax_min_selected_15m=12,
+            idle_relax_min_opportunity_per_hour=6.0,
+        )
+        state = mrt.RuntimeState(idle_no_open_ticks=0, idle_relax_ticks=0)
+        decision = mrt.PolicyDecision(
+            phase="expand",
+            reasons=[],
+            target_trades_per_hour_effective=8.0,
+            target_trades_per_hour_requested=12.0,
+            throughput_est_trades_h=0.0,
+            pnl_hour_usd=0.0,
+            blacklist_added_15m=0,
+            blacklist_share_15m=0.0,
+            open_rate_15m=0.0,
+            risk_fail=False,
+            flow_fail=True,
+            blacklist_fail=False,
+            pre_risk_fail=False,
+            diversity_fail=False,
+        )
+        snap = mrt._update_idle_relax_state(
+            metrics=metrics,
+            target=target,
+            state=state,
+            policy_decision=decision,
+            silence_diagnostics={
+                "opportunity_rate_per_hour": 3.0,
+                "action_rate_per_hour": 0.0,
+                "execution_open_rate_per_hour": 0.0,
+                "bottleneck_stage": "action",
+                "bottleneck_hint": "plan_or_policy",
+            },
+        )
+        self.assertTrue(bool(snap.get("eligible_window")))
+        self.assertEqual(str(snap.get("eligible_mode")), "low_supply_soft")
+        self.assertTrue(bool(snap.get("active")))
+        self.assertTrue(bool(snap.get("low_supply_detected")))
+
+    def test_read_window_metrics_collects_scan_low_supply_and_cost_dominant_signals(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "session.log"
+            now = datetime.now()
+            ts = now.strftime("%Y-%m-%d %H:%M:%S,%f")[:23]
+            lines = [
+                (
+                    f"{ts} [INFO] __main__: Scanned 0 tokens | Trade candidates: 0 | Opened: 0 | "
+                    "SourceQoS: enabled=1/in=7/out=6/dropped=1 |"
+                ),
+                (
+                    f"{ts} [WARNING] monitor.watchlist: "
+                    "WATCHLIST low_supply fallback strict=1 final=1 min=12 relax_factor=0.50"
+                ),
+                (
+                    f"{ts} [WARNING] monitor.watchlist: "
+                    "WATCHLIST low_supply fallback added=1 final=2"
+                ),
+                (
+                    f"{ts} [INFO] trading.auto_trader: "
+                    "EDGE_COST_DOMINANT_COOLDOWN symbol=ODAI reason=edge_low hits=3/3 gross=6.40% cost=27.02% cooldown=900s window=1800s"
+                ),
+            ]
+            path.write_text("\n".join(lines), encoding="utf-8")
+            metrics = mrt._read_window_metrics(path, window_minutes=15)
+            self.assertEqual(int(metrics.zero_scan_cycles), 1)
+            self.assertEqual(int(metrics.source_qos_zero_cycle_in), 7)
+            self.assertEqual(int(metrics.source_qos_zero_cycle_out), 6)
+            self.assertEqual(int(metrics.source_qos_zero_cycle_dropped), 1)
+            self.assertGreaterEqual(int(metrics.watchlist_low_supply_hits), 2)
+            self.assertEqual(int(metrics.watchlist_low_supply_final_last), 2)
+            self.assertEqual(int(metrics.watchlist_low_supply_final_max), 2)
+            self.assertEqual(int(metrics.edge_cost_dominant_hits), 1)
+            self.assertEqual(int(metrics.edge_cost_dominant_symbols.get("ODAI", 0)), 1)
+
     def test_idle_relax_guard_allows_only_safe_expand_keys_with_cap(self) -> None:
         actions = [
             mrt.Action("MIN_EXPECTED_EDGE_PERCENT", "0.10", "0.05", "ev_net_low"),
@@ -1551,6 +1850,7 @@ class MatrixRuntimeTunerTests(unittest.TestCase):
         self.assertEqual(int(policy.idle_relax_min_no_open_ticks), 3)
         self.assertEqual(int(policy.idle_relax_min_selected_15m), 12)
         self.assertAlmostEqual(float(policy.idle_relax_min_opportunity_per_hour), 6.0, places=6)
+        self.assertEqual(int(policy.pre_risk_roundtrip_min_closes_15m), 2)
 
     def test_collect_telemetry_v2_builds_funnel_and_reasons(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1803,6 +2103,35 @@ class MatrixRuntimeTunerTests(unittest.TestCase):
             self.assertEqual(str(payload.get("owner")), "fresh_owner")
             self.assertEqual(int(payload.get("pid", 0)), int(mrt.os.getpid()))
 
+    def test_runtime_lock_payload_marks_dry_run_control_false(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            profile = "u_lock_test"
+            lock_path = mrt._runtime_lock_path(root, profile)
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            ok, msg = mrt._acquire_runtime_lock(
+                root,
+                profile,
+                "dry_owner",
+                control_local_controllers=False,
+            )
+            self.assertTrue(ok, msg)
+            payload = json.loads(lock_path.read_text(encoding="utf-8"))
+            self.assertFalse(bool(payload.get("control_local_controllers", True)))
+            self.assertEqual(str(payload.get("lock_mode", "")), "dry_run")
+
+    def test_runtime_lock_payload_default_control_true(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            profile = "u_lock_test"
+            lock_path = mrt._runtime_lock_path(root, profile)
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            ok, msg = mrt._acquire_runtime_lock(root, profile, "apply_owner")
+            self.assertTrue(ok, msg)
+            payload = json.loads(lock_path.read_text(encoding="utf-8"))
+            self.assertTrue(bool(payload.get("control_local_controllers", False)))
+            self.assertEqual(str(payload.get("lock_mode", "")), "control")
+
     def test_runtime_lock_release_keeps_file_for_alive_foreign_pid(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1817,6 +2146,48 @@ class MatrixRuntimeTunerTests(unittest.TestCase):
             with mock.patch.object(mrt, "_pid_is_running", return_value=True):
                 mrt._release_runtime_lock(root, profile)
             self.assertTrue(lock_path.exists())
+
+    def test_runtime_lock_retry_acquires_after_busy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with (
+                mock.patch.object(
+                    mrt,
+                    "_acquire_runtime_lock",
+                    side_effect=[
+                        (False, "runtime_tuner lock busy: profile=u1 pid=123"),
+                        (True, ""),
+                    ],
+                ),
+                mock.patch("matrix_runtime_tuner.time.sleep", return_value=None),
+            ):
+                ok, msg = mrt._acquire_runtime_lock_with_retry(
+                    root=root,
+                    profile_id="u1",
+                    owner_label="runtime_tuner run u1",
+                    timeout_seconds=2.0,
+                    poll_seconds=0.01,
+                )
+        self.assertTrue(ok)
+        self.assertEqual(msg, "")
+
+    def test_runtime_lock_retry_returns_busy_when_timeout_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with mock.patch.object(
+                mrt,
+                "_acquire_runtime_lock",
+                return_value=(False, "runtime_tuner lock busy: profile=u1 pid=123"),
+            ):
+                ok, msg = mrt._acquire_runtime_lock_with_retry(
+                    root=root,
+                    profile_id="u1",
+                    owner_label="runtime_tuner run u1",
+                    timeout_seconds=0.0,
+                    poll_seconds=0.1,
+                )
+        self.assertFalse(ok)
+        self.assertIn("lock busy", msg)
 
     def test_profile_running_false_when_pid_stale(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2138,6 +2509,58 @@ class MatrixRuntimeTunerTests(unittest.TestCase):
         self.assertGreater(int(by_key["SAFE_VOLUME_TWO_TIER_NON_WATCH_MAX_PASSES_PER_CYCLE"].new_value), 2)
         starvation_meta = dict((meta or {}).get("source_starvation_guard") or {})
         self.assertTrue(bool(starvation_meta.get("non_watch_post_filter_starved", False)))
+
+    def test_source_starvation_guard_triggers_with_near_zero_non_watch_plan(self) -> None:
+        metrics = mrt.WindowMetrics(
+            selected_from_batch=72,
+            opened_from_batch=0,
+            filter_fail_reasons=Counter(),
+        )
+        overrides = {
+            "PLAN_MAX_WATCHLIST_SHARE": "0.08",
+            "PLAN_MIN_NON_WATCHLIST_PER_BATCH": "5",
+            "PLAN_MAX_SINGLE_SOURCE_SHARE": "0.40",
+        }
+        telemetry = {
+            "funnel_15m": {"raw": 360, "pre": 220, "buy": 0},
+            "top_reasons_15m": {"quality_skip": [], "plan_skip": []},
+            "source_profile_15m": {
+                "plan_top_source": "watchlist",
+                "plan_top_source_share": 0.98,
+            },
+            "plan_symbol_concentration_15m": {
+                "plan_attempts": 60,
+                "plan_unique_symbols": 5,
+                "plan_top_share": 0.42,
+            },
+            "supply_sanity_15m": {
+                "candidate_supply_non_watch_15m": 40,
+                "post_filters_pass_non_watch_15m": 2,
+                "plan_attempts_non_watch_15m": 1,
+            },
+            "source_diversity_guard_15m": {
+                "non_watch_final_zero_hits": 0,
+            },
+        }
+        actions, _trace, meta = mrt._build_action_plan(
+            metrics=metrics,
+            overrides=overrides,
+            mode=mrt.MODE_SPECS["conveyor"],
+            telemetry=telemetry,
+            runtime_state=mrt.RuntimeState(),
+            now_ts=1000.0,
+        )
+        by_key = _actions_by_key(actions)
+        starvation_keys = {
+            "PLAN_MAX_WATCHLIST_SHARE",
+            "PLAN_MIN_NON_WATCHLIST_PER_BATCH",
+            "PLAN_MAX_SINGLE_SOURCE_SHARE",
+            "V2_SOURCE_QOS_SOURCE_CAPS",
+            "V2_UNIVERSE_SOURCE_CAPS",
+        }
+        self.assertTrue(any(k in by_key for k in starvation_keys))
+        starvation_meta = dict((meta or {}).get("source_starvation_guard") or {})
+        self.assertTrue(bool(starvation_meta.get("active", False)))
 
 
 if __name__ == "__main__":

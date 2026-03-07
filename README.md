@@ -33,6 +33,7 @@
 - изменяет только разрешённые mutable-ключи;
 - использует rollback к стабильному набору при деградации;
 - поддерживает `idle-relax` для controlled-расширения в простое;
+- hot-apply применяет runtime patch только при активном lock тюнера (`control_local_controllers=true`) и игнорирует stale patch;
 - не имеет права отключать hard anti-scam и safety guard.
 
 ## Логи и данные
@@ -104,3 +105,11 @@ python -m unittest discover -s tests -p "test_*.py" -v
 - Hardened matrix watchdog in `tools/matrix_watchdog.py`:
   - follow-lock to prevent duplicate watchdog workers,
   - stale restart requires both heartbeat age and runtime activity age.
+
+## Recent Update: Runtime Hot-Apply Lock Guard (2026-03-07)
+- `main_local.py`:
+  - hot-apply now requires active tuner lock (`RUNTIME_TUNER_HOT_APPLY_REQUIRE_ACTIVE_LOCK=true` by default),
+  - ignores stale `runtime_tuner_runtime_overrides.json` payloads by patch timestamp,
+  - validates patch `profile_id` against current `run_tag` before applying overrides.
+- Effect:
+  - old dry-run/runtime patch files can no longer overwrite fresh preset/active overrides after restart.

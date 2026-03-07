@@ -52,14 +52,9 @@ if ($Run) {
       }
     }
     try {
-      $syncPsi = New-Object System.Diagnostics.ProcessStartInfo
-      $syncPsi.FileName = $python
-      $syncPsi.Arguments = "tools/unified_dataset_sync.py --root . --follow --loop-seconds 45"
-      $syncPsi.WorkingDirectory = $root
-      $syncPsi.UseShellExecute = $false
-      $syncPsi.RedirectStandardOutput = $false
-      $syncPsi.RedirectStandardError = $false
-      $syncProc = [System.Diagnostics.Process]::Start($syncPsi)
+      $syncArgs = @("tools/unified_dataset_sync.py","--root",".","--follow","--loop-seconds","45")
+      # Run detached/hidden: avoids console QuickEdit blocking background workers.
+      $syncProc = Start-Process -FilePath $python -ArgumentList $syncArgs -WorkingDirectory $root -WindowStyle Hidden -PassThru
       if ($syncProc -and -not $syncProc.HasExited) {
         Write-Host ("Unified dataset sync started pid={0}" -f [int]$syncProc.Id)
       }
@@ -84,14 +79,19 @@ if ($Run) {
       }
     }
     try {
-      $wdPsi = New-Object System.Diagnostics.ProcessStartInfo
-      $wdPsi.FileName = $python
-      $wdPsi.Arguments = "tools/matrix_watchdog.py --root . --follow --loop-seconds 20 --stale-seconds 360 --restart-cooldown-seconds 120 --watch-tuner --tuner-stale-seconds 420 --tuner-restart-cooldown-seconds 300"
-      $wdPsi.WorkingDirectory = $root
-      $wdPsi.UseShellExecute = $false
-      $wdPsi.RedirectStandardOutput = $false
-      $wdPsi.RedirectStandardError = $false
-      $wdProc = [System.Diagnostics.Process]::Start($wdPsi)
+      $wdArgs = @(
+        "tools/matrix_watchdog.py",
+        "--root",".",
+        "--follow",
+        "--loop-seconds","20",
+        "--stale-seconds","360",
+        "--restart-cooldown-seconds","120",
+        "--watch-tuner",
+        "--tuner-stale-seconds","420",
+        "--tuner-restart-cooldown-seconds","300"
+      )
+      # Run detached/hidden: watchdog must not depend on interactive console focus.
+      $wdProc = Start-Process -FilePath $python -ArgumentList $wdArgs -WorkingDirectory $root -WindowStyle Hidden -PassThru
       if ($wdProc -and -not $wdProc.HasExited) {
         Write-Host ("Matrix watchdog started pid={0}" -f [int]$wdProc.Id)
       }

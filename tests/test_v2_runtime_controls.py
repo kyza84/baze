@@ -873,6 +873,7 @@ class QualityGateTests(ConfigPatchMixin, unittest.TestCase):
             V2_QUALITY_EXPLORE_MIN_ABS=0,
             V2_QUALITY_COOLDOWN_PROBE_PROBABILITY=0.0,
             V2_QUALITY_SYMBOL_MAX_SHARE=1.0,
+            V2_QUALITY_NON_WATCH_RESCUE_ENABLED=False,
         )
         q = UniverseQualityGateController()
         now = datetime.now(timezone.utc)
@@ -947,6 +948,127 @@ class QualityGateTests(ConfigPatchMixin, unittest.TestCase):
         out, _meta = q.filter_candidates(candidates=rows, auto_trader=trader, market_mode="YELLOW")
         self.assertEqual(len(out), 5)
 
+    def test_quality_gate_non_watch_rescue_replaces_watchlist_rows(self) -> None:
+        self.patch_cfg(
+            V2_QUALITY_GATE_ENABLED=True,
+            V2_QUALITY_REFRESH_SECONDS=60,
+            V2_QUALITY_WINDOW_SECONDS=3600,
+            V2_QUALITY_MIN_SYMBOL_TRADES=99,
+            V2_QUALITY_MIN_CLUSTER_TRADES=99,
+            V2_QUALITY_EXPLORE_MAX_SHARE=1.0,
+            V2_QUALITY_EXPLORE_MIN_ABS=0,
+            V2_QUALITY_COOLDOWN_PROBE_PROBABILITY=0.0,
+            V2_QUALITY_SOURCE_BUDGET_ENABLED=True,
+            V2_QUALITY_SOURCE_MIN_TRADES=1,
+            V2_QUALITY_SOURCE_BAD_AVG_PNL_USD=-0.0010,
+            V2_QUALITY_SOURCE_SEVERE_AVG_PNL_USD=-0.0020,
+            V2_QUALITY_SOURCE_BAD_ENTRY_PROBABILITY=0.0,
+            V2_QUALITY_SOURCE_SEVERE_ENTRY_PROBABILITY=0.0,
+            V2_QUALITY_SOURCE_COOLDOWN_IN_RED_MULT=1.0,
+            V2_QUALITY_SYMBOL_MAX_SHARE=1.0,
+            V2_QUALITY_SOURCE_CAP_SOFT_FILL_ENABLED=True,
+            V2_QUALITY_NON_WATCH_RESCUE_ENABLED=True,
+            V2_QUALITY_NON_WATCH_MIN_OUT_ABS=2,
+            V2_QUALITY_NON_WATCH_MIN_OUT_SHARE=0.34,
+            V2_QUALITY_WATCHLIST_MAX_OUT_SHARE=0.66,
+            V2_QUALITY_NON_WATCH_RESCUE_MAX_REPLACEMENTS=2,
+            V2_QUALITY_NON_WATCH_RESCUE_IGNORE_SOURCE_PROB=True,
+        )
+        q = UniverseQualityGateController()
+        now = datetime.now(timezone.utc)
+        closed = [
+            _ClosedRichPos(
+                symbol="NW1",
+                token_cluster_key="s1|l1|v1|m1|r1",
+                pnl_usd=-0.02,
+                candidate_id="n1",
+                closed_at=now,
+            ),
+            _ClosedRichPos(
+                symbol="NW2",
+                token_cluster_key="s1|l1|v1|m1|r1",
+                pnl_usd=-0.02,
+                candidate_id="n2",
+                closed_at=now,
+            ),
+        ]
+        trader = type("T", (), {"closed_positions": closed, "_recent_open_symbols": []})()
+        rows = [
+            (
+                {
+                    "_candidate_id": f"w{i}",
+                    "symbol": f"WL{i}",
+                    "source": "watchlist",
+                    "liquidity": 45000 + i,
+                    "volume_5m": 6000 + i,
+                },
+                {"score": 95 - i},
+            )
+            for i in range(5)
+        ] + [
+            (
+                {
+                    "_candidate_id": "n1",
+                    "symbol": "NW1",
+                    "source": "onchain",
+                    "liquidity": 42000,
+                    "volume_5m": 5800,
+                },
+                {"score": 82},
+            ),
+            (
+                {
+                    "_candidate_id": "n2",
+                    "symbol": "NW2",
+                    "source": "geckoterminal",
+                    "liquidity": 41000,
+                    "volume_5m": 5700,
+                },
+                {"score": 81},
+            ),
+        ]
+        out, meta = q.filter_candidates(candidates=rows, auto_trader=trader, market_mode="YELLOW")
+        out_non_watch = [
+            row
+            for row in out
+            if "watchlist" not in str((row[0] or {}).get("source", "")).lower()
+        ]
+        self.assertGreaterEqual(len(out_non_watch), 2)
+        self.assertGreaterEqual(int(meta.get("non_watch_selected_after", 0) or 0), 2)
+        self.assertGreaterEqual(int(meta.get("non_watch_rescue_added", 0) or 0), 1)
+        expected_watch_share_cap = 1.0 - (2.0 / float(max(1, len(out))))
+        self.assertLessEqual(
+            float(meta.get("watchlist_share_after", 1.0) or 1.0),
+            expected_watch_share_cap + 1e-6,
+        )
+
+    def test_quality_source_caps_preserve_non_watch_floor_under_bad_source_multiplier(self) -> None:
+        self.patch_cfg(
+            V2_QUALITY_GATE_ENABLED=True,
+            V2_QUALITY_SOURCE_BUDGET_ENABLED=True,
+            V2_QUALITY_SOURCE_MIN_TRADES=1,
+            V2_QUALITY_SOURCE_BAD_AVG_PNL_USD=-0.0010,
+            V2_QUALITY_SOURCE_BAD_LOSS_SHARE=0.60,
+            V2_QUALITY_SOURCE_CUT_MULT=0.10,
+            V2_QUALITY_NON_WATCH_MIN_OUT_ABS=2,
+            V2_QUALITY_NON_WATCH_MIN_OUT_SHARE=0.40,
+            V2_QUALITY_WATCHLIST_MAX_OUT_SHARE=0.60,
+            V2_QUALITY_SOURCE_MAX_SHARE=0.90,
+        )
+        q = UniverseQualityGateController()
+        q._source_stats = {
+            "onchain": {"trades": 12.0, "avg_pnl": -0.02, "loss_share": 0.95},
+            "watchlist": {"trades": 12.0, "avg_pnl": 0.01, "loss_share": 0.20},
+        }
+        rows: list[dict] = []
+        for i in range(12):
+            rows.append({"source": "watchlist", "priority": 100.0 - i})
+        for i in range(6):
+            rows.append({"source": "onchain", "priority": 50.0 - i})
+        caps = q._source_caps(rows, target=10)
+        non_watch_total = int(caps.get("onchain", 0) or 0)
+        self.assertGreaterEqual(non_watch_total, 4)
+
     def test_quality_gate_drop_counts_are_deduped_per_candidate_reason(self) -> None:
         self.patch_cfg(
             V2_QUALITY_GATE_ENABLED=True,
@@ -987,6 +1109,48 @@ class QualityGateTests(ConfigPatchMixin, unittest.TestCase):
             if str((row or {}).get("reason", "")) == "source_budget"
         ]
         self.assertEqual(len(dropped_source_budget), 1)
+
+    def test_quality_gate_retracts_source_budget_drop_when_soft_fill_readmits_row(self) -> None:
+        self.patch_cfg(
+            V2_QUALITY_GATE_ENABLED=True,
+            V2_QUALITY_REFRESH_SECONDS=60,
+            V2_QUALITY_WINDOW_SECONDS=3600,
+            V2_QUALITY_MIN_SYMBOL_TRADES=99,
+            V2_QUALITY_MIN_CLUSTER_TRADES=99,
+            V2_QUALITY_EXPLORE_MAX_SHARE=1.0,
+            V2_QUALITY_EXPLORE_MIN_ABS=0,
+            V2_QUALITY_COOLDOWN_PROBE_PROBABILITY=0.0,
+            V2_QUALITY_SOURCE_BUDGET_ENABLED=True,
+            V2_QUALITY_SOURCE_MIN_TRADES=99,
+            V2_QUALITY_SOURCE_MAX_SHARE=0.34,
+            V2_QUALITY_SOURCE_CAP_SOFT_FILL_ENABLED=True,
+            V2_QUALITY_SYMBOL_MAX_SHARE=1.0,
+        )
+        q = UniverseQualityGateController()
+        trader = type("T", (), {"closed_positions": [], "_recent_open_symbols": []})()
+        rows = [
+            (
+                {
+                    "_candidate_id": f"cid_{i}",
+                    "address": f"0x{i+11:040x}",
+                    "symbol": f"S{i}",
+                    "source": "watchlist",
+                    "liquidity": 25000 + i,
+                    "volume_5m": 5000 + i,
+                },
+                {"score": 95 - i},
+            )
+            for i in range(3)
+        ]
+        out, meta = q.filter_candidates(candidates=rows, auto_trader=trader, market_mode="YELLOW")
+        self.assertEqual(len(out), 3)
+        self.assertEqual(int(meta.get("drop_counts", {}).get("source_budget", 0) or 0), 0)
+        dropped_source_budget = [
+            row
+            for row in list(meta.get("dropped", []) or [])
+            if str((row or {}).get("reason", "")) == "source_budget"
+        ]
+        self.assertEqual(len(dropped_source_budget), 0)
 
     def test_quality_gate_does_not_report_duplicate_for_soft_fill_revisit(self) -> None:
         self.patch_cfg(

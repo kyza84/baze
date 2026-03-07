@@ -114,24 +114,65 @@ class TokenChecker:
         return False
 
     @staticmethod
-    def _fallback_assessment(token_address: str, liquidity: float | None = None) -> dict[str, Any]:
+    def _fallback_assessment(
+        token_address: str,
+        liquidity: float | None = None,
+        volume_5m: float | None = None,
+        age_seconds: int | None = None,
+    ) -> dict[str, Any]:
         warnings: list[str] = []
         risky_flags: list[str] = []
         risk_level = "MEDIUM"
         is_safe = True
+        min_liquidity = max(
+            float(getattr(config, "SAFE_MIN_LIQUIDITY_USD", 0.0) or 0.0),
+            float(getattr(config, "TOKEN_SAFETY_FALLBACK_MIN_LIQUIDITY_USD", 6000.0) or 6000.0),
+        )
+        min_volume_5m = max(
+            0.0,
+            float(getattr(config, "TOKEN_SAFETY_FALLBACK_MIN_VOLUME_5M_USD", 100.0) or 100.0),
+        )
+        min_age_seconds = max(
+            0,
+            int(getattr(config, "TOKEN_SAFETY_FALLBACK_MIN_AGE_SECONDS", 180) or 180),
+        )
+        require_volume = bool(getattr(config, "TOKEN_SAFETY_FALLBACK_REQUIRE_VOLUME", True))
+        require_age = bool(getattr(config, "TOKEN_SAFETY_FALLBACK_REQUIRE_AGE", False))
 
-        if liquidity is not None and liquidity < 15000:
-            risk_level = "HIGH"
+        if liquidity is None:
             is_safe = False
-            warnings.append("Low liquidity")
+            risk_level = "HIGH"
+            warnings.append("Missing liquidity for fallback safety")
+            risky_flags.append("missing_liquidity")
+        elif float(liquidity) < float(min_liquidity):
+            is_safe = False
+            risk_level = "HIGH"
+            warnings.append(f"Low liquidity fallback {float(liquidity):.0f}<{float(min_liquidity):.0f}")
             risky_flags.append("low_liquidity")
 
-        top_10_holders = 85 if (liquidity is not None and liquidity < 15000) else 70
-        if top_10_holders > 80:
-            risk_level = "HIGH"
-            is_safe = False
-            warnings.append("Concentrated ownership")
-            risky_flags.append("concentrated_ownership")
+        if require_volume:
+            if volume_5m is None:
+                is_safe = False
+                risk_level = "HIGH"
+                warnings.append("Missing 5m volume for fallback safety")
+                risky_flags.append("missing_volume_5m")
+            elif float(volume_5m) < float(min_volume_5m):
+                is_safe = False
+                risk_level = "HIGH"
+                warnings.append(f"Low 5m volume fallback {float(volume_5m):.0f}<{float(min_volume_5m):.0f}")
+                risky_flags.append("low_volume_5m")
+
+        if require_age:
+            if age_seconds is None:
+                is_safe = False
+                risk_level = "HIGH"
+                warnings.append("Missing age for fallback safety")
+                risky_flags.append("missing_age")
+            elif int(age_seconds) < int(min_age_seconds):
+                is_safe = False
+                risk_level = "HIGH"
+                warnings.append(f"Young token fallback {int(age_seconds)}<{int(min_age_seconds)}")
+                risky_flags.append("young_token")
 
         return {
             "token_address": token_address,
@@ -144,7 +185,13 @@ class TokenChecker:
             "source": "fallback",
         }
 
-    async def check_token_safety(self, token_address: str, liquidity: float | None = None) -> dict[str, Any]:
+    async def check_token_safety(
+        self,
+        token_address: str,
+        liquidity: float | None = None,
+        volume_5m: float | None = None,
+        age_seconds: int | None = None,
+    ) -> dict[str, Any]:
         self._checks_total += 1
         api_result, fail_reason = await self._check_with_goplus(token_address)
         if api_result:
@@ -169,7 +216,12 @@ class TokenChecker:
                         cached_out["warning_flags"] = int(cached_out.get("warning_flags", 0) or 0)
                         return cached_out
                 if bool(getattr(config, "TOKEN_SAFETY_TRANSIENT_USE_FALLBACK", True)):
-                    fallback = self._fallback_assessment(token_address, liquidity=liquidity)
+                    fallback = self._fallback_assessment(
+                        token_address,
+                        liquidity=liquidity,
+                        volume_5m=volume_5m,
+                        age_seconds=age_seconds,
+                    )
                     fallback["source"] = "transient_fallback"
                     fallback["fail_reason"] = fail_key
                     return fallback
@@ -191,7 +243,12 @@ class TokenChecker:
         self._api_fail += 1
         self._api_fail_total += 1
         self._mark_fail_reason(fail_reason)
-        return self._fallback_assessment(token_address, liquidity=liquidity)
+        return self._fallback_assessment(
+            token_address,
+            liquidity=liquidity,
+            volume_5m=volume_5m,
+            age_seconds=age_seconds,
+        )
 
     async def _check_with_goplus(self, token_address: str) -> tuple[dict[str, Any] | None, str | None]:
         if not token_address:

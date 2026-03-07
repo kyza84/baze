@@ -510,6 +510,18 @@ class SourceQosController:
         self.topk_enabled = bool(_cfg("V2_SOURCE_QOS_TOPK_ENABLED", True))
         self.topk_per_cycle = max(0, int(_cfg("V2_SOURCE_QOS_TOPK_PER_CYCLE", 220)))
         self.max_per_symbol_per_cycle = max(0, int(_cfg("V2_SOURCE_QOS_MAX_PER_SYMBOL_PER_CYCLE", 3)))
+        self.watchlist_low_supply_cap_floor = max(
+            2,
+            int(_cfg("V2_SOURCE_QOS_WATCHLIST_LOW_SUPPLY_CAP_FLOOR", 4)),
+        )
+        self.watchlist_low_supply_cap_floor_max = max(
+            self.watchlist_low_supply_cap_floor,
+            int(_cfg("V2_SOURCE_QOS_WATCHLIST_LOW_SUPPLY_CAP_FLOOR_MAX", 12)),
+        )
+        self.watchlist_low_supply_cap_step_rows = max(
+            1,
+            int(_cfg("V2_SOURCE_QOS_WATCHLIST_LOW_SUPPLY_CAP_STEP_ROWS", 6)),
+        )
         self.source_caps = _parse_int_map(
             str(
                 _cfg(
@@ -621,6 +633,8 @@ class SourceQosController:
         drop_counts: dict[str, int] = defaultdict(int)
         source_used: dict[str, int] = defaultdict(int)
         symbol_used: dict[str, int] = defaultdict(int)
+        watchlist_low_supply_rows_by_source: dict[str, int] = defaultdict(int)
+        watchlist_low_supply_cap_floor: dict[str, int] = {}
 
         source_caps_effective: dict[str, int] = {}
         for src in {str(row.get("source", "unknown")) for row in rows}:
@@ -641,6 +655,29 @@ class SourceQosController:
                 if current_cap > 0 and current_cap < floor_target:
                     source_caps_effective[only_src] = int(floor_target)
                     single_source_cap_floor[only_src] = int(floor_target)
+
+        for row in rows:
+            src = str(row.get("source", "unknown") or "unknown")
+            token = row.get("token") or {}
+            if not src.startswith("watchlist"):
+                continue
+            if bool((token or {}).get("_watchlist_low_supply_relaxed", False)):
+                watchlist_low_supply_rows_by_source[src] = int(watchlist_low_supply_rows_by_source[src]) + 1
+        if watchlist_low_supply_rows_by_source:
+            for src, relaxed_rows in watchlist_low_supply_rows_by_source.items():
+                cap_now = int(source_caps_effective.get(src, 0) or 0)
+                if cap_now <= 0:
+                    continue
+                floor_target = int(self.watchlist_low_supply_cap_floor)
+                if int(relaxed_rows) > 0:
+                    floor_target += int(int(relaxed_rows) // int(self.watchlist_low_supply_cap_step_rows))
+                floor_target = max(
+                    int(self.watchlist_low_supply_cap_floor),
+                    min(int(self.watchlist_low_supply_cap_floor_max), int(floor_target)),
+                )
+                if cap_now < floor_target:
+                    source_caps_effective[src] = int(floor_target)
+                    watchlist_low_supply_cap_floor[src] = int(floor_target)
 
         for row in rows:
             token = dict(row.get("token") or {})
@@ -687,6 +724,8 @@ class SourceQosController:
             "source_used": dict(source_used),
             "single_source_mode": bool(len(source_caps_effective) == 1),
             "single_source_cap_floor": dict(single_source_cap_floor),
+            "watchlist_low_supply_rows": dict(watchlist_low_supply_rows_by_source),
+            "watchlist_low_supply_cap_floor": dict(watchlist_low_supply_cap_floor),
         }
         self._last_filter_meta = dict(meta)
         return accepted, dropped, meta
@@ -891,6 +930,25 @@ class UniverseQualityGateController:
         self.source_min_share = _clamp(float(_cfg("V2_QUALITY_SOURCE_MIN_SHARE", 0.08)), 0.0, 0.40)
         self.source_max_share = _clamp(float(_cfg("V2_QUALITY_SOURCE_MAX_SHARE", 0.58)), 0.10, 1.0)
         self.source_cap_soft_fill_enabled = bool(_cfg("V2_QUALITY_SOURCE_CAP_SOFT_FILL_ENABLED", True))
+        self.non_watch_rescue_enabled = bool(_cfg("V2_QUALITY_NON_WATCH_RESCUE_ENABLED", True))
+        self.non_watch_min_out_abs = max(0, int(_cfg("V2_QUALITY_NON_WATCH_MIN_OUT_ABS", 1)))
+        self.non_watch_min_out_share = _clamp(
+            float(_cfg("V2_QUALITY_NON_WATCH_MIN_OUT_SHARE", 0.20)),
+            0.0,
+            0.80,
+        )
+        self.watchlist_max_out_share = _clamp(
+            float(_cfg("V2_QUALITY_WATCHLIST_MAX_OUT_SHARE", 0.88)),
+            0.20,
+            1.0,
+        )
+        self.non_watch_rescue_max_replacements = max(
+            0,
+            int(_cfg("V2_QUALITY_NON_WATCH_RESCUE_MAX_REPLACEMENTS", 2)),
+        )
+        self.non_watch_rescue_ignore_source_prob = bool(
+            _cfg("V2_QUALITY_NON_WATCH_RESCUE_IGNORE_SOURCE_PROB", True)
+        )
         self.provisional_core_enabled = bool(_cfg("V2_QUALITY_PROVISIONAL_CORE_ENABLED", True))
         self.provisional_core_min_score = max(0.0, _safe_float(_cfg("V2_QUALITY_PROVISIONAL_CORE_MIN_SCORE", 92), 92.0))
         self.provisional_core_min_liquidity = max(
@@ -1205,6 +1263,55 @@ class UniverseQualityGateController:
                 cap = 1
                 rem = max(0, rem - 1)
             caps[src] = int(min(cap, src_max))
+
+        # Keep a minimum non-watch allocation at cap stage.
+        # Without this, source_budget can starve non-watch rows before the plan stage.
+        non_watch_sources = [src for src in caps.keys() if "watchlist" not in str(src or "").lower()]
+        watch_sources = [src for src in caps.keys() if "watchlist" in str(src or "").lower()]
+        non_watch_available = int(sum(len(by_source.get(src, [])) for src in non_watch_sources))
+        if non_watch_sources and non_watch_available > 0:
+            min_non_watch_by_abs = int(max(0, self.non_watch_min_out_abs))
+            min_non_watch_by_share = int(math.ceil(float(base_target) * float(self.non_watch_min_out_share)))
+            max_watch_allowed = int(math.floor(float(base_target) * float(self.watchlist_max_out_share)))
+            min_non_watch_by_watch_cap = max(0, int(base_target) - int(max_watch_allowed))
+            non_watch_floor = int(
+                min(
+                    non_watch_available,
+                    max(min_non_watch_by_abs, min_non_watch_by_share, min_non_watch_by_watch_cap),
+                )
+            )
+            non_watch_capped = int(sum(int(caps.get(src, 0) or 0) for src in non_watch_sources))
+            if non_watch_floor > non_watch_capped and watch_sources:
+                need = int(non_watch_floor - non_watch_capped)
+                recipients = sorted(
+                    non_watch_sources,
+                    key=lambda s: (len(by_source.get(s, [])) - int(caps.get(s, 0) or 0)),
+                    reverse=True,
+                )
+                donors = sorted(watch_sources, key=lambda s: int(caps.get(s, 0) or 0), reverse=True)
+                while need > 0:
+                    moved = False
+                    for dst in recipients:
+                        room = int(len(by_source.get(dst, []))) - int(caps.get(dst, 0) or 0)
+                        if room <= 0:
+                            continue
+                        donor_idx: int | None = None
+                        for idx, src in enumerate(donors):
+                            if int(caps.get(src, 0) or 0) > 0:
+                                donor_idx = idx
+                                break
+                        if donor_idx is None:
+                            continue
+                        donor = donors[int(donor_idx)]
+                        caps[donor] = int(max(0, int(caps.get(donor, 0) or 0) - 1))
+                        caps[dst] = int(min(len(by_source.get(dst, [])), int(caps.get(dst, 0) or 0) + 1))
+                        need -= 1
+                        moved = True
+                        donors.sort(key=lambda s: int(caps.get(s, 0) or 0), reverse=True)
+                        if need <= 0:
+                            break
+                    if not moved:
+                        break
         return caps
 
     def _prune_symbol_history(self, now_ts: float) -> None:
@@ -1455,9 +1562,8 @@ class UniverseQualityGateController:
                 core_rows_native.extend(core_fallback_rows)
                 core_rows.extend(core_fallback_rows)
 
-        dropped: list[dict[str, Any]] = []
+        dropped: dict[tuple[str, str], dict[str, Any]] = {}
         drop_counts: dict[str, int] = defaultdict(int)
-        dropped_seen: set[tuple[str, str]] = set()
         probe_rows: list[dict[str, Any]] = []
         probe_p = float(self.cooldown_probe_probability)
         if regime == "RED":
@@ -1480,19 +1586,29 @@ class UniverseQualityGateController:
             reason_key = str(reason or "unknown").strip().lower() or "unknown"
             ident = _drop_identity(row)
             key = (ident, reason_key)
-            if key in dropped_seen:
+            if key in dropped:
                 return
-            dropped_seen.add(key)
             drop_counts[reason_key] += 1
             token = dict(row.get("token") or {})
-            dropped.append(
-                {
-                    "candidate_id": str(token.get("_candidate_id", "") or ""),
-                    "symbol": str(token.get("symbol", "") or ""),
-                    "reason": reason_key,
-                    "bucket": str(bucket if bucket is not None else row.get("bucket", "")),
-                }
-            )
+            dropped[key] = {
+                "candidate_id": str(token.get("_candidate_id", "") or ""),
+                "symbol": str(token.get("symbol", "") or ""),
+                "reason": reason_key,
+                "bucket": str(bucket if bucket is not None else row.get("bucket", "")),
+            }
+
+        def _retract_drop(row: dict[str, Any], reason: str) -> None:
+            reason_key = str(reason or "unknown").strip().lower() or "unknown"
+            ident = _drop_identity(row)
+            key = (ident, reason_key)
+            if key not in dropped:
+                return
+            dropped.pop(key, None)
+            current = int(drop_counts.get(reason_key, 0) or 0)
+            if current <= 1:
+                drop_counts.pop(reason_key, None)
+            else:
+                drop_counts[reason_key] = int(current - 1)
 
         for row in cooldown_rows:
             token = dict(row.get("token") or {})
@@ -1532,6 +1648,10 @@ class UniverseQualityGateController:
         )
         core_buckets = {"core", "core_provisional", "core_fallback"}
 
+        def _is_watch_source(source_value: Any) -> bool:
+            src = str(source_value or "").strip().lower()
+            return "watchlist" in src
+
         def _uniq_key_for_row(row: dict[str, Any]) -> tuple[str, str, str, dict[str, Any]]:
             token = dict(row.get("token") or {})
             addr_norm = normalize_address(str(token.get("address", "") or ""))
@@ -1551,6 +1671,7 @@ class UniverseQualityGateController:
             *,
             ignore_source_cap: bool = False,
             record_duplicate_drop: bool = True,
+            ignore_source_probability: bool = False,
         ) -> bool:
             uniq_key, source, symbol, token = _uniq_key_for_row(row)
             candidate_id = str(token.get("_candidate_id", "") or "")
@@ -1561,7 +1682,7 @@ class UniverseQualityGateController:
                     _record_drop(row, "duplicate_address")
                 return False
             source_p = _clamp(_safe_float(row.get("source_entry_probability"), 1.0), 0.0, 1.0)
-            if source_p < 1.0:
+            if (not ignore_source_probability) and source_p < 1.0:
                 slot = int(now_ts // 600)
                 seed = f"{candidate_id or uniq_key}|{source}|{regime}|srcp|{slot}"
                 if _deterministic_probability(seed) > source_p:
@@ -1592,6 +1713,12 @@ class UniverseQualityGateController:
             source_used[source] = int(source_used.get(source, 0)) + 1
             selected_symbol_counts[symbol] = int(selected_symbol_counts.get(symbol, 0)) + 1
             selected_symbol_last_ts[symbol] = float(now_ts)
+            # Rows can be dropped by caps/probability in earlier passes and then re-admitted
+            # in a soft-fill/rescue pass. Keep drop_counts as final losses, not transient attempts.
+            if bool(ignore_source_cap):
+                _retract_drop(row, "source_budget")
+            if bool(ignore_source_probability):
+                _retract_drop(row, "source_ev_cooldown")
             return True
 
         core_taken = 0
@@ -1690,6 +1817,122 @@ class UniverseQualityGateController:
                 drop_counts["core_rescue"] += 1
                 break
 
+        non_watch_rescue_target = 0
+        non_watch_selected_before = sum(
+            1
+            for row in selected
+            if not _is_watch_source(str((row or {}).get("source", "") or ""))
+        )
+        non_watch_rescue_added = 0
+        non_watch_rescue_replaced = 0
+        if bool(self.non_watch_rescue_enabled) and selected:
+            total_selected = int(len(selected))
+            max_watch_allowed = int(math.floor(float(total_selected) * float(self.watchlist_max_out_share)))
+            max_watch_allowed = max(0, min(total_selected, max_watch_allowed))
+            min_non_watch_by_watch_cap = max(0, total_selected - max_watch_allowed)
+            min_non_watch_by_share = int(math.ceil(float(total_selected) * float(self.non_watch_min_out_share)))
+            min_non_watch_by_abs = int(max(0, self.non_watch_min_out_abs))
+            non_watch_rescue_target = max(min_non_watch_by_abs, min_non_watch_by_share, min_non_watch_by_watch_cap)
+
+            non_watch_candidates_all: list[dict[str, Any]] = [
+                row
+                for row in rows
+                if not _is_watch_source(str(row.get("source", "") or ""))
+            ]
+            non_watch_rescue_target = min(non_watch_rescue_target, int(len(non_watch_candidates_all)))
+            non_watch_needed = max(0, int(non_watch_rescue_target) - int(non_watch_selected_before))
+            rescue_budget_cfg = int(max(0, self.non_watch_rescue_max_replacements))
+            rescue_budget_dynamic = int(math.ceil(float(non_watch_needed) * 0.75))
+            if total_selected >= 12:
+                rescue_budget_dynamic = max(
+                    rescue_budget_dynamic,
+                    int(math.ceil(float(total_selected) * 0.20)),
+                )
+            rescue_budget = int(max(rescue_budget_cfg, rescue_budget_dynamic))
+            rescue_budget = int(min(rescue_budget, non_watch_needed, len(non_watch_candidates_all)))
+            if non_watch_needed > 0 and rescue_budget > 0:
+                selected_keys = set(selected_addrs)
+                rescue_pool = [
+                    row
+                    for row in non_watch_candidates_all
+                    if _uniq_key_for_row(row)[0] not in selected_keys
+                ]
+                rescue_pool.sort(key=lambda row: float(row.get("priority", 0.0) or 0.0), reverse=True)
+
+                for candidate_row in rescue_pool:
+                    if non_watch_needed <= 0 or rescue_budget <= 0:
+                        break
+
+                    replacement_idx: int | None = None
+                    replacement_priority = 0.0
+                    replacement_fallback_idx: int | None = None
+                    replacement_fallback_priority = 0.0
+                    if len(selected) >= int(target_total):
+                        for idx, selected_row in enumerate(selected):
+                            selected_source = str((selected_row or {}).get("source", "") or "")
+                            if not _is_watch_source(selected_source):
+                                continue
+                            selected_bucket = str((selected_row or {}).get("bucket", "") or "").strip().lower()
+                            selected_priority = float((selected_row or {}).get("priority", 0.0) or 0.0)
+                            if replacement_fallback_idx is None or selected_priority < replacement_fallback_priority:
+                                replacement_fallback_idx = idx
+                                replacement_fallback_priority = selected_priority
+                            if selected_bucket in core_buckets:
+                                continue
+                            if replacement_idx is None or selected_priority < replacement_priority:
+                                replacement_idx = idx
+                                replacement_priority = selected_priority
+                        if replacement_idx is None:
+                            replacement_idx = replacement_fallback_idx
+                        if replacement_idx is None:
+                            break
+
+                    replaced_row: dict[str, Any] | None = None
+                    if replacement_idx is not None:
+                        replaced_row = selected.pop(int(replacement_idx))
+                        replaced_key, replaced_source, replaced_symbol, _ = _uniq_key_for_row(replaced_row)
+                        selected_addrs.discard(replaced_key)
+                        source_used[replaced_source] = max(0, int(source_used.get(replaced_source, 0)) - 1)
+                        if source_used[replaced_source] <= 0:
+                            source_used.pop(replaced_source, None)
+                        selected_symbol_counts[replaced_symbol] = max(0, int(selected_symbol_counts.get(replaced_symbol, 0)) - 1)
+                        if selected_symbol_counts[replaced_symbol] <= 0:
+                            selected_symbol_counts.pop(replaced_symbol, None)
+
+                    taken = _try_take(
+                        candidate_row,
+                        ignore_source_cap=True,
+                        record_duplicate_drop=False,
+                        ignore_source_probability=bool(self.non_watch_rescue_ignore_source_prob),
+                    )
+                    if taken:
+                        non_watch_rescue_added += 1
+                        non_watch_needed -= 1
+                        rescue_budget -= 1
+                        if replaced_row is not None:
+                            non_watch_rescue_replaced += 1
+                        continue
+
+                    if replaced_row is not None:
+                        restore_key, restore_source, restore_symbol, _ = _uniq_key_for_row(replaced_row)
+                        if restore_key not in selected_addrs:
+                            selected.append(replaced_row)
+                            selected_addrs.add(restore_key)
+                            source_used[restore_source] = int(source_used.get(restore_source, 0)) + 1
+                            selected_symbol_counts[restore_symbol] = int(selected_symbol_counts.get(restore_symbol, 0)) + 1
+
+        non_watch_selected_after = sum(
+            1
+            for row in selected
+            if not _is_watch_source(str((row or {}).get("source", "") or ""))
+        )
+        watchlist_selected_after = max(0, int(len(selected)) - int(non_watch_selected_after))
+        watchlist_share_after = float(watchlist_selected_after) / float(max(1, len(selected)))
+        if non_watch_rescue_added > 0:
+            drop_counts["non_watch_rescue"] += int(non_watch_rescue_added)
+        if non_watch_rescue_replaced > 0:
+            drop_counts["non_watch_rescue_replaced_watchlist"] += int(non_watch_rescue_replaced)
+
         if not bool(self.symbol_concentration_use_open_history):
             for row in selected:
                 sym = str(row.get("symbol", "") or "")
@@ -1787,11 +2030,18 @@ class UniverseQualityGateController:
             "source_used": dict(source_used),
             "source_share_out": source_share_out,
             "drop_counts": dict(drop_counts),
-            "dropped": dropped,
+            "dropped": list(dropped.values()),
             "forced_cooldown_probe_out": 1 if forced_cooldown_probe else 0,
             "core_share_out": round((float(core_out) / float(max(1, total_out))), 6),
             "explore_share_out": round((float(explore_out) / float(max(1, total_out))), 6),
             "max_symbol_share_out": round(float(max_symbol_share), 6),
+            "non_watch_rescue_enabled": bool(self.non_watch_rescue_enabled),
+            "non_watch_rescue_target": int(non_watch_rescue_target),
+            "non_watch_selected_before": int(non_watch_selected_before),
+            "non_watch_selected_after": int(non_watch_selected_after),
+            "non_watch_rescue_added": int(non_watch_rescue_added),
+            "non_watch_rescue_replaced": int(non_watch_rescue_replaced),
+            "watchlist_share_after": round(float(watchlist_share_after), 6),
             **dict(refresh_meta or {}),
         }
         return tagged, meta

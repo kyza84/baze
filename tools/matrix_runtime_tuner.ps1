@@ -157,5 +157,9 @@ Write-Host ("[runtime_tuner] console_log {0}" -f $consoleLog) -ForegroundColor D
 & $python @args 2>&1 | Tee-Object -FilePath $consoleLog -Append
 $exitCode = $LASTEXITCODE
 if ($exitCode -ne 0) {
+  if ($Command -eq 'run' -and $exitCode -eq 2) {
+    Write-Warning "[runtime_tuner] lock busy: another tuner instance already owns this profile lock. Existing process keeps running."
+    return
+  }
   throw ("[runtime_tuner] python exited with code {0}" -f $exitCode)
 }

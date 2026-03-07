@@ -73,3 +73,54 @@
 - Watchdog resilience update:
   - lock file `data/matrix/runs/watchdog.lock.json`
   - stale detection now requires heartbeat + runtime activity age.
+
+## Commit Update 2026-03-06 (Phase C)
+- Runtime tuner phase/filter alignment:
+  - `hold` phase now allows lane-recovery actions for `non_watch_conversion_guard` and `prefilter_plan_choke`.
+- Pre-risk roundtrip gating:
+  - new target policy key `pre_risk_roundtrip_min_closes_15m`.
+  - roundtrip-only pre-risk no longer triggers early degrade rollback while non-watch conversion is improving.
+- New policy telemetry flags to verify:
+  - `policy_snapshot.pre_risk_roundtrip_only`
+  - `policy_snapshot.pre_risk_roundtrip_guard_active`
+  - `decision_meta.policy.pre_risk_roundtrip_only`
+  - `decision_meta.policy.pre_risk_roundtrip_guard_active`
+
+## Commit Update 2026-03-06 (Post-Entry Anti-Rug)
+- New dynamic post-entry anti-rug controls:
+  - `POST_ENTRY_RUG_GUARD_ENABLED`
+  - `POST_ENTRY_RUG_MIN_ENTRY_LIQUIDITY_USD`
+  - `POST_ENTRY_RUG_MIN_CURRENT_LIQUIDITY_USD`
+  - `POST_ENTRY_RUG_MAX_LIQUIDITY_RATIO`
+  - `POST_ENTRY_RUG_HITS_TO_TRIGGER`
+- New close reason to monitor in `trade_decisions.jsonl`:
+  - `reason=RUG_GUARD` / `reason_code=EXIT_RUG_GUARD`
+- In paper hard-only blacklist mode, `rug_guard:*` is treated as hard block.
+
+## Commit Update 2026-03-06 (Anti-Scam hardening + tuner lock)
+- New pre-entry pump-history anti-scam block in runtime:
+  - `safe_pump_history` (mapped to `PRE_PUMP_HISTORY_BLOCK`)
+  - rolling window-based guard against cooled-down post-pump rug candidates.
+- New config keys to verify in active profile/env:
+  - `LOCAL_ANTISCAM_PUMP_HISTORY_ENABLED`
+  - `LOCAL_ANTISCAM_PUMP_HISTORY_WINDOW_SECONDS`
+  - `LOCAL_ANTISCAM_PUMP_HISTORY_BLOCK_MAX_ABS_CHANGE_5M`
+  - `LOCAL_ANTISCAM_PUMP_HISTORY_BLOCK_MAX_AGE_SECONDS`
+  - `LOCAL_ANTISCAM_PUMP_HISTORY_TO_BLACKLIST`
+- Runtime tuner now hard-blocks mutation attempts for safety families:
+  - `LOCAL_ANTISCAM_*`
+  - `ENTRY_PRE_RUG_*`
+  - `POST_ENTRY_RUG_*`
+  - `TOKEN_SAFETY_*`
+  - `HONEYPOT_*`
+- Contract hardening:
+  - `tools/matrix_safe_tuning_contract.json` now protects anti-scam/honeypot/rug/token-safety keys from tuning contract overrides.
+
+## Commit Update 2026-03-07 (Runtime Hot-Apply lock/stale guard)
+- Runtime apply safety in `main_local.py`:
+  - hot-apply now requires active tuner lock with local control (`control_local_controllers=true`),
+  - stale runtime patch payloads are ignored,
+  - patch `profile_id` must match current `run_tag`.
+- First diagnostic checks after restart:
+  - verify `active_matrix` override values for `PAPER_TRADE_SIZE_MIN_USD`, `SOURCE_ROUTER_MIN_TRADES`, `TOKEN_EV_MEMORY_MIN_TRADES`,
+  - verify latest session log has no unexpected `RUNTIME_TUNER_HOT_APPLY` while tuner runs in dry-run lock mode.

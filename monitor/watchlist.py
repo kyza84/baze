@@ -26,6 +26,7 @@ class WatchlistMonitor:
     def __init__(self) -> None:
         self._last_refresh_ts = 0.0
         self._cached_tokens: list[dict[str, Any]] = []
+        self._prefilter_blocked_until_ts: dict[str, float] = {}
         self._headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -51,6 +52,103 @@ class WatchlistMonitor:
     def runtime_stats(self, reset: bool = False) -> dict[str, dict[str, int | float]]:
         return self._http.snapshot_stats(reset=reset)
 
+    def _prune_prefilter_blocked(self, now_ts: float | None = None) -> None:
+        if not self._prefilter_blocked_until_ts:
+            return
+        cur = float(now_ts if now_ts is not None else time.time())
+        self._prefilter_blocked_until_ts = {
+            addr: float(until_ts)
+            for addr, until_ts in self._prefilter_blocked_until_ts.items()
+            if float(until_ts) > cur
+        }
+
+    def _is_prefilter_blocked(self, address: str, now_ts: float | None = None) -> bool:
+        addr = normalize_address(address)
+        if not addr:
+            return False
+        self._prune_prefilter_blocked(now_ts=now_ts)
+        until_ts = float(self._prefilter_blocked_until_ts.get(addr, 0.0) or 0.0)
+        cur = float(now_ts if now_ts is not None else time.time())
+        return until_ts > cur
+
+    def _mark_prefilter_blocked(
+        self,
+        addresses: list[str] | set[str] | tuple[str, ...],
+        *,
+        ttl_seconds: int,
+    ) -> int:
+        ttl = max(0, int(ttl_seconds))
+        if ttl <= 0:
+            return 0
+        now_ts = time.time()
+        until_ts = now_ts + float(ttl)
+        self._prune_prefilter_blocked(now_ts=now_ts)
+        added = 0
+        for raw_addr in (addresses or []):
+            addr = normalize_address(raw_addr)
+            if not addr:
+                continue
+            prev = float(self._prefilter_blocked_until_ts.get(addr, 0.0) or 0.0)
+            if until_ts > prev:
+                self._prefilter_blocked_until_ts[addr] = until_ts
+                added += 1
+        return added
+
+    def prune_cached_tokens(
+        self,
+        addresses: list[str] | set[str] | tuple[str, ...],
+        *,
+        reason: str = "",
+    ) -> int:
+        """Remove known-bad addresses from in-memory watchlist cache to avoid recycle loops."""
+        ttl_seconds = max(
+            0,
+            int(getattr(config, "WATCHLIST_PREFILTER_BLOCKED_CACHE_TTL_SECONDS", 900) or 900),
+        )
+        blocked_marked = self._mark_prefilter_blocked(
+            addresses,
+            ttl_seconds=ttl_seconds,
+        )
+        if not self._cached_tokens:
+            if blocked_marked > 0:
+                logger.info(
+                    "WATCHLIST blocked_ttl marked=%s ttl=%ss reason=%s",
+                    blocked_marked,
+                    ttl_seconds,
+                    str(reason or "-"),
+                )
+            return 0
+        drop_set = {
+            normalize_address(addr)
+            for addr in (addresses or [])
+            if normalize_address(addr)
+        }
+        if not drop_set:
+            return 0
+        before = len(self._cached_tokens)
+        self._cached_tokens = [
+            row
+            for row in self._cached_tokens
+            if normalize_address((row or {}).get("address", "")) not in drop_set
+        ]
+        removed = max(0, before - len(self._cached_tokens))
+        if removed > 0:
+            logger.info(
+                "WATCHLIST cache_prune removed=%s remaining=%s reason=%s",
+                removed,
+                len(self._cached_tokens),
+                str(reason or "-"),
+            )
+            self._save_cache(self._cached_tokens)
+        if blocked_marked > 0:
+            logger.info(
+                "WATCHLIST blocked_ttl marked=%s ttl=%ss reason=%s",
+                blocked_marked,
+                ttl_seconds,
+                str(reason or "-"),
+            )
+        return removed
+
     async def _fetch_json(self, url: str, source: str, retries: int | None = None) -> Any | None:
         result = await self._http.get_json(
             url,
@@ -72,6 +170,27 @@ class WatchlistMonitor:
         if self._cached_tokens and (now - self._last_refresh_ts) < refresh:
             return list(self._cached_tokens)
         tokens = await self._refresh()
+        min_retain = max(0, int(getattr(config, "WATCHLIST_CACHE_RETAIN_MIN_COUNT", 3) or 3))
+        new_count = len(tokens)
+        old_count = len(self._cached_tokens)
+        if new_count <= 0 and old_count > 0:
+            logger.warning(
+                "WATCHLIST refresh empty -> keep cache cached=%s refresh=%.0fs",
+                int(old_count),
+                float(refresh),
+            )
+            self._last_refresh_ts = now
+            return list(self._cached_tokens)
+        if old_count >= min_retain and new_count < min_retain:
+            logger.warning(
+                "WATCHLIST refresh low_supply -> keep cache new=%s cached=%s retain_min=%s",
+                int(new_count),
+                int(old_count),
+                int(min_retain),
+            )
+            self._last_refresh_ts = now
+            return list(self._cached_tokens)
+
         self._cached_tokens = list(tokens)
         self._last_refresh_ts = now
         self._save_cache(tokens)
@@ -84,16 +203,21 @@ class WatchlistMonitor:
         seen_addr: set[str] = set()
         strict_count = 0
 
-        def _add_rows(rows: list[dict[str, Any]]) -> int:
+        def _add_rows(rows: list[dict[str, Any]], *, low_supply_relaxed: bool = False) -> int:
             added = 0
             for row in rows:
                 addr = normalize_address(row.get("address"))
                 if not addr or addr in seen_addr:
                     continue
+                if self._is_prefilter_blocked(addr):
+                    continue
                 if self._is_blocked_token(address=addr, symbol=str(row.get("symbol", "") or "")):
                     continue
+                row_out = dict(row)
+                if low_supply_relaxed:
+                    row_out["_watchlist_low_supply_relaxed"] = True
                 seen_addr.add(addr)
-                tokens.append(row)
+                tokens.append(row_out)
                 added += 1
             return added
 
@@ -211,7 +335,8 @@ class WatchlistMonitor:
                         min_vol_h24=relaxed_min_vol_h24,
                         min_vol_5m=relaxed_min_vol_5m,
                         require_weth_quote=relaxed_require_weth,
-                    )
+                    ),
+                    low_supply_relaxed=True,
                 )
                 relaxed_trending_tasks = [
                     self._fetch_gecko_pool_page(
@@ -265,7 +390,7 @@ class WatchlistMonitor:
                         if isinstance(rows, list):
                             relaxed_rows.append(rows)
                 for rows in relaxed_rows:
-                    relaxed_added += _add_rows(rows)
+                    relaxed_added += _add_rows(rows, low_supply_relaxed=True)
                 if relaxed_added > 0:
                     logger.warning(
                         "WATCHLIST low_supply fallback added=%s final=%s",
@@ -317,6 +442,13 @@ class WatchlistMonitor:
             if str(x or "").strip()
         }
         if addr in hard_blocked:
+            return True
+        excluded_addresses = {
+            normalize_address(x)
+            for x in WatchlistMonitor._csv_items(getattr(config, "AUTO_TRADE_EXCLUDED_ADDRESSES", []) or [])
+            if str(x or "").strip()
+        }
+        if addr in excluded_addresses:
             return True
 
         sym = str(symbol or "").strip().upper()

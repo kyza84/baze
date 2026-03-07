@@ -1,0 +1,272 @@
+[
+  {
+    "symbol": "FAI",
+    "source": "watchlist",
+    "opens": 39,
+    "closes": 39,
+    "pnl_usd_sum": -0.134971,
+    "wins": 15,
+    "losses": 24
+  },
+  {
+    "symbol": "VVV",
+    "source": "watchlist",
+    "opens": 23,
+    "closes": 23,
+    "pnl_usd_sum": 0.008754,
+    "wins": 14,
+    "losses": 9
+  },
+  {
+    "symbol": "SOL",
+    "source": "watchlist",
+    "opens": 18,
+    "closes": 17,
+    "pnl_usd_sum": 0.02405,
+    "wins": 12,
+    "losses": 5
+  },
+  {
+    "symbol": "SYND",
+    "source": "watchlist",
+    "opens": 10,
+    "closes": 10,
+    "pnl_usd_sum": -0.081863,
+    "wins": 3,
+    "losses": 7
+  },
+  {
+    "symbol": "TIBBIR",
+    "source": "watchlist",
+    "opens": 6,
+    "closes": 6,
+    "pnl_usd_sum": -0.011655,
+    "wins": 2,
+    "losses": 4
+  },
+  {
+    "symbol": "LIZARD",
+    "source": "watchlist",
+    "opens": 6,
+    "closes": 6,
+    "pnl_usd_sum": -0.412584,
+    "wins": 1,
+    "losses": 5
+  },
+  {
+    "symbol": "JUNO",
+    "source": "watchlist",
+    "opens": 5,
+    "closes": 5,
+    "pnl_usd_sum": 0.063423,
+    "wins": 5,
+    "losses": 0
+  },
+  {
+    "symbol": "DEFI.ssi",
+    "source": "watchlist",
+    "opens": 5,
+    "closes": 5,
+    "pnl_usd_sum": 0.0,
+    "wins": 0,
+    "losses": 0
+  },
+  {
+    "symbol": "shitcoin",
+    "source": "watchlist",
+    "opens": 5,
+    "closes": 5,
+    "pnl_usd_sum": 0.192698,
+    "wins": 5,
+    "losses": 0
+  },
+  {
+    "symbol": "REI",
+    "source": "watchlist",
+    "opens": 2,
+    "closes": 2,
+    "pnl_usd_sum": 0.01763,
+    "wins": 2,
+    "losses": 0
+  },
+  {
+    "symbol": "AICOIN",
+    "source": "geckoterminal",
+    "opens": 1,
+    "closes": 1,
+    "pnl_usd_sum": 0.080701,
+    "wins": 1,
+    "losses": 0
+  },
+  {
+    "symbol": "VibeCraft",
+    "source": "geckoterminal",
+    "opens": 1,
+    "closes": 1,
+    "pnl_usd_sum": -0.007646,
+    "wins": 0,
+    "losses": 1
+  },
+  {
+    "symbol": "Caine",
+    "source": "geckoterminal",
+    "opens": 1,
+    "closes": 1,
+    "pnl_usd_sum": 0.162202,
+    "wins": 1,
+    "losses": 0
+  },
+  {
+    "symbol": "BNKR",
+    "source": "watchlist",
+    "opens": 1,
+    "closes": 1,
+    "pnl_usd_sum": 0.009637,
+    "wins": 1,
+    "losses": 0
+  },
+  {
+    "symbol": "EDGE",
+    "source": "watchlist",
+    "opens": 1,
+    "closes": 1,
+    "pnl_usd_sum": 0.004721,
+    "wins": 1,
+    "losses": 0
+  },
+  {
+    "symbol": "DINO",
+    "source": "watchlist",
+    "opens": 1,
+    "closes": 1,
+    "pnl_usd_sum": -0.000521,
+    "wins": 0,
+    "losses": 1
+  },
+  {
+    "symbol": "CLAWD",
+    "source": "watchlist",
+    "opens": 1,
+    "closes": 1,
+    "pnl_usd_sum": -0.013675,
+    "wins": 0,
+    "losses": 1
+  },
+  {
+    "symbol": "扑街仔",
+    "source": "geckoterminal",
+    "opens": 1,
+    "closes": 1,
+    "pnl_usd_sum": 0.0,
+    "wins": 0,
+    "losses": 0
+  },
+  {
+    "symbol": "Naka",
+    "source": "geckoterminal",
+    "opens": 1,
+    "closes": 1,
+    "pnl_usd_sum": 0.0,
+    "wins": 0,
+    "losses": 0
+  },
+  {
+    "symbol": "1",
+    "source": "geckoterminal",
+    "opens": 1,
+    "closes": 1,
+    "pnl_usd_sum": -0.036901,
+    "wins": 0,
+    "losses": 1
+  },
+  {
+    "symbol": "ZOOMER",
+    "source": "geckoterminal",
+    "opens": 1,
+    "closes": 1,
+    "pnl_usd_sum": 0.175236,
+    "wins": 1,
+    "losses": 0
+  },
+  {
+    "symbol": "HOLD",
+    "source": "geckoterminal",
+    "opens": 1,
+    "closes": 1,
+    "pnl_usd_sum": 0.01718,
+    "wins": 1,
+    "losses": 0
+  },
+  {
+    "symbol": "小杰",
+    "source": "geckoterminal",
+    "opens": 1,
+    "closes": 1,
+    "pnl_usd_sum": -0.293682,
+    "wins": 0,
+    "losses": 1
+  },
+  {
+    "symbol": "窝要验",
+    "source": "geckoterminal",
+    "opens": 1,
+    "closes": 1,
+    "pnl_usd_sum": -0.126134,
+    "wins": 0,
+    "losses": 1
+  },
+  {
+    "symbol": "Tittie",
+    "source": "geckoterminal",
+    "opens": 1,
+    "closes": 1,
+    "pnl_usd_sum": 0.258784,
+    "wins": 1,
+    "losses": 0
+  },
+  {
+    "symbol": "$WGIRRAFE",
+    "source": "geckoterminal",
+    "opens": 1,
+    "closes": 1,
+    "pnl_usd_sum": 0.036486,
+    "wins": 1,
+    "losses": 0
+  },
+  {
+    "symbol": "Messenger",
+    "source": "geckoterminal",
+    "opens": 1,
+    "closes": 1,
+    "pnl_usd_sum": -0.113012,
+    "wins": 0,
+    "losses": 1
+  },
+  {
+    "symbol": "GorillaBox",
+    "source": "geckoterminal",
+    "opens": 1,
+    "closes": 1,
+    "pnl_usd_sum": -0.047362,
+    "wins": 0,
+    "losses": 1
+  },
+  {
+    "symbol": "CLAWNCH",
+    "source": "watchlist",
+    "opens": 1,
+    "closes": 1,
+    "pnl_usd_sum": -0.006682,
+    "wins": 0,
+    "losses": 1
+  },
+  {
+    "symbol": "KTA",
+    "source": "watchlist",
+    "opens": 1,
+    "closes": 1,
+    "pnl_usd_sum": 0.001252,
+    "wins": 1,
+    "losses": 0
+  }
+]

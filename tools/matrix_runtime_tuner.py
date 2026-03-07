@@ -4,9 +4,11 @@ import argparse
 import csv
 import hashlib
 import json
+import math
 import os
 import re
 import subprocess
+import sys
 import time
 from collections import Counter
 from dataclasses import dataclass, field
@@ -14,7 +16,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+# Allow direct `python tools/matrix_runtime_tuner.py ...` execution to import project modules.
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_PROJECT_ROOT = _SCRIPT_DIR.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
 from matrix_preset_guard import load_contract, validate_overrides
+from utils.state_file import atomic_write_json, read_json_locked, state_file_lock
 
 
 SUMMARY_RE = re.compile(r"Scanned\s+(\d+)\s+tokens.*Trade candidates:\s+(\d+).*Opened:\s+(\d+)")
@@ -33,6 +42,12 @@ AUTO_BUY_RE = re.compile(r"AUTO_BUY .*token=([^\s]+)")
 PLAN_SOURCE_NON_WATCH_RE = re.compile(r"PLAN_SOURCE_DIVERSITY .*non_watch_final=(\d+)")
 SAFETY_SUMMARY_RE = re.compile(r"Safety:\s*checked=(\d+)\s+fail_closed=(\d+)\s+reasons=([^|]+)")
 SYMBOL_CONCENTRATION_DROP_RE = re.compile(r"symbol_concentration['\"]?\s*:\s*(\d+)")
+SOURCE_QOS_SUMMARY_RE = re.compile(r"SourceQoS:\s*enabled=(\d+)/in=(\d+)/out=(\d+)/dropped=(\d+)")
+WATCHLIST_LOW_SUPPLY_STRICT_RE = re.compile(
+    r"WATCHLIST low_supply fallback strict=(\d+)\s+final=(\d+)\s+min=(\d+)(?:\s+relax_factor=([0-9.]+))?"
+)
+WATCHLIST_LOW_SUPPLY_ADDED_RE = re.compile(r"WATCHLIST low_supply fallback added=(\d+)\s+final=(\d+)")
+EDGE_COST_DOMINANT_COOLDOWN_RE = re.compile(r"EDGE_COST_DOMINANT_COOLDOWN\s+symbol=([^\s]+)")
 PAPER_SUMMARY_RE = re.compile(
     r"PAPER_SUMMARY .*total_closed=(\d+)\s+winrate_total=([0-9.]+)%\s+realized_total=\$(-?[0-9.]+).*open=(\d+)"
 )
@@ -100,6 +115,7 @@ TUNER_RUNTIME_FALLBACK_KEYS = {
     "V2_CALIBRATION_VOLUME_MIN",
     "EV_FIRST_ENTRY_MIN_NET_USD",
     "EV_FIRST_ENTRY_CORE_PROBE_EV_TOLERANCE_USD",
+    "EV_FIRST_ENTRY_CORE_PROBE_MIN_NET_USD",
     "MAX_TOKEN_COOLDOWN_SECONDS",
     "MIN_TRADE_USD",
     "PAPER_TRADE_SIZE_MIN_USD",
@@ -126,7 +142,11 @@ TUNER_RUNTIME_FALLBACK_KEYS = {
     "WATCHLIST_REFRESH_SECONDS",
     "WATCHLIST_MAX_TOKENS",
     "WATCHLIST_MIN_LIQUIDITY_USD",
+    "WATCHLIST_MIN_VOLUME_5M_USD",
     "WATCHLIST_MIN_VOLUME_24H_USD",
+    "WATCHLIST_LOW_SUPPLY_MIN_COUNT",
+    "WATCHLIST_LOW_SUPPLY_RELAX_FACTOR",
+    "WATCHLIST_LOW_SUPPLY_MIN_VOLUME_5M_USD",
     "PAPER_WATCHLIST_MIN_SCORE",
     "PAPER_WATCHLIST_MIN_LIQUIDITY_USD",
     "PAPER_WATCHLIST_MIN_VOLUME_5M_USD",
@@ -137,6 +157,7 @@ TUNER_MUTABLE_KEYS = {
     "AUTO_TRADE_EXCLUDED_SYMBOLS",
     "ENTRY_A_CORE_MIN_TRADE_USD",
     "EV_FIRST_ENTRY_CORE_PROBE_EV_TOLERANCE_USD",
+    "EV_FIRST_ENTRY_CORE_PROBE_MIN_NET_USD",
     "EV_FIRST_ENTRY_MIN_NET_USD",
     "HEAVY_CHECK_DEDUP_TTL_SECONDS",
     "MARKET_MODE_SOFT_SCORE",
@@ -178,7 +199,11 @@ TUNER_MUTABLE_KEYS = {
     "WATCHLIST_REFRESH_SECONDS",
     "WATCHLIST_MAX_TOKENS",
     "WATCHLIST_MIN_LIQUIDITY_USD",
+    "WATCHLIST_MIN_VOLUME_5M_USD",
     "WATCHLIST_MIN_VOLUME_24H_USD",
+    "WATCHLIST_LOW_SUPPLY_MIN_COUNT",
+    "WATCHLIST_LOW_SUPPLY_RELAX_FACTOR",
+    "WATCHLIST_LOW_SUPPLY_MIN_VOLUME_5M_USD",
     "PAPER_WATCHLIST_MIN_SCORE",
     "PAPER_WATCHLIST_MIN_LIQUIDITY_USD",
     "PAPER_WATCHLIST_MIN_VOLUME_5M_USD",
@@ -198,6 +223,26 @@ TUNER_EPHEMERAL_KEYS = {"AUTO_TRADE_EXCLUDED_SYMBOLS"}
 TUNER_HOT_APPLY_KEYS = set(TUNER_MUTABLE_KEYS)
 # Explicitly restart-required keys (kept empty by default, can be extended later safely).
 TUNER_RESTART_REQUIRED_KEYS: set[str] = set()
+TUNER_DRY_RUN_STRUCTURAL_LOCK_KEYS = {
+    "PLAN_MAX_WATCHLIST_SHARE",
+    "PLAN_MIN_NON_WATCHLIST_PER_BATCH",
+    "V2_SOURCE_QOS_SOURCE_CAPS",
+    "V2_UNIVERSE_SOURCE_CAPS",
+}
+TUNER_HARD_PROTECTED_PREFIXES = (
+    "LOCAL_ANTISCAM_",
+    "ENTRY_PRE_RUG_",
+    "POST_ENTRY_RUG_",
+    "TOKEN_SAFETY_",
+    "HONEYPOT_",
+)
+TUNER_HARD_PROTECTED_KEYS = {
+    "SAFE_REQUIRE_CONTRACT_SAFE",
+    "SAFE_REQUIRE_RISK_LEVEL",
+    "ENTRY_FAIL_CLOSED_ON_SAFETY_GAP",
+    "ENTRY_ALLOWED_SAFETY_SOURCES",
+    "PAPER_WATCHLIST_STRICT_GUARD_ENABLED",
+}
 FORCE_ACTION_REASONS = {"soft_must_be_leq_strict"}
 TIGHTEN_FLOW_ESCAPE_SIGNALS = {
     "source_qos_cap_rebalance",
@@ -227,6 +272,10 @@ HOLD_FLOW_ESCAPE_SIGNALS = {
     "feed_starvation",
     "plan_concentration",
     "source_diversity_rebalance",
+    "non_watch_conversion_guard",
+    "prefilter_plan_choke",
+    "score_min_dominant",
+    "safe_volume_dominant",
     "safe_volume_soft_flow_expand",
     "safe_volume_non_watch_soft",
     "score_non_watch_soft",
@@ -247,6 +296,26 @@ ROLLBACK_SOURCE_GUARD_KEYS = {
     "SAFE_VOLUME_TWO_TIER_NON_WATCH_MAX_PASSES_PER_CYCLE",
     "MARKET_MODE_NON_WATCH_SOFT_SCORE_DELTA",
     "MARKET_MODE_NON_WATCH_SOFT_MAX_PER_CYCLE",
+    "WATCHLIST_MIN_VOLUME_5M_USD",
+    "WATCHLIST_LOW_SUPPLY_MIN_COUNT",
+    "WATCHLIST_LOW_SUPPLY_RELAX_FACTOR",
+    "WATCHLIST_LOW_SUPPLY_MIN_VOLUME_5M_USD",
+}
+ROLLBACK_FEED_STARVATION_GUARD_KEYS = {
+    # Keep starvation-recovery knobs during sparse/zero-scan windows.
+    "TOKEN_AGE_MAX",
+    "SEEN_TOKEN_TTL",
+    "WATCHLIST_REFRESH_SECONDS",
+    "WATCHLIST_MAX_TOKENS",
+    "WATCHLIST_MIN_LIQUIDITY_USD",
+    "WATCHLIST_MIN_VOLUME_5M_USD",
+    "WATCHLIST_MIN_VOLUME_24H_USD",
+    "WATCHLIST_LOW_SUPPLY_MIN_COUNT",
+    "WATCHLIST_LOW_SUPPLY_RELAX_FACTOR",
+    "WATCHLIST_LOW_SUPPLY_MIN_VOLUME_5M_USD",
+    "PAPER_WATCHLIST_MIN_LIQUIDITY_USD",
+    "PAPER_WATCHLIST_MIN_VOLUME_5M_USD",
+    "PAPER_WATCHLIST_MIN_SCORE",
 }
 IDLE_RELAX_SAFE_KEYS = {
     "AUTO_TRADE_TOP_N",
@@ -266,6 +335,7 @@ IDLE_RELAX_SAFE_KEYS = {
     "MIN_EXPECTED_EDGE_USD",
     "EV_FIRST_ENTRY_MIN_NET_USD",
     "EV_FIRST_ENTRY_CORE_PROBE_EV_TOLERANCE_USD",
+    "EV_FIRST_ENTRY_CORE_PROBE_MIN_NET_USD",
     "HEAVY_CHECK_DEDUP_TTL_SECONDS",
     "V2_UNIVERSE_NOVELTY_MIN_SHARE",
     "SYMBOL_CONCENTRATION_MAX_SHARE",
@@ -277,6 +347,10 @@ IDLE_RELAX_SAFE_KEYS = {
     "PLAN_MIN_NON_WATCHLIST_PER_BATCH",
     "PLAN_MAX_SINGLE_SOURCE_SHARE",
     "V2_QUALITY_SYMBOL_REENTRY_MIN_SECONDS",
+    "WATCHLIST_MIN_VOLUME_5M_USD",
+    "WATCHLIST_LOW_SUPPLY_MIN_COUNT",
+    "WATCHLIST_LOW_SUPPLY_RELAX_FACTOR",
+    "WATCHLIST_LOW_SUPPLY_MIN_VOLUME_5M_USD",
 }
 PHASE_CHOICES = ("expand", "hold", "tighten")
 STATE_MACHINE_CHOICES = ("auto",) + PHASE_CHOICES
@@ -285,12 +359,15 @@ LOCK_STALE_SECONDS = 900
 LOCK_STALE_TERMINATE_TIMEOUT_SECONDS = 8
 DEAD_PROFILE_HEARTBEAT_MAX_AGE_SECONDS = 90.0
 WATCHDOG_ACTIVE_MAX_AGE_SECONDS = 75.0
+ACTIVE_MATRIX_LOCK_TIMEOUT_SECONDS = 2.5
+ACTIVE_MATRIX_LOCK_POLL_SECONDS = 0.05
 
 _BASE_TO_REASON_CODE: dict[str, str] = {
     "ev_net_low": "PLAN_EV_NET_LOW",
     "edge_low": "PLAN_EDGE_LOW",
     "edge_usd_low": "PLAN_EDGE_USD_LOW",
     "negative_edge": "PLAN_NEGATIVE_EDGE",
+    "cost_dominant_edge": "PLAN_COST_DOMINANT_EDGE",
     "cooldown": "PLAN_COOLDOWN",
     "blacklist": "PRE_BLACKLIST",
     "honeypot_guard": "PRE_HONEYPOT_GUARD",
@@ -336,6 +413,7 @@ class TargetPolicy:
     pre_risk_buy_fail_rate_15m: float = 0.35
     pre_risk_sell_fail_rate_15m: float = 0.30
     pre_risk_roundtrip_loss_median_pct_15m: float = -1.2
+    pre_risk_roundtrip_min_closes_15m: int = 2
     tail_loss_min_closes_60m: int = 6
     tail_loss_ratio_max: float = 8.0
     diversity_min_buys_15m: int = 4
@@ -373,7 +451,9 @@ class PolicyDecision:
     blacklist_fail: bool
     risk_fail_core: bool = False
     tail_loss_fail: bool = False
+    tail_loss_soft_hold: bool = False
     pre_risk_fail: bool = False
+    pre_risk_roundtrip_only: bool = False
     diversity_fail: bool = False
     plan_concentration_fail: bool = False
     source_concentration_fail: bool = False
@@ -508,6 +588,18 @@ class WindowMetrics:
     safety_reason_counts: Counter[str] = field(default_factory=Counter)
     source_diversity_non_watch_zero_hits: int = 0
     symbol_concentration_drop_hits: int = 0
+    edge_cost_dominant_hits: int = 0
+    edge_cost_dominant_symbols: Counter[str] = field(default_factory=Counter)
+    zero_scan_cycles: int = 0
+    source_qos_zero_cycle_in: int = 0
+    source_qos_zero_cycle_out: int = 0
+    source_qos_zero_cycle_dropped: int = 0
+    watchlist_low_supply_hits: int = 0
+    watchlist_low_supply_final_last: int = 0
+    watchlist_low_supply_final_max: int = 0
+    watchlist_low_supply_min_last: int = 0
+    watchlist_low_supply_strict_last: int = 0
+    watchlist_low_supply_relax_last: float = 0.0
     open_positions: int = 0
     total_closed: int = 0
     winrate_total: float | None = None
@@ -774,7 +866,13 @@ def _terminate_pid(pid: int, *, timeout_seconds: int = LOCK_STALE_TERMINATE_TIME
     return not _pid_is_running(pid)
 
 
-def _acquire_runtime_lock(root: Path, profile_id: str, owner_label: str) -> tuple[bool, str]:
+def _acquire_runtime_lock(
+    root: Path,
+    profile_id: str,
+    owner_label: str,
+    *,
+    control_local_controllers: bool = True,
+) -> tuple[bool, str]:
     path = _runtime_lock_path(root, profile_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     current_pid = int(os.getpid())
@@ -833,11 +931,50 @@ def _acquire_runtime_lock(root: Path, profile_id: str, owner_label: str) -> tupl
         "owner": str(owner_label or "runtime_tuner"),
         "profile_id": str(profile_id),
         "started_at": _now_iso(),
+        # `main_local` local controllers should be locked only for apply-mode tuner.
+        "control_local_controllers": bool(control_local_controllers),
+        "lock_mode": "control" if bool(control_local_controllers) else "dry_run",
     }
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     tmp.replace(path)
     return True, ""
+
+
+def _acquire_runtime_lock_with_retry(
+    *,
+    root: Path,
+    profile_id: str,
+    owner_label: str,
+    control_local_controllers: bool = True,
+    timeout_seconds: float,
+    poll_seconds: float,
+) -> tuple[bool, str]:
+    timeout = max(0.0, float(timeout_seconds))
+    poll = max(0.2, float(poll_seconds))
+    deadline = float(time.time()) + timeout
+    last_msg = ""
+    while True:
+        ok, msg = _acquire_runtime_lock(
+            root=root,
+            profile_id=profile_id,
+            owner_label=owner_label,
+            control_local_controllers=bool(control_local_controllers),
+        )
+        if ok:
+            return True, ""
+        last_msg = str(msg or "")
+        lock_busy = "lock busy" in last_msg.lower() or "takeover failed" in last_msg.lower()
+        if not lock_busy or float(time.time()) >= deadline:
+            break
+        time.sleep(poll)
+    if timeout <= 0.0:
+        return False, last_msg
+    waited = max(0.0, timeout)
+    detail = f"runtime_tuner lock acquire timeout after {waited:.1f}s"
+    if last_msg:
+        detail = f"{detail} | last={last_msg}"
+    return False, detail
 
 
 def _release_runtime_lock(root: Path, profile_id: str) -> None:
@@ -1061,10 +1198,52 @@ def _read_window_metrics(session_log: Path, window_minutes: int) -> WindowMetric
             continue
         metrics.lines_seen += 1
         m = SUMMARY_RE.search(line)
+        scanned_now = -1
         if m:
-            metrics.scanned += int(m.group(1))
+            scanned_now = int(m.group(1))
+            metrics.scanned += scanned_now
             metrics.trade_candidates += int(m.group(2))
             metrics.opened_from_summary += int(m.group(3))
+            if scanned_now <= 0:
+                metrics.zero_scan_cycles += 1
+        m = SOURCE_QOS_SUMMARY_RE.search(line)
+        if m:
+            if scanned_now == -1:
+                scanned_fallback = SUMMARY_RE.search(line)
+                if scanned_fallback:
+                    scanned_now = int(scanned_fallback.group(1))
+            if scanned_now == 0:
+                metrics.source_qos_zero_cycle_in += int(m.group(2))
+                metrics.source_qos_zero_cycle_out += int(m.group(3))
+                metrics.source_qos_zero_cycle_dropped += int(m.group(4))
+        m = WATCHLIST_LOW_SUPPLY_STRICT_RE.search(line)
+        if m:
+            metrics.watchlist_low_supply_hits += 1
+            metrics.watchlist_low_supply_strict_last = int(m.group(1) or 0)
+            metrics.watchlist_low_supply_final_last = int(m.group(2) or 0)
+            metrics.watchlist_low_supply_final_max = max(
+                int(metrics.watchlist_low_supply_final_max),
+                int(metrics.watchlist_low_supply_final_last),
+            )
+            metrics.watchlist_low_supply_min_last = int(m.group(3) or 0)
+            try:
+                metrics.watchlist_low_supply_relax_last = float(m.group(4) or 0.0)
+            except Exception:
+                metrics.watchlist_low_supply_relax_last = 0.0
+        m = WATCHLIST_LOW_SUPPLY_ADDED_RE.search(line)
+        if m:
+            metrics.watchlist_low_supply_hits += 1
+            metrics.watchlist_low_supply_final_last = int(m.group(2) or 0)
+            metrics.watchlist_low_supply_final_max = max(
+                int(metrics.watchlist_low_supply_final_max),
+                int(metrics.watchlist_low_supply_final_last),
+            )
+        m = EDGE_COST_DOMINANT_COOLDOWN_RE.search(line)
+        if m:
+            metrics.edge_cost_dominant_hits += 1
+            symbol = str(m.group(1) or "").strip().upper()
+            if symbol:
+                metrics.edge_cost_dominant_symbols[symbol] += 1
         m = FILTER_FAIL_RE.search(line)
         if m:
             metrics.filter_fail_reasons[m.group(1)] += 1
@@ -2056,7 +2235,7 @@ def _plan_symbol_concentration_15m(trade_rows: list[dict[str, Any]]) -> dict[str
 
 
 def _ev_forensics_15m(trade_rows: list[dict[str, Any]]) -> dict[str, Any]:
-    reasons = {"ev_net_low", "edge_low", "edge_usd_low", "negative_edge"}
+    reasons = {"ev_net_low", "edge_low", "edge_usd_low", "negative_edge", "cost_dominant_edge"}
     by_reason = Counter[str]()
     expected_edge_values: list[float] = []
     expected_net_values: list[float] = []
@@ -2090,6 +2269,43 @@ def _ev_forensics_15m(trade_rows: list[dict[str, Any]]) -> dict[str, Any]:
             round(float(_median(expected_net_values) or 0.0), 6) if expected_net_values else "N/A"
         ),
         "position_size_usd_median": round(float(_median(size_values) or 0.0), 6) if size_values else "N/A",
+    }
+
+
+def _edge_cost_forensics_15m(trade_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    reasons = {"edge_low", "edge_usd_low", "negative_edge", "cost_dominant_edge"}
+    gross_values: list[float] = []
+    cost_values: list[float] = []
+    size_values: list[float] = []
+    by_reason = Counter[str]()
+    for row in trade_rows:
+        stage = str(row.get("decision_stage", "") or "").strip().lower()
+        decision = str(row.get("decision", "") or "").strip().lower()
+        reason = _row_reason_base(row)
+        if stage != "plan_trade" or decision != "skip" or reason not in reasons:
+            continue
+        by_reason[_reason_code(reason)] += 1
+        try:
+            gross_values.append(float(row.get("gross_percent", 0.0) or 0.0))
+        except Exception:
+            pass
+        try:
+            cost_values.append(float(row.get("cost_total_percent", 0.0) or 0.0))
+        except Exception:
+            pass
+        try:
+            size_values.append(float(row.get("position_size_usd", 0.0) or 0.0))
+        except Exception:
+            pass
+    gross_median = float(_median(gross_values) or 0.0) if gross_values else 0.0
+    cost_median = float(_median(cost_values) or 0.0) if cost_values else 0.0
+    return {
+        "rows": int(sum(int(v) for v in by_reason.values())),
+        "by_reason": _to_share_rows(by_reason, limit=6),
+        "gross_percent_median": round(float(gross_median), 6) if gross_values else "N/A",
+        "cost_percent_median": round(float(cost_median), 6) if cost_values else "N/A",
+        "cost_minus_gross_median": round(float(cost_median - gross_median), 6) if (gross_values and cost_values) else "N/A",
+        "size_usd_median": round(float(_median(size_values) or 0.0), 6) if size_values else "N/A",
     }
 
 
@@ -2214,6 +2430,10 @@ def _target_policy_from_args(args: argparse.Namespace) -> TargetPolicy:
         pre_risk_roundtrip_loss_median_pct_15m=min(
             -0.05,
             _safe_float(_pick("pre_risk_roundtrip_loss_median_pct_15m", -1.2), -1.2),
+        ),
+        pre_risk_roundtrip_min_closes_15m=max(
+            1,
+            int(_safe_float(_pick("pre_risk_roundtrip_min_closes_15m", 2), 2)),
         ),
         tail_loss_min_closes_60m=max(
             1,
@@ -2598,17 +2818,26 @@ def _resolve_policy_phase(
             or throughput_est < float(throughput_target_effective) * 0.40
         )
     )
+    roundtrip_pre_risk_hit = bool(
+        roundtrip_loss_median_pct is not None
+        and closes >= int(target.pre_risk_roundtrip_min_closes_15m)
+        and float(roundtrip_loss_median_pct) <= float(target.pre_risk_roundtrip_loss_median_pct_15m)
+    )
     pre_risk_fail = (
         plan_attempts >= int(target.pre_risk_min_plan_attempts_15m)
         and (
             route_fail_rate >= float(target.pre_risk_route_fail_rate_15m)
             or buy_fail_rate >= float(target.pre_risk_buy_fail_rate_15m)
             or sell_fail_rate >= float(target.pre_risk_sell_fail_rate_15m)
-            or (
-                roundtrip_loss_median_pct is not None
-                and float(roundtrip_loss_median_pct) <= float(target.pre_risk_roundtrip_loss_median_pct_15m)
-            )
+            or roundtrip_pre_risk_hit
         )
+    )
+    pre_risk_roundtrip_only = bool(
+        pre_risk_fail
+        and roundtrip_pre_risk_hit
+        and route_fail_rate < float(target.pre_risk_route_fail_rate_15m)
+        and buy_fail_rate < float(target.pre_risk_buy_fail_rate_15m)
+        and sell_fail_rate < float(target.pre_risk_sell_fail_rate_15m)
     )
     diversity_fail_buys = (
         buy_total_15m >= int(target.diversity_min_buys_15m)
@@ -2639,14 +2868,31 @@ def _resolve_policy_phase(
         and tail_loss_ratio is not None
         and float(tail_loss_ratio) >= float(target.tail_loss_ratio_max)
     )
-    risk_fail = bool(risk_fail_core or tail_loss_fail)
-    blacklist_fail_raw = (
+    blacklist_fail_raw_pre = (
         blacklist_added >= int(target.max_blacklist_added_15m)
         or (
             plan_attempts >= int(blacklist_share_min_attempts)
             and blacklist_share >= float(target.max_blacklist_share_15m)
         )
     )
+    # Tail-loss can be dominated by a single outlier close in 60m.
+    # Keep a soft-hold mode when execution is active and no other hard risk signal is failing.
+    tail_loss_only = bool(
+        tail_loss_fail
+        and (not risk_fail_core)
+        and (not pre_risk_fail)
+        and (not blacklist_fail_raw_pre)
+        and (not diversity_fail)
+        and (not flow_fail)
+    )
+    tail_loss_soft_hold = bool(
+        tail_loss_only
+        and open_rate >= float(target.min_open_rate_15m) * 0.70
+        and throughput_est >= max(2.0, float(throughput_target_effective) * 0.70)
+        and closes <= max(2, int(target.min_closed_for_risk_checks) // 2)
+    )
+    risk_fail = bool(risk_fail_core or (tail_loss_fail and (not tail_loss_soft_hold)))
+    blacklist_fail_raw = bool(blacklist_fail_raw_pre)
     concentrated_single_token_pressure = (
         blacklist_fail_raw
         and blacklist_unique <= 1
@@ -2683,6 +2929,22 @@ def _resolve_policy_phase(
             f"route_fail_rate={route_fail_rate:.3f} buy_fail_rate={buy_fail_rate:.3f} "
             f"sell_fail_rate={sell_fail_rate:.3f} roundtrip_loss_median={roundtrip_loss_median_pct}"
         )
+        if pre_risk_roundtrip_only:
+            reasons.append(
+                "pre_risk_roundtrip_only "
+                f"closes15={closes} min_closes15={int(target.pre_risk_roundtrip_min_closes_15m)} "
+                f"roundtrip_median={roundtrip_loss_median_pct}"
+            )
+    elif (
+        roundtrip_loss_median_pct is not None
+        and float(roundtrip_loss_median_pct) <= float(target.pre_risk_roundtrip_loss_median_pct_15m)
+        and closes < int(target.pre_risk_roundtrip_min_closes_15m)
+    ):
+        reasons.append(
+            "pre_risk_roundtrip_pending_closes "
+            f"closes15={closes} min_closes15={int(target.pre_risk_roundtrip_min_closes_15m)} "
+            f"roundtrip_median={roundtrip_loss_median_pct}"
+        )
     if diversity_fail:
         reasons.append(
             "diversity_fail "
@@ -2702,6 +2964,12 @@ def _resolve_policy_phase(
             f"plan_attempts15={plan_attempts_total_15m} source_top={source_top_name_15m} "
             f"source_top_share15={source_top_share_15m:.3f} "
             f"non_watch_supply15={non_watch_supply_15m} non_watch_plan15={non_watch_plan_attempts_15m}"
+        )
+    if tail_loss_soft_hold:
+        reasons.append(
+            "tail_loss_soft_hold "
+            f"tail_loss_ratio={tail_loss_ratio} open_rate={open_rate:.3f} "
+            f"tph_est={throughput_est:.2f} closes15={closes}"
         )
     if risk_fail:
         if tail_loss_fail:
@@ -2789,9 +3057,11 @@ def _resolve_policy_phase(
         risk_fail=bool(risk_fail),
         risk_fail_core=bool(risk_fail_core),
         tail_loss_fail=bool(tail_loss_fail),
+        tail_loss_soft_hold=bool(tail_loss_soft_hold),
         flow_fail=bool(flow_fail),
         blacklist_fail=bool(blacklist_fail),
         pre_risk_fail=bool(pre_risk_fail),
+        pre_risk_roundtrip_only=bool(pre_risk_roundtrip_only),
         diversity_fail=bool(diversity_fail),
         plan_concentration_fail=bool(plan_concentration_fail),
         source_concentration_fail=bool(source_concentration_fail),
@@ -2898,6 +3168,7 @@ def _apply_action_delta_caps(actions: list[Action], phase: str) -> tuple[list[Ac
         "V2_CALIBRATION_VOLUME_MIN": (12.0, False),
         "EV_FIRST_ENTRY_MIN_NET_USD": (0.0010, False),
         "EV_FIRST_ENTRY_CORE_PROBE_EV_TOLERANCE_USD": (0.0010, False),
+        "EV_FIRST_ENTRY_CORE_PROBE_MIN_NET_USD": (0.0010, False),
         "MAX_TOKEN_COOLDOWN_SECONDS": (40.0, True),
         "MIN_TRADE_USD": (0.10, False),
         "PAPER_TRADE_SIZE_MIN_USD": (0.10, False),
@@ -2926,7 +3197,11 @@ def _apply_action_delta_caps(actions: list[Action], phase: str) -> tuple[list[Ac
         "WATCHLIST_REFRESH_SECONDS": (300.0, True),
         "WATCHLIST_MAX_TOKENS": (12.0, True),
         "WATCHLIST_MIN_LIQUIDITY_USD": (50000.0, False),
+        "WATCHLIST_MIN_VOLUME_5M_USD": (1000.0, False),
         "WATCHLIST_MIN_VOLUME_24H_USD": (150000.0, False),
+        "WATCHLIST_LOW_SUPPLY_MIN_COUNT": (2.0, True),
+        "WATCHLIST_LOW_SUPPLY_RELAX_FACTOR": (0.08, False),
+        "WATCHLIST_LOW_SUPPLY_MIN_VOLUME_5M_USD": (30.0, False),
         "PAPER_WATCHLIST_MIN_SCORE": (4.0, True),
         "PAPER_WATCHLIST_MIN_LIQUIDITY_USD": (30000.0, False),
         "PAPER_WATCHLIST_MIN_VOLUME_5M_USD": (200.0, False),
@@ -2947,8 +3222,11 @@ def _apply_action_delta_caps(actions: list[Action], phase: str) -> tuple[list[Ac
         key = str(action.key or "").strip().upper()
         old_value = str(action.old_value or "").strip()
         new_value = str(action.new_value or "").strip()
+        reason_low = str(action.reason or "").strip().lower()
         updated = new_value
-        if key in {"V2_SOURCE_QOS_SOURCE_CAPS", "V2_UNIVERSE_SOURCE_CAPS"}:
+        if "trade_size_floor_guard" in reason_low:
+            updated = new_value
+        elif key in {"V2_SOURCE_QOS_SOURCE_CAPS", "V2_UNIVERSE_SOURCE_CAPS"}:
             updated = _cap_source_caps_delta(old_value, new_value, per_source_limit=per_source_cap_limit)
         elif key in limits and _is_numeric_pair(old_value, new_value):
             limit, integer = limits[key]
@@ -3022,18 +3300,40 @@ def _update_idle_relax_state(
     selected_now = int(metrics.selected_from_batch)
     opened_now = int(metrics.opened_from_batch)
     open_positions_now = int(metrics.open_positions)
+    zero_scan_cycles_now = int(max(0, metrics.zero_scan_cycles))
+    watchlist_low_supply_hits_now = int(max(0, metrics.watchlist_low_supply_hits))
     fail_now = bool(
         policy_decision.risk_fail
         or policy_decision.pre_risk_fail
         or policy_decision.blacklist_fail
         or policy_decision.diversity_fail
     )
-    eligible_window = bool(
-        selected_now >= int(target.idle_relax_min_selected_15m)
+    min_selected = max(1, int(target.idle_relax_min_selected_15m))
+    min_opp_h = max(0.0, float(target.idle_relax_min_opportunity_per_hour))
+    strict_eligible_window = bool(
+        selected_now >= min_selected
         and opened_now <= 0
         and open_positions_now <= 0
-        and opportunity_rate_h >= float(target.idle_relax_min_opportunity_per_hour)
+        and opportunity_rate_h >= min_opp_h
     )
+    low_supply_detected = bool(zero_scan_cycles_now > 0 or watchlist_low_supply_hits_now > 0)
+    soft_selected_floor = max(1, min(4, int(max(1, min_selected // 3))))
+    soft_min_opp_h = max(2.0, min_opp_h * 0.35)
+    bottleneck_allows_soft = bool(
+        bottleneck_stage in {"opportunity", "action"}
+        or bottleneck_hint in {"discovery_or_filters", "plan_or_policy"}
+    )
+    soft_eligible_window = bool(
+        (not strict_eligible_window)
+        and low_supply_detected
+        and selected_now >= soft_selected_floor
+        and opened_now <= 0
+        and open_positions_now <= 0
+        and opportunity_rate_h >= soft_min_opp_h
+        and bottleneck_allows_soft
+    )
+    eligible_window = bool(strict_eligible_window or soft_eligible_window)
+    eligible_mode = "strict" if strict_eligible_window else ("low_supply_soft" if soft_eligible_window else "none")
     if eligible_window:
         state.idle_no_open_ticks = int(max(0, state.idle_no_open_ticks) + 1)
     elif opened_now > 0 or open_positions_now > 0:
@@ -3065,18 +3365,20 @@ def _update_idle_relax_state(
     elif eligible_window:
         state.idle_last_reason = (
             f"idle_relax_wait ticks={int(state.idle_no_open_ticks)}/{int(target.idle_relax_min_no_open_ticks)} "
-            f"stage={bottleneck_stage} hint={bottleneck_hint}"
+            f"stage={bottleneck_stage} hint={bottleneck_hint} mode={eligible_mode}"
         )
     elif opened_now <= 0 and open_positions_now <= 0:
         state.idle_last_reason = (
             f"idle_relax_not_eligible selected={selected_now} "
-            f"opp_h={opportunity_rate_h:.2f} min_selected={int(target.idle_relax_min_selected_15m)} "
-            f"min_opp_h={float(target.idle_relax_min_opportunity_per_hour):.2f}"
+            f"opp_h={opportunity_rate_h:.2f} min_selected={min_selected} soft_selected={soft_selected_floor} "
+            f"min_opp_h={min_opp_h:.2f} soft_min_opp_h={soft_min_opp_h:.2f} "
+            f"zero_scan={zero_scan_cycles_now} watch_low_supply={watchlist_low_supply_hits_now}"
         )
 
     return {
         "enabled": bool(target.idle_relax_enabled),
         "eligible_window": bool(eligible_window),
+        "eligible_mode": str(eligible_mode),
         "active": bool(active),
         "no_open_ticks": int(state.idle_no_open_ticks),
         "relax_ticks": int(state.idle_relax_ticks),
@@ -3089,6 +3391,9 @@ def _update_idle_relax_state(
         "execution_open_rate_h": round(float(execution_open_rate_h), 6),
         "bottleneck_stage": bottleneck_stage,
         "bottleneck_hint": bottleneck_hint,
+        "zero_scan_cycles_15m": int(zero_scan_cycles_now),
+        "watchlist_low_supply_hits_15m": int(watchlist_low_supply_hits_now),
+        "low_supply_detected": bool(low_supply_detected),
         "last_reason": str(state.idle_last_reason or ""),
     }
 
@@ -3147,6 +3452,15 @@ def _idle_relax_fast_rollback_required(
     )
 
 
+def _is_tuner_hard_protected_key(key: str) -> bool:
+    k = str(key or "").strip().upper()
+    if not k:
+        return False
+    if k in TUNER_HARD_PROTECTED_KEYS:
+        return True
+    return any(k.startswith(prefix) for prefix in TUNER_HARD_PROTECTED_PREFIXES)
+
+
 def _enforce_mutable_action_keys(
     *,
     actions: list[Action],
@@ -3157,6 +3471,15 @@ def _enforce_mutable_action_keys(
     for action in actions:
         key = str(action.key or "").strip()
         if not key:
+            continue
+        if _is_tuner_hard_protected_key(key):
+            blocked.append(
+                {
+                    "key": key,
+                    "reason": str(action.reason or ""),
+                    "blocked_by": "hard_protected_key",
+                }
+            )
             continue
         if key in protected_keys:
             blocked.append(
@@ -3173,6 +3496,27 @@ def _enforce_mutable_action_keys(
                     "key": key,
                     "reason": str(action.reason or ""),
                     "blocked_by": "mutable_whitelist",
+                }
+            )
+            continue
+        out.append(action)
+    return out, blocked
+
+
+def _enforce_dry_run_structural_locks(
+    *,
+    actions: list[Action],
+) -> tuple[list[Action], list[dict[str, Any]]]:
+    out: list[Action] = []
+    blocked: list[dict[str, Any]] = []
+    for action in actions:
+        key = str(action.key or "").strip()
+        if key in TUNER_DRY_RUN_STRUCTURAL_LOCK_KEYS:
+            blocked.append(
+                {
+                    "key": key,
+                    "reason": str(action.reason or ""),
+                    "blocked_by": "dry_run_structural_lock",
                 }
             )
             continue
@@ -3214,7 +3558,7 @@ def _overrides_hash(overrides: dict[str, str]) -> str:
 def _latest_jsonl_row(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
-    lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    lines = path.read_text(encoding="utf-8-sig", errors="ignore").splitlines()
     for line in reversed(lines):
         s = line.strip()
         if not s:
@@ -3309,6 +3653,18 @@ def _collect_telemetry_v2(
     safety_reason_total = 0
     source_diversity_non_watch_zero_hits = 0
     safety_api_4029_hits = 0
+    zero_scan_cycles_15m = 0
+    source_qos_zero_cycle_in_15m = 0
+    source_qos_zero_cycle_out_15m = 0
+    source_qos_zero_cycle_dropped_15m = 0
+    watchlist_low_supply_hits_15m = 0
+    watchlist_low_supply_final_last_15m = 0
+    watchlist_low_supply_final_max_15m = 0
+    watchlist_low_supply_min_last_15m = 0
+    watchlist_low_supply_strict_last_15m = 0
+    watchlist_low_supply_relax_last_15m = 0.0
+    edge_cost_dominant_hits_15m = 0
+    edge_cost_dominant_symbols_rows: list[dict[str, Any]] = []
     if metrics is not None:
         safety_reason_total = int(
             sum(int(v) for v in (metrics.safety_reason_counts or Counter()).values())
@@ -3316,6 +3672,18 @@ def _collect_telemetry_v2(
         safety_api_4029_hits = int((metrics.safety_reason_counts or Counter()).get("api_code_4029", 0) or 0)
         safety_reason_rows = _to_share_rows(metrics.safety_reason_counts, limit=8)
         source_diversity_non_watch_zero_hits = int(max(0, metrics.source_diversity_non_watch_zero_hits))
+        zero_scan_cycles_15m = int(max(0, metrics.zero_scan_cycles))
+        source_qos_zero_cycle_in_15m = int(max(0, metrics.source_qos_zero_cycle_in))
+        source_qos_zero_cycle_out_15m = int(max(0, metrics.source_qos_zero_cycle_out))
+        source_qos_zero_cycle_dropped_15m = int(max(0, metrics.source_qos_zero_cycle_dropped))
+        watchlist_low_supply_hits_15m = int(max(0, metrics.watchlist_low_supply_hits))
+        watchlist_low_supply_final_last_15m = int(max(0, metrics.watchlist_low_supply_final_last))
+        watchlist_low_supply_final_max_15m = int(max(0, metrics.watchlist_low_supply_final_max))
+        watchlist_low_supply_min_last_15m = int(max(0, metrics.watchlist_low_supply_min_last))
+        watchlist_low_supply_strict_last_15m = int(max(0, metrics.watchlist_low_supply_strict_last))
+        watchlist_low_supply_relax_last_15m = float(max(0.0, metrics.watchlist_low_supply_relax_last))
+        edge_cost_dominant_hits_15m = int(max(0, metrics.edge_cost_dominant_hits))
+        edge_cost_dominant_symbols_rows = _to_share_rows(metrics.edge_cost_dominant_symbols, limit=6)
     safety_api_only = bool(safety_reason_total > 0 and safety_reason_total == safety_api_4029_hits)
     safety_mode = "normal"
     if safety_reason_total > 0:
@@ -3339,6 +3707,7 @@ def _collect_telemetry_v2(
         "blacklist_filter_dominator_15m": blacklist_filter_dominator_15m,
         "silence_diagnostics_15m": silence_diagnostics_15m,
         "ev_forensics_15m": _ev_forensics_15m(trade_rows_15m),
+        "edge_cost_forensics_15m": _edge_cost_forensics_15m(trade_rows_15m),
         "symbol_churn_15m": _symbol_churn_15m(trade_rows_15m),
         "exit_mix_60m": _exit_mix_60m(trade_rows_60m),
         "symbol_pnl_60m": _symbol_pnl_60m(trade_rows_60m),
@@ -3349,6 +3718,26 @@ def _collect_telemetry_v2(
             "api_only": bool(safety_api_only),
             "mode": str(safety_mode),
             "reasons": safety_reason_rows,
+        },
+        "scan_health_15m": {
+            "zero_scan_cycles": int(zero_scan_cycles_15m),
+            "source_qos_in_zero_cycles": {
+                "in": int(source_qos_zero_cycle_in_15m),
+                "out": int(source_qos_zero_cycle_out_15m),
+                "dropped": int(source_qos_zero_cycle_dropped_15m),
+            },
+            "watchlist_low_supply_fallback": {
+                "hits": int(watchlist_low_supply_hits_15m),
+                "strict_last": int(watchlist_low_supply_strict_last_15m),
+                "final_last": int(watchlist_low_supply_final_last_15m),
+                "final_max": int(watchlist_low_supply_final_max_15m),
+                "min_last": int(watchlist_low_supply_min_last_15m),
+                "relax_factor_last": round(float(watchlist_low_supply_relax_last_15m), 6),
+            },
+        },
+        "cost_dominant_15m": {
+            "hits": int(edge_cost_dominant_hits_15m),
+            "top_symbols": edge_cost_dominant_symbols_rows,
         },
         "source_diversity_guard_15m": {
             "non_watch_final_zero_hits": int(source_diversity_non_watch_zero_hits),
@@ -3372,7 +3761,7 @@ def _load_runtime_rows(path: Path, *, limit: int) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     if not path.exists():
         return rows
-    with path.open("r", encoding="utf-8", errors="ignore") as f:
+    with path.open("r", encoding="utf-8-sig", errors="ignore") as f:
         for line in f:
             s = line.strip()
             if not s:
@@ -3780,6 +4169,9 @@ def _action_priority(action: Action) -> int:
         "SEEN_TOKEN_TTL",
         "WATCHLIST_REFRESH_SECONDS",
         "WATCHLIST_MAX_TOKENS",
+        "WATCHLIST_LOW_SUPPLY_MIN_COUNT",
+        "WATCHLIST_LOW_SUPPLY_RELAX_FACTOR",
+        "WATCHLIST_LOW_SUPPLY_MIN_VOLUME_5M_USD",
         "V2_CALIBRATION_ENABLED",
     }
     medium = {
@@ -3802,7 +4194,11 @@ def _action_priority(action: Action) -> int:
         "V2_QUALITY_SYMBOL_MIN_ABS_CAP",
         "V2_QUALITY_SYMBOL_REENTRY_MIN_SECONDS",
         "WATCHLIST_MIN_LIQUIDITY_USD",
+        "WATCHLIST_MIN_VOLUME_5M_USD",
         "WATCHLIST_MIN_VOLUME_24H_USD",
+        "WATCHLIST_LOW_SUPPLY_MIN_COUNT",
+        "WATCHLIST_LOW_SUPPLY_RELAX_FACTOR",
+        "WATCHLIST_LOW_SUPPLY_MIN_VOLUME_5M_USD",
         "PAPER_WATCHLIST_MIN_SCORE",
         "PAPER_WATCHLIST_MIN_LIQUIDITY_USD",
         "PAPER_WATCHLIST_MIN_VOLUME_5M_USD",
@@ -3880,11 +4276,44 @@ def _build_action_plan(
     min_edge_usd = _get_float(staged, "MIN_EXPECTED_EDGE_USD", 0.010)
     ev_first_min_net_usd = _get_float(staged, "EV_FIRST_ENTRY_MIN_NET_USD", 0.0016)
     ev_probe_tolerance_usd = _get_float(staged, "EV_FIRST_ENTRY_CORE_PROBE_EV_TOLERANCE_USD", 0.0030)
+    ev_probe_min_net_usd = _get_float(staged, "EV_FIRST_ENTRY_CORE_PROBE_MIN_NET_USD", -0.0015)
     cooldown = _get_int(staged, "MAX_TOKEN_COOLDOWN_SECONDS", 90)
     trade_min_paper = _get_float(staged, "PAPER_TRADE_SIZE_MIN_USD", 0.45)
     trade_min_gate = _get_float(staged, "MIN_TRADE_USD", trade_min_paper)
     trade_max_paper = _get_float(staged, "PAPER_TRADE_SIZE_MAX_USD", 1.0)
     trade_min_a_core = _get_float(staged, "ENTRY_A_CORE_MIN_TRADE_USD", 0.45)
+    # Keep paper size above micro-lot zone where modeled costs dominate gross edge.
+    trade_min_floor_usd = 0.80
+    if trade_min_gate < trade_min_floor_usd:
+        trade_min_gate = float(trade_min_floor_usd)
+        _apply_action(staged, actions, "MIN_TRADE_USD", _to_float_str(trade_min_gate), "trade_size_floor_guard")
+    if trade_min_paper < trade_min_floor_usd:
+        trade_min_paper = float(trade_min_floor_usd)
+        _apply_action(
+            staged,
+            actions,
+            "PAPER_TRADE_SIZE_MIN_USD",
+            _to_float_str(trade_min_paper),
+            "trade_size_floor_guard",
+        )
+    if trade_min_a_core < trade_min_floor_usd:
+        trade_min_a_core = float(trade_min_floor_usd)
+        _apply_action(
+            staged,
+            actions,
+            "ENTRY_A_CORE_MIN_TRADE_USD",
+            _to_float_str(trade_min_a_core),
+            "trade_size_floor_guard",
+        )
+    if trade_max_paper < trade_min_paper:
+        trade_max_paper = float(trade_min_paper)
+        _apply_action(
+            staged,
+            actions,
+            "PAPER_TRADE_SIZE_MAX_USD",
+            _to_float_str(trade_max_paper),
+            "trade_size_floor_guard",
+        )
     pe_enabled = _get_bool(staged, "PROFIT_ENGINE_ENABLED", True)
     novelty_share = _get_float(staged, "V2_UNIVERSE_NOVELTY_MIN_SHARE", 0.20)
     symbol_share_cap = _get_float(staged, "SYMBOL_CONCENTRATION_MAX_SHARE", 0.35)
@@ -3919,7 +4348,11 @@ def _build_action_plan(
     watchlist_refresh_seconds = _get_int(staged, "WATCHLIST_REFRESH_SECONDS", 3600)
     watchlist_max_tokens = _get_int(staged, "WATCHLIST_MAX_TOKENS", 30)
     watchlist_min_liquidity = _get_float(staged, "WATCHLIST_MIN_LIQUIDITY_USD", 200000.0)
+    watchlist_min_volume_5m = _get_float(staged, "WATCHLIST_MIN_VOLUME_5M_USD", 5000.0)
     watchlist_min_volume_24h = _get_float(staged, "WATCHLIST_MIN_VOLUME_24H_USD", 500000.0)
+    watchlist_low_supply_min_count = _get_int(staged, "WATCHLIST_LOW_SUPPLY_MIN_COUNT", 12)
+    watchlist_low_supply_relax_factor = _get_float(staged, "WATCHLIST_LOW_SUPPLY_RELAX_FACTOR", 0.50)
+    watchlist_low_supply_min_volume_5m = _get_float(staged, "WATCHLIST_LOW_SUPPLY_MIN_VOLUME_5M_USD", 120.0)
     paper_watchlist_min_score = _get_int(staged, "PAPER_WATCHLIST_MIN_SCORE", 90)
     paper_watchlist_min_liquidity = _get_float(staged, "PAPER_WATCHLIST_MIN_LIQUIDITY_USD", 150000.0)
     paper_watchlist_min_volume_5m = _get_float(staged, "PAPER_WATCHLIST_MIN_VOLUME_5M_USD", 500.0)
@@ -3940,6 +4373,8 @@ def _build_action_plan(
     edge_low_hits = int(metrics.autotrade_skip_reasons.get("edge_low", 0))
     edge_usd_low_hits = int(metrics.autotrade_skip_reasons.get("edge_usd_low", 0))
     negative_edge_hits = int(metrics.autotrade_skip_reasons.get("negative_edge", 0))
+    cost_dominant_hits = int(metrics.autotrade_skip_reasons.get("cost_dominant_edge", 0))
+    cost_dominant_hits = max(cost_dominant_hits, int(metrics.edge_cost_dominant_hits))
     min_trade_hits = int(metrics.autotrade_skip_reasons.get("min_trade_size", 0))
     symbol_concentration_skip_hits = int(metrics.autotrade_skip_reasons.get("symbol_concentration", 0))
     source_route_prob_hits = int(metrics.autotrade_skip_reasons.get("source_route_prob", 0))
@@ -3962,18 +4397,19 @@ def _build_action_plan(
     open_rate = float(metrics.open_rate)
     low_throughput = _is_low_throughput(metrics)
     # Flow guardrails: prevent tuner from self-choking entry funnel on weak windows.
-    flow_watchlist_share_floor = 0.08 if low_throughput else 0.02
+    flow_watchlist_share_floor = 0.02
     flow_watchlist_share_ceiling = 0.60
     flow_non_watchlist_ceiling = 3 if low_throughput else 6
     cooldown_dominant_early = bool(
         low_throughput and cooldown_hits >= max(12, int(metrics.selected_from_batch) // 2)
     )
     flow_per_symbol_cap_floor = 1
-    flow_qos_watchlist_cap_floor = 8 if low_throughput else 2
-    flow_universe_watchlist_cap_floor = 4 if low_throughput else 2
+    flow_qos_watchlist_cap_floor = 2
+    flow_universe_watchlist_cap_floor = 2
+    low_supply_watchlist_cap_floor = 0
     source_qos_cap_hits = int(metrics.filter_fail_reasons.get("source_qos_cap", 0))
     source_qos_symbol_cap_hits = int(metrics.filter_fail_reasons.get("source_qos_symbol_cap", 0))
-    edge_pressure_hits = int(ev_low_hits + edge_low_hits + edge_usd_low_hits + negative_edge_hits)
+    edge_pressure_hits = int(ev_low_hits + edge_low_hits + edge_usd_low_hits + negative_edge_hits + cost_dominant_hits)
     filter_fail_total = 0
     for _rk, _rv in metrics.filter_fail_reasons.items():
         try:
@@ -4005,9 +4441,13 @@ def _build_action_plan(
     source_profile_15m: dict[str, Any] = {}
     supply_sanity_15m: dict[str, Any] = {}
     safety_degraded_15m: dict[str, Any] = {}
+    scan_health_15m: dict[str, Any] = {}
+    cost_dominant_15m: dict[str, Any] = {}
+    edge_cost_forensics_15m: dict[str, Any] = {}
     source_diversity_guard_15m: dict[str, Any] = {}
     plan_concentration_15m: dict[str, Any] = {}
     ev_forensics_15m: dict[str, Any] = {}
+    edge_cost_forensics_15m: dict[str, Any] = {}
     blacklist_dominator_15m: dict[str, Any] = {}
     symbol_pnl_60m: dict[str, Any] = {}
     prefilter_15m: dict[str, Any] = {}
@@ -4036,6 +4476,15 @@ def _build_action_plan(
         safety_raw = telemetry.get("safety_degraded_15m", {}) or {}
         if isinstance(safety_raw, dict):
             safety_degraded_15m = safety_raw
+        scan_raw = telemetry.get("scan_health_15m", {}) or {}
+        if isinstance(scan_raw, dict):
+            scan_health_15m = scan_raw
+        cost_dom_raw = telemetry.get("cost_dominant_15m", {}) or {}
+        if isinstance(cost_dom_raw, dict):
+            cost_dominant_15m = cost_dom_raw
+        edge_cost_forensics_raw = telemetry.get("edge_cost_forensics_15m", {}) or {}
+        if isinstance(edge_cost_forensics_raw, dict):
+            edge_cost_forensics_15m = edge_cost_forensics_raw
         source_guard_raw = telemetry.get("source_diversity_guard_15m", {}) or {}
         if isinstance(source_guard_raw, dict):
             source_diversity_guard_15m = source_guard_raw
@@ -4048,6 +4497,9 @@ def _build_action_plan(
         ev_raw = telemetry.get("ev_forensics_15m", {}) or {}
         if isinstance(ev_raw, dict):
             ev_forensics_15m = ev_raw
+        edge_cost_raw = telemetry.get("edge_cost_forensics_15m", {}) or {}
+        if isinstance(edge_cost_raw, dict):
+            edge_cost_forensics_15m = edge_cost_raw
         pnl60_raw = telemetry.get("symbol_pnl_60m", {}) or {}
         if isinstance(pnl60_raw, dict):
             symbol_pnl_60m = pnl60_raw
@@ -4068,6 +4520,7 @@ def _build_action_plan(
     quality_source_budget_hits = _reason_count(quality_skip_rows, "source_budget")
     quality_symbol_concentration_hits = _reason_count(quality_skip_rows, "symbol_concentration")
     plan_ev_low_hits = _reason_count(plan_skip_rows, "ev_net_low")
+    plan_cost_dominant_hits = _reason_count(plan_skip_rows, "cost_dominant_edge")
     plan_excluded_hits = _reason_count(plan_skip_rows, "excluded_symbol")
     funnel_raw_count = int(_safe_float((funnel_15m or {}).get("raw", 0), 0.0))
     funnel_pre_count = int(_safe_float((funnel_15m or {}).get("pre", 0), 0.0))
@@ -4106,6 +4559,40 @@ def _build_action_plan(
     safety_api_4029_hits_15m = int(_safe_float((safety_degraded_15m or {}).get("api_code_4029_hits", 0), 0.0))
     safety_api_only_15m = bool((safety_degraded_15m or {}).get("api_only", False))
     safety_degraded_mode_15m = str((safety_degraded_15m or {}).get("mode", "normal") or "normal").strip().lower()
+    zero_scan_cycles_15m = int(_safe_float((scan_health_15m or {}).get("zero_scan_cycles", 0), 0.0))
+    watchlist_low_supply_hits_15m = int(
+        _safe_float(((scan_health_15m or {}).get("watchlist_low_supply_fallback") or {}).get("hits", 0), 0.0)
+    )
+    watchlist_low_supply_final_last_15m = int(
+        _safe_float(((scan_health_15m or {}).get("watchlist_low_supply_fallback") or {}).get("final_last", 0), 0.0)
+    )
+    watchlist_low_supply_final_max_15m = int(
+        _safe_float(((scan_health_15m or {}).get("watchlist_low_supply_fallback") or {}).get("final_max", 0), 0.0)
+    )
+    if watchlist_low_supply_hits_15m > 0:
+        low_supply_observed = max(int(watchlist_low_supply_final_last_15m), int(watchlist_low_supply_final_max_15m))
+        if low_supply_observed > 0:
+            low_supply_watchlist_cap_floor = _clamp_int(
+                max(4, int(math.ceil(float(low_supply_observed) * 0.35))),
+                4,
+                12,
+            )
+            flow_qos_watchlist_cap_floor = max(
+                int(flow_qos_watchlist_cap_floor),
+                int(low_supply_watchlist_cap_floor),
+            )
+            flow_universe_watchlist_cap_floor = max(
+                int(flow_universe_watchlist_cap_floor),
+                max(2, int(low_supply_watchlist_cap_floor) - 1),
+            )
+    cost_dominant_hits_telemetry_15m = int(_safe_float((cost_dominant_15m or {}).get("hits", 0), 0.0))
+    cost_dominant_hits = max(cost_dominant_hits, cost_dominant_hits_telemetry_15m)
+    edge_cost_rows_15m = int(_safe_float((edge_cost_forensics_15m or {}).get("rows", 0), 0.0))
+    edge_cost_gross_median_15m = _safe_float((edge_cost_forensics_15m or {}).get("gross_percent_median", 0.0), 0.0)
+    edge_cost_total_median_15m = _safe_float((edge_cost_forensics_15m or {}).get("cost_percent_median", 0.0), 0.0)
+    edge_cost_size_median_15m = _safe_float((edge_cost_forensics_15m or {}).get("size_usd_median", 0.0), 0.0)
+    edge_cost_gap_median_15m = float(edge_cost_total_median_15m - edge_cost_gross_median_15m)
+    edge_pressure_hits = int(ev_low_hits + edge_low_hits + edge_usd_low_hits + negative_edge_hits + cost_dominant_hits)
     prefilter_removed_total_15m = int(
         _safe_float(((prefilter_15m or {}).get("removed") or {}).get("total", 0), 0.0)
     )
@@ -4144,9 +4631,9 @@ def _build_action_plan(
     cooldown_symbol_dominant = bool(
         low_throughput
         and cooldown_top_symbol not in {"", "N/A", "UNKNOWN"}
-        and cooldown_hits >= max(18, int(metrics.selected_from_batch) // 2)
-        and cooldown_top_hits >= max(8, int(cooldown_hits * 0.35))
-        and cooldown_top_share >= 0.45
+        and cooldown_hits >= max(10, int(metrics.selected_from_batch) // 3)
+        and cooldown_top_hits >= max(5, int(cooldown_hits * 0.30))
+        and cooldown_top_share >= 0.40
     )
     loss_symbol_dominant = bool(
         top_loss_symbol_60m not in {"", "N/A", "UNKNOWN"}
@@ -4176,14 +4663,14 @@ def _build_action_plan(
         supply_non_watch_15m >= max(12, int(metrics.selected_from_batch) // 3)
         and post_filters_non_watch_15m <= source_non_watch_starved_floor_15m
     )
+    source_non_watch_plan_floor_15m = max(1, int(source_non_watch_actionable_min_15m // 4))
     source_starvation_guard = bool(
         low_throughput
         and source_top_name_15m.startswith("watchlist")
         and source_top_share_15m >= 0.75
         and supply_non_watch_15m >= max(12, int(metrics.selected_from_batch) // 3)
         and (source_non_watch_actionable or non_watch_post_filter_starved)
-        and plan_non_watch_15m <= 0
-        and source_non_watch_zero_hits_15m >= max(3, int(plan_attempts_15m // 8))
+        and plan_non_watch_15m <= source_non_watch_plan_floor_15m
     )
     non_watch_conversion_choke = bool(
         source_top_name_15m.startswith("watchlist")
@@ -4200,6 +4687,13 @@ def _build_action_plan(
         and int(metrics.opened_from_batch) <= 2
     )
     edge_low_share_15m = float(edge_low_hits) / float(max(1, plan_attempts_15m))
+    cost_dominant_edge_choke = bool(
+        low_throughput
+        and edge_cost_rows_15m >= max(8, int(plan_attempts_15m // 3))
+        and edge_low_hits >= max(6, int(plan_attempts_15m * 0.40))
+        and edge_cost_total_median_15m >= 4.0
+        and edge_cost_gap_median_15m >= 1.8
+    )
     edge_low_symbol_loop = bool(
         source_top_name_15m.startswith("watchlist")
         and plan_attempts_15m >= max(8, int(metrics.selected_from_batch) // 2)
@@ -4224,6 +4718,8 @@ def _build_action_plan(
     symbol_concentration_skip_hits = max(symbol_concentration_skip_hits, quality_symbol_concentration_hits)
     concentration_drop_hits = max(concentration_drop_hits, quality_symbol_concentration_hits)
     ev_low_hits = max(ev_low_hits, plan_ev_low_hits)
+    cost_dominant_hits = max(cost_dominant_hits, plan_cost_dominant_hits)
+    edge_pressure_hits = int(ev_low_hits + edge_low_hits + edge_usd_low_hits + negative_edge_hits + cost_dominant_hits)
     excluded_symbol_hits = max(excluded_symbol_hits, plan_excluded_hits)
     quality_source_budget_share = (
         float(quality_source_budget_hits) / float(max(1, quality_skip_total))
@@ -4661,6 +5157,14 @@ def _build_action_plan(
             f"api_only={bool(safety_api_only_15m)} mode={safety_degraded_mode_15m or 'normal'}"
         )
 
+    if low_supply_watchlist_cap_floor > 0:
+        trace.append(
+            "low_supply_watchlist_cap_floor "
+            f"hits15={watchlist_low_supply_hits_15m} final_last={watchlist_low_supply_final_last_15m} "
+            f"final_max={watchlist_low_supply_final_max_15m} qos_floor={flow_qos_watchlist_cap_floor} "
+            f"universe_floor={flow_universe_watchlist_cap_floor}"
+        )
+
     if mode.name in {"fast", "conveyor"} and cold_start_hits > 0 and pe_enabled:
         pe_enabled = False
         rule_hits["pe_cold_start_guard"] += 1
@@ -4742,22 +5246,30 @@ def _build_action_plan(
 
     active_lock_until = 0.0
     active_lock_symbol = ""
+
+    def _release_lock_symbol(symbol: str, *, reason: str) -> None:
+        nonlocal excluded_symbols
+        sym = str(symbol or "").strip().upper()
+        if not sym:
+            return
+        if sym in excluded_symbol_set:
+            excluded_symbols = [item for item in excluded_symbols if item != sym]
+            excluded_symbol_set.discard(sym)
+            _apply_action(
+                staged,
+                actions,
+                "AUTO_TRADE_EXCLUDED_SYMBOLS",
+                _format_symbol_csv(excluded_symbols),
+                f"churn_lock_release {reason}",
+            )
+        rule_hits["churn_lock_release"] += 1
+        trace.append(f"churn_lock_release symbol={sym} reason={reason}")
+
     if runtime_state is not None:
         active_lock_symbol = str(runtime_state.churn_lock_symbol or "").strip().upper()
         active_lock_until = float(runtime_state.churn_lock_until_ts or 0.0)
         if active_lock_symbol and tick_ts >= active_lock_until:
-            if active_lock_symbol in excluded_symbol_set:
-                excluded_symbols = [sym for sym in excluded_symbols if sym != active_lock_symbol]
-                excluded_symbol_set.discard(active_lock_symbol)
-                _apply_action(
-                    staged,
-                    actions,
-                    "AUTO_TRADE_EXCLUDED_SYMBOLS",
-                    _format_symbol_csv(excluded_symbols),
-                    "churn_lock_release ttl_expired",
-                )
-            rule_hits["churn_lock_release"] += 1
-            trace.append(f"churn_lock_release symbol={active_lock_symbol} reason=ttl_expired")
+            _release_lock_symbol(active_lock_symbol, reason="ttl_expired")
             runtime_state.churn_lock_symbol = ""
             runtime_state.churn_lock_until_ts = 0.0
             runtime_state.churn_lock_last_reason = "ttl_expired"
@@ -4766,6 +5278,8 @@ def _build_action_plan(
         if churn_detected and churn_symbol:
             ttl_seconds = max(600, int(churn_ttl_seconds or 0))
             lock_until = tick_ts + float(ttl_seconds)
+            if active_lock_symbol and active_lock_symbol != churn_symbol:
+                _release_lock_symbol(active_lock_symbol, reason=f"switch_to_{str(churn_symbol).lower()}")
             if active_lock_symbol == churn_symbol:
                 active_lock_until = max(float(active_lock_until), float(lock_until))
             else:
@@ -4780,6 +5294,8 @@ def _build_action_plan(
         elif edge_low_symbol_loop and plan_top_symbol_15m:
             ttl_seconds = _clamp_int(max(1200, int(cooldown * 12)), 1200, 3600)
             lock_until = tick_ts + float(ttl_seconds)
+            if active_lock_symbol and active_lock_symbol != plan_top_symbol_15m:
+                _release_lock_symbol(active_lock_symbol, reason=f"switch_to_{str(plan_top_symbol_15m).lower()}")
             if active_lock_symbol == plan_top_symbol_15m:
                 active_lock_until = max(float(active_lock_until), float(lock_until))
             else:
@@ -4804,6 +5320,8 @@ def _build_action_plan(
                 3600,
             )
             lock_until = tick_ts + float(ttl_seconds)
+            if active_lock_symbol and active_lock_symbol != top_loss_symbol_60m:
+                _release_lock_symbol(active_lock_symbol, reason=f"switch_to_{str(top_loss_symbol_60m).lower()}")
             if active_lock_symbol == top_loss_symbol_60m:
                 active_lock_until = max(float(active_lock_until), float(lock_until))
             else:
@@ -4828,6 +5346,8 @@ def _build_action_plan(
                 3600,
             )
             lock_until = tick_ts + float(ttl_seconds)
+            if active_lock_symbol and active_lock_symbol != cooldown_top_symbol:
+                _release_lock_symbol(active_lock_symbol, reason=f"switch_to_{str(cooldown_top_symbol).lower()}")
             if active_lock_symbol == cooldown_top_symbol:
                 active_lock_until = max(float(active_lock_until), float(lock_until))
             else:
@@ -4852,19 +5372,9 @@ def _build_action_plan(
             and (not churn_detected)
         )
         if release_ready:
-            if active_lock_symbol in excluded_symbol_set:
-                excluded_symbols = [sym for sym in excluded_symbols if sym != active_lock_symbol]
-                excluded_symbol_set.discard(active_lock_symbol)
-                _apply_action(
-                    staged,
-                    actions,
-                    "AUTO_TRADE_EXCLUDED_SYMBOLS",
-                    _format_symbol_csv(excluded_symbols),
-                    "churn_lock_release diversity_recovered",
-                )
-            rule_hits["churn_lock_release"] += 1
+            _release_lock_symbol(active_lock_symbol, reason="diversity_recovered")
             trace.append(
-                f"churn_lock_release symbol={active_lock_symbol} reason=diversity_recovered uniq={buy_unique} top={buy_top_share:.2f}"
+                f"churn_lock_release_detail symbol={active_lock_symbol} reason=diversity_recovered uniq={buy_unique} top={buy_top_share:.2f}"
             )
             runtime_state.churn_lock_symbol = ""
             runtime_state.churn_lock_until_ts = 0.0
@@ -5297,25 +5807,47 @@ def _build_action_plan(
                 "blacklist_dominator_shaping non_watch_min",
             )
 
-    feed_starvation = (
-        low_throughput
-        and funnel_raw_count > 0
+    feed_starvation_base = bool(
+        funnel_raw_count > 0
         and funnel_pre_count > 0
         and funnel_raw_count < 260
         and (funnel_buy_count <= 1 or open_rate < 0.03)
+    )
+    feed_starvation_zero_scan = bool(
+        zero_scan_cycles_15m >= max(2, int(min(8, max(2, metrics.lines_seen // 6))))
+    )
+    feed_starvation_watchlist_low_supply = bool(watchlist_low_supply_hits_15m >= 2)
+    feed_starvation = bool(
+        low_throughput
+        and (
+            feed_starvation_base
+            or feed_starvation_zero_scan
+            or feed_starvation_watchlist_low_supply
+        )
     )
     if feed_starvation:
         rule_hits["feed_starvation"] += 1
         trace.append(
             "feed_starvation "
-            f"raw15={funnel_raw_count} pre15={funnel_pre_count} buy15={funnel_buy_count} open_rate={open_rate:.3f}"
+            f"raw15={funnel_raw_count} pre15={funnel_pre_count} buy15={funnel_buy_count} open_rate={open_rate:.3f} "
+            f"zero_scan15={zero_scan_cycles_15m} low_supply15={watchlist_low_supply_hits_15m}"
         )
         token_age_max = _clamp_int(token_age_max + 900, 1800, 21600)
         seen_token_ttl = _clamp_int(seen_token_ttl - 900, 300, 21600)
         watchlist_refresh_seconds = _clamp_int(watchlist_refresh_seconds - 120, 60, 3600)
         watchlist_max_tokens = _clamp_int(watchlist_max_tokens + 10, 5, 120)
         watchlist_min_liquidity = _clamp_float(watchlist_min_liquidity - 20000.0, 5000.0, 1000000.0)
+        watchlist_min_volume_5m = _clamp_float(watchlist_min_volume_5m - 1200.0, 100.0, 5000.0)
         watchlist_min_volume_24h = _clamp_float(watchlist_min_volume_24h - 60000.0, 10000.0, 5000000.0)
+        low_supply_min_floor = 4 if watchlist_low_supply_hits_15m <= 0 else 6
+        low_supply_min_step = 1 if watchlist_low_supply_hits_15m <= 1 else 2
+        watchlist_low_supply_min_count = _clamp_int(
+            max(watchlist_low_supply_min_count + low_supply_min_step, low_supply_min_floor),
+            1,
+            30,
+        )
+        watchlist_low_supply_relax_factor = _clamp_float(watchlist_low_supply_relax_factor - 0.05, 0.10, 1.00)
+        watchlist_low_supply_min_volume_5m = _clamp_float(watchlist_low_supply_min_volume_5m - 20.0, 0.0, 5000.0)
         paper_watchlist_min_liquidity = _clamp_float(paper_watchlist_min_liquidity - 12000.0, 10000.0, 500000.0)
         paper_watchlist_min_volume_5m = _clamp_float(paper_watchlist_min_volume_5m - 40.0, 10.0, 20000.0)
         paper_watchlist_min_score = _clamp_int(paper_watchlist_min_score - 2, 70, 98)
@@ -5339,9 +5871,37 @@ def _build_action_plan(
         _apply_action(
             staged,
             actions,
+            "WATCHLIST_MIN_VOLUME_5M_USD",
+            _to_float_str(watchlist_min_volume_5m),
+            "feed_starvation watch_min_vol5m",
+        )
+        _apply_action(
+            staged,
+            actions,
             "WATCHLIST_MIN_VOLUME_24H_USD",
             _to_float_str(watchlist_min_volume_24h),
             "feed_starvation watch_min_vol24h",
+        )
+        _apply_action(
+            staged,
+            actions,
+            "WATCHLIST_LOW_SUPPLY_MIN_COUNT",
+            _to_int_str(watchlist_low_supply_min_count),
+            "feed_starvation low_supply_min_count",
+        )
+        _apply_action(
+            staged,
+            actions,
+            "WATCHLIST_LOW_SUPPLY_RELAX_FACTOR",
+            _to_float_str(watchlist_low_supply_relax_factor),
+            "feed_starvation low_supply_relax_factor",
+        )
+        _apply_action(
+            staged,
+            actions,
+            "WATCHLIST_LOW_SUPPLY_MIN_VOLUME_5M_USD",
+            _to_float_str(watchlist_low_supply_min_volume_5m),
+            "feed_starvation low_supply_min_vol5m",
         )
         _apply_action(
             staged,
@@ -5364,6 +5924,74 @@ def _build_action_plan(
             _to_int_str(paper_watchlist_min_score),
             "feed_starvation paper_watch_min_score",
         )
+        if feed_starvation_zero_scan:
+            source_qos_topk_per_cycle = _clamp_int(source_qos_topk_per_cycle + 40, 20, 600)
+            top_n = _clamp_int(top_n + 4, 8, 80)
+            novelty_share = _clamp_float(novelty_share + 0.05, 0.05, 0.90)
+            _apply_action(
+                staged,
+                actions,
+                "V2_SOURCE_QOS_TOPK_PER_CYCLE",
+                _to_int_str(source_qos_topk_per_cycle),
+                "feed_starvation_zero_scan topk",
+            )
+            _apply_action(
+                staged,
+                actions,
+                "AUTO_TRADE_TOP_N",
+                _to_int_str(top_n),
+                "feed_starvation_zero_scan topn",
+            )
+            _apply_action(
+                staged,
+                actions,
+                "V2_UNIVERSE_NOVELTY_MIN_SHARE",
+                _to_float_str(novelty_share),
+                "feed_starvation_zero_scan novelty",
+            )
+            if qos_caps:
+                for src in ("onchain", "onchain+market", "dexscreener", "geckoterminal"):
+                    prev = int(qos_caps.get(src, 0) or 0)
+                    if prev > 0:
+                        qos_caps[src] = _clamp_int(prev + 12, 1, 600)
+                watch_prev = int(qos_caps.get("watchlist", 0) or 0)
+                if watch_prev > 0:
+                    watch_floor = max(1, int(flow_qos_watchlist_cap_floor))
+                    if watchlist_source_concentration:
+                        qos_caps["watchlist"] = _clamp_int(watch_prev - 2, watch_floor, 600)
+                    else:
+                        qos_caps["watchlist"] = _clamp_int(max(watch_prev, watch_floor), watch_floor, 600)
+                _apply_action(
+                    staged,
+                    actions,
+                    "V2_SOURCE_QOS_SOURCE_CAPS",
+                    _format_source_cap_map(qos_caps),
+                    "feed_starvation_zero_scan source_caps",
+                )
+            if universe_caps:
+                for src in ("onchain", "onchain+market", "dexscreener", "geckoterminal"):
+                    prev = int(universe_caps.get(src, 0) or 0)
+                    if prev > 0:
+                        universe_caps[src] = _clamp_int(prev + 12, 1, 600)
+                watch_prev = int(universe_caps.get("watchlist", 0) or 0)
+                if watch_prev > 0:
+                    watch_floor = max(1, int(flow_universe_watchlist_cap_floor))
+                    if watchlist_source_concentration:
+                        universe_caps["watchlist"] = _clamp_int(watch_prev - 2, watch_floor, 600)
+                    else:
+                        universe_caps["watchlist"] = _clamp_int(max(watch_prev, watch_floor), watch_floor, 600)
+                _apply_action(
+                    staged,
+                    actions,
+                    "V2_UNIVERSE_SOURCE_CAPS",
+                    _format_source_cap_map(universe_caps),
+                    "feed_starvation_zero_scan universe_caps",
+                )
+            rule_hits["feed_starvation_zero_scan_expand"] += 1
+            trace.append(
+                "feed_starvation_zero_scan_expand "
+                f"zero_scan15={zero_scan_cycles_15m} topn={top_n} topk={source_qos_topk_per_cycle}"
+            )
 
     source_qos_cap_choke = low_throughput and (
         source_qos_cap_hits >= max(10, int(metrics.selected_from_batch) // 8)
@@ -5512,6 +6140,7 @@ def _build_action_plan(
         )
         ev_first_min_net_usd = _clamp_float(ev_first_min_net_usd - 0.0005, -0.0020, 0.02)
         ev_probe_tolerance_usd = _clamp_float(ev_probe_tolerance_usd + 0.0008, 0.001, 0.01)
+        ev_probe_min_net_usd = _clamp_float(ev_probe_min_net_usd - 0.0008, -0.0100, 0.0050)
         _apply_action(
             staged,
             actions,
@@ -5525,6 +6154,13 @@ def _build_action_plan(
             "EV_FIRST_ENTRY_CORE_PROBE_EV_TOLERANCE_USD",
             _to_float_str(ev_probe_tolerance_usd),
             "edge_deadlock_recovery ev_probe_tolerance",
+        )
+        _apply_action(
+            staged,
+            actions,
+            "EV_FIRST_ENTRY_CORE_PROBE_MIN_NET_USD",
+            _to_float_str(ev_probe_min_net_usd),
+            "edge_deadlock_recovery ev_probe_min_net",
         )
         if not calibration_no_tighten:
             calibration_no_tighten = True
@@ -5822,6 +6458,7 @@ def _build_action_plan(
             if ev_low_hits >= 6 or int(metrics.selected_from_batch) <= 8:
                 ev_first_min_net_usd = _clamp_float(ev_first_min_net_usd - 0.0004, -0.0020, 0.02)
                 ev_probe_tolerance_usd = _clamp_float(ev_probe_tolerance_usd + 0.0005, 0.001, 0.01)
+                ev_probe_min_net_usd = _clamp_float(ev_probe_min_net_usd - 0.0005, -0.0100, 0.0050)
                 _apply_action(
                     staged,
                     actions,
@@ -5835,6 +6472,13 @@ def _build_action_plan(
                     "EV_FIRST_ENTRY_CORE_PROBE_EV_TOLERANCE_USD",
                     _to_float_str(ev_probe_tolerance_usd),
                     "ev_net_low_probe_tolerance",
+                )
+                _apply_action(
+                    staged,
+                    actions,
+                    "EV_FIRST_ENTRY_CORE_PROBE_MIN_NET_USD",
+                    _to_float_str(ev_probe_min_net_usd),
+                    "ev_net_low_probe_min_net",
                 )
         if cooldown_hits > 0:
             next_cooldown = _clamp_int(cooldown - 15, bounds.cooldown_floor, bounds.cooldown_ceiling)
@@ -5865,21 +6509,80 @@ def _build_action_plan(
                             _to_int_str(quality_symbol_reentry_min_seconds),
                             "cooldown_floor_reached reentry_relax",
                         )
-        if min_trade_hits > 0:
-            trade_min_gate = _clamp_float(trade_min_gate - 0.05, 0.1, 2.0)
-            trade_min_paper = _clamp_float(trade_min_paper - 0.05, 0.1, 2.0)
-            trade_min_a_core = _clamp_float(trade_min_a_core - 0.05, 0.1, 2.5)
-            trade_max_paper = _clamp_float(
-                trade_max_paper + (0.20 if min_trade_hits >= 8 else 0.10),
-                max(0.3, trade_min_paper),
-                2.5,
+        if cost_dominant_edge_choke:
+            # Cost-dominant edge_low at plan stage: raise viable trade size floor instead of
+            # endlessly relaxing edge gates on micro-notional rows.
+            target_floor = 0.80
+            if edge_cost_gap_median_15m >= 4.0:
+                target_floor = 0.95
+            if edge_cost_gap_median_15m >= 6.0:
+                target_floor = 1.10
+            if edge_cost_size_median_15m > 0.0:
+                target_floor = max(target_floor, min(1.25, edge_cost_size_median_15m + 0.10))
+            trade_min_gate_next = _clamp_float(max(trade_min_gate, target_floor), trade_min_floor_usd, 2.0)
+            trade_min_paper_next = _clamp_float(max(trade_min_paper, target_floor), trade_min_floor_usd, 2.0)
+            trade_min_a_core_next = _clamp_float(max(trade_min_a_core, target_floor), trade_min_floor_usd, 2.5)
+            trade_max_floor = max(trade_min_paper_next + 0.25, trade_min_a_core_next + 0.20)
+            trade_max_paper_next = _clamp_float(max(trade_max_paper, trade_max_floor), 0.30, 2.5)
+            if trade_min_gate_next > trade_min_gate:
+                trade_min_gate = trade_min_gate_next
+                _apply_action(staged, actions, "MIN_TRADE_USD", _to_float_str(trade_min_gate), "cost_dominant_viable_floor")
+            if trade_min_paper_next > trade_min_paper:
+                trade_min_paper = trade_min_paper_next
+                _apply_action(
+                    staged,
+                    actions,
+                    "PAPER_TRADE_SIZE_MIN_USD",
+                    _to_float_str(trade_min_paper),
+                    "cost_dominant_viable_floor",
+                )
+            if trade_min_a_core_next > trade_min_a_core:
+                trade_min_a_core = trade_min_a_core_next
+                _apply_action(
+                    staged,
+                    actions,
+                    "ENTRY_A_CORE_MIN_TRADE_USD",
+                    _to_float_str(trade_min_a_core),
+                    "cost_dominant_viable_floor",
+                )
+            if trade_max_paper_next > trade_max_paper:
+                trade_max_paper = trade_max_paper_next
+                _apply_action(
+                    staged,
+                    actions,
+                    "PAPER_TRADE_SIZE_MAX_USD",
+                    _to_float_str(trade_max_paper),
+                    "cost_dominant_viable_floor",
+                )
+            rule_hits["cost_dominant_viable_floor"] += 1
+            trace.append(
+                "cost_dominant_viable_floor "
+                f"rows={edge_cost_rows_15m} gross_med={edge_cost_gross_median_15m:.2f} "
+                f"cost_med={edge_cost_total_median_15m:.2f} gap_med={edge_cost_gap_median_15m:.2f} "
+                f"size_med={edge_cost_size_median_15m:.2f} target={target_floor:.2f}"
             )
-            rule_hits["relax_trade_size_min"] += 1
-            trace.append(f"relax_trade_size_min hits={min_trade_hits}")
-            _apply_action(staged, actions, "MIN_TRADE_USD", _to_float_str(trade_min_gate), "min_trade_size_gate")
-            _apply_action(staged, actions, "PAPER_TRADE_SIZE_MIN_USD", _to_float_str(trade_min_paper), "min_trade_size")
-            _apply_action(staged, actions, "PAPER_TRADE_SIZE_MAX_USD", _to_float_str(trade_max_paper), "min_trade_size_max")
-            _apply_action(staged, actions, "ENTRY_A_CORE_MIN_TRADE_USD", _to_float_str(trade_min_a_core), "min_trade_size_a_core")
+        if min_trade_hits > 0:
+            if cost_dominant_edge_choke:
+                rule_hits["relax_trade_size_min_blocked"] += 1
+                trace.append(
+                    "relax_trade_size_min_blocked "
+                    f"hits={min_trade_hits} reason=cost_dominant_edge_choke gap_med={edge_cost_gap_median_15m:.2f}"
+                )
+            else:
+                trade_min_gate = _clamp_float(trade_min_gate - 0.05, trade_min_floor_usd, 2.0)
+                trade_min_paper = _clamp_float(trade_min_paper - 0.05, trade_min_floor_usd, 2.0)
+                trade_min_a_core = _clamp_float(trade_min_a_core - 0.05, trade_min_floor_usd, 2.5)
+                trade_max_paper = _clamp_float(
+                    trade_max_paper + (0.20 if min_trade_hits >= 8 else 0.10),
+                    max(0.3, trade_min_paper),
+                    2.5,
+                )
+                rule_hits["relax_trade_size_min"] += 1
+                trace.append(f"relax_trade_size_min hits={min_trade_hits}")
+                _apply_action(staged, actions, "MIN_TRADE_USD", _to_float_str(trade_min_gate), "min_trade_size_gate")
+                _apply_action(staged, actions, "PAPER_TRADE_SIZE_MIN_USD", _to_float_str(trade_min_paper), "min_trade_size")
+                _apply_action(staged, actions, "PAPER_TRADE_SIZE_MAX_USD", _to_float_str(trade_max_paper), "min_trade_size_max")
+                _apply_action(staged, actions, "ENTRY_A_CORE_MIN_TRADE_USD", _to_float_str(trade_min_a_core), "min_trade_size_a_core")
         if low_throughput and (safe_age_hits > 0 or safe_volume_hits > 0 or min_trade_hits > 0):
             top_n = _clamp_int(top_n + 4, 8, 80)
             rule_hits["low_throughput_expand_topn"] += 1
@@ -5888,8 +6591,11 @@ def _build_action_plan(
 
     cooldown_dominant_flow = (
         low_throughput
-        and cooldown_hits >= max(18, int(metrics.selected_from_batch) // 2)
-        and cooldown_hits >= max(8, ev_low_hits + edge_low_hits)
+        and cooldown_hits >= max(10, int(metrics.selected_from_batch) // 3)
+        and (
+            cooldown_hits >= max(6, ev_low_hits + edge_low_hits)
+            or (int(metrics.opened_from_batch) <= 0 and plan_attempts_15m >= 12 and cooldown_hits >= 8)
+        )
     )
     if cooldown_dominant_flow:
         rule_hits["cooldown_dominant_flow_expand"] += 1
@@ -5899,7 +6605,7 @@ def _build_action_plan(
             f"selected={metrics.selected_from_batch}"
         )
         if cooldown > bounds.cooldown_floor:
-            cooldown = _clamp_int(cooldown - 10, bounds.cooldown_floor, bounds.cooldown_ceiling)
+            cooldown = _clamp_int(cooldown - 20, bounds.cooldown_floor, bounds.cooldown_ceiling)
             _apply_action(
                 staged,
                 actions,
@@ -5909,7 +6615,7 @@ def _build_action_plan(
             )
         if quality_symbol_reentry_min_seconds > 60:
             quality_symbol_reentry_min_seconds = _clamp_int(
-                quality_symbol_reentry_min_seconds - 30,
+                quality_symbol_reentry_min_seconds - 60,
                 60,
                 3600,
             )
@@ -5930,7 +6636,7 @@ def _build_action_plan(
                 0.35,
             )
         else:
-            plan_watchlist_share = _clamp_float(plan_watchlist_share + 0.04, flow_watchlist_share_floor, 0.35)
+            plan_watchlist_share = _clamp_float(plan_watchlist_share - 0.01, flow_watchlist_share_floor, 0.35)
         plan_single_source_share = _clamp_float(plan_single_source_share - 0.04, 0.20, 1.0)
         per_symbol_cycle_cap = _clamp_int(per_symbol_cycle_cap - 1, flow_per_symbol_cap_floor, 20)
         _apply_action(staged, actions, "AUTO_TRADE_TOP_N", _to_int_str(top_n), "cooldown_dominant_flow_expand topn")
@@ -6630,6 +7336,22 @@ def _build_action_plan(
         "api_only": bool(safety_api_only_15m),
         "mode": str(safety_degraded_mode_15m or "normal"),
     }
+    meta["scan_health_15m"] = {
+        "zero_scan_cycles": int(zero_scan_cycles_15m),
+        "watchlist_low_supply_hits": int(watchlist_low_supply_hits_15m),
+    }
+    meta["cost_dominant_15m"] = {
+        "hits": int(cost_dominant_hits),
+        "top_symbols": _to_share_rows(metrics.edge_cost_dominant_symbols, limit=4),
+    }
+    meta["edge_cost_forensics_15m"] = {
+        "rows": int(edge_cost_rows_15m),
+        "gross_percent_median": round(float(edge_cost_gross_median_15m), 6),
+        "cost_percent_median": round(float(edge_cost_total_median_15m), 6),
+        "cost_minus_gross_median": round(float(edge_cost_gap_median_15m), 6),
+        "size_usd_median": round(float(edge_cost_size_median_15m), 6),
+        "cost_dominant_edge_choke": bool(cost_dominant_edge_choke),
+    }
     if trimmed > 0:
         meta["trimmed_actions"] = int(trimmed)
     if coalesced_count > 0:
@@ -6730,8 +7452,25 @@ def _apply_contract_bounds(
     return out, capped_rows
 
 
+def _strip_utf8_bom_prefix(path: Path) -> None:
+    try:
+        if (not path.exists()) or (path.stat().st_size <= 0):
+            return
+        with path.open("rb") as fh:
+            prefix = fh.read(3)
+        if prefix != b"\xef\xbb\xbf":
+            return
+        data = path.read_bytes()
+        if data.startswith(b"\xef\xbb\xbf"):
+            path.write_bytes(data[3:])
+    except Exception:
+        # Non-fatal: log appends must continue even if BOM cleanup failed.
+        return
+
+
 def _append_runtime_log(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    _strip_utf8_bom_prefix(path)
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
@@ -6829,7 +7568,12 @@ def _active_matrix_payload(root: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = read_json_locked(
+            str(path),
+            timeout_seconds=ACTIVE_MATRIX_LOCK_TIMEOUT_SECONDS,
+            poll_seconds=ACTIVE_MATRIX_LOCK_POLL_SECONDS,
+            encoding="utf-8",
+        )
         return payload if isinstance(payload, dict) else {}
     except Exception:
         return {}
@@ -6839,30 +7583,83 @@ def _write_active_matrix_payload(root: Path, payload: dict[str, Any]) -> bool:
     path = _active_matrix_path(root)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(path)
+        atomic_write_json(
+            str(path),
+            payload,
+            encoding="utf-8",
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=False,
+        )
         return True
-    except Exception:
+    except Exception as exc:
+        try:
+            print(f"[runtime_tuner] active_matrix_write_failed path={path} err={exc}", flush=True)
+        except Exception:
+            pass
+        return False
+
+
+def _mutate_active_matrix_payload(root: Path, mutate_fn: Any) -> bool:
+    path = _active_matrix_path(root)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with state_file_lock(
+            str(path),
+            timeout_seconds=ACTIVE_MATRIX_LOCK_TIMEOUT_SECONDS,
+            poll_seconds=ACTIVE_MATRIX_LOCK_POLL_SECONDS,
+        ):
+            payload: dict[str, Any] = {}
+            if path.exists():
+                try:
+                    raw = json.loads(path.read_text(encoding="utf-8"))
+                    if isinstance(raw, dict):
+                        payload = raw
+                except Exception:
+                    payload = {}
+            changed = bool(mutate_fn(payload))
+            if not changed:
+                return False
+            payload["updated_at"] = _now_iso()
+            atomic_write_json(
+                str(path),
+                payload,
+                encoding="utf-8",
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=False,
+            )
+            return True
+    except Exception as exc:
+        try:
+            print(f"[runtime_tuner] active_matrix_mutate_failed path={path} err={exc}", flush=True)
+        except Exception:
+            pass
         return False
 
 
 def _update_active_matrix_overrides(root: Path, profile_id: str, overrides: dict[str, str]) -> bool:
-    payload = _active_matrix_payload(root)
-    items = payload.get("items") if isinstance(payload.get("items"), list) else []
-    changed = False
-    for row in items:
-        if not isinstance(row, dict):
-            continue
-        if str(row.get("id", "")).strip() != str(profile_id):
-            continue
-        row["overrides"] = {str(k): str(v) for k, v in (overrides or {}).items()}
-        changed = True
-    if not changed:
-        return False
-    payload["items"] = items
-    payload["updated_at"] = _now_iso()
-    return _write_active_matrix_payload(root, payload)
+    wanted = {str(k): str(v) for k, v in (overrides or {}).items()}
+
+    def _mutate(payload: dict[str, Any]) -> bool:
+        items = payload.get("items") if isinstance(payload.get("items"), list) else []
+        changed = False
+        for row in items:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("id", "")).strip() != str(profile_id):
+                continue
+            current = row.get("overrides") if isinstance(row.get("overrides"), dict) else {}
+            normalized = {str(k): str(v) for k, v in current.items()}
+            if normalized == wanted:
+                continue
+            row["overrides"] = dict(wanted)
+            changed = True
+        if changed:
+            payload["items"] = items
+        return changed
+
+    return _mutate_active_matrix_payload(root, _mutate)
 
 
 def _active_item_for_profile(root: Path, profile_id: str) -> dict[str, Any]:
@@ -7022,29 +7819,41 @@ def _spawn_profile_process(root: Path, profile_id: str) -> tuple[bool, str, int]
 
 
 def _update_active_matrix_pid(root: Path, profile_id: str, pid: int, status: str) -> bool:
-    payload = _active_matrix_payload(root)
-    items = payload.get("items") if isinstance(payload.get("items"), list) else []
-    changed = False
-    alive_count = 0
-    for row in items:
-        if not isinstance(row, dict):
-            continue
-        row_pid = int(row.get("pid", 0) or 0)
-        row_alive = row_pid > 0 and _pid_is_running(row_pid)
-        if str(row.get("id", "")).strip() == str(profile_id):
-            row["pid"] = int(pid) if int(pid) > 0 else None
-            row["status"] = str(status or "unknown")
-            row_alive = int(pid) > 0 and _pid_is_running(int(pid))
+    target_pid = int(pid)
+    target_status = str(status or "unknown")
+
+    def _mutate(payload: dict[str, Any]) -> bool:
+        items = payload.get("items") if isinstance(payload.get("items"), list) else []
+        changed = False
+        alive_count = 0
+        for row in items:
+            if not isinstance(row, dict):
+                continue
+            row_pid = int(row.get("pid", 0) or 0)
+            row_alive = row_pid > 0 and _pid_is_running(row_pid)
+            if str(row.get("id", "")).strip() == str(profile_id):
+                next_pid = target_pid if target_pid > 0 else None
+                if row.get("pid", None) != next_pid:
+                    row["pid"] = next_pid
+                    changed = True
+                if str(row.get("status", "") or "") != target_status:
+                    row["status"] = target_status
+                    changed = True
+                row_alive = target_pid > 0 and _pid_is_running(target_pid)
+            if row_alive:
+                alive_count += 1
+        running_next = bool(alive_count > 0)
+        if bool(payload.get("running", False)) != running_next:
+            payload["running"] = running_next
             changed = True
-        if row_alive:
-            alive_count += 1
-    if not changed:
-        return False
-    payload["updated_at"] = _now_iso()
-    payload["running"] = bool(alive_count > 0)
-    payload["alive_count"] = int(alive_count)
-    payload["items"] = items
-    return _write_active_matrix_payload(root, payload)
+        if int(payload.get("alive_count", -1) or -1) != int(alive_count):
+            payload["alive_count"] = int(alive_count)
+            changed = True
+        if changed:
+            payload["items"] = items
+        return changed
+
+    return _mutate_active_matrix_payload(root, _mutate)
 
 
 def _run_dead_profile_recovery(root: Path, profile_id: str) -> tuple[bool, str]:
@@ -7397,6 +8206,17 @@ def _tick(
         and plan_non_watch_before <= 0
         and non_watch_zero_hits_before >= 3
     )
+    scan_health_before = telemetry_before.get("scan_health_15m", {}) if isinstance(telemetry_before, dict) else {}
+    if not isinstance(scan_health_before, dict):
+        scan_health_before = {}
+    scan_zero_cycles_before = int(_safe_float((scan_health_before or {}).get("zero_scan_cycles", 0), 0.0))
+    scan_watchlist_low_supply_before = int(
+        _safe_float(((scan_health_before or {}).get("watchlist_low_supply_fallback") or {}).get("hits", 0), 0.0)
+    )
+    scan_rollback_guard_active = bool(
+        scan_zero_cycles_before >= max(4, int(target_policy.idle_relax_min_no_open_ticks) + 1)
+        or scan_watchlist_low_supply_before >= max(8, int(target_policy.min_selected_15m) // 2)
+    )
     source_rollback_guard_active = bool(
         source_top_name_before.startswith("watchlist")
         and (
@@ -7446,6 +8266,14 @@ def _tick(
             "scanned": int(metrics.scanned),
         }
     actions, blocked_mutations = _enforce_mutable_action_keys(actions=actions, protected_keys=protected_keys)
+    blocked_dry_run_structural: list[dict[str, Any]] = []
+    if dry_run:
+        actions, blocked_dry_run_structural = _enforce_dry_run_structural_locks(actions=actions)
+        if blocked_dry_run_structural:
+            decision_trace.append(
+                "dry_run_structural_lock "
+                f"blocked_keys={len(blocked_dry_run_structural)}"
+            )
     actions, blocked_phase = _filter_actions_by_phase(actions=actions, phase=policy_decision.phase)
     actions, blocked_idle_relax = _apply_idle_relax_guard(
         actions=actions,
@@ -7467,15 +8295,39 @@ def _tick(
         pre_rows = decision_meta.get("prelimit_blocked_actions", [])
         if isinstance(pre_rows, list):
             prelimit_blocked_actions = [x for x in pre_rows if isinstance(x, dict)]
-    blocked_actions = prelimit_blocked_actions + blocked_mutations + blocked_phase + blocked_idle_relax
+    blocked_actions = (
+        prelimit_blocked_actions
+        + blocked_mutations
+        + blocked_dry_run_structural
+        + blocked_phase
+        + blocked_idle_relax
+    )
     rollback_triggered = False
     rollback_reason = ""
+    non_watch_post_filter_ratio_for_guard = float(post_filters_non_watch_before) / float(max(1, supply_non_watch_before))
+    non_watch_plan_ratio_for_guard = float(plan_non_watch_before) / float(max(1, post_filters_non_watch_before))
+    pre_risk_roundtrip_guard_active = bool(
+        policy_decision.pre_risk_roundtrip_only
+        and post_filters_non_watch_before >= max(3, int(target_policy.min_selected_15m) // 6)
+        and plan_non_watch_before >= 1
+        and non_watch_post_filter_ratio_for_guard >= 0.01
+        and non_watch_plan_ratio_for_guard >= 0.12
+    )
     fail_now_for_degrade = bool(
-        policy_decision.risk_fail
-        or policy_decision.pre_risk_fail
+        policy_decision.risk_fail_core
         or policy_decision.blacklist_fail
         or policy_decision.diversity_fail
+        or (policy_decision.tail_loss_fail and (not policy_decision.tail_loss_soft_hold))
     )
+    if bool(policy_decision.pre_risk_fail) and (not pre_risk_roundtrip_guard_active):
+        fail_now_for_degrade = True
+    if pre_risk_roundtrip_guard_active:
+        decision_trace.append(
+            "pre_risk_roundtrip_guard_active "
+            f"post_non_watch15={post_filters_non_watch_before} plan_non_watch15={plan_non_watch_before} "
+            f"post_ratio={non_watch_post_filter_ratio_for_guard:.3f} "
+            f"plan_ratio={non_watch_plan_ratio_for_guard:.3f}"
+        )
     tail_loss_only_fail = bool(
         policy_decision.tail_loss_fail
         and (not policy_decision.risk_fail_core)
@@ -7526,6 +8378,7 @@ def _tick(
         rollback_actions = _build_rollback_actions(current=overrides, stable=state.stable_overrides)
         rollback_guard_keys: set[str] = set()
         guard_source_active = bool(policy_decision.source_concentration_fail) or bool(source_rollback_guard_active)
+        guard_scan_active = bool(scan_rollback_guard_active)
         guard_source_name = str(policy_decision.source_top_name_15m or "").strip().lower()
         guard_source_share = float(policy_decision.source_top_share_15m or 0.0)
         if not guard_source_name:
@@ -7533,6 +8386,8 @@ def _tick(
             guard_source_share = float(source_top_share_before or 0.0)
         if guard_source_active and guard_source_name.startswith("watchlist"):
             rollback_guard_keys.update(ROLLBACK_SOURCE_GUARD_KEYS)
+        if guard_scan_active:
+            rollback_guard_keys.update(ROLLBACK_FEED_STARVATION_GUARD_KEYS)
         if rollback_guard_keys:
             kept_rollback_actions: list[Action] = []
             rollback_guard_blocked: list[dict[str, Any]] = []
@@ -7556,6 +8411,12 @@ def _tick(
                     f"blocked_keys={len(rollback_guard_blocked)} source_top={guard_source_name} "
                     f"source_share={guard_source_share:.3f}"
                 )
+                if guard_scan_active:
+                    decision_trace.append(
+                        "rollback_scan_guard "
+                        f"zero_scan15={scan_zero_cycles_before} "
+                        f"watch_low_supply15={scan_watchlist_low_supply_before}"
+                    )
         rollback_actions, rollback_blocked = _enforce_mutable_action_keys(
             actions=rollback_actions,
             protected_keys=protected_keys,
@@ -7843,6 +8704,9 @@ def _tick(
         "open_rate_15m": float(policy_decision.open_rate_15m),
         "pnl_hour_usd": float(policy_decision.pnl_hour_usd),
         "pre_risk_fail": bool(policy_decision.pre_risk_fail),
+        "pre_risk_roundtrip_only": bool(policy_decision.pre_risk_roundtrip_only),
+        "pre_risk_roundtrip_guard_active": bool(pre_risk_roundtrip_guard_active),
+        "tail_loss_soft_hold": bool(policy_decision.tail_loss_soft_hold),
         "diversity_fail": bool(policy_decision.diversity_fail),
         "diversity_buys_15m": int(metrics.autobuy_total),
         "diversity_unique_symbols_15m": int(metrics.unique_buy_symbols),
@@ -7880,11 +8744,13 @@ def _tick(
 
     state.last_phase = str(policy_decision.phase)
     fail_now_for_degrade = bool(
-        policy_decision.risk_fail
-        or policy_decision.pre_risk_fail
+        policy_decision.risk_fail_core
         or policy_decision.blacklist_fail
         or policy_decision.diversity_fail
+        or (policy_decision.tail_loss_fail and (not policy_decision.tail_loss_soft_hold))
     )
+    if bool(policy_decision.pre_risk_fail) and (not pre_risk_roundtrip_guard_active):
+        fail_now_for_degrade = True
     tail_loss_only_fail = bool(
         policy_decision.tail_loss_fail
         and (not policy_decision.risk_fail_core)
@@ -7972,9 +8838,12 @@ def _tick(
     decision_meta["policy"] = {
         "flow_fail": bool(policy_decision.flow_fail),
         "pre_risk_fail": bool(policy_decision.pre_risk_fail),
+        "pre_risk_roundtrip_only": bool(policy_decision.pre_risk_roundtrip_only),
+        "pre_risk_roundtrip_guard_active": bool(pre_risk_roundtrip_guard_active),
         "risk_fail": bool(policy_decision.risk_fail),
         "risk_fail_core": bool(policy_decision.risk_fail_core),
         "tail_loss_fail": bool(policy_decision.tail_loss_fail),
+        "tail_loss_soft_hold": bool(policy_decision.tail_loss_soft_hold),
         "blacklist_fail": bool(policy_decision.blacklist_fail),
         "diversity_fail": bool(policy_decision.diversity_fail),
         "plan_concentration_fail": bool(policy_decision.plan_concentration_fail),
@@ -7997,6 +8866,11 @@ def _tick(
         "pending_hot_apply_diff_keys": [str(x) for x in pending_hot_apply_diff_keys[:64]],
     }
     decision_meta["idle_relax_v1"] = dict(idle_relax_snapshot or {})
+    decision_meta["rollback_scan_guard"] = {
+        "active": bool(scan_rollback_guard_active),
+        "zero_scan_cycles_15m": int(scan_zero_cycles_before),
+        "watchlist_low_supply_hits_15m": int(scan_watchlist_low_supply_before),
+    }
     decision_meta["blocked_actions"] = int(len(blocked_actions))
     decision_meta["delta_capped_actions"] = int(len(capped_actions))
     if rollback_triggered:
@@ -8135,10 +9009,13 @@ def _print_tick(report: dict[str, Any]) -> None:
 
 def cmd_once(args: argparse.Namespace) -> int:
     root = _project_root(args.root)
-    ok, lock_msg = _acquire_runtime_lock(
+    ok, lock_msg = _acquire_runtime_lock_with_retry(
         root=root,
         profile_id=args.profile_id,
         owner_label=f"runtime_tuner once {args.profile_id}",
+        control_local_controllers=(not bool(args.dry_run)),
+        timeout_seconds=float(args.lock_acquire_timeout_seconds),
+        poll_seconds=float(args.lock_acquire_poll_seconds),
     )
     if not ok:
         print(lock_msg)
@@ -8167,10 +9044,13 @@ def cmd_once(args: argparse.Namespace) -> int:
 
 def cmd_run(args: argparse.Namespace) -> int:
     root = _project_root(args.root)
-    ok, lock_msg = _acquire_runtime_lock(
+    ok, lock_msg = _acquire_runtime_lock_with_retry(
         root=root,
         profile_id=args.profile_id,
         owner_label=f"runtime_tuner run {args.profile_id}",
+        control_local_controllers=(not bool(args.dry_run)),
+        timeout_seconds=float(args.lock_acquire_timeout_seconds),
+        poll_seconds=float(args.lock_acquire_poll_seconds),
     )
     if not ok:
         print(lock_msg)
@@ -8252,6 +9132,18 @@ def build_parser() -> argparse.ArgumentParser:
             help="Hard cap for restarts in rolling 1h window.",
         )
         sp.add_argument(
+            "--lock-acquire-timeout-seconds",
+            type=float,
+            default=20.0,
+            help="Wait for existing runtime_tuner lock owner before exit.",
+        )
+        sp.add_argument(
+            "--lock-acquire-poll-seconds",
+            type=float,
+            default=1.0,
+            help="Polling interval while waiting runtime_tuner lock to free.",
+        )
+        sp.add_argument(
             "--allow-zero-cooldown",
             action="store_true",
             help="Allow MAX_TOKEN_COOLDOWN_SECONDS=0 (disabled by default for anti-churn safety).",
@@ -8270,6 +9162,7 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--pre-risk-buy-fail-rate-15m", type=float, default=0.35)
         sp.add_argument("--pre-risk-sell-fail-rate-15m", type=float, default=0.30)
         sp.add_argument("--pre-risk-roundtrip-loss-median-pct-15m", type=float, default=-1.2)
+        sp.add_argument("--pre-risk-roundtrip-min-closes-15m", type=int, default=2)
         sp.add_argument("--tail-loss-min-closes-60m", type=int, default=6)
         sp.add_argument("--tail-loss-ratio-max", type=float, default=8.0)
         sp.add_argument("--rollback-degrade-streak", type=int, default=3)

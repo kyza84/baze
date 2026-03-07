@@ -115,6 +115,26 @@ GECKO_NEW_POOLS_INGEST_INTERVAL_SECONDS = max(15, int(os.getenv("GECKO_NEW_POOLS
 GECKO_NEW_POOLS_QUEUE_MAX = max(50, int(os.getenv("GECKO_NEW_POOLS_QUEUE_MAX", "400")))
 GECKO_NEW_POOLS_DRAIN_MAX_PER_CYCLE = max(10, int(os.getenv("GECKO_NEW_POOLS_DRAIN_MAX_PER_CYCLE", "120")))
 GECKO_INGEST_DEDUP_TTL_SECONDS = max(60, int(os.getenv("GECKO_INGEST_DEDUP_TTL_SECONDS", "3600")))
+NON_WATCH_LOW_FLOW_TRIGGER_TOKENS = max(1, int(os.getenv("NON_WATCH_LOW_FLOW_TRIGGER_TOKENS", "20")))
+NON_WATCH_LOW_FLOW_BOOST_INTERVAL_SECONDS = max(
+    5,
+    int(os.getenv("NON_WATCH_LOW_FLOW_BOOST_INTERVAL_SECONDS", "30")),
+)
+NON_WATCH_LOW_FLOW_RELAXED_AGE_CAP_SECONDS = max(
+    TOKEN_AGE_MAX,
+    int(os.getenv("NON_WATCH_LOW_FLOW_RELAXED_AGE_CAP_SECONDS", "2592000")),
+)
+NON_WATCH_LOW_FLOW_RELAXED_MIN_LIQUIDITY_USD = max(
+    500.0,
+    float(os.getenv("NON_WATCH_LOW_FLOW_RELAXED_MIN_LIQUIDITY_USD", str(max(500.0, MIN_LIQUIDITY * 0.40)))),
+)
+NON_WATCH_LOW_FLOW_GECKO_PAGES = max(
+    0,
+    int(os.getenv("NON_WATCH_LOW_FLOW_GECKO_PAGES", "2")),
+)
+NON_WATCH_LOW_FLOW_INCLUDE_DEX_BOOSTS = (
+    os.getenv("NON_WATCH_LOW_FLOW_INCLUDE_DEX_BOOSTS", "true").lower() == "true"
+)
 HEAVY_CHECK_DEDUP_TTL_SECONDS = max(0, int(os.getenv("HEAVY_CHECK_DEDUP_TTL_SECONDS", "900")))
 HEAVY_CHECK_OVERRIDE_LIQ_MULT = max(1.1, float(os.getenv("HEAVY_CHECK_OVERRIDE_LIQ_MULT", "2.0")))
 HEAVY_CHECK_OVERRIDE_VOL_MULT = max(1.1, float(os.getenv("HEAVY_CHECK_OVERRIDE_VOL_MULT", "3.0")))
@@ -190,6 +210,26 @@ TOKEN_SAFETY_TRANSIENT_REASONS = [
     ).split(",")
     if x.strip()
 ]
+TOKEN_SAFETY_FALLBACK_MIN_LIQUIDITY_USD = max(
+    0.0,
+    float(os.getenv("TOKEN_SAFETY_FALLBACK_MIN_LIQUIDITY_USD", "6000")),
+)
+TOKEN_SAFETY_FALLBACK_MIN_VOLUME_5M_USD = max(
+    0.0,
+    float(os.getenv("TOKEN_SAFETY_FALLBACK_MIN_VOLUME_5M_USD", "100")),
+)
+TOKEN_SAFETY_FALLBACK_MIN_AGE_SECONDS = max(
+    0,
+    int(os.getenv("TOKEN_SAFETY_FALLBACK_MIN_AGE_SECONDS", "180")),
+)
+TOKEN_SAFETY_FALLBACK_REQUIRE_VOLUME = os.getenv(
+    "TOKEN_SAFETY_FALLBACK_REQUIRE_VOLUME",
+    "true",
+).strip().lower() in ("1", "true", "yes", "y", "on")
+TOKEN_SAFETY_FALLBACK_REQUIRE_AGE = os.getenv(
+    "TOKEN_SAFETY_FALLBACK_REQUIRE_AGE",
+    "false",
+).strip().lower() in ("1", "true", "yes", "y", "on")
 
 # Dynamic watchlist (vetted tokens) for stability-first trading.
 WATCHLIST_ENABLED = os.getenv("WATCHLIST_ENABLED", "false").strip().lower() in ("1", "true", "yes", "y", "on")
@@ -246,12 +286,32 @@ WATCHLIST_LOW_SUPPLY_FALLBACK_TIMEOUT_SECONDS = max(
     1.0,
     float(os.getenv("WATCHLIST_LOW_SUPPLY_FALLBACK_TIMEOUT_SECONDS", "8.0")),
 )
+WATCHLIST_CACHE_RETAIN_MIN_COUNT = max(
+    0,
+    int(os.getenv("WATCHLIST_CACHE_RETAIN_MIN_COUNT", "3")),
+)
 WATCHLIST_ALERTS_ENABLED = os.getenv("WATCHLIST_ALERTS_ENABLED", "false").strip().lower() in (
     "1",
     "true",
     "yes",
     "y",
     "on",
+)
+WATCHLIST_PREFILTER_BLOCKED_ENABLED = os.getenv(
+    "WATCHLIST_PREFILTER_BLOCKED_ENABLED",
+    "true",
+).strip().lower() in ("1", "true", "yes", "y", "on")
+WATCHLIST_PREFILTER_OPEN_DUP_ENABLED = os.getenv(
+    "WATCHLIST_PREFILTER_OPEN_DUP_ENABLED",
+    "true",
+).strip().lower() in ("1", "true", "yes", "y", "on")
+WATCHLIST_PREFILTER_BLACKLIST_CACHE_PRUNE_ENABLED = os.getenv(
+    "WATCHLIST_PREFILTER_BLACKLIST_CACHE_PRUNE_ENABLED",
+    "true",
+).strip().lower() in ("1", "true", "yes", "y", "on")
+WATCHLIST_PREFILTER_BLOCKED_CACHE_TTL_SECONDS = max(
+    0,
+    int(os.getenv("WATCHLIST_PREFILTER_BLOCKED_CACHE_TTL_SECONDS", "900")),
 )
 WATCHLIST_CACHE_FILE = os.getenv("WATCHLIST_CACHE_FILE", os.path.join("data", "watchlist_cache.json"))
 RPC_TIMEOUT_SECONDS = max(3, int(os.getenv("RPC_TIMEOUT_SECONDS", "10")))
@@ -322,6 +382,26 @@ SAFE_VOLUME_TWO_TIER_NON_WATCH_MAX_PASSES_PER_CYCLE = max(
     0,
     int(os.getenv("SAFE_VOLUME_TWO_TIER_NON_WATCH_MAX_PASSES_PER_CYCLE", "2")),
 )
+SAFE_VOLUME_TWO_TIER_NON_WATCH_GECKO_SOFT_CAP_MULT = max(
+    1.0,
+    min(5.0, float(os.getenv("SAFE_VOLUME_TWO_TIER_NON_WATCH_GECKO_SOFT_CAP_MULT", "2.0"))),
+)
+SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_SOFT_ENABLED = os.getenv(
+    "SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_SOFT_ENABLED",
+    "true",
+).lower() == "true"
+SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_SOFT_RATIO = max(
+    0.20,
+    min(1.00, float(os.getenv("SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_SOFT_RATIO", "0.70"))),
+)
+SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_MIN_VOLUME_5M_MULT = max(
+    0.10,
+    min(2.50, float(os.getenv("SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_MIN_VOLUME_5M_MULT", "0.60"))),
+)
+SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_MAX_PASSES_PER_CYCLE = max(
+    0,
+    int(os.getenv("SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_MAX_PASSES_PER_CYCLE", "2")),
+)
 SAFE_AGE_NON_WATCH_SOFT_ENABLED = os.getenv(
     "SAFE_AGE_NON_WATCH_SOFT_ENABLED",
     "true",
@@ -358,6 +438,86 @@ SAFE_CHANGE_5M_NON_WATCH_MAX_PASSES_PER_CYCLE = max(
     0,
     int(os.getenv("SAFE_CHANGE_5M_NON_WATCH_MAX_PASSES_PER_CYCLE", "2")),
 )
+LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_AGE_SOFT_ENABLED = os.getenv(
+    "LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_AGE_SOFT_ENABLED",
+    "true",
+).strip().lower() in ("1", "true", "yes", "y", "on")
+LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_AGE_SOFT_MIN_SECONDS = max(
+    0,
+    int(os.getenv("LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_AGE_SOFT_MIN_SECONDS", "240")),
+)
+LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_AGE_SOFT_MIN_LIQUIDITY_USD = max(
+    0.0,
+    float(os.getenv("LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_AGE_SOFT_MIN_LIQUIDITY_USD", "12000")),
+)
+LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_AGE_SOFT_MIN_VOLUME_5M_USD = max(
+    0.0,
+    float(os.getenv("LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_AGE_SOFT_MIN_VOLUME_5M_USD", "200")),
+)
+LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_AGE_SOFT_MIN_SCORE = max(
+    0,
+    int(os.getenv("LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_AGE_SOFT_MIN_SCORE", "45")),
+)
+LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_AGE_SOFT_MAX_PASSES_PER_CYCLE = max(
+    0,
+    int(os.getenv("LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_AGE_SOFT_MAX_PASSES_PER_CYCLE", "4")),
+)
+LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_ENABLED = os.getenv(
+    "LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_ENABLED",
+    "true",
+).strip().lower() in ("1", "true", "yes", "y", "on")
+LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_MIN_AGE_SECONDS = max(
+    0,
+    int(os.getenv("LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_MIN_AGE_SECONDS", "240")),
+)
+LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_MIN_LIQUIDITY_USD = max(
+    0.0,
+    float(os.getenv("LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_MIN_LIQUIDITY_USD", "10000")),
+)
+LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_MIN_VOLUME_5M_USD = max(
+    0.0,
+    float(os.getenv("LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_MIN_VOLUME_5M_USD", "150")),
+)
+LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_MIN_SCORE = max(
+    0,
+    int(os.getenv("LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_MIN_SCORE", "45")),
+)
+LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_MAX_PASSES_PER_CYCLE = max(
+    0,
+    int(os.getenv("LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_MAX_PASSES_PER_CYCLE", "3")),
+)
+LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_REQUIRE_LOW_RISK = (
+    os.getenv("LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_REQUIRE_LOW_RISK", "true").strip().lower()
+    in ("1", "true", "yes", "y", "on")
+)
+LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_MAX_WARNING_FLAGS = max(
+    0,
+    int(os.getenv("LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_MAX_WARNING_FLAGS", "0")),
+)
+LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_MAX_ABS_CHANGE_5M = max(
+    0.0,
+    float(os.getenv("LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_MAX_ABS_CHANGE_5M", "10.0")),
+)
+LOCAL_ANTISCAM_NON_WATCH_FAST_PUMP_BLOCK_ENABLED = (
+    os.getenv("LOCAL_ANTISCAM_NON_WATCH_FAST_PUMP_BLOCK_ENABLED", "true").strip().lower()
+    in ("1", "true", "yes", "y", "on")
+)
+LOCAL_ANTISCAM_NON_WATCH_FAST_PUMP_MAX_ABS_CHANGE_5M = max(
+    0.0,
+    float(os.getenv("LOCAL_ANTISCAM_NON_WATCH_FAST_PUMP_MAX_ABS_CHANGE_5M", "18.0")),
+)
+LOCAL_ANTISCAM_NON_WATCH_FAST_PUMP_MAX_AGE_SECONDS = max(
+    0,
+    int(os.getenv("LOCAL_ANTISCAM_NON_WATCH_FAST_PUMP_MAX_AGE_SECONDS", "1200")),
+)
+LOCAL_ANTISCAM_NON_WATCH_FAST_PUMP_TO_BLACKLIST = (
+    os.getenv("LOCAL_ANTISCAM_NON_WATCH_FAST_PUMP_TO_BLACKLIST", "true").strip().lower()
+    in ("1", "true", "yes", "y", "on")
+)
+LOCAL_ANTISCAM_NON_WATCH_FAST_PUMP_BLACKLIST_TTL_SECONDS = max(
+    300,
+    int(os.getenv("LOCAL_ANTISCAM_NON_WATCH_FAST_PUMP_BLACKLIST_TTL_SECONDS", "21600")),
+)
 SAFE_REQUIRE_CONTRACT_SAFE = os.getenv("SAFE_REQUIRE_CONTRACT_SAFE", "true").lower() == "true"
 SAFE_REQUIRE_RISK_LEVEL = os.getenv("SAFE_REQUIRE_RISK_LEVEL", "MEDIUM").strip().upper()
 SAFE_MAX_WARNING_FLAGS = int(os.getenv("SAFE_MAX_WARNING_FLAGS", "1"))
@@ -393,6 +553,123 @@ ENTRY_ALLOWED_SAFETY_SOURCES = [
     for x in os.getenv("ENTRY_ALLOWED_SAFETY_SOURCES", _entry_allowed_safety_sources_default).split(",")
     if x.strip()
 ]
+# Local anti-scam hardening for transient safety sources (no GoPlus / degraded safety API).
+_local_transient_strict_default = "false"
+if not str(GOPLUS_ACCESS_TOKEN or "").strip():
+    _local_transient_strict_default = "true"
+LOCAL_ANTISCAM_TRANSIENT_STRICT_ENABLED = (
+    os.getenv("LOCAL_ANTISCAM_TRANSIENT_STRICT_ENABLED", _local_transient_strict_default).lower() == "true"
+)
+LOCAL_ANTISCAM_TRANSIENT_MIN_AGE_SECONDS = max(
+    0,
+    int(os.getenv("LOCAL_ANTISCAM_TRANSIENT_MIN_AGE_SECONDS", "900")),
+)
+LOCAL_ANTISCAM_TRANSIENT_MIN_LIQUIDITY_USD = max(
+    0.0,
+    float(os.getenv("LOCAL_ANTISCAM_TRANSIENT_MIN_LIQUIDITY_USD", "25000")),
+)
+LOCAL_ANTISCAM_TRANSIENT_MIN_VOLUME_5M_USD = max(
+    0.0,
+    float(os.getenv("LOCAL_ANTISCAM_TRANSIENT_MIN_VOLUME_5M_USD", "1500")),
+)
+LOCAL_ANTISCAM_TRANSIENT_MAX_ABS_CHANGE_5M = max(
+    0.0,
+    float(os.getenv("LOCAL_ANTISCAM_TRANSIENT_MAX_ABS_CHANGE_5M", "15")),
+)
+LOCAL_ANTISCAM_TRANSIENT_BLOCK_SOFT_CHANGE_PASS = (
+    os.getenv("LOCAL_ANTISCAM_TRANSIENT_BLOCK_SOFT_CHANGE_PASS", "true").lower() == "true"
+)
+# Track short-window pump bursts and block early entry if a token recently showed
+# extreme 5m moves (common scam/rug pattern: pump then immediate collapse).
+_local_pump_history_default = "false"
+if not str(GOPLUS_ACCESS_TOKEN or "").strip():
+    _local_pump_history_default = "true"
+LOCAL_ANTISCAM_PUMP_HISTORY_ENABLED = (
+    os.getenv("LOCAL_ANTISCAM_PUMP_HISTORY_ENABLED", _local_pump_history_default).lower() == "true"
+)
+LOCAL_ANTISCAM_PUMP_HISTORY_WINDOW_SECONDS = max(
+    60,
+    int(os.getenv("LOCAL_ANTISCAM_PUMP_HISTORY_WINDOW_SECONDS", "1800")),
+)
+LOCAL_ANTISCAM_PUMP_HISTORY_BLOCK_MAX_ABS_CHANGE_5M = max(
+    0.0,
+    float(os.getenv("LOCAL_ANTISCAM_PUMP_HISTORY_BLOCK_MAX_ABS_CHANGE_5M", "80")),
+)
+LOCAL_ANTISCAM_PUMP_HISTORY_BLOCK_MAX_AGE_SECONDS = max(
+    0,
+    int(os.getenv("LOCAL_ANTISCAM_PUMP_HISTORY_BLOCK_MAX_AGE_SECONDS", "1800")),
+)
+LOCAL_ANTISCAM_PUMP_HISTORY_ONLY_NON_WATCH = (
+    os.getenv("LOCAL_ANTISCAM_PUMP_HISTORY_ONLY_NON_WATCH", "true").lower() == "true"
+)
+LOCAL_ANTISCAM_PUMP_HISTORY_TO_BLACKLIST = (
+    os.getenv("LOCAL_ANTISCAM_PUMP_HISTORY_TO_BLACKLIST", "true").lower() == "true"
+)
+LOCAL_ANTISCAM_PUMP_HISTORY_BLACKLIST_TTL_SECONDS = max(
+    300,
+    int(os.getenv("LOCAL_ANTISCAM_PUMP_HISTORY_BLACKLIST_TTL_SECONDS", "21600")),
+)
+# Post-entry anti-rug guard: closes and blacklists tokens that quickly lose liquidity
+# after buy. This is dynamic protection and complements pre-entry safety checks.
+POST_ENTRY_RUG_GUARD_ENABLED = os.getenv("POST_ENTRY_RUG_GUARD_ENABLED", "true").lower() == "true"
+POST_ENTRY_RUG_MIN_AGE_SECONDS = max(
+    0,
+    int(os.getenv("POST_ENTRY_RUG_MIN_AGE_SECONDS", "20")),
+)
+POST_ENTRY_RUG_MIN_ENTRY_LIQUIDITY_USD = max(
+    0.0,
+    float(os.getenv("POST_ENTRY_RUG_MIN_ENTRY_LIQUIDITY_USD", "10000")),
+)
+POST_ENTRY_RUG_MIN_CURRENT_LIQUIDITY_USD = max(
+    0.0,
+    float(os.getenv("POST_ENTRY_RUG_MIN_CURRENT_LIQUIDITY_USD", "2500")),
+)
+POST_ENTRY_RUG_MAX_LIQUIDITY_RATIO = max(
+    0.0,
+    min(1.0, float(os.getenv("POST_ENTRY_RUG_MAX_LIQUIDITY_RATIO", "0.20"))),
+)
+POST_ENTRY_RUG_HIT_WINDOW_SECONDS = max(
+    10,
+    int(os.getenv("POST_ENTRY_RUG_HIT_WINDOW_SECONDS", "120")),
+)
+POST_ENTRY_RUG_HITS_TO_TRIGGER = max(
+    1,
+    int(os.getenv("POST_ENTRY_RUG_HITS_TO_TRIGGER", "2")),
+)
+POST_ENTRY_RUG_BLACKLIST_TTL_SECONDS = max(
+    300,
+    int(os.getenv("POST_ENTRY_RUG_BLACKLIST_TTL_SECONDS", "21600")),
+)
+# Pre-entry anti-rug guard: block and optionally hard-blacklist tokens that show
+# unstable market micro-structure before BUY (spread/source-divergence/liquidity collapse).
+ENTRY_PRE_RUG_GUARD_ENABLED = os.getenv("ENTRY_PRE_RUG_GUARD_ENABLED", "true").lower() == "true"
+ENTRY_PRE_RUG_MAX_SPREAD_BPS = max(0.0, float(os.getenv("ENTRY_PRE_RUG_MAX_SPREAD_BPS", "180")))
+ENTRY_PRE_RUG_MAX_SOURCE_DIVERGENCE_PCT = max(
+    0.0,
+    float(os.getenv("ENTRY_PRE_RUG_MAX_SOURCE_DIVERGENCE_PCT", "2.0")),
+)
+ENTRY_PRE_RUG_MIN_LIQUIDITY_RATIO = max(
+    0.0,
+    min(1.0, float(os.getenv("ENTRY_PRE_RUG_MIN_LIQUIDITY_RATIO", "0.45"))),
+)
+ENTRY_PRE_RUG_HIT_WINDOW_SECONDS = max(
+    30,
+    int(os.getenv("ENTRY_PRE_RUG_HIT_WINDOW_SECONDS", "300")),
+)
+ENTRY_PRE_RUG_HITS_TO_BLACKLIST = max(
+    1,
+    int(os.getenv("ENTRY_PRE_RUG_HITS_TO_BLACKLIST", "2")),
+)
+ENTRY_PRE_RUG_BLACKLIST_TTL_SECONDS = max(
+    300,
+    int(os.getenv("ENTRY_PRE_RUG_BLACKLIST_TTL_SECONDS", "21600")),
+)
+# Contract-risk hard block registry (mint/freeze/proxy/owner privileges/etc).
+ENTRY_CONTRACT_RISK_HARD_BLOCK_ENABLED = os.getenv("ENTRY_CONTRACT_RISK_HARD_BLOCK_ENABLED", "true").lower() == "true"
+ENTRY_CONTRACT_RISK_HARD_BLOCK_TTL_SECONDS = max(
+    3600,
+    int(os.getenv("ENTRY_CONTRACT_RISK_HARD_BLOCK_TTL_SECONDS", str(30 * 24 * 3600))),
+)
 FILTER_THRESH_LOG_EVERY_CYCLES = max(1, int(os.getenv("FILTER_THRESH_LOG_EVERY_CYCLES", "30")))
 CANDIDATE_DECISIONS_LOG_ENABLED = os.getenv("CANDIDATE_DECISIONS_LOG_ENABLED", "true").lower() == "true"
 CANDIDATE_DECISIONS_LOG_FILE = os.getenv("CANDIDATE_DECISIONS_LOG_FILE", os.path.join("logs", "candidates.jsonl"))
@@ -944,6 +1221,30 @@ V2_QUALITY_SOURCE_MAX_SHARE = max(
 V2_QUALITY_SOURCE_CAP_SOFT_FILL_ENABLED = (
     os.getenv("V2_QUALITY_SOURCE_CAP_SOFT_FILL_ENABLED", "true").lower() == "true"
 )
+V2_QUALITY_NON_WATCH_RESCUE_ENABLED = os.getenv(
+    "V2_QUALITY_NON_WATCH_RESCUE_ENABLED",
+    "true",
+).lower() == "true"
+V2_QUALITY_NON_WATCH_MIN_OUT_ABS = max(
+    0,
+    int(os.getenv("V2_QUALITY_NON_WATCH_MIN_OUT_ABS", "1")),
+)
+V2_QUALITY_NON_WATCH_MIN_OUT_SHARE = max(
+    0.0,
+    min(0.80, float(os.getenv("V2_QUALITY_NON_WATCH_MIN_OUT_SHARE", "0.20"))),
+)
+V2_QUALITY_WATCHLIST_MAX_OUT_SHARE = max(
+    0.20,
+    min(1.0, float(os.getenv("V2_QUALITY_WATCHLIST_MAX_OUT_SHARE", "0.88"))),
+)
+V2_QUALITY_NON_WATCH_RESCUE_MAX_REPLACEMENTS = max(
+    0,
+    int(os.getenv("V2_QUALITY_NON_WATCH_RESCUE_MAX_REPLACEMENTS", "2")),
+)
+V2_QUALITY_NON_WATCH_RESCUE_IGNORE_SOURCE_PROB = os.getenv(
+    "V2_QUALITY_NON_WATCH_RESCUE_IGNORE_SOURCE_PROB",
+    "true",
+).lower() == "true"
 V2_QUALITY_PROVISIONAL_CORE_ENABLED = os.getenv("V2_QUALITY_PROVISIONAL_CORE_ENABLED", "true").lower() == "true"
 V2_QUALITY_PROVISIONAL_CORE_MIN_SCORE = max(
     0,
@@ -1758,6 +2059,18 @@ HONEYPOT_API_FAIL_CLOSED = os.getenv("HONEYPOT_API_FAIL_CLOSED", "true").lower()
 HONEYPOT_GUARD_IN_PAPER = os.getenv("HONEYPOT_GUARD_IN_PAPER", "true").lower() == "true"
 # When false, transient honeypot API failures (status/timeouts) only trigger cooldown, not persistent blacklist.
 HONEYPOT_TRANSIENT_TO_BLACKLIST = os.getenv("HONEYPOT_TRANSIENT_TO_BLACKLIST", "false").lower() == "true"
+HONEYPOT_TRANSIENT_HIT_WINDOW_SECONDS = max(
+    60,
+    int(os.getenv("HONEYPOT_TRANSIENT_HIT_WINDOW_SECONDS", "900")),
+)
+HONEYPOT_TRANSIENT_HITS_TO_BLACKLIST = max(
+    0,
+    int(os.getenv("HONEYPOT_TRANSIENT_HITS_TO_BLACKLIST", "3")),
+)
+HONEYPOT_TRANSIENT_BLACKLIST_TTL_SECONDS = max(
+    300,
+    int(os.getenv("HONEYPOT_TRANSIENT_BLACKLIST_TTL_SECONDS", "3600")),
+)
 HONEYPOT_MAX_BUY_TAX_PERCENT = float(os.getenv("HONEYPOT_MAX_BUY_TAX_PERCENT", "10"))
 HONEYPOT_MAX_SELL_TAX_PERCENT = float(os.getenv("HONEYPOT_MAX_SELL_TAX_PERCENT", "10"))
 
@@ -1772,6 +2085,29 @@ LIVE_ROUNDTRIP_SELL_FRACTION = float(os.getenv("LIVE_ROUNDTRIP_SELL_FRACTION", "
 LIVE_ROUNDTRIP_MIN_RETURN_RATIO = float(os.getenv("LIVE_ROUNDTRIP_MIN_RETURN_RATIO", "0.70"))
 LIVE_ROUNDTRIP_MAX_LOSS_PERCENT = max(0.0, min(99.0, float(os.getenv("LIVE_ROUNDTRIP_MAX_LOSS_PERCENT", "8.0"))))
 LIVE_ROUNDTRIP_REQUIRE_STABLE_ROUTER = os.getenv("LIVE_ROUNDTRIP_REQUIRE_STABLE_ROUTER", "true").lower() == "true"
+# Matrix/paper equivalent of roundtrip proof-of-sell gate.
+PAPER_ROUNDTRIP_CHECK_ENABLED = os.getenv("PAPER_ROUNDTRIP_CHECK_ENABLED", "true").lower() == "true"
+PAPER_ROUNDTRIP_MIN_RETURN_RATIO = max(
+    0.0,
+    min(1.0, float(os.getenv("PAPER_ROUNDTRIP_MIN_RETURN_RATIO", "0.80"))),
+)
+PAPER_ROUNDTRIP_MAX_LOSS_PERCENT = max(
+    0.0,
+    min(99.0, float(os.getenv("PAPER_ROUNDTRIP_MAX_LOSS_PERCENT", "12.0"))),
+)
+PAPER_ROUNDTRIP_INCLUDE_SPREAD_BPS = os.getenv("PAPER_ROUNDTRIP_INCLUDE_SPREAD_BPS", "true").lower() == "true"
+PAPER_ROUNDTRIP_TO_BLACKLIST = os.getenv("PAPER_ROUNDTRIP_TO_BLACKLIST", "true").lower() == "true"
+# Post-entry proof-of-sell canary (live mode): verify sell-route quickly after BUY.
+PROOF_SELL_CANARY_ENABLED = os.getenv("PROOF_SELL_CANARY_ENABLED", "true").lower() == "true"
+PROOF_SELL_CANARY_DELAY_SECONDS = max(5, int(os.getenv("PROOF_SELL_CANARY_DELAY_SECONDS", "30")))
+PROOF_SELL_CANARY_SELL_FRACTION = max(
+    0.01,
+    min(1.0, float(os.getenv("PROOF_SELL_CANARY_SELL_FRACTION", "0.20"))),
+)
+PROOF_SELL_CANARY_BLACKLIST_TTL_SECONDS = max(
+    300,
+    int(os.getenv("PROOF_SELL_CANARY_BLACKLIST_TTL_SECONDS", "21600")),
+)
 LIVE_PRECHECK_USE_REAL_SIZE = os.getenv("LIVE_PRECHECK_USE_REAL_SIZE", "true").lower() == "true"
 LIVE_PRECHECK_MIN_SPEND_USD = max(0.10, float(os.getenv("LIVE_PRECHECK_MIN_SPEND_USD", "2.00")))
 LIVE_PRECHECK_MAX_SPEND_ETH = max(0.00001, float(os.getenv("LIVE_PRECHECK_MAX_SPEND_ETH", "0.0030")))
@@ -1805,6 +2141,11 @@ LIVE_BLACKLIST_SELL_FAIL_TTL_SECONDS = max(
 
 # New-token quarantine and risk caps for auto-discovery mode.
 ENTRY_QUARANTINE_ENABLED = os.getenv("ENTRY_QUARANTINE_ENABLED", "true").lower() == "true"
+# Apply quarantine in paper mode for non-watch discovery tokens as fail-closed anti-rug protection.
+ENTRY_QUARANTINE_IN_PAPER_NON_WATCH = os.getenv(
+    "ENTRY_QUARANTINE_IN_PAPER_NON_WATCH",
+    "true",
+).lower() == "true"
 ENTRY_QUARANTINE_REQUIRED_CYCLES = max(0, int(os.getenv("ENTRY_QUARANTINE_REQUIRED_CYCLES", "2")))
 ENTRY_QUARANTINE_MAX_LIQUIDITY_DELTA_PCT = max(
     0.0,
@@ -1885,6 +2226,64 @@ PLAN_MAX_WATCHLIST_SHARE = max(
     min(1.00, float(os.getenv("PLAN_MAX_WATCHLIST_SHARE", "0.30"))),
 )
 PLAN_MIN_NON_WATCHLIST_PER_BATCH = max(0, int(os.getenv("PLAN_MIN_NON_WATCHLIST_PER_BATCH", "1")))
+PLAN_WATCHLIST_SYMBOL_COOLDOWN_SHAPE_ENABLED = (
+    os.getenv("PLAN_WATCHLIST_SYMBOL_COOLDOWN_SHAPE_ENABLED", "true").lower() == "true"
+)
+PLAN_WATCHLIST_SYMBOL_COOLDOWN_MAX_SHARE = max(
+    0.0,
+    min(1.0, float(os.getenv("PLAN_WATCHLIST_SYMBOL_COOLDOWN_MAX_SHARE", "0.25"))),
+)
+PLAN_WATCHLIST_SYMBOL_COOLDOWN_MIN_KEEP = max(
+    0,
+    int(os.getenv("PLAN_WATCHLIST_SYMBOL_COOLDOWN_MIN_KEEP", "1")),
+)
+# Prefilter source-shaping guard: avoid watchlist-only plan attempts when non-watch rows exist.
+PLAN_PREFILTER_SOURCE_SHAPE_ENABLED = os.getenv("PLAN_PREFILTER_SOURCE_SHAPE_ENABLED", "true").lower() == "true"
+PLAN_PREFILTER_MAX_WATCHLIST_SHARE = max(
+    0.0,
+    min(1.0, float(os.getenv("PLAN_PREFILTER_MAX_WATCHLIST_SHARE", "0.65"))),
+)
+PLAN_PREFILTER_MIN_NON_WATCH_ROWS = max(
+    0,
+    int(os.getenv("PLAN_PREFILTER_MIN_NON_WATCH_ROWS", "3")),
+)
+PLAN_PREFILTER_MAX_WATCH_PER_NON_WATCH = max(
+    0,
+    int(os.getenv("PLAN_PREFILTER_MAX_WATCH_PER_NON_WATCH", "3")),
+)
+RAW_SOURCE_REBALANCE_ENABLED = os.getenv("RAW_SOURCE_REBALANCE_ENABLED", "true").lower() == "true"
+RAW_SOURCE_REBALANCE_MIN_NON_WATCH = max(
+    0,
+    int(os.getenv("RAW_SOURCE_REBALANCE_MIN_NON_WATCH", "12")),
+)
+RAW_SOURCE_REBALANCE_EXTRA_FETCH_ROUNDS = max(
+    0,
+    int(os.getenv("RAW_SOURCE_REBALANCE_EXTRA_FETCH_ROUNDS", "2")),
+)
+RAW_SOURCE_REBALANCE_WATCHLIST_MAX_SHARE = max(
+    0.0,
+    min(0.95, float(os.getenv("RAW_SOURCE_REBALANCE_WATCHLIST_MAX_SHARE", "0.25"))),
+)
+RAW_SOURCE_REBALANCE_WATCHLIST_FLOOR = max(
+    0,
+    int(os.getenv("RAW_SOURCE_REBALANCE_WATCHLIST_FLOOR", "2")),
+)
+RAW_LANE_SPLIT_ENABLED = os.getenv("RAW_LANE_SPLIT_ENABLED", "true").lower() == "true"
+RAW_LANE_SPLIT_NON_WATCH_PRIMARY_MIN = max(
+    0,
+    int(os.getenv("RAW_LANE_SPLIT_NON_WATCH_PRIMARY_MIN", "4")),
+)
+RAW_LANE_SPLIT_WATCH_FALLBACK_MAX = max(
+    0,
+    int(os.getenv("RAW_LANE_SPLIT_WATCH_FALLBACK_MAX", "2")),
+)
+RAW_LANE_SPLIT_WATCH_FALLBACK_WHEN_EMPTY = max(
+    0,
+    int(os.getenv("RAW_LANE_SPLIT_WATCH_FALLBACK_WHEN_EMPTY", "6")),
+)
+# Emergency rollback switch for intake/planner experiments.
+# When enabled, runtime uses legacy merge/planner behavior.
+FLOW_LEGACY_ROLLBACK_MODE = os.getenv("FLOW_LEGACY_ROLLBACK_MODE", "false").lower() == "true"
 # Optional hard guard at plan stage: enforce non-watchlist quota in rolling open window.
 PLAN_NON_WATCHLIST_QUOTA_ENABLED = os.getenv("PLAN_NON_WATCHLIST_QUOTA_ENABLED", "true").lower() == "true"
 PLAN_NON_WATCHLIST_QUOTA_WINDOW_SECONDS = max(
@@ -1902,8 +2301,92 @@ PLAN_NON_WATCHLIST_QUOTA_EMPTY_BATCH_MIN_OPENS = max(
     1,
     int(os.getenv("PLAN_NON_WATCHLIST_QUOTA_EMPTY_BATCH_MIN_OPENS", "10")),
 )
+# Prefer non-watch by actionable (post-filter plan batch) context instead of
+# historical opens-mix whenever per-batch metadata is available.
+PLAN_NON_WATCHLIST_QUOTA_USE_ACTIONABLE_WINDOW = (
+    os.getenv("PLAN_NON_WATCHLIST_QUOTA_USE_ACTIONABLE_WINDOW", "true").lower() == "true"
+)
+PLAN_NON_WATCHLIST_QUOTA_ACTIONABLE_MIN_ROWS = max(
+    1,
+    int(os.getenv("PLAN_NON_WATCHLIST_QUOTA_ACTIONABLE_MIN_ROWS", "2")),
+)
 PLAN_SOURCE_DIVERSITY_ALLOW_WATCHLIST_CAP_BYPASS = (
     os.getenv("PLAN_SOURCE_DIVERSITY_ALLOW_WATCHLIST_CAP_BYPASS", "false").lower() == "true"
+)
+PLAN_STRICT_NON_WATCH_PRIORITY_ENABLED = (
+    os.getenv("PLAN_STRICT_NON_WATCH_PRIORITY_ENABLED", "true").lower() == "true"
+)
+PLAN_FORBID_WATCH_BYPASS_WITH_NON_WATCH_SUPPLY = (
+    os.getenv("PLAN_FORBID_WATCH_BYPASS_WITH_NON_WATCH_SUPPLY", "true").lower() == "true"
+)
+PLAN_ACTIONABLE_NON_WATCH_PRIORITY_ENABLED = (
+    os.getenv("PLAN_ACTIONABLE_NON_WATCH_PRIORITY_ENABLED", "true").lower() == "true"
+)
+PLAN_ACTIONABLE_NON_WATCH_PRIORITY_MIN_ROWS = max(
+    1,
+    int(os.getenv("PLAN_ACTIONABLE_NON_WATCH_PRIORITY_MIN_ROWS", "4")),
+)
+# Non-watch bridge: safely promote non-watch rows into plan when BUY set is watchlist-only.
+# Does not bypass hard safety; rows are still produced only after candidate hard filters.
+PLAN_NON_WATCH_MIN_SCORE = max(
+    0,
+    min(
+        int(MIN_TOKEN_SCORE),
+        int(os.getenv("PLAN_NON_WATCH_MIN_SCORE", str(MIN_TOKEN_SCORE))),
+    ),
+)
+PLAN_NON_WATCH_BRIDGE_ENABLED = os.getenv("PLAN_NON_WATCH_BRIDGE_ENABLED", "true").lower() == "true"
+PLAN_NON_WATCH_BRIDGE_ALLOW_HOLD = os.getenv("PLAN_NON_WATCH_BRIDGE_ALLOW_HOLD", "true").lower() == "true"
+PLAN_NON_WATCH_BRIDGE_MIN_SCORE = max(
+    0,
+    min(
+        int(MIN_TOKEN_SCORE),
+        int(
+            os.getenv(
+                "PLAN_NON_WATCH_BRIDGE_MIN_SCORE",
+                str(max(0, int(MIN_TOKEN_SCORE) - 12)),
+            )
+        ),
+    ),
+)
+PLAN_NON_WATCH_BRIDGE_MAX_PER_BATCH = max(
+    0,
+    int(os.getenv("PLAN_NON_WATCH_BRIDGE_MAX_PER_BATCH", "4")),
+)
+# Target minimum non-watch rows in plan batch before source rebalance.
+# Bridge tries to fill this deficit safely from non-watch BUY/HOLD rows.
+PLAN_NON_WATCH_BRIDGE_MIN_PER_BATCH = max(
+    0,
+    int(os.getenv("PLAN_NON_WATCH_BRIDGE_MIN_PER_BATCH", "2")),
+)
+# If a non-watch row passed score soft-probe upstream, allow a lower bridge floor.
+PLAN_NON_WATCH_BRIDGE_PROBE_MIN_SCORE = max(
+    0,
+    min(
+        int(MIN_TOKEN_SCORE),
+        int(
+            os.getenv(
+                "PLAN_NON_WATCH_BRIDGE_PROBE_MIN_SCORE",
+                str(max(0, int(MIN_TOKEN_SCORE) - 35)),
+            )
+        ),
+    ),
+)
+PLAN_NON_WATCH_BRIDGE_POST_PREFILTER_ENABLED = (
+    os.getenv("PLAN_NON_WATCH_BRIDGE_POST_PREFILTER_ENABLED", "true").lower() == "true"
+)
+PLAN_NON_WATCH_BRIDGE_POST_PREFILTER_MAX_PER_BATCH = max(
+    0,
+    int(
+        os.getenv(
+            "PLAN_NON_WATCH_BRIDGE_POST_PREFILTER_MAX_PER_BATCH",
+            str(PLAN_NON_WATCH_BRIDGE_MAX_PER_BATCH),
+        )
+    ),
+)
+PLAN_WATCHLIST_SYMBOL_COOLDOWN_MAX_KEEP_WHEN_NON_WATCH = max(
+    0,
+    int(os.getenv("PLAN_WATCHLIST_SYMBOL_COOLDOWN_MAX_KEEP_WHEN_NON_WATCH", "2")),
 )
 # MAX_OPEN_TRADES:
 # - 0 means unlimited open positions
@@ -2110,6 +2593,16 @@ EDGE_COST_DOMINANT_MIN_DELTA_PERCENT = max(
     0.0,
     float(os.getenv("EDGE_COST_DOMINANT_MIN_DELTA_PERCENT", "2.0")),
 )
+EDGE_COST_DOMINANT_ALLOW_NEGATIVE_GROSS = (
+    os.getenv("EDGE_COST_DOMINANT_ALLOW_NEGATIVE_GROSS", "true").lower() == "true"
+)
+EDGE_COST_DOMINANT_NEGATIVE_GROSS_MAX_PERCENT = float(
+    os.getenv("EDGE_COST_DOMINANT_NEGATIVE_GROSS_MAX_PERCENT", "0.0")
+)
+EDGE_COST_DOMINANT_NEGATIVE_GROSS_MIN_COST_PERCENT = max(
+    0.0,
+    float(os.getenv("EDGE_COST_DOMINANT_NEGATIVE_GROSS_MIN_COST_PERCENT", "4.0")),
+)
 EDGE_COST_DOMINANT_HIT_WINDOW_SECONDS = max(
     300,
     int(os.getenv("EDGE_COST_DOMINANT_HIT_WINDOW_SECONDS", "1800")),
@@ -2153,6 +2646,45 @@ EDGE_COST_DOMINANT_NON_WATCH_EXPLORE_SYMBOL_COOLDOWN_SECONDS = max(
     0,
     int(os.getenv("EDGE_COST_DOMINANT_NON_WATCH_EXPLORE_SYMBOL_COOLDOWN_SECONDS", "1800")),
 )
+# Fast short-TTL lock for repeated cost-dominant rows to prevent wasting plan slots on the same symbol.
+EDGE_COST_DOMINANT_SHORT_TTL_ENABLED = os.getenv("EDGE_COST_DOMINANT_SHORT_TTL_ENABLED", "true").lower() == "true"
+EDGE_COST_DOMINANT_SHORT_TTL_SECONDS = max(
+    0,
+    int(os.getenv("EDGE_COST_DOMINANT_SHORT_TTL_SECONDS", "180")),
+)
+EDGE_COST_DOMINANT_SHORT_TTL_MIN_DELTA_PERCENT = max(
+    0.0,
+    float(os.getenv("EDGE_COST_DOMINANT_SHORT_TTL_MIN_DELTA_PERCENT", "4.0")),
+)
+EDGE_COST_DOMINANT_SHORT_TTL_MIN_COST_PERCENT = max(
+    0.0,
+    float(os.getenv("EDGE_COST_DOMINANT_SHORT_TTL_MIN_COST_PERCENT", "8.0")),
+)
+EDGE_LOW_LOOP_GUARD_ENABLED = os.getenv("EDGE_LOW_LOOP_GUARD_ENABLED", "true").lower() == "true"
+EDGE_LOW_LOOP_ONLY_WATCHLIST = os.getenv("EDGE_LOW_LOOP_ONLY_WATCHLIST", "true").lower() == "true"
+EDGE_LOW_LOOP_HIT_WINDOW_SECONDS = max(
+    120,
+    int(os.getenv("EDGE_LOW_LOOP_HIT_WINDOW_SECONDS", "900")),
+)
+EDGE_LOW_LOOP_HITS_TO_COOLDOWN = max(
+    2,
+    int(os.getenv("EDGE_LOW_LOOP_HITS_TO_COOLDOWN", "4")),
+)
+EDGE_LOW_LOOP_SYMBOL_COOLDOWN_SECONDS = max(
+    60,
+    int(os.getenv("EDGE_LOW_LOOP_SYMBOL_COOLDOWN_SECONDS", "600")),
+)
+PLAN_NEGATIVE_EDGE_PRECHECK_ENABLED = os.getenv(
+    "PLAN_NEGATIVE_EDGE_PRECHECK_ENABLED",
+    "true",
+).strip().lower() in ("1", "true", "yes", "y", "on")
+PLAN_NEGATIVE_EDGE_PRECHECK_MAX_GROSS_PERCENT = float(
+    os.getenv("PLAN_NEGATIVE_EDGE_PRECHECK_MAX_GROSS_PERCENT", "0.0")
+)
+PLAN_NEGATIVE_EDGE_PRECHECK_MIN_COST_PERCENT = max(
+    0.0,
+    float(os.getenv("PLAN_NEGATIVE_EDGE_PRECHECK_MIN_COST_PERCENT", "3.0")),
+)
 ENTRY_EDGE_SOFTEN_GREEN_A_CORE_ENABLED = os.getenv(
     "ENTRY_EDGE_SOFTEN_GREEN_A_CORE_ENABLED",
     "true",
@@ -2176,6 +2708,18 @@ NON_WATCH_EXPLORE_MIN_TRADE_FLOOR_ENABLED = (
 )
 NON_WATCH_EXPLORE_MIN_TRADE_USD = max(0.0, float(os.getenv("NON_WATCH_EXPLORE_MIN_TRADE_USD", "0.30")))
 NON_WATCH_EXPLORE_GAS_MULT_FLOOR = max(0.0, float(os.getenv("NON_WATCH_EXPLORE_GAS_MULT_FLOOR", "8.0")))
+# Fail closed for non-watch explore entries with negative expected net EV.
+NON_WATCH_EXPLORE_REQUIRE_POSITIVE_EV = os.getenv(
+    "NON_WATCH_EXPLORE_REQUIRE_POSITIVE_EV",
+    "true",
+).lower() == "true"
+NON_WATCH_EXPLORE_MIN_EV_NET_USD = float(
+    os.getenv("NON_WATCH_EXPLORE_MIN_EV_NET_USD", "0.0000")
+)
+PAPER_VIABLE_SIZE_GUARD_ENABLED = os.getenv("PAPER_VIABLE_SIZE_GUARD_ENABLED", "true").lower() == "true"
+PAPER_VIABLE_SIZE_MIN_USD = max(0.0, float(os.getenv("PAPER_VIABLE_SIZE_MIN_USD", "0.80")))
+PAPER_VIABLE_SIZE_GAS_MULT_FLOOR = max(0.0, float(os.getenv("PAPER_VIABLE_SIZE_GAS_MULT_FLOOR", "12.0")))
+PAPER_VIABLE_SIZE_MAX_USD = max(0.0, float(os.getenv("PAPER_VIABLE_SIZE_MAX_USD", "2.00")))
 ENTRY_SMALL_SIZE_EV_RELAX_ENABLED = os.getenv("ENTRY_SMALL_SIZE_EV_RELAX_ENABLED", "true").lower() == "true"
 ENTRY_SMALL_SIZE_EV_RELAX_NOMINAL_USD = max(0.1, float(os.getenv("ENTRY_SMALL_SIZE_EV_RELAX_NOMINAL_USD", "1.00")))
 ENTRY_SMALL_SIZE_EV_RELAX_MIN_FACTOR = max(
@@ -2283,6 +2827,21 @@ SYMBOL_EV_WINDOW_MINUTES = max(10, int(os.getenv("SYMBOL_EV_WINDOW_MINUTES", "12
 SYMBOL_EV_MIN_TRADES = max(1, int(os.getenv("SYMBOL_EV_MIN_TRADES", "3")))
 SYMBOL_EV_MIN_AVG_PNL_USD = float(os.getenv("SYMBOL_EV_MIN_AVG_PNL_USD", "0.0005"))
 SYMBOL_EV_MAX_LOSS_SHARE = max(0.0, min(1.0, float(os.getenv("SYMBOL_EV_MAX_LOSS_SHARE", "0.60"))))
+# Optional hard stop for non-watch symbols with confirmed negative local EV profile.
+SYMBOL_EV_BAD_NON_WATCH_FORCE_SKIP_ENABLED = (
+    os.getenv("SYMBOL_EV_BAD_NON_WATCH_FORCE_SKIP_ENABLED", "true").lower() == "true"
+)
+SYMBOL_EV_BAD_NON_WATCH_FORCE_SKIP_MIN_TRADES = max(
+    1,
+    int(os.getenv("SYMBOL_EV_BAD_NON_WATCH_FORCE_SKIP_MIN_TRADES", "4")),
+)
+SYMBOL_EV_BAD_NON_WATCH_FORCE_SKIP_MAX_LOSS_SHARE = max(
+    0.0,
+    min(1.0, float(os.getenv("SYMBOL_EV_BAD_NON_WATCH_FORCE_SKIP_MAX_LOSS_SHARE", "0.62"))),
+)
+SYMBOL_EV_BAD_NON_WATCH_FORCE_SKIP_MAX_AVG_PNL_USD = float(
+    os.getenv("SYMBOL_EV_BAD_NON_WATCH_FORCE_SKIP_MAX_AVG_PNL_USD", "-0.0005")
+)
 # `skip` hard-blocks bad symbol EV; `degrade` keeps symbol tradable with EV-memory penalties.
 SYMBOL_EV_BAD_ACTION = str(os.getenv("SYMBOL_EV_BAD_ACTION", "degrade") or "degrade").strip().lower()
 SYMBOL_EV_BAD_TO_STRICT_ONLY = os.getenv("SYMBOL_EV_BAD_TO_STRICT_ONLY", "true").lower() == "true"

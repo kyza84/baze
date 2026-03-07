@@ -19,6 +19,11 @@
       "sensitivity": "high",
       "importance": "routing"
     },
+    "FLOW_LEGACY_ROLLBACK_MODE": {
+      "type": "bool",
+      "sensitivity": "critical",
+      "importance": "rollback"
+    },
     "MAX_OPEN_TRADES": {
       "type": "int",
       "min": 2,
@@ -104,6 +109,27 @@
       "sensitivity": "high",
       "importance": "entry_quality"
     },
+    "EDGE_COST_DOMINANT_MIN_DELTA_PERCENT": {
+      "type": "float",
+      "min": 1.0,
+      "max": 10.0,
+      "sensitivity": "medium",
+      "importance": "entry_quality"
+    },
+    "EDGE_COST_DOMINANT_HITS_TO_COOLDOWN": {
+      "type": "int",
+      "min": 2,
+      "max": 8,
+      "sensitivity": "medium",
+      "importance": "risk"
+    },
+    "EDGE_COST_DOMINANT_SYMBOL_COOLDOWN_SECONDS": {
+      "type": "int",
+      "min": 60,
+      "max": 1800,
+      "sensitivity": "medium",
+      "importance": "risk"
+    },
     "V2_ROLLING_EDGE_MIN_USD": {
       "type": "float",
       "min": 0.0005,
@@ -153,6 +179,13 @@
       "type": "float",
       "min": 0.001,
       "max": 0.01,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "EV_FIRST_ENTRY_CORE_PROBE_MIN_NET_USD": {
+      "type": "float",
+      "min": -0.01,
+      "max": 0.005,
       "sensitivity": "high",
       "importance": "entry_quality"
     },
@@ -443,12 +476,40 @@
       "sensitivity": "high",
       "importance": "entry_quality"
     },
+    "WATCHLIST_MIN_VOLUME_5M_USD": {
+      "type": "float",
+      "min": 100.0,
+      "max": 20000.0,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
     "WATCHLIST_MIN_VOLUME_24H_USD": {
       "type": "float",
       "min": 10000.0,
       "max": 5000000.0,
       "sensitivity": "high",
       "importance": "entry_quality"
+    },
+    "WATCHLIST_LOW_SUPPLY_MIN_COUNT": {
+      "type": "int",
+      "min": 1,
+      "max": 30,
+      "sensitivity": "medium",
+      "importance": "routing"
+    },
+    "WATCHLIST_LOW_SUPPLY_RELAX_FACTOR": {
+      "type": "float",
+      "min": 0.1,
+      "max": 1.0,
+      "sensitivity": "medium",
+      "importance": "routing"
+    },
+    "WATCHLIST_LOW_SUPPLY_MIN_VOLUME_5M_USD": {
+      "type": "float",
+      "min": 0.0,
+      "max": 20000.0,
+      "sensitivity": "medium",
+      "importance": "routing"
     },
     "WATCHLIST_GECKO_TRENDING_PAGES": {
       "type": "int",
@@ -708,12 +769,49 @@
     "PROFILE_AUTOSTOP_MAX_DRAWDOWN_FROM_PEAK_USD",
     "PROFILE_AUTOSTOP_MIN_FAIL_SIGNALS",
     "TOKEN_SAFETY_FAIL_CLOSED",
+    "TOKEN_SAFETY_TRANSIENT_DEGRADED_ENABLED",
+    "TOKEN_SAFETY_TRANSIENT_USE_CACHE",
+    "TOKEN_SAFETY_TRANSIENT_USE_FALLBACK",
+    "TOKEN_SAFETY_TRANSIENT_REASONS",
     "HONEYPOT_API_FAIL_CLOSED",
+    "HONEYPOT_API_ENABLED",
+    "HONEYPOT_GUARD_IN_PAPER",
+    "HONEYPOT_MAX_BUY_TAX_PERCENT",
+    "HONEYPOT_MAX_SELL_TAX_PERCENT",
+    "HONEYPOT_TRANSIENT_TO_BLACKLIST",
+    "HONEYPOT_TRANSIENT_HITS_TO_BLACKLIST",
+    "HONEYPOT_TRANSIENT_BLACKLIST_TTL_SECONDS",
     "SAFE_REQUIRE_CONTRACT_SAFE",
     "SAFE_REQUIRE_RISK_LEVEL",
     "ENTRY_FAIL_CLOSED_ON_SAFETY_GAP",
     "ENTRY_ALLOWED_SAFETY_SOURCES",
     "PAPER_WATCHLIST_STRICT_GUARD_ENABLED",
+    "LOCAL_ANTISCAM_TRANSIENT_STRICT_ENABLED",
+    "LOCAL_ANTISCAM_TRANSIENT_MIN_AGE_SECONDS",
+    "LOCAL_ANTISCAM_TRANSIENT_MIN_LIQUIDITY_USD",
+    "LOCAL_ANTISCAM_TRANSIENT_MIN_VOLUME_5M_USD",
+    "LOCAL_ANTISCAM_TRANSIENT_MAX_ABS_CHANGE_5M",
+    "LOCAL_ANTISCAM_TRANSIENT_BLOCK_SOFT_CHANGE_PASS",
+    "LOCAL_ANTISCAM_PUMP_HISTORY_ENABLED",
+    "LOCAL_ANTISCAM_PUMP_HISTORY_WINDOW_SECONDS",
+    "LOCAL_ANTISCAM_PUMP_HISTORY_BLOCK_MAX_ABS_CHANGE_5M",
+    "LOCAL_ANTISCAM_PUMP_HISTORY_BLOCK_MAX_AGE_SECONDS",
+    "LOCAL_ANTISCAM_PUMP_HISTORY_ONLY_NON_WATCH",
+    "LOCAL_ANTISCAM_PUMP_HISTORY_TO_BLACKLIST",
+    "LOCAL_ANTISCAM_PUMP_HISTORY_BLACKLIST_TTL_SECONDS",
+    "ENTRY_PRE_RUG_GUARD_ENABLED",
+    "ENTRY_PRE_RUG_MAX_SPREAD_BPS",
+    "ENTRY_PRE_RUG_MAX_SOURCE_DIVERGENCE_PCT",
+    "ENTRY_PRE_RUG_MIN_LIQUIDITY_RATIO",
+    "ENTRY_PRE_RUG_HITS_TO_BLACKLIST",
+    "ENTRY_PRE_RUG_BLACKLIST_TTL_SECONDS",
+    "POST_ENTRY_RUG_GUARD_ENABLED",
+    "POST_ENTRY_RUG_MIN_AGE_SECONDS",
+    "POST_ENTRY_RUG_MIN_ENTRY_LIQUIDITY_USD",
+    "POST_ENTRY_RUG_MIN_CURRENT_LIQUIDITY_USD",
+    "POST_ENTRY_RUG_MAX_LIQUIDITY_RATIO",
+    "POST_ENTRY_RUG_HITS_TO_TRIGGER",
+    "POST_ENTRY_RUG_BLACKLIST_TTL_SECONDS",
     "V2_POLICY_ROUTER_ENABLED",
     "V2_POLICY_FAIL_CLOSED_ACTION",
     "V2_POLICY_DEGRADED_ACTION",
