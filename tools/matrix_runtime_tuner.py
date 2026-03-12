@@ -99,6 +99,9 @@ TUNER_RUNTIME_FALLBACK_KEYS = {
     "SAFE_MIN_VOLUME_5M_USD",
     "SAFE_VOLUME_TWO_TIER_NON_WATCH_SOFT_RATIO",
     "SAFE_VOLUME_TWO_TIER_NON_WATCH_MAX_PASSES_PER_CYCLE",
+    "SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_SOFT_RATIO",
+    "SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_MIN_VOLUME_5M_MULT",
+    "SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_MAX_PASSES_PER_CYCLE",
     "SAFE_AGE_NON_WATCH_SOFT_RATIO",
     "SAFE_AGE_NON_WATCH_MAX_PASSES_PER_CYCLE",
     "SAFE_CHANGE_5M_NON_WATCH_SOFT_MULT",
@@ -181,6 +184,9 @@ TUNER_MUTABLE_KEYS = {
     "SAFE_MIN_VOLUME_5M_USD",
     "SAFE_VOLUME_TWO_TIER_NON_WATCH_SOFT_RATIO",
     "SAFE_VOLUME_TWO_TIER_NON_WATCH_MAX_PASSES_PER_CYCLE",
+    "SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_SOFT_RATIO",
+    "SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_MIN_VOLUME_5M_MULT",
+    "SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_MAX_PASSES_PER_CYCLE",
     "SAFE_AGE_NON_WATCH_SOFT_RATIO",
     "SAFE_AGE_NON_WATCH_MAX_PASSES_PER_CYCLE",
     "SAFE_CHANGE_5M_NON_WATCH_SOFT_MULT",
@@ -219,16 +225,42 @@ TUNER_MUTABLE_KEYS = {
 }
 TUNER_EPHEMERAL_KEYS = {"AUTO_TRADE_EXCLUDED_SYMBOLS"}
 # Keys that can be hot-applied into a running `main_local.py` without process restart.
-# They are still persisted into preset/env; runtime patch just removes restart dependency.
-TUNER_HOT_APPLY_KEYS = set(TUNER_MUTABLE_KEYS)
+# Final set is normalized after hard-protected keys are defined.
+TUNER_HOT_APPLY_KEYS: set[str] = set()
 # Explicitly restart-required keys (kept empty by default, can be extended later safely).
 TUNER_RESTART_REQUIRED_KEYS: set[str] = set()
-TUNER_DRY_RUN_STRUCTURAL_LOCK_KEYS = {
+TUNER_STRUCTURAL_LOCK_KEYS = {
+    "PLAN_MAX_SINGLE_SOURCE_SHARE",
     "PLAN_MAX_WATCHLIST_SHARE",
     "PLAN_MIN_NON_WATCHLIST_PER_BATCH",
     "V2_SOURCE_QOS_SOURCE_CAPS",
     "V2_UNIVERSE_SOURCE_CAPS",
+    # Lane split / batch routing invariants
+    "PLAN_LANE_TAG_ENABLED",
+    "PLAN_LANE_QUOTAS_ENABLED",
+    "PLAN_MIN_STABLE_PER_BATCH",
+    "PLAN_MIN_DISCOVERY_PER_BATCH",
+    "PLAN_WATCHLIST_FALLBACK_ONLY",
+    # Stable upstream invariants
+    "RAW_STABLE_UPSTREAM_ENABLED",
+    "RAW_STABLE_UPSTREAM_MIN_ACTIONABLE",
+    "RAW_STABLE_UPSTREAM_EXTRA_FETCH_ROUNDS",
+    "RAW_STABLE_UPSTREAM_MAX_EXTRA_PER_CYCLE",
+    "RAW_STABLE_UPSTREAM_ONLY_NON_WATCH",
+    # Lane-econ split invariants
+    "LANE_ECON_SPLIT_ENABLED",
+    "LANE_ECON_STABLE_EDGE_PCT_MULT",
+    "LANE_ECON_STABLE_EDGE_USD_MULT",
+    "LANE_ECON_STABLE_EV_MIN_MULT",
+    "LANE_ECON_STABLE_MIN_TRADE_USD",
+    "LANE_ECON_DISCOVERY_EDGE_PCT_MULT",
+    "LANE_ECON_DISCOVERY_EDGE_USD_MULT",
+    "LANE_ECON_DISCOVERY_EV_MIN_MULT",
+    "LANE_ECON_DISCOVERY_MIN_TRADE_USD",
+    "LANE_ECON_DISCOVERY_MIN_TRADE_GAS_MULT",
+    "LANE_ECON_DISCOVERY_HINT_MIN_SIZE_USD",
 }
+TUNER_DRY_RUN_STRUCTURAL_LOCK_KEYS = set(TUNER_STRUCTURAL_LOCK_KEYS)
 TUNER_HARD_PROTECTED_PREFIXES = (
     "LOCAL_ANTISCAM_",
     "ENTRY_PRE_RUG_",
@@ -237,12 +269,52 @@ TUNER_HARD_PROTECTED_PREFIXES = (
     "HONEYPOT_",
 )
 TUNER_HARD_PROTECTED_KEYS = {
+    "ANTI_SCAM_LOCKED_MODE",
+    "ANTI_SCAM_LOCKED_DISCOVERY_BRIDGE_ENABLED",
     "SAFE_REQUIRE_CONTRACT_SAFE",
     "SAFE_REQUIRE_RISK_LEVEL",
+    "SAFE_VOLUME_TWO_TIER_NON_WATCH_ENABLED",
+    "SAFE_VOLUME_TWO_TIER_NON_WATCH_SOFT_RATIO",
+    "SAFE_VOLUME_TWO_TIER_NON_WATCH_MAX_PASSES_PER_CYCLE",
+    "SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_SOFT_ENABLED",
+    "SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_SOFT_RATIO",
+    "SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_MIN_VOLUME_5M_MULT",
+    "SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_MAX_PASSES_PER_CYCLE",
+    "SAFE_AGE_NON_WATCH_SOFT_ENABLED",
+    "SAFE_AGE_NON_WATCH_SOFT_RATIO",
+    "SAFE_AGE_NON_WATCH_MAX_PASSES_PER_CYCLE",
+    "SAFE_CHANGE_5M_NON_WATCH_SOFT_ENABLED",
+    "SAFE_CHANGE_5M_NON_WATCH_SOFT_MULT",
+    "SAFE_CHANGE_5M_NON_WATCH_MAX_PASSES_PER_CYCLE",
+    "MARKET_MODE_NON_WATCH_SOFT_SCORE_DELTA",
+    "MARKET_MODE_NON_WATCH_SOFT_MAX_PER_CYCLE",
+    "ENTRY_HARD_NON_WATCH_SCAM_GUARD_ENABLED",
+    "ENTRY_HARD_NON_WATCH_SCAM_ONLY_DISCOVERY",
+    "ENTRY_HARD_NON_WATCH_SCAM_MIN_AGE_SECONDS",
+    "ENTRY_HARD_NON_WATCH_SCAM_MIN_LIQUIDITY_USD",
+    "ENTRY_HARD_NON_WATCH_SCAM_MIN_VOLUME_5M_USD",
+    "ENTRY_HARD_NON_WATCH_SCAM_MAX_ABS_CHANGE_5M",
+    "ENTRY_HARD_NON_WATCH_SCAM_REQUIRE_CONTRACT_SAFE",
+    "ENTRY_HARD_NON_WATCH_SCAM_MAX_WARNING_FLAGS",
+    "ENTRY_HARD_NON_WATCH_SCAM_MAX_RISK_LEVEL",
+    "ENTRY_HARD_NON_WATCH_SCAM_HITS_TO_BLACKLIST",
+    "ENTRY_HARD_NON_WATCH_SCAM_BLACKLIST_TTL_SECONDS",
+    "ENTRY_HARD_SCAM_APPLY_DISCOVERY_LANE",
+    "ENTRY_HARD_NON_WATCH_SCAM_PASS_STREAK_REQUIRED",
+    "ENTRY_HARD_NON_WATCH_SCAM_PASS_STREAK_WINDOW_SECONDS",
+    "ENTRY_HARD_NON_WATCH_SCAM_PASS_STREAK_MAX_AGE_SECONDS",
+    "POST_ENTRY_RUG_SYMBOL_COOLDOWN_SECONDS",
     "ENTRY_FAIL_CLOSED_ON_SAFETY_GAP",
     "ENTRY_ALLOWED_SAFETY_SOURCES",
     "PAPER_WATCHLIST_STRICT_GUARD_ENABLED",
 }
+# Never mutate or hot-apply hard protected keys from tuner loops.
+if TUNER_HARD_PROTECTED_KEYS:
+    TUNER_MUTABLE_KEYS = set(TUNER_MUTABLE_KEYS) - set(TUNER_HARD_PROTECTED_KEYS)
+# Structural routing/lane keys are single-writer: tuner must never mutate them.
+if TUNER_STRUCTURAL_LOCK_KEYS:
+    TUNER_MUTABLE_KEYS = set(TUNER_MUTABLE_KEYS) - set(TUNER_STRUCTURAL_LOCK_KEYS)
+TUNER_HOT_APPLY_KEYS = set(TUNER_MUTABLE_KEYS)
 FORCE_ACTION_REASONS = {"soft_must_be_leq_strict"}
 TIGHTEN_FLOW_ESCAPE_SIGNALS = {
     "source_qos_cap_rebalance",
@@ -255,6 +327,7 @@ TIGHTEN_FLOW_ESCAPE_SIGNALS = {
     "cooldown_dominant_flow_expand",
     "safe_volume_soft_flow_expand",
     "safe_volume_non_watch_soft",
+    "safe_liquidity_onchain_non_watch_soft",
     "score_non_watch_soft",
     "safe_age_non_watch_soft",
     "safe_change_non_watch_soft",
@@ -278,6 +351,7 @@ HOLD_FLOW_ESCAPE_SIGNALS = {
     "safe_volume_dominant",
     "safe_volume_soft_flow_expand",
     "safe_volume_non_watch_soft",
+    "safe_liquidity_onchain_non_watch_soft",
     "score_non_watch_soft",
     "safe_age_non_watch_soft",
     "safe_change_non_watch_soft",
@@ -294,6 +368,9 @@ ROLLBACK_SOURCE_GUARD_KEYS = {
     "V2_SOURCE_QOS_MAX_PER_SYMBOL_PER_CYCLE",
     "SAFE_VOLUME_TWO_TIER_NON_WATCH_SOFT_RATIO",
     "SAFE_VOLUME_TWO_TIER_NON_WATCH_MAX_PASSES_PER_CYCLE",
+    "SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_SOFT_RATIO",
+    "SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_MIN_VOLUME_5M_MULT",
+    "SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_MAX_PASSES_PER_CYCLE",
     "MARKET_MODE_NON_WATCH_SOFT_SCORE_DELTA",
     "MARKET_MODE_NON_WATCH_SOFT_MAX_PER_CYCLE",
     "WATCHLIST_MIN_VOLUME_5M_USD",
@@ -325,6 +402,9 @@ IDLE_RELAX_SAFE_KEYS = {
     "SAFE_MIN_VOLUME_5M_USD",
     "SAFE_VOLUME_TWO_TIER_NON_WATCH_SOFT_RATIO",
     "SAFE_VOLUME_TWO_TIER_NON_WATCH_MAX_PASSES_PER_CYCLE",
+    "SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_SOFT_RATIO",
+    "SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_MIN_VOLUME_5M_MULT",
+    "SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_MAX_PASSES_PER_CYCLE",
     "SAFE_AGE_NON_WATCH_SOFT_RATIO",
     "SAFE_AGE_NON_WATCH_MAX_PASSES_PER_CYCLE",
     "SAFE_CHANGE_5M_NON_WATCH_SOFT_MULT",
@@ -1923,6 +2003,36 @@ def _resolve_trade_source(
     return "unknown"
 
 
+def _source_to_lane(source_name: str) -> str:
+    src = str(source_name or "").strip().lower()
+    if src.startswith("watchlist"):
+        return "stable"
+    return "discovery"
+
+
+def _resolve_trade_lane(
+    row: dict[str, Any],
+    *,
+    candidate_lane_by_id: dict[str, str],
+    candidate_source_by_id: dict[str, str],
+) -> str:
+    lane_raw = str(
+        row.get("lane_tag", "")
+        or row.get("economic_lane", "")
+        or row.get("entry_lane", "")
+        or ""
+    ).strip().lower()
+    if lane_raw in {"stable", "discovery"}:
+        return lane_raw
+    cid = str(row.get("candidate_id", "") or "").strip()
+    if cid:
+        mapped_lane = str(candidate_lane_by_id.get(cid, "") or "").strip().lower()
+        if mapped_lane in {"stable", "discovery"}:
+            return mapped_lane
+    src = _resolve_trade_source(row, candidate_source_by_id=candidate_source_by_id)
+    return _source_to_lane(src)
+
+
 def _source_profile_15m(candidate_rows: list[dict[str, Any]], trade_rows: list[dict[str, Any]]) -> dict[str, Any]:
     candidate_source_by_id: dict[str, str] = {}
     pass_by_source = Counter[str]()
@@ -1996,6 +2106,89 @@ def _source_profile_15m(candidate_rows: list[dict[str, Any]], trade_rows: list[d
         "plan_top_source": str(top_source),
         "plan_top_source_attempts": int(top_source_plan_attempts),
         "plan_top_source_share": round(float(top_source_share), 6),
+    }
+
+
+def _lane_profile_15m(candidate_rows: list[dict[str, Any]], trade_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    candidate_source_by_id: dict[str, str] = {}
+    candidate_lane_by_id: dict[str, str] = {}
+    candidate_count_by_lane = Counter[str]()
+    post_filters_pass_by_lane = Counter[str]()
+    filter_fail_by_lane = Counter[str]()
+    plan_attempts_by_lane = Counter[str]()
+    plan_skips_by_lane = Counter[str]()
+    opens_by_lane = Counter[str]()
+    closes_by_lane = Counter[str]()
+
+    seen_ids: set[str] = set()
+    for idx, row in enumerate(candidate_rows):
+        key = _row_candidate_key(row, idx)
+        src = str(row.get("source", "") or row.get("source_mode", "") or "").strip().lower() or "unknown"
+        lane = str(row.get("lane_tag", "") or "").strip().lower()
+        if lane not in {"stable", "discovery"}:
+            lane = _source_to_lane(src)
+        candidate_source_by_id[key] = src
+        candidate_lane_by_id[key] = lane
+        if key not in seen_ids:
+            seen_ids.add(key)
+            candidate_count_by_lane[lane] += 1
+        stage = str(row.get("decision_stage", "") or "").strip().lower()
+        decision = str(row.get("decision", "") or "").strip().lower()
+        if stage == "post_filters" and decision in {"candidate_pass", "pass", "ok"}:
+            post_filters_pass_by_lane[lane] += 1
+        elif stage == "filter_fail":
+            filter_fail_by_lane[lane] += 1
+
+    for row in trade_rows:
+        stage = str(row.get("decision_stage", "") or "").strip().lower()
+        decision = str(row.get("decision", "") or "").strip().lower()
+        lane = _resolve_trade_lane(
+            row,
+            candidate_lane_by_id=candidate_lane_by_id,
+            candidate_source_by_id=candidate_source_by_id,
+        )
+        if stage == "plan_trade":
+            plan_attempts_by_lane[lane] += 1
+            if decision == "skip":
+                plan_skips_by_lane[lane] += 1
+        elif stage == "trade_open" and decision == "open":
+            opens_by_lane[lane] += 1
+        elif stage == "trade_close" and decision == "close":
+            closes_by_lane[lane] += 1
+
+    rows: list[dict[str, Any]] = []
+    lanes = {"stable", "discovery"} | set(candidate_count_by_lane.keys()) | set(plan_attempts_by_lane.keys())
+    for lane in sorted(lanes):
+        attempts = int(plan_attempts_by_lane.get(lane, 0))
+        opens = int(opens_by_lane.get(lane, 0))
+        rows.append(
+            {
+                "lane": str(lane),
+                "candidate_count": int(candidate_count_by_lane.get(lane, 0)),
+                "filter_fail": int(filter_fail_by_lane.get(lane, 0)),
+                "post_filters_pass": int(post_filters_pass_by_lane.get(lane, 0)),
+                "plan_attempts": int(attempts),
+                "plan_skips": int(plan_skips_by_lane.get(lane, 0)),
+                "opens": int(opens),
+                "closes": int(closes_by_lane.get(lane, 0)),
+                "open_rate": round(float(opens) / float(max(1, attempts)), 6),
+            }
+        )
+    rows.sort(key=lambda r: int(r.get("plan_attempts", 0)), reverse=True)
+    total_plan_attempts = int(sum(int(r.get("plan_attempts", 0) or 0) for r in rows))
+    top_lane = str(rows[0].get("lane", "")) if rows else ""
+    top_lane_plan_attempts = int(rows[0].get("plan_attempts", 0) or 0) if rows else 0
+    top_lane_share = (
+        float(top_lane_plan_attempts) / float(max(1, total_plan_attempts))
+        if total_plan_attempts > 0
+        else 0.0
+    )
+    return {
+        "rows": rows[:4],
+        "plan_attempts_total": int(total_plan_attempts),
+        "plan_top_lane": str(top_lane),
+        "plan_top_lane_attempts": int(top_lane_plan_attempts),
+        "plan_top_lane_share": round(float(top_lane_share), 6),
     }
 
 
@@ -3156,6 +3349,9 @@ def _apply_action_delta_caps(actions: list[Action], phase: str) -> tuple[list[Ac
         "SAFE_MIN_VOLUME_5M_USD": (3.0, False),
         "SAFE_VOLUME_TWO_TIER_NON_WATCH_SOFT_RATIO": (0.08, False),
         "SAFE_VOLUME_TWO_TIER_NON_WATCH_MAX_PASSES_PER_CYCLE": (2.0, True),
+        "SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_SOFT_RATIO": (0.08, False),
+        "SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_MIN_VOLUME_5M_MULT": (0.10, False),
+        "SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_MAX_PASSES_PER_CYCLE": (2.0, True),
         "SAFE_AGE_NON_WATCH_SOFT_RATIO": (0.08, False),
         "SAFE_AGE_NON_WATCH_MAX_PASSES_PER_CYCLE": (2.0, True),
         "SAFE_CHANGE_5M_NON_WATCH_SOFT_MULT": (0.10, False),
@@ -3503,20 +3699,21 @@ def _enforce_mutable_action_keys(
     return out, blocked
 
 
-def _enforce_dry_run_structural_locks(
+def _enforce_structural_locks(
     *,
     actions: list[Action],
+    dry_run: bool,
 ) -> tuple[list[Action], list[dict[str, Any]]]:
     out: list[Action] = []
     blocked: list[dict[str, Any]] = []
     for action in actions:
         key = str(action.key or "").strip()
-        if key in TUNER_DRY_RUN_STRUCTURAL_LOCK_KEYS:
+        if key in TUNER_STRUCTURAL_LOCK_KEYS:
             blocked.append(
                 {
                     "key": key,
                     "reason": str(action.reason or ""),
-                    "blocked_by": "dry_run_structural_lock",
+                    "blocked_by": "dry_run_structural_lock" if bool(dry_run) else "structural_lock",
                 }
             )
             continue
@@ -3630,6 +3827,7 @@ def _collect_telemetry_v2(
     )
     exec_health_15m = _exec_health_15m(trade_rows_15m)
     source_profile_15m = _source_profile_15m(candidate_rows_15m, trade_rows_15m)
+    lane_profile_15m = _lane_profile_15m(candidate_rows_15m, trade_rows_15m)
     supply_sanity_15m = _supply_sanity_15m(
         candidate_rows_15m=candidate_rows_15m,
         candidate_rows_60m=candidate_rows_60m,
@@ -3702,6 +3900,7 @@ def _collect_telemetry_v2(
         "top_reasons_15m": top_reasons_15m,
         "exec_health_15m": exec_health_15m,
         "source_profile_15m": source_profile_15m,
+        "lane_profile_15m": lane_profile_15m,
         "supply_sanity_15m": supply_sanity_15m,
         "plan_symbol_concentration_15m": plan_concentration_15m,
         "blacklist_filter_dominator_15m": blacklist_filter_dominator_15m,
@@ -3948,6 +4147,9 @@ def _parse_symbol_csv(value: Any) -> list[str]:
     out: list[str] = []
     for raw in str(value or "").split(","):
         sym = str(raw or "").strip().upper()
+        # Keep contract-safe csv symbols compatible with preset validator:
+        # allow only [A-Za-z0-9._-], drop any other chars (e.g. '@AIZEL' -> 'AIZEL').
+        sym = re.sub(r"[^A-Z0-9._-]+", "", sym)
         if not sym or sym in seen:
             continue
         seen.add(sym)
@@ -4151,6 +4353,9 @@ def _action_priority(action: Action) -> int:
         "SAFE_MIN_VOLUME_5M_USD",
         "SAFE_VOLUME_TWO_TIER_NON_WATCH_SOFT_RATIO",
         "SAFE_VOLUME_TWO_TIER_NON_WATCH_MAX_PASSES_PER_CYCLE",
+        "SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_SOFT_RATIO",
+        "SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_MIN_VOLUME_5M_MULT",
+        "SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_MAX_PASSES_PER_CYCLE",
         "SAFE_AGE_NON_WATCH_SOFT_RATIO",
         "SAFE_AGE_NON_WATCH_MAX_PASSES_PER_CYCLE",
         "SAFE_CHANGE_5M_NON_WATCH_SOFT_MULT",
@@ -4182,6 +4387,9 @@ def _action_priority(action: Action) -> int:
         "MARKET_MODE_NON_WATCH_SOFT_MAX_PER_CYCLE",
         "SAFE_VOLUME_TWO_TIER_NON_WATCH_SOFT_RATIO",
         "SAFE_VOLUME_TWO_TIER_NON_WATCH_MAX_PASSES_PER_CYCLE",
+        "SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_SOFT_RATIO",
+        "SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_MIN_VOLUME_5M_MULT",
+        "SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_MAX_PASSES_PER_CYCLE",
         "SAFE_AGE_NON_WATCH_SOFT_RATIO",
         "SAFE_AGE_NON_WATCH_MAX_PASSES_PER_CYCLE",
         "SAFE_CHANGE_5M_NON_WATCH_SOFT_MULT",
@@ -4270,6 +4478,21 @@ def _build_action_plan(
     safe_volume_non_watch_max_passes = _get_int(
         staged,
         "SAFE_VOLUME_TWO_TIER_NON_WATCH_MAX_PASSES_PER_CYCLE",
+        2,
+    )
+    safe_liquidity_onchain_non_watch_soft_ratio = _get_float(
+        staged,
+        "SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_SOFT_RATIO",
+        0.70,
+    )
+    safe_liquidity_onchain_non_watch_min_volume_mult = _get_float(
+        staged,
+        "SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_MIN_VOLUME_5M_MULT",
+        0.60,
+    )
+    safe_liquidity_onchain_non_watch_max_passes = _get_int(
+        staged,
+        "SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_MAX_PASSES_PER_CYCLE",
         2,
     )
     min_edge_pct = _get_float(staged, "MIN_EXPECTED_EDGE_PERCENT", 0.8)
@@ -4366,6 +4589,7 @@ def _build_action_plan(
 
     score_min_hits = int(metrics.filter_fail_reasons.get("score_min", 0))
     safe_volume_hits = int(metrics.filter_fail_reasons.get("safe_volume", 0))
+    safe_liquidity_hits = int(metrics.filter_fail_reasons.get("safe_liquidity", 0))
     safe_age_hits = int(metrics.filter_fail_reasons.get("safe_age", 0))
     safe_change_hits = int(metrics.filter_fail_reasons.get("safe_change_5m", 0))
     heavy_dedup_hits = int(metrics.filter_fail_reasons.get("heavy_dedup_ttl", 0))
@@ -4972,9 +5196,25 @@ def _build_action_plan(
             f"plan_ratio={non_watch_plan_ratio_15m:.3f} source_top={source_top_name_15m}:{source_top_share_15m:.3f}"
         )
         non_watch_soft_score_delta = _clamp_int(non_watch_soft_score_delta + 2, 0, 24)
-        non_watch_soft_max_per_cycle = _clamp_int(non_watch_soft_max_per_cycle + 1, 0, 8)
+        non_watch_soft_max_per_cycle = _clamp_int(non_watch_soft_max_per_cycle + 1, 0, 12)
         safe_volume_non_watch_soft_ratio = _clamp_float(safe_volume_non_watch_soft_ratio - 0.06, 0.20, 0.95)
         safe_volume_non_watch_max_passes = _clamp_int(safe_volume_non_watch_max_passes + 1, 0, 10)
+        if safe_liquidity_hits > 0:
+            safe_liquidity_onchain_non_watch_soft_ratio = _clamp_float(
+                safe_liquidity_onchain_non_watch_soft_ratio - 0.05,
+                0.20,
+                1.00,
+            )
+            safe_liquidity_onchain_non_watch_min_volume_mult = _clamp_float(
+                safe_liquidity_onchain_non_watch_min_volume_mult - 0.05,
+                0.10,
+                2.50,
+            )
+            safe_liquidity_onchain_non_watch_max_passes = _clamp_int(
+                safe_liquidity_onchain_non_watch_max_passes + 1,
+                0,
+                12,
+            )
         safe_age_non_watch_soft_ratio = _clamp_float(safe_age_non_watch_soft_ratio - 0.06, 0.25, 1.0)
         safe_age_non_watch_max_passes = _clamp_int(safe_age_non_watch_max_passes + 1, 0, 10)
         safe_change_non_watch_soft_mult = _clamp_float(safe_change_non_watch_soft_mult + 0.06, 1.00, 2.20)
@@ -5012,6 +5252,28 @@ def _build_action_plan(
             _to_int_str(safe_volume_non_watch_max_passes),
             "non_watch_conversion_guard volume_cap",
         )
+        if safe_liquidity_hits > 0:
+            _apply_action(
+                staged,
+                actions,
+                "SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_SOFT_RATIO",
+                _to_float_str(safe_liquidity_onchain_non_watch_soft_ratio),
+                "non_watch_conversion_guard onchain_liquidity_ratio",
+            )
+            _apply_action(
+                staged,
+                actions,
+                "SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_MIN_VOLUME_5M_MULT",
+                _to_float_str(safe_liquidity_onchain_non_watch_min_volume_mult),
+                "non_watch_conversion_guard onchain_liquidity_vol_mult",
+            )
+            _apply_action(
+                staged,
+                actions,
+                "SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_MAX_PASSES_PER_CYCLE",
+                _to_int_str(safe_liquidity_onchain_non_watch_max_passes),
+                "non_watch_conversion_guard onchain_liquidity_cap",
+            )
         _apply_action(
             staged,
             actions,
@@ -6239,7 +6501,7 @@ def _build_action_plan(
                 non_watch_soft_max_per_cycle = _clamp_int(
                     non_watch_soft_max_per_cycle + 1,
                     0,
-                    8,
+                    12,
                 )
                 rule_hits["relax_score_non_watch_soft"] += 1
                 trace.append(
@@ -6332,7 +6594,7 @@ def _build_action_plan(
                 safe_volume_non_watch_max_passes = _clamp_int(
                     safe_volume_non_watch_max_passes + 1,
                     0,
-                    8,
+                    12,
                 )
                 rule_hits["relax_safe_volume_non_watch"] += 1
                 trace.append(
@@ -6359,6 +6621,49 @@ def _build_action_plan(
                 rule_hits["relax_safe_volume"] += 1
                 trace.append(f"relax_safe_volume hits={safe_volume_hits}")
                 _apply_action(staged, actions, "SAFE_MIN_VOLUME_5M_USD", _to_float_str(min_vol), "safe_volume_dominant")
+        if safe_liquidity_hits > 0 and (source_starvation_guard or non_watch_post_filter_starved):
+            safe_liquidity_onchain_non_watch_soft_ratio = _clamp_float(
+                safe_liquidity_onchain_non_watch_soft_ratio - 0.05,
+                0.20,
+                1.00,
+            )
+            safe_liquidity_onchain_non_watch_min_volume_mult = _clamp_float(
+                safe_liquidity_onchain_non_watch_min_volume_mult - 0.05,
+                0.10,
+                2.50,
+            )
+            safe_liquidity_onchain_non_watch_max_passes = _clamp_int(
+                safe_liquidity_onchain_non_watch_max_passes + 1,
+                0,
+                12,
+            )
+            rule_hits["relax_safe_liquidity_onchain_non_watch"] += 1
+            trace.append(
+                "relax_safe_liquidity_onchain_non_watch "
+                f"hits={safe_liquidity_hits} supply_non_watch={supply_non_watch_15m} "
+                f"post_filters_non_watch={post_filters_non_watch_15m}"
+            )
+            _apply_action(
+                staged,
+                actions,
+                "SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_SOFT_RATIO",
+                _to_float_str(safe_liquidity_onchain_non_watch_soft_ratio),
+                "safe_liquidity_onchain_non_watch_soft ratio",
+            )
+            _apply_action(
+                staged,
+                actions,
+                "SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_MIN_VOLUME_5M_MULT",
+                _to_float_str(safe_liquidity_onchain_non_watch_min_volume_mult),
+                "safe_liquidity_onchain_non_watch_soft min_volume_mult",
+            )
+            _apply_action(
+                staged,
+                actions,
+                "SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_MAX_PASSES_PER_CYCLE",
+                _to_int_str(safe_liquidity_onchain_non_watch_max_passes),
+                "safe_liquidity_onchain_non_watch_soft cap",
+            )
         if safe_age_hits > 0 and (source_starvation_guard or non_watch_post_filter_starved):
             safe_age_non_watch_soft_ratio = _clamp_float(
                 safe_age_non_watch_soft_ratio - 0.05,
@@ -6368,7 +6673,7 @@ def _build_action_plan(
             safe_age_non_watch_max_passes = _clamp_int(
                 safe_age_non_watch_max_passes + 1,
                 0,
-                8,
+                12,
             )
             rule_hits["relax_safe_age_non_watch"] += 1
             trace.append(
@@ -6399,7 +6704,7 @@ def _build_action_plan(
             safe_change_non_watch_max_passes = _clamp_int(
                 safe_change_non_watch_max_passes + 1,
                 0,
-                8,
+                12,
             )
             rule_hits["relax_safe_change_non_watch"] += 1
             trace.append(
@@ -8266,14 +8571,12 @@ def _tick(
             "scanned": int(metrics.scanned),
         }
     actions, blocked_mutations = _enforce_mutable_action_keys(actions=actions, protected_keys=protected_keys)
-    blocked_dry_run_structural: list[dict[str, Any]] = []
-    if dry_run:
-        actions, blocked_dry_run_structural = _enforce_dry_run_structural_locks(actions=actions)
-        if blocked_dry_run_structural:
-            decision_trace.append(
-                "dry_run_structural_lock "
-                f"blocked_keys={len(blocked_dry_run_structural)}"
-            )
+    actions, blocked_structural = _enforce_structural_locks(actions=actions, dry_run=bool(dry_run))
+    if blocked_structural:
+        decision_trace.append(
+            ("dry_run_structural_lock " if bool(dry_run) else "structural_lock ")
+            + f"blocked_keys={len(blocked_structural)}"
+        )
     actions, blocked_phase = _filter_actions_by_phase(actions=actions, phase=policy_decision.phase)
     actions, blocked_idle_relax = _apply_idle_relax_guard(
         actions=actions,
@@ -8298,7 +8601,7 @@ def _tick(
     blocked_actions = (
         prelimit_blocked_actions
         + blocked_mutations
-        + blocked_dry_run_structural
+        + blocked_structural
         + blocked_phase
         + blocked_idle_relax
     )

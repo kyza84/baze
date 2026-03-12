@@ -86,6 +86,48 @@ _RUNTIME_TUNER_RELOAD_EXACT_MAP: dict[str, str] = {
     "PROFIT_ENGINE_ENABLED": "kpi_loop",
 }
 _SWALLOWED_ERROR_TS: dict[str, float] = {}
+_PHASE0_REQUIRED_CONFIG_KEYS: tuple[str, ...] = (
+    "RAW_NON_WATCH_ACTIONABLE_MIN_LIQUIDITY_USD",
+    "RAW_NON_WATCH_ACTIONABLE_MIN_VOLUME_5M_USD",
+    "RAW_NON_WATCH_ACTIONABLE_MIN_AGE_SECONDS",
+    "RAW_NON_WATCH_ACTIONABLE_MAX_ABS_CHANGE_5M",
+    "NON_WATCH_LOW_FLOW_RELAXED_AGE_CAP_SECONDS",
+    "NON_WATCH_LOW_FLOW_RELAXED_MIN_LIQUIDITY_USD",
+    "NON_WATCH_LOW_FLOW_RELAXED_MIN_VOLUME_5M_USD",
+    "NON_WATCH_LOW_FLOW_RELAXED_MIN_AGE_SECONDS",
+    "NON_WATCH_LOW_FLOW_RELAXED_MAX_ABS_CHANGE_5M",
+    "NON_WATCH_LOW_FLOW_GECKO_TRENDING_PAGES",
+    "NON_WATCH_LOW_FLOW_GECKO_MARKET_PAGES",
+)
+_PHASE0_CRITICAL_EFFECTIVE_KEYS: tuple[str, ...] = (
+    "PLAN_MAX_SINGLE_SOURCE_SHARE",
+    "PLAN_MAX_WATCHLIST_SHARE",
+    "PLAN_MIN_NON_WATCHLIST_PER_BATCH",
+    "MARKET_MODE_SOFT_SCORE",
+    "MARKET_MODE_STRICT_SCORE",
+)
+_PHASE0_HOT_APPLY_STRUCTURAL_BLOCK_KEYS: tuple[str, ...] = (
+    "PLAN_MAX_SINGLE_SOURCE_SHARE",
+    "PLAN_MAX_WATCHLIST_SHARE",
+    "PLAN_MIN_NON_WATCHLIST_PER_BATCH",
+    "V2_SOURCE_QOS_SOURCE_CAPS",
+    "V2_UNIVERSE_SOURCE_CAPS",
+    "PLAN_LANE_TAG_ENABLED",
+    "PLAN_LANE_QUOTAS_ENABLED",
+    "PLAN_MIN_STABLE_PER_BATCH",
+    "PLAN_MIN_DISCOVERY_PER_BATCH",
+    "PLAN_WATCHLIST_FALLBACK_ONLY",
+    "LANE_ECON_SPLIT_ENABLED",
+    "RAW_LANE_SPLIT_ENABLED",
+    "RAW_LANE_SPLIT_NON_WATCH_PRIMARY_MIN",
+    "RAW_LANE_SPLIT_WATCH_FALLBACK_MAX",
+    "RAW_LANE_SPLIT_WATCH_FALLBACK_WHEN_EMPTY",
+    "RAW_STABLE_UPSTREAM_ENABLED",
+    "RAW_STABLE_UPSTREAM_MIN_ACTIONABLE",
+    "RAW_STABLE_UPSTREAM_EXTRA_FETCH_ROUNDS",
+    "RAW_STABLE_UPSTREAM_MAX_EXTRA_PER_CYCLE",
+    "RAW_STABLE_UPSTREAM_ONLY_NON_WATCH",
+)
 
 
 def _log_swallowed_error(
@@ -394,6 +436,230 @@ def _runtime_tuner_reload_targets(applied_keys: list[str]) -> set[str]:
     return targets
 
 
+def _load_json_dict(path: str) -> dict[str, Any]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def _safe_tuning_contract_path() -> str:
+    return os.path.join(PROJECT_ROOT, "tools", "matrix_safe_tuning_contract.json")
+
+
+def _active_matrix_profile_overrides(*, run_tag: str) -> dict[str, str]:
+    path = os.path.join(PROJECT_ROOT, "data", "matrix", "runs", "active_matrix.json")
+    data = _load_json_dict(path)
+    items = data.get("items") if isinstance(data.get("items"), list) else []
+    needle = str(run_tag or "").strip().lower()
+    if not needle:
+        return {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        item_id = str(item.get("id") or "").strip().lower()
+        if item_id != needle:
+            continue
+        raw = item.get("overrides") if isinstance(item.get("overrides"), dict) else {}
+        out: dict[str, str] = {}
+        for k, v in raw.items():
+            key = str(k or "").strip().upper()
+            if key:
+                out[key] = str(v).strip()
+        return out
+    return {}
+
+
+def _runtime_patch_overrides(*, run_tag: str) -> dict[str, str]:
+    payload = _load_json_dict(_runtime_tuner_patch_file(run_tag))
+    raw = payload.get("overrides") if isinstance(payload.get("overrides"), dict) else {}
+    out: dict[str, str] = {}
+    for k, v in raw.items():
+        key = str(k or "").strip().upper()
+        if key:
+            out[key] = str(v).strip()
+    return out
+
+
+def _startup_self_check_override_keys(*, run_tag: str) -> dict[str, Any]:
+    config_keys = {str(k).strip().upper() for k in vars(config).keys() if str(k).strip().isupper()}
+    missing_required = [k for k in _PHASE0_REQUIRED_CONFIG_KEYS if k not in config_keys]
+
+    contract_payload = _load_json_dict(_safe_tuning_contract_path())
+    contract_keys: set[str] = set()
+    contract_allowed_keys: set[str] = set()
+    contract_protected_keys: set[str] = set()
+    allowed = contract_payload.get("allowed_keys")
+    bounds = contract_payload.get("bounds")
+    protected = contract_payload.get("protected_keys")
+    if isinstance(allowed, dict):
+        contract_allowed_keys = {str(k).strip().upper() for k in allowed.keys() if str(k).strip()}
+        contract_keys.update(contract_allowed_keys)
+    if isinstance(bounds, dict):
+        contract_keys.update(str(k).strip().upper() for k in bounds.keys() if str(k).strip())
+    if isinstance(protected, list):
+        contract_protected_keys = {str(k).strip().upper() for k in protected if str(k).strip()}
+        contract_keys.update(contract_protected_keys)
+    contract_overlap = sorted(contract_allowed_keys.intersection(contract_protected_keys))
+
+    active_overrides = _active_matrix_profile_overrides(run_tag=run_tag)
+    runtime_overrides = _runtime_patch_overrides(run_tag=run_tag)
+    override_keys = sorted(set(active_overrides.keys()) | set(runtime_overrides.keys()))
+
+    unknown_in_config = sorted([k for k in override_keys if k not in config_keys])
+    unused_not_in_contract = sorted([k for k in override_keys if contract_keys and k not in contract_keys])
+    structural_keys = {
+        str(k).strip().upper()
+        for k in (set(_PHASE0_HOT_APPLY_STRUCTURAL_BLOCK_KEYS) | set(_PHASE0_CRITICAL_EFFECTIVE_KEYS))
+        if str(k).strip()
+    }
+    structural_unused_not_in_contract = sorted(
+        [
+            k
+            for k in unused_not_in_contract
+            if str(k).strip().upper() in structural_keys
+        ]
+    )
+
+    critical_diff: list[str] = []
+    for key in _PHASE0_CRITICAL_EFFECTIVE_KEYS:
+        active_value = active_overrides.get(key, "").strip()
+        runtime_value = runtime_overrides.get(key, "").strip()
+        if active_value and runtime_value and active_value != runtime_value:
+            critical_diff.append(f"{key}:{active_value}->{runtime_value}")
+
+    summary: dict[str, Any] = {
+        "run_tag": str(run_tag or "").strip(),
+        "overrides": int(len(override_keys)),
+        "unknown_in_config": int(len(unknown_in_config)),
+        "unused_not_in_contract": int(len(unused_not_in_contract)),
+        "structural_unused_not_in_contract": int(len(structural_unused_not_in_contract)),
+        "missing_required": int(len(missing_required)),
+        "critical_diff": int(len(critical_diff)),
+        "contract_overlap": int(len(contract_overlap)),
+        "unknown_override_keys": list(unknown_in_config),
+        "unused_override_keys_not_in_contract": list(unused_not_in_contract),
+        "structural_unused_override_keys_not_in_contract": list(structural_unused_not_in_contract),
+        "missing_required_keys": list(missing_required),
+        "critical_diff_rows": list(critical_diff),
+        "contract_overlap_keys": list(contract_overlap),
+    }
+
+    logger.info(
+        "STARTUP_CONFIG_SELF_CHECK run_tag=%s overrides=%s unknown_in_config=%s unused_not_in_contract=%s missing_required=%s critical_diff=%s",
+        run_tag,
+        int(len(override_keys)),
+        int(len(unknown_in_config)),
+        int(len(unused_not_in_contract)),
+        int(len(missing_required)),
+        int(len(critical_diff)),
+    )
+    if missing_required:
+        logger.error("STARTUP_CONFIG_SELF_CHECK missing_required_keys=%s", ",".join(missing_required[:24]))
+    if unknown_in_config:
+        logger.warning("STARTUP_CONFIG_SELF_CHECK unknown_override_keys=%s", ",".join(unknown_in_config[:24]))
+    if unused_not_in_contract:
+        logger.info(
+            "STARTUP_CONFIG_SELF_CHECK unused_override_keys_not_in_contract sample=%s total=%s",
+            ",".join(unused_not_in_contract[:24]),
+            int(len(unused_not_in_contract)),
+        )
+    if structural_unused_not_in_contract:
+        logger.error(
+            "STARTUP_CONFIG_SELF_CHECK structural_unused_override_keys_not_in_contract=%s",
+            ",".join(structural_unused_not_in_contract[:24]),
+        )
+    if critical_diff:
+        logger.warning(
+            "STARTUP_CONFIG_SELF_CHECK active_effective_critical_diff=%s",
+            ";".join(critical_diff[:12]),
+        )
+    if contract_overlap:
+        logger.error(
+            "STARTUP_CONFIG_SELF_CHECK contract_overlap_allowed_protected=%s",
+            ",".join(contract_overlap[:24]),
+        )
+    fail_fast_reasons: list[str] = []
+    if missing_required and bool(getattr(config, "STARTUP_CONFIG_FAIL_FAST_ON_MISSING_REQUIRED", True)):
+        fail_fast_reasons.append(f"missing_required={len(missing_required)}")
+    if unknown_in_config and bool(getattr(config, "STARTUP_CONFIG_FAIL_FAST_ON_UNKNOWN_OVERRIDE_KEYS", False)):
+        fail_fast_reasons.append(f"unknown_in_config={len(unknown_in_config)}")
+    if unused_not_in_contract and bool(getattr(config, "STARTUP_CONFIG_FAIL_FAST_ON_UNUSED_NOT_IN_CONTRACT", False)):
+        fail_fast_reasons.append(f"unused_not_in_contract={len(unused_not_in_contract)}")
+    if structural_unused_not_in_contract and bool(
+        getattr(config, "STARTUP_CONFIG_FAIL_FAST_ON_STRUCTURAL_UNUSED_NOT_IN_CONTRACT", True)
+    ):
+        fail_fast_reasons.append(f"structural_unused_not_in_contract={len(structural_unused_not_in_contract)}")
+    if critical_diff and bool(getattr(config, "STARTUP_CONFIG_FAIL_FAST_ON_CRITICAL_DIFF", False)):
+        fail_fast_reasons.append(f"critical_diff={len(critical_diff)}")
+    if contract_overlap and bool(getattr(config, "STARTUP_CONFIG_FAIL_FAST_ON_CONTRACT_OVERLAP", True)):
+        fail_fast_reasons.append(f"contract_overlap={len(contract_overlap)}")
+    if fail_fast_reasons:
+        reason = "STARTUP_CONFIG_FAIL_FAST " + ", ".join(fail_fast_reasons[:8])
+        logger.error("%s", reason)
+        raise RuntimeError(reason)
+    return summary
+
+
+def _startup_align_runtime_patch_critical_keys(*, run_tag: str) -> None:
+    patch_path = _runtime_tuner_patch_file(run_tag)
+    payload = _load_json_dict(patch_path)
+    runtime_overrides = payload.get("overrides")
+    if not isinstance(runtime_overrides, dict):
+        return
+    key_index: dict[str, str] = {}
+    for raw_key in runtime_overrides.keys():
+        normalized = str(raw_key or "").strip().upper()
+        if normalized:
+            key_index[normalized] = str(raw_key)
+
+    # Single-writer discipline: structural/critical keys must come only from the
+    # active preset, never from stale runtime patch artifacts.
+    prune_keys = set(_PHASE0_HOT_APPLY_STRUCTURAL_BLOCK_KEYS) | set(_PHASE0_CRITICAL_EFFECTIVE_KEYS)
+    pruned: list[str] = []
+    for key in sorted(prune_keys):
+        raw_key = key_index.get(str(key).strip().upper())
+        if not raw_key:
+            continue
+        prev_value = str(runtime_overrides.pop(raw_key, "") or "").strip()
+        if prev_value:
+            pruned.append(f"{key}:{prev_value}")
+
+    active_overrides = _active_matrix_profile_overrides(run_tag=run_tag)
+    legacy_aligned: list[str] = []
+    if active_overrides and bool(getattr(config, "STARTUP_CONFIG_LEGACY_ALIGN_RUNTIME_PATCH_CRITICAL", False)):
+        for key in _PHASE0_CRITICAL_EFFECTIVE_KEYS:
+            raw_key = key_index.get(str(key).strip().upper())
+            if not raw_key:
+                continue
+            active_value = str(active_overrides.get(key, "") or "").strip()
+            runtime_value = str(runtime_overrides.get(raw_key, "") or "").strip()
+            if active_value and runtime_value and runtime_value != active_value:
+                runtime_overrides[raw_key] = active_value
+                legacy_aligned.append(f"{key}:{runtime_value}->{active_value}")
+
+    if not pruned and not legacy_aligned:
+        return
+
+    payload["overrides"] = runtime_overrides
+    payload["ts"] = datetime.now(timezone.utc).isoformat()
+    payload["synced_by"] = "main_local_startup"
+    _write_json_atomic(patch_path, payload)
+    if pruned:
+        logger.warning(
+            "STARTUP_CONFIG_SYNC runtime_patch_structural_pruned count=%s sample=%s",
+            int(len(pruned)),
+            ";".join(pruned[:12]),
+        )
+    if legacy_aligned:
+        logger.warning(
+            "STARTUP_CONFIG_SYNC runtime_patch_critical_aligned changed=%s",
+            ";".join(legacy_aligned[:12]),
+        )
+
+
 def _enforce_source_qos_dual_entry_guard() -> None:
     if (
         bool(getattr(config, "V2_SOURCE_QOS_FORCE_DUAL_ENTRY", True))
@@ -518,9 +784,14 @@ def _runtime_tuner_apply_runtime_overrides(*, run_tag: str, lock_active: bool = 
 
     applied_keys: list[str] = []
     skipped_unknown = 0
+    skipped_structural = 0
+    blocked = {str(k).strip().upper() for k in _PHASE0_HOT_APPLY_STRUCTURAL_BLOCK_KEYS if str(k).strip()}
     for key in sorted(normalized.keys()):
         if not key or (not hasattr(config, key)):
             skipped_unknown += 1
+            continue
+        if str(key).strip().upper() in blocked:
+            skipped_structural += 1
             continue
         current = getattr(config, key)
         value = _coerce_runtime_override_value(key=key, raw=normalized[key])
@@ -539,9 +810,16 @@ def _runtime_tuner_apply_runtime_overrides(*, run_tag: str, lock_active: bool = 
             detail += ",..."
         if skipped_unknown > 0:
             detail += f" skipped_unknown={skipped_unknown}"
+        if skipped_structural > 0:
+            detail += f" skipped_structural={skipped_structural}"
         return True, len(applied_keys), detail
-    if skipped_unknown > 0:
-        return False, 0, f"no_changes skipped_unknown={skipped_unknown}"
+    if skipped_unknown > 0 or skipped_structural > 0:
+        suffix: list[str] = []
+        if skipped_unknown > 0:
+            suffix.append(f"skipped_unknown={skipped_unknown}")
+        if skipped_structural > 0:
+            suffix.append(f"skipped_structural={skipped_structural}")
+        return False, 0, "no_changes " + " ".join(suffix)
     return False, 0, "no_changes"
 
 
@@ -799,6 +1077,102 @@ def _count_candidate_sources(candidates: list[tuple[dict[str, Any], dict[str, An
     return out
 
 
+def _normalized_lane_tag(value: Any) -> str:
+    key = str(value or "").strip().lower()
+    if key in {"stable", "discovery"}:
+        return key
+    return ""
+
+
+def _candidate_lane_tag(token: dict[str, Any]) -> str:
+    row = dict(token or {})
+    explicit_locked = _normalized_lane_tag(
+        row.get("economic_lane")
+        or row.get("entry_lane")
+    )
+    if explicit_locked:
+        return explicit_locked
+    explicit_hint = _normalized_lane_tag(
+        row.get("_lane_tag")
+        or row.get("lane_tag")
+    )
+
+    source_name = _source_name_key(row.get("source", "unknown"))
+    fallback = "stable" if source_name.startswith("watchlist") else "discovery"
+    if not bool(getattr(config, "PLAN_LANE_TAG_ENABLED", True)):
+        return fallback
+
+    def _f(*keys: str, default: float = 0.0) -> float:
+        for key in keys:
+            if key in row and row.get(key) is not None:
+                try:
+                    return float(row.get(key) or 0.0)
+                except Exception:
+                    continue
+        return float(default)
+
+    age_seconds = int(_f("age_seconds", default=0.0))
+    liquidity_usd = _f("liquidity_usd", "liquidity", default=0.0)
+    volume_5m_usd = _f("volume_5m_usd", "volume_5m", default=0.0)
+    abs_change_5m = abs(_f("price_change_5m", default=0.0))
+    contract_raw = row.get("is_contract_safe", None)
+    contract_safe = (
+        bool(contract_raw)
+        if contract_raw is not None
+        else source_name.startswith("watchlist")
+    )
+    warning_flags = int(row.get("warning_flags") or 0)
+    risk_level = str(row.get("risk_level", "") or "").strip().upper()
+
+    stable_min_age = max(0, int(getattr(config, "PLAN_LANE_STABLE_MIN_AGE_SECONDS", 900) or 900))
+    stable_min_liq = max(0.0, float(getattr(config, "PLAN_LANE_STABLE_MIN_LIQUIDITY_USD", 90000.0) or 90000.0))
+    stable_min_vol5 = max(0.0, float(getattr(config, "PLAN_LANE_STABLE_MIN_VOLUME_5M_USD", 900.0) or 900.0))
+    stable_max_abs5 = max(0.0, float(getattr(config, "PLAN_LANE_STABLE_MAX_ABS_CHANGE_5M", 18.0) or 18.0))
+    max_warning_flags = max(0, int(getattr(config, "PLAN_LANE_STABLE_MAX_WARNING_FLAGS", 1) or 1))
+    require_contract_safe = bool(getattr(config, "PLAN_LANE_STABLE_REQUIRE_CONTRACT_SAFE", True))
+    risk_allowed = (
+        (risk_level in {"LOW", "MEDIUM"})
+        or (source_name.startswith("watchlist") and risk_level in {"", "UNKNOWN", "N/A", "NONE"})
+    )
+
+    stable = (
+        age_seconds >= stable_min_age
+        and liquidity_usd >= stable_min_liq
+        and volume_5m_usd >= stable_min_vol5
+        and abs_change_5m <= stable_max_abs5
+        and warning_flags <= max_warning_flags
+        and risk_allowed
+        and ((not require_contract_safe) or contract_safe)
+    )
+    if stable:
+        return "stable"
+    if explicit_hint and age_seconds <= 0 and liquidity_usd <= 0.0 and volume_5m_usd <= 0.0:
+        return explicit_hint
+    return "discovery"
+
+
+def _count_lanes(tokens: list[dict[str, Any]] | None) -> dict[str, int]:
+    out: dict[str, int] = {"stable": 0, "discovery": 0}
+    for token in (tokens or []):
+        if not isinstance(token, dict):
+            continue
+        lane = _candidate_lane_tag(token)
+        if lane not in out:
+            out[lane] = 0
+        out[lane] = int(out.get(lane, 0)) + 1
+    return out
+
+
+def _count_candidate_lanes(candidates: list[tuple[dict[str, Any], dict[str, Any]]] | None) -> dict[str, int]:
+    out: dict[str, int] = {"stable": 0, "discovery": 0}
+    for token_data, _ in (candidates or []):
+        lane = _candidate_lane_tag(token_data or {})
+        if lane not in out:
+            out[lane] = 0
+        out[lane] = int(out.get(lane, 0)) + 1
+    return out
+
+
 def _belongs_to_candidate_shard(address: str) -> bool:
     mod = max(1, int(getattr(config, "CANDIDATE_SHARD_MOD", 1) or 1))
     slot = int(getattr(config, "CANDIDATE_SHARD_SLOT", 0) or 0)
@@ -869,6 +1243,7 @@ def _candidate_quality_features(token: dict, score_data: dict) -> dict[str, obje
 
     return {
         "quality_band": quality_band,
+        "lane_tag": _candidate_lane_tag(token),
         "score": score,
         "risk_level": risk_level,
         "liquidity_usd": liquidity,
@@ -2639,6 +3014,7 @@ async def run_local_loop() -> None:
     onchain_monitor: OnChainFactoryMonitor | None = None
     onchain_error_streak = 0
     fallback_until_ts = 0.0
+    onchain_unresolved_retry_queue: dict[str, dict[str, float | int]] = {}
 
     if str(config.SIGNAL_SOURCE).lower() == "onchain":
         try:
@@ -2708,8 +3084,39 @@ async def run_local_loop() -> None:
     shutdown_reason = "loop_exit"
     shutdown_detail = ""
     shutdown_meta: dict[str, Any] = {}
+    position_watchdog_interval_seconds = max(
+        2,
+        int(getattr(config, "OPEN_POSITIONS_WATCHDOG_INTERVAL_SECONDS", 5) or 5),
+    )
+    position_watchdog_stop = asyncio.Event()
+    position_watchdog_task: asyncio.Task | None = None
 
     logger.info("Local mode started (Telegram disabled).")
+    logger.info(
+        "POSITION_WATCHDOG init interval=%ss",
+        int(position_watchdog_interval_seconds),
+    )
+
+    async def _position_watchdog_loop() -> None:
+        while not position_watchdog_stop.is_set():
+            try:
+                await auto_trader.process_open_positions(bot=None)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("POSITION_WATCHDOG cycle failed")
+            try:
+                await asyncio.wait_for(
+                    position_watchdog_stop.wait(),
+                    timeout=float(position_watchdog_interval_seconds),
+                )
+            except asyncio.TimeoutError:
+                pass
+
+    position_watchdog_task = asyncio.create_task(
+        _position_watchdog_loop(),
+        name=f"{RUN_TAG}:position_watchdog",
+    )
     _write_heartbeat(stage="startup", cycle_index=cycle_index, open_trades=0)
     try:
         while True:
@@ -2846,10 +3253,485 @@ async def run_local_loop() -> None:
                 else:
                     tokens = await dex_monitor.fetch_new_tokens()
                 market_tokens: list[dict[str, Any]] = list(tokens or [])
+                retry_queue_enabled = False
+                retry_queue_ttl_seconds = 900.0
+                retry_queue_max_attempts = 8
+                if (
+                    str(config.SIGNAL_SOURCE).lower() == "onchain"
+                    and bool(getattr(config, "ONCHAIN_REENRICH_MISSING_MARKET_FIELDS_ENABLED", True))
+                    and market_tokens
+                ):
+                    retry_queue_enabled = bool(
+                        getattr(config, "ONCHAIN_UNRESOLVED_RETRY_QUEUE_ENABLED", True)
+                    )
+                    retry_queue_max_pending = max(
+                        0,
+                        int(getattr(config, "ONCHAIN_UNRESOLVED_RETRY_MAX_PENDING", 512) or 512),
+                    )
+                    retry_queue_ttl_seconds = max(
+                        60.0,
+                        float(getattr(config, "ONCHAIN_UNRESOLVED_RETRY_TTL_SECONDS", 900) or 900),
+                    )
+                    retry_queue_backoff_seconds = max(
+                        1.0,
+                        float(getattr(config, "ONCHAIN_UNRESOLVED_RETRY_BACKOFF_SECONDS", 20.0) or 20.0),
+                    )
+                    retry_queue_max_attempts = max(
+                        1,
+                        int(getattr(config, "ONCHAIN_UNRESOLVED_RETRY_MAX_ATTEMPTS", 8) or 8),
+                    )
+                    retry_queue_max_per_cycle = max(
+                        0,
+                        int(getattr(config, "ONCHAIN_UNRESOLVED_RETRY_MAX_PER_CYCLE", 24) or 24),
+                    )
+                    max_reenrich = max(
+                        0,
+                        int(getattr(config, "ONCHAIN_REENRICH_MAX_PER_CYCLE", 16) or 16),
+                    )
+                    reenrich_on_missing_liquidity = bool(
+                        getattr(config, "ONCHAIN_REENRICH_MISSING_LIQUIDITY_ENABLED", True)
+                    )
+                    if retry_queue_enabled and onchain_unresolved_retry_queue:
+                        dropped_retry_ttl = 0
+                        dropped_retry_attempts = 0
+                        retry_filtered: dict[str, dict[str, float | int]] = {}
+                        for addr_key, meta in onchain_unresolved_retry_queue.items():
+                            if not isinstance(meta, dict):
+                                continue
+                            first_seen_ts = float(meta.get("first_seen_ts", 0.0) or 0.0)
+                            last_seen_ts = float(meta.get("last_seen_ts", first_seen_ts) or first_seen_ts)
+                            attempts = int(meta.get("attempts", 0) or 0)
+                            ts_ref = max(first_seen_ts, last_seen_ts, 0.0)
+                            if ts_ref > 0.0 and (now_ts - ts_ref) > float(retry_queue_ttl_seconds):
+                                dropped_retry_ttl += 1
+                                continue
+                            if attempts >= int(retry_queue_max_attempts):
+                                dropped_retry_attempts += 1
+                                continue
+                            retry_filtered[str(addr_key)] = meta
+                        if dropped_retry_ttl or dropped_retry_attempts:
+                            logger.info(
+                                "ONCHAIN_REENRICH_RETRY prune_ttl=%s prune_attempts=%s kept=%s",
+                                int(dropped_retry_ttl),
+                                int(dropped_retry_attempts),
+                                int(len(retry_filtered)),
+                            )
+                        onchain_unresolved_retry_queue = retry_filtered
+                    if max_reenrich > 0 and hasattr(dex_monitor, "fetch_tokens_by_addresses"):
+                        unresolved_onchain_addresses: list[str] = []
+                        unresolved_onchain_seen: set[str] = set()
+                        unresolved_onchain_all: set[str] = set()
+                        unresolved_rows = 0
+                        unresolved_zero_market_candidates = 0
+                        unresolved_missing_liquidity_candidates = 0
+                        for row in market_tokens:
+                            source_name = str((row or {}).get("source", "") or "").strip().lower()
+                            if not source_name.startswith("onchain"):
+                                continue
+                            unresolved_rows += 1
+                            liq = float((row or {}).get("liquidity") or 0.0)
+                            vol5 = float((row or {}).get("volume_5m") or 0.0)
+                            price = float((row or {}).get("price_usd") or 0.0)
+                            zero_market_fields = (liq <= 0.0) and (vol5 <= 0.0) and (price <= 0.0)
+                            liquidity_missing = liq <= 0.0
+                            needs_reenrich = bool(zero_market_fields)
+                            if (not needs_reenrich) and reenrich_on_missing_liquidity and liquidity_missing:
+                                needs_reenrich = True
+                            if not needs_reenrich:
+                                continue
+                            if zero_market_fields:
+                                unresolved_zero_market_candidates += 1
+                            elif liquidity_missing:
+                                unresolved_missing_liquidity_candidates += 1
+                            addr = normalize_address(str((row or {}).get("address", "") or ""))
+                            if (not addr) or addr in unresolved_onchain_seen:
+                                continue
+                            unresolved_onchain_all.add(addr)
+                            unresolved_onchain_seen.add(addr)
+                            if len(unresolved_onchain_addresses) < int(max_reenrich):
+                                unresolved_onchain_addresses.append(addr)
+                        if unresolved_onchain_addresses:
+                            try:
+                                enriched_rows = await dex_monitor.fetch_tokens_by_addresses(
+                                    unresolved_onchain_addresses,
+                                    max_count=max_reenrich,
+                                )
+                                enriched_by_address: dict[str, dict[str, Any]] = {}
+                                for item in enriched_rows or []:
+                                    addr = normalize_address(str((item or {}).get("address", "") or ""))
+                                    if addr:
+                                        enriched_by_address[addr] = dict(item or {})
+                                enriched_applied = 0
+                                resolved_addresses: set[str] = set()
+                                for idx, row in enumerate(market_tokens):
+                                    source_name = str((row or {}).get("source", "") or "").strip().lower()
+                                    if not source_name.startswith("onchain"):
+                                        continue
+                                    addr = normalize_address(str((row or {}).get("address", "") or ""))
+                                    if not addr:
+                                        continue
+                                    extra = enriched_by_address.get(addr)
+                                    if not extra:
+                                        continue
+                                    merged = dict(row or {})
+                                    for k, v in (extra or {}).items():
+                                        if k == "source":
+                                            continue
+                                        cur = merged.get(k)
+                                        if cur in (None, "", 0, 0.0):
+                                            merged[k] = v
+                                            continue
+                                        if isinstance(cur, (int, float)) and isinstance(v, (int, float)):
+                                            if float(v) > float(cur):
+                                                merged[k] = v
+                                    merged["source"] = str((row or {}).get("source", "onchain") or "onchain")
+                                    liq_after = float(merged.get("liquidity") or 0.0)
+                                    vol5_after = float(merged.get("volume_5m") or 0.0)
+                                    price_after = float(merged.get("price_usd") or 0.0)
+                                    if (liq_after > 0.0) or (vol5_after > 0.0) or (price_after > 0.0):
+                                        enriched_applied += 1
+                                        resolved_addresses.add(addr)
+                                    market_tokens[idx] = merged
+                                if retry_queue_enabled and resolved_addresses:
+                                    for addr in resolved_addresses:
+                                        onchain_unresolved_retry_queue.pop(addr, None)
+                                logger.info(
+                                    "ONCHAIN_REENRICH unresolved_rows=%s candidates=%s enriched=%s zero_market_candidates=%s "
+                                    "missing_liquidity_candidates=%s max_per_cycle=%s",
+                                    int(unresolved_rows),
+                                    int(len(unresolved_onchain_addresses)),
+                                    int(enriched_applied),
+                                    int(unresolved_zero_market_candidates),
+                                    int(unresolved_missing_liquidity_candidates),
+                                    int(max_reenrich),
+                                )
+                            except Exception as exc:
+                                logger.warning("ONCHAIN_REENRICH failed: %s", exc)
+                        if retry_queue_enabled and unresolved_onchain_all:
+                            queue_added = 0
+                            queue_updated = 0
+                            for addr in unresolved_onchain_all:
+                                row = onchain_unresolved_retry_queue.get(addr)
+                                if not isinstance(row, dict):
+                                    onchain_unresolved_retry_queue[addr] = {
+                                        "first_seen_ts": float(now_ts),
+                                        "last_seen_ts": float(now_ts),
+                                        "attempts": int(0),
+                                        "next_retry_ts": float(now_ts),
+                                    }
+                                    queue_added += 1
+                                else:
+                                    row["last_seen_ts"] = float(now_ts)
+                                    row["next_retry_ts"] = float(row.get("next_retry_ts", 0.0) or 0.0) or float(now_ts)
+                                    queue_updated += 1
+                            if retry_queue_max_pending > 0 and len(onchain_unresolved_retry_queue) > retry_queue_max_pending:
+                                sorted_rows = sorted(
+                                    onchain_unresolved_retry_queue.items(),
+                                    key=lambda kv: float(
+                                        (kv[1] or {}).get("last_seen_ts", (kv[1] or {}).get("first_seen_ts", 0.0)) or 0.0
+                                    ),
+                                    reverse=True,
+                                )
+                                onchain_unresolved_retry_queue = dict(sorted_rows[: int(retry_queue_max_pending)])
+                            if queue_added or queue_updated:
+                                logger.info(
+                                    "ONCHAIN_REENRICH_RETRY queue_add=%s queue_touch=%s queue_size=%s",
+                                    int(queue_added),
+                                    int(queue_updated),
+                                    int(len(onchain_unresolved_retry_queue)),
+                                )
+                        if (
+                            retry_queue_enabled
+                            and retry_queue_max_per_cycle > 0
+                            and onchain_unresolved_retry_queue
+                            and hasattr(dex_monitor, "fetch_tokens_by_addresses")
+                        ):
+                            due_candidates: list[tuple[int, float, str]] = []
+                            for addr, meta in onchain_unresolved_retry_queue.items():
+                                if not isinstance(meta, dict):
+                                    continue
+                                attempts = int(meta.get("attempts", 0) or 0)
+                                if attempts >= int(retry_queue_max_attempts):
+                                    continue
+                                next_retry_ts = float(meta.get("next_retry_ts", 0.0) or 0.0)
+                                if next_retry_ts > float(now_ts):
+                                    continue
+                                last_seen_ts = float(meta.get("last_seen_ts", 0.0) or 0.0)
+                                due_candidates.append((attempts, last_seen_ts, addr))
+                            due_candidates.sort(key=lambda row: (int(row[0]), -float(row[1]), str(row[2])))
+                            retry_addresses = [
+                                str(addr)
+                                for _attempts, _last_seen, addr in due_candidates[: int(retry_queue_max_per_cycle)]
+                            ]
+                            if retry_addresses:
+                                try:
+                                    second_rows = await dex_monitor.fetch_tokens_by_addresses(
+                                        retry_addresses,
+                                        max_count=int(retry_queue_max_per_cycle),
+                                    )
+                                    second_by_address: dict[str, dict[str, Any]] = {}
+                                    for item in second_rows or []:
+                                        addr = normalize_address(str((item or {}).get("address", "") or ""))
+                                        if addr:
+                                            second_by_address[addr] = dict(item or {})
+                                    market_idx_by_addr: dict[str, int] = {}
+                                    for idx, row in enumerate(market_tokens):
+                                        addr = normalize_address(str((row or {}).get("address", "") or ""))
+                                        if addr:
+                                            market_idx_by_addr[addr] = idx
+                                    recovered = 0
+                                    for addr in retry_addresses:
+                                        meta = onchain_unresolved_retry_queue.get(addr)
+                                        if not isinstance(meta, dict):
+                                            continue
+                                        attempts_now = int(meta.get("attempts", 0) or 0) + 1
+                                        meta["attempts"] = int(attempts_now)
+                                        meta["last_retry_ts"] = float(now_ts)
+                                        meta["next_retry_ts"] = float(now_ts) + float(retry_queue_backoff_seconds) * float(
+                                            max(1, min(6, attempts_now))
+                                        )
+                                        second = second_by_address.get(addr)
+                                        if not isinstance(second, dict):
+                                            continue
+                                        liq2 = float(second.get("liquidity") or 0.0)
+                                        vol52 = float(second.get("volume_5m") or 0.0)
+                                        price2 = float(second.get("price_usd") or 0.0)
+                                        if (liq2 <= 0.0) and (vol52 <= 0.0) and (price2 <= 0.0):
+                                            continue
+                                        recovered += 1
+                                        onchain_unresolved_retry_queue.pop(addr, None)
+                                        idx = market_idx_by_addr.get(addr)
+                                        if idx is not None:
+                                            merged = dict(market_tokens[idx] or {})
+                                            for k, v in second.items():
+                                                if k == "source":
+                                                    continue
+                                                cur = merged.get(k)
+                                                if cur in (None, "", 0, 0.0):
+                                                    merged[k] = v
+                                                    continue
+                                                if isinstance(cur, (int, float)) and isinstance(v, (int, float)):
+                                                    if float(v) > float(cur):
+                                                        merged[k] = v
+                                            merged["source"] = str((market_tokens[idx] or {}).get("source", "onchain") or "onchain")
+                                            market_tokens[idx] = merged
+                                        else:
+                                            merged = dict(second)
+                                            merged["source"] = "onchain_retry"
+                                            market_tokens.append(merged)
+                                    logger.info(
+                                        "ONCHAIN_REENRICH_RETRY due=%s tried=%s recovered=%s queue_size=%s",
+                                        int(len(due_candidates)),
+                                        int(len(retry_addresses)),
+                                        int(recovered),
+                                        int(len(onchain_unresolved_retry_queue)),
+                                    )
+                                except Exception as exc:
+                                    logger.warning("ONCHAIN_REENRICH_RETRY failed: %s", exc)
+                        # Fast-path for unresolved onchain rows that are still pending retry backoff.
+                        # This avoids starvation where rows are repeatedly parked before they ever get
+                        # a chance to recover market fields in the same cycle.
+                        eager_drop_retry_enabled = bool(
+                            getattr(config, "ONCHAIN_REENRICH_EAGER_DROP_RETRY_ENABLED", True)
+                        )
+                        eager_drop_retry_max_per_cycle = max(
+                            0,
+                            int(
+                                getattr(
+                                    config,
+                                    "ONCHAIN_REENRICH_EAGER_DROP_RETRY_MAX_PER_CYCLE",
+                                    max(8, int(retry_queue_max_per_cycle)),
+                                )
+                                or max(8, int(retry_queue_max_per_cycle))
+                            ),
+                        )
+                        if (
+                            str(config.SIGNAL_SOURCE).lower() == "onchain"
+                            and retry_queue_enabled
+                            and eager_drop_retry_enabled
+                            and eager_drop_retry_max_per_cycle > 0
+                            and onchain_unresolved_retry_queue
+                            and hasattr(dex_monitor, "fetch_tokens_by_addresses")
+                            and market_tokens
+                        ):
+                            try:
+                                pending_retry_addresses: list[str] = []
+                                seen_pending: set[str] = set()
+                                for row in market_tokens:
+                                    source_name = str((row or {}).get("source", "") or "").strip().lower()
+                                    if not source_name.startswith("onchain"):
+                                        continue
+                                    liq = float((row or {}).get("liquidity") or 0.0)
+                                    vol5 = float((row or {}).get("volume_5m") or 0.0)
+                                    price = float((row or {}).get("price_usd") or 0.0)
+                                    if (liq > 0.0) and (vol5 > 0.0 or price > 0.0):
+                                        continue
+                                    addr = normalize_address(str((row or {}).get("address", "") or ""))
+                                    if not addr or addr in seen_pending:
+                                        continue
+                                    meta = onchain_unresolved_retry_queue.get(addr)
+                                    if not isinstance(meta, dict):
+                                        continue
+                                    attempts = int(meta.get("attempts", 0) or 0)
+                                    if attempts >= int(retry_queue_max_attempts):
+                                        continue
+                                    first_seen_ts = float(meta.get("first_seen_ts", 0.0) or 0.0)
+                                    last_seen_ts = float(meta.get("last_seen_ts", first_seen_ts) or first_seen_ts)
+                                    ts_ref = max(first_seen_ts, last_seen_ts, 0.0)
+                                    if ts_ref > 0.0 and (float(now_ts) - float(ts_ref)) > float(retry_queue_ttl_seconds):
+                                        continue
+                                    next_retry_ts = float(meta.get("next_retry_ts", 0.0) or 0.0)
+                                    # Eager retry only for rows currently waiting on backoff.
+                                    if next_retry_ts <= float(now_ts):
+                                        continue
+                                    pending_retry_addresses.append(addr)
+                                    seen_pending.add(addr)
+                                    if len(pending_retry_addresses) >= int(eager_drop_retry_max_per_cycle):
+                                        break
+                                if pending_retry_addresses:
+                                    second_rows = await dex_monitor.fetch_tokens_by_addresses(
+                                        pending_retry_addresses,
+                                        max_count=int(eager_drop_retry_max_per_cycle),
+                                    )
+                                    second_by_address: dict[str, dict[str, Any]] = {}
+                                    for item in second_rows or []:
+                                        addr = normalize_address(str((item or {}).get("address", "") or ""))
+                                        if addr:
+                                            second_by_address[addr] = dict(item or {})
+                                    market_idx_by_addr: dict[str, int] = {}
+                                    for idx, row in enumerate(market_tokens):
+                                        addr = normalize_address(str((row or {}).get("address", "") or ""))
+                                        if addr:
+                                            market_idx_by_addr[addr] = idx
+                                    eager_recovered = 0
+                                    for addr in pending_retry_addresses:
+                                        second = second_by_address.get(addr)
+                                        if not isinstance(second, dict):
+                                            continue
+                                        liq2 = float(second.get("liquidity") or 0.0)
+                                        vol52 = float(second.get("volume_5m") or 0.0)
+                                        price2 = float(second.get("price_usd") or 0.0)
+                                        if (liq2 <= 0.0) and (vol52 <= 0.0) and (price2 <= 0.0):
+                                            continue
+                                        eager_recovered += 1
+                                        onchain_unresolved_retry_queue.pop(addr, None)
+                                        idx = market_idx_by_addr.get(addr)
+                                        if idx is not None:
+                                            merged = dict(market_tokens[idx] or {})
+                                            for k, v in second.items():
+                                                if k == "source":
+                                                    continue
+                                                cur = merged.get(k)
+                                                if cur in (None, "", 0, 0.0):
+                                                    merged[k] = v
+                                                    continue
+                                                if isinstance(cur, (int, float)) and isinstance(v, (int, float)):
+                                                    if float(v) > float(cur):
+                                                        merged[k] = v
+                                            merged["source"] = str((market_tokens[idx] or {}).get("source", "onchain") or "onchain")
+                                            market_tokens[idx] = merged
+                                        else:
+                                            merged = dict(second)
+                                            merged["source"] = "onchain_retry"
+                                            market_tokens.append(merged)
+                                    logger.info(
+                                        "ONCHAIN_REENRICH_EAGER_RETRY pending=%s recovered=%s queue_size=%s",
+                                        int(len(pending_retry_addresses)),
+                                        int(eager_recovered),
+                                        int(len(onchain_unresolved_retry_queue)),
+                                    )
+                            except Exception as exc:
+                                logger.warning("ONCHAIN_REENRICH_EAGER_RETRY failed: %s", exc)
+                drop_zero_market_fields = bool(
+                    getattr(config, "ONCHAIN_DROP_UNRESOLVED_ZERO_MARKET_FIELDS", True)
+                )
+                drop_missing_liquidity = bool(
+                    getattr(config, "ONCHAIN_DROP_UNRESOLVED_MISSING_LIQUIDITY", True)
+                )
+                keep_retry_pending_rows = bool(
+                    getattr(config, "ONCHAIN_REENRICH_KEEP_RETRY_PENDING_ROWS", True)
+                )
+                if (
+                    str(config.SIGNAL_SOURCE).lower() == "onchain"
+                    and (drop_zero_market_fields or drop_missing_liquidity)
+                    and market_tokens
+                ):
+                    filtered_market_tokens: list[dict[str, Any]] = []
+                    dropped_onchain_zero_market = 0
+                    dropped_onchain_missing_liquidity = 0
+                    kept_onchain_retry_pending = 0
+                    parked_onchain_retry_pending = 0
+                    for row in market_tokens:
+                        source_name = str((row or {}).get("source", "") or "").strip().lower()
+                        if source_name.startswith("onchain"):
+                            liq = float((row or {}).get("liquidity") or 0.0)
+                            vol5 = float((row or {}).get("volume_5m") or 0.0)
+                            price = float((row or {}).get("price_usd") or 0.0)
+                            is_zero_market = (liq <= 0.0) and (vol5 <= 0.0) and (price <= 0.0)
+                            is_missing_liquidity = liq <= 0.0
+                            keep_via_retry_pending = False
+                            if retry_queue_enabled and (is_zero_market or is_missing_liquidity):
+                                addr = normalize_address(str((row or {}).get("address", "") or ""))
+                                if addr:
+                                    meta = onchain_unresolved_retry_queue.get(addr)
+                                    if isinstance(meta, dict):
+                                        attempts = int(meta.get("attempts", 0) or 0)
+                                        first_seen_ts = float(meta.get("first_seen_ts", 0.0) or 0.0)
+                                        last_seen_ts = float(meta.get("last_seen_ts", first_seen_ts) or first_seen_ts)
+                                        ts_ref = max(first_seen_ts, last_seen_ts, 0.0)
+                                        within_ttl = (ts_ref <= 0.0) or (
+                                            (float(now_ts) - float(ts_ref)) <= float(retry_queue_ttl_seconds)
+                                        )
+                                        if attempts < int(retry_queue_max_attempts) and within_ttl:
+                                            keep_via_retry_pending = True
+                            if drop_zero_market_fields and is_zero_market:
+                                if keep_via_retry_pending:
+                                    kept_onchain_retry_pending += 1
+                                    parked_onchain_retry_pending += 1
+                                    if keep_retry_pending_rows:
+                                        pending_row = dict(row or {})
+                                        pending_row["_onchain_retry_pending"] = 1
+                                        pending_row["_onchain_retry_reason"] = "zero_market"
+                                        filtered_market_tokens.append(pending_row)
+                                    continue
+                                dropped_onchain_zero_market += 1
+                                continue
+                            if drop_missing_liquidity and is_missing_liquidity:
+                                if keep_via_retry_pending:
+                                    kept_onchain_retry_pending += 1
+                                    parked_onchain_retry_pending += 1
+                                    if keep_retry_pending_rows:
+                                        pending_row = dict(row or {})
+                                        pending_row["_onchain_retry_pending"] = 1
+                                        pending_row["_onchain_retry_reason"] = "missing_liquidity"
+                                        filtered_market_tokens.append(pending_row)
+                                    continue
+                                dropped_onchain_missing_liquidity += 1
+                                continue
+                        filtered_market_tokens.append(row)
+                    if (
+                        (dropped_onchain_zero_market > 0)
+                        or (dropped_onchain_missing_liquidity > 0)
+                        or (kept_onchain_retry_pending > 0)
+                    ):
+                        logger.info(
+                            "ONCHAIN_REENRICH_DROP_UNRESOLVED dropped_zero_market=%s dropped_missing_liquidity=%s kept_retry_pending=%s parked_retry_pending=%s kept=%s",
+                            int(dropped_onchain_zero_market),
+                            int(dropped_onchain_missing_liquidity),
+                            int(kept_onchain_retry_pending),
+                            int(parked_onchain_retry_pending),
+                            int(len(filtered_market_tokens)),
+                        )
+                    market_tokens = filtered_market_tokens
                 raw_non_watch_cycle = int(len(market_tokens))
                 raw_watchlist_cycle = 0
                 watchlist_fallback_used_cycle = False
                 watchlist_fallback_reason_cycle = "watchlist_disabled_or_empty"
+                non_watch_actionable_total_cycle = int(raw_non_watch_cycle)
+                non_watch_actionable_pass_cycle = int(raw_non_watch_cycle)
+                non_watch_actionable_fail_cycle = 0
+                non_watch_actionable_reasons_cycle: dict[str, int] = {}
+                non_watch_actionable_reasons_brief_cycle = "none"
                 flow_legacy_rollback_mode = bool(getattr(config, "FLOW_LEGACY_ROLLBACK_MODE", False))
 
                 # Stability flow: dynamic watchlist tokens (vetted) in parallel to new-pairs sources.
@@ -2937,17 +3819,422 @@ async def run_local_loop() -> None:
                                 src = str((row or {}).get("source", "") or "").strip().lower()
                                 return src.startswith("watchlist")
 
-                            def _non_watch_count(rows: list[dict[str, Any]]) -> int:
+                            actionable_min_liq = max(
+                                500.0,
+                                float(
+                                    getattr(
+                                        config,
+                                        "RAW_NON_WATCH_ACTIONABLE_MIN_LIQUIDITY_USD",
+                                        max(
+                                            500.0,
+                                            float(getattr(config, "MIN_LIQUIDITY", 5000.0) or 5000.0) * 0.60,
+                                        ),
+                                    )
+                                    or max(
+                                        500.0,
+                                        float(getattr(config, "MIN_LIQUIDITY", 5000.0) or 5000.0) * 0.60,
+                                    )
+                                ),
+                            )
+                            actionable_min_vol5 = max(
+                                30.0,
+                                float(
+                                    getattr(
+                                        config,
+                                        "RAW_NON_WATCH_ACTIONABLE_MIN_VOLUME_5M_USD",
+                                        max(
+                                            30.0,
+                                            float(getattr(config, "SAFE_MIN_VOLUME_5M_USD", 50.0) or 50.0) * 0.60,
+                                        ),
+                                    )
+                                    or max(
+                                        30.0,
+                                        float(getattr(config, "SAFE_MIN_VOLUME_5M_USD", 50.0) or 50.0) * 0.60,
+                                    )
+                                ),
+                            )
+                            actionable_min_age = max(
+                                60,
+                                int(
+                                    getattr(
+                                        config,
+                                        "RAW_NON_WATCH_ACTIONABLE_MIN_AGE_SECONDS",
+                                        max(
+                                            60,
+                                            int(round(float(getattr(config, "SAFE_MIN_AGE_SECONDS", 120) or 120) * 0.50)),
+                                        ),
+                                    )
+                                    or max(
+                                        60,
+                                        int(round(float(getattr(config, "SAFE_MIN_AGE_SECONDS", 120) or 120) * 0.50)),
+                                    )
+                                ),
+                            )
+                            actionable_max_abs5 = max(
+                                8.0,
+                                float(
+                                    getattr(
+                                        config,
+                                        "RAW_NON_WATCH_ACTIONABLE_MAX_ABS_CHANGE_5M",
+                                        min(
+                                            35.0,
+                                            max(
+                                                12.0,
+                                                float(
+                                                    getattr(
+                                                        config,
+                                                        "SAFE_MAX_PRICE_CHANGE_5M_ABS_PERCENT",
+                                                        15.0,
+                                                    )
+                                                    or 15.0
+                                                )
+                                                * 1.50,
+                                            ),
+                                        ),
+                                    )
+                                    or min(
+                                        35.0,
+                                        max(
+                                            12.0,
+                                            float(
+                                                getattr(
+                                                    config,
+                                                    "SAFE_MAX_PRICE_CHANGE_5M_ABS_PERCENT",
+                                                    15.0,
+                                                )
+                                                or 15.0
+                                            )
+                                            * 1.50,
+                                        ),
+                                    )
+                                ),
+                            )
+                            relaxed_min_liq = max(
+                                500.0,
+                                float(
+                                    getattr(
+                                        config,
+                                        "NON_WATCH_LOW_FLOW_RELAXED_MIN_LIQUIDITY_USD",
+                                        actionable_min_liq,
+                                    )
+                                    or actionable_min_liq
+                                ),
+                            )
+                            relaxed_min_vol5 = max(
+                                30.0,
+                                float(
+                                    getattr(
+                                        config,
+                                        "NON_WATCH_LOW_FLOW_RELAXED_MIN_VOLUME_5M_USD",
+                                        actionable_min_vol5,
+                                    )
+                                    or actionable_min_vol5
+                                ),
+                            )
+                            relaxed_min_age = max(
+                                60,
+                                int(
+                                    getattr(
+                                        config,
+                                        "NON_WATCH_LOW_FLOW_RELAXED_MIN_AGE_SECONDS",
+                                        actionable_min_age,
+                                    )
+                                    or actionable_min_age
+                                ),
+                            )
+                            relaxed_max_abs5 = max(
+                                8.0,
+                                float(
+                                    getattr(
+                                        config,
+                                        "NON_WATCH_LOW_FLOW_RELAXED_MAX_ABS_CHANGE_5M",
+                                        actionable_max_abs5,
+                                    )
+                                    or actionable_max_abs5
+                                ),
+                            )
+                            if bool(getattr(config, "ANTI_SCAM_LOCKED_MODE", False)):
+                                fallback_min_liq = max(
+                                    500.0,
+                                    float(
+                                        getattr(
+                                            config,
+                                            "TOKEN_SAFETY_FALLBACK_MIN_LIQUIDITY_USD",
+                                            6000.0,
+                                        )
+                                        or 6000.0
+                                    ),
+                                )
+                                fallback_min_vol = max(
+                                    30.0,
+                                    float(
+                                        getattr(
+                                            config,
+                                            "TOKEN_SAFETY_FALLBACK_MIN_VOLUME_5M_USD",
+                                            100.0,
+                                        )
+                                        or 100.0
+                                    ),
+                                )
+                                fallback_min_age = max(
+                                    60,
+                                    int(
+                                        getattr(
+                                            config,
+                                            "TOKEN_SAFETY_FALLBACK_MIN_AGE_SECONDS",
+                                            180,
+                                        )
+                                        or 180
+                                    ),
+                                )
+                                transient_max_abs = max(
+                                    8.0,
+                                    float(
+                                        getattr(
+                                            config,
+                                            "LOCAL_ANTISCAM_TRANSIENT_MAX_ABS_CHANGE_5M",
+                                            15.0,
+                                        )
+                                        or 15.0
+                                    ),
+                                )
+                                if bool(
+                                    getattr(
+                                        config,
+                                        "ANTI_SCAM_LOCKED_NON_WATCH_UPSTREAM_FLOOR_ENABLED",
+                                        False,
+                                    )
+                                ):
+                                    # Optional strict upstream floor for non-watch actionability in
+                                    # locked mode. Disabled by default to avoid starving non-watch
+                                    # before hardened safety/anti-scam checks later in pipeline.
+                                    actionable_min_liq = max(float(actionable_min_liq), float(fallback_min_liq) * 0.60)
+                                    actionable_min_vol5 = max(float(actionable_min_vol5), float(fallback_min_vol) * 0.60)
+                                    actionable_min_age = max(
+                                        int(actionable_min_age),
+                                        int(round(float(fallback_min_age) * 0.60)),
+                                    )
+                                    actionable_max_abs5 = min(
+                                        float(actionable_max_abs5),
+                                        max(12.0, float(transient_max_abs) * 1.50),
+                                    )
+                                if bool(
+                                    getattr(
+                                        config,
+                                        "ANTI_SCAM_LOCKED_NON_WATCH_ACTIONABLE_ALIGN_ENABLED",
+                                        False,
+                                    )
+                                ):
+                                    liq_mult = max(
+                                        0.30,
+                                        min(
+                                            1.00,
+                                            float(
+                                                getattr(
+                                                    config,
+                                                    "ANTI_SCAM_LOCKED_NON_WATCH_ACTIONABLE_LIQ_MULT",
+                                                    0.70,
+                                                )
+                                                or 0.70
+                                            ),
+                                        ),
+                                    )
+                                    vol_mult = max(
+                                        0.30,
+                                        min(
+                                            1.00,
+                                            float(
+                                                getattr(
+                                                    config,
+                                                    "ANTI_SCAM_LOCKED_NON_WATCH_ACTIONABLE_VOL_MULT",
+                                                    0.70,
+                                                )
+                                                or 0.70
+                                            ),
+                                        ),
+                                    )
+                                    age_mult = max(
+                                        0.30,
+                                        min(
+                                            1.00,
+                                            float(
+                                                getattr(
+                                                    config,
+                                                    "ANTI_SCAM_LOCKED_NON_WATCH_ACTIONABLE_AGE_MULT",
+                                                    0.70,
+                                                )
+                                                or 0.70
+                                            ),
+                                        ),
+                                    )
+                                    abs5_mult = max(
+                                        1.00,
+                                        min(
+                                            2.50,
+                                            float(
+                                                getattr(
+                                                    config,
+                                                    "ANTI_SCAM_LOCKED_NON_WATCH_ACTIONABLE_MAX_ABS5_MULT",
+                                                    1.20,
+                                                )
+                                                or 1.20
+                                            ),
+                                        ),
+                                    )
+                                    transient_min_liq = max(
+                                        500.0,
+                                        float(
+                                            getattr(
+                                                config,
+                                                "LOCAL_ANTISCAM_TRANSIENT_MIN_LIQUIDITY_USD",
+                                                18000.0,
+                                            )
+                                            or 18000.0
+                                        ),
+                                    )
+                                    transient_min_vol = max(
+                                        30.0,
+                                        float(
+                                            getattr(
+                                                config,
+                                                "LOCAL_ANTISCAM_TRANSIENT_MIN_VOLUME_5M_USD",
+                                                900.0,
+                                            )
+                                            or 900.0
+                                        ),
+                                    )
+                                    transient_min_age = max(
+                                        60,
+                                        int(
+                                            getattr(
+                                                config,
+                                                "LOCAL_ANTISCAM_TRANSIENT_MIN_AGE_SECONDS",
+                                                900,
+                                            )
+                                            or 900
+                                        ),
+                                    )
+                                    actionable_min_liq = max(
+                                        float(actionable_min_liq),
+                                        float(transient_min_liq) * float(liq_mult),
+                                    )
+                                    actionable_min_vol5 = max(
+                                        float(actionable_min_vol5),
+                                        float(transient_min_vol) * float(vol_mult),
+                                    )
+                                    actionable_min_age = max(
+                                        int(actionable_min_age),
+                                        int(round(float(transient_min_age) * float(age_mult))),
+                                    )
+                                    actionable_max_abs5 = min(
+                                        float(actionable_max_abs5),
+                                        max(12.0, float(transient_max_abs) * float(abs5_mult)),
+                                    )
+
+                            def _non_watch_actionable_eval(row: dict[str, Any]) -> tuple[bool, str]:
+                                if _is_watch_source(row):
+                                    return False, "watch_source"
+                                src_name = str((row or {}).get("source", "") or "").strip().lower()
+                                liq_floor = float(actionable_min_liq)
+                                vol_floor = float(actionable_min_vol5)
+                                age_floor = int(actionable_min_age)
+                                abs5_cap = float(actionable_max_abs5)
+                                if src_name.startswith("onchain"):
+                                    liq_floor = min(float(liq_floor), float(relaxed_min_liq))
+                                    vol_floor = min(float(vol_floor), float(relaxed_min_vol5))
+                                    age_floor = min(int(age_floor), int(relaxed_min_age))
+                                    abs5_cap = max(float(abs5_cap), float(relaxed_max_abs5))
+                                elif src_name.startswith("dexscreener"):
+                                    liq_floor = min(float(liq_floor), max(500.0, float(relaxed_min_liq) * 1.10))
+                                    vol_floor = min(float(vol_floor), max(30.0, float(relaxed_min_vol5) * 1.10))
+                                    age_floor = min(int(age_floor), max(60, int(round(float(relaxed_min_age) * 1.10))))
+                                    abs5_cap = max(float(abs5_cap), max(10.0, float(relaxed_max_abs5) * 0.95))
+                                liq = float((row or {}).get("liquidity") or 0.0)
+                                vol5 = float((row or {}).get("volume_5m") or 0.0)
+                                age_s = int((row or {}).get("age_seconds") or 0)
+                                abs5 = abs(float((row or {}).get("price_change_5m") or 0.0))
+                                if liq < float(liq_floor):
+                                    return False, "liq"
+                                if vol5 < float(vol_floor):
+                                    return False, "vol5"
+                                if age_s < int(age_floor):
+                                    return False, "age"
+                                if abs5 > float(abs5_cap):
+                                    return False, "abs5"
+                                return True, "pass"
+
+                            def _is_actionable_non_watch(row: dict[str, Any]) -> bool:
+                                ok, _reason = _non_watch_actionable_eval(row)
+                                return bool(ok)
+
+                            def _non_watch_count(rows: list[dict[str, Any]], *, actionable: bool = False) -> int:
                                 return int(
                                     sum(
                                         1
                                         for row in (rows or [])
-                                        if (not _is_watch_source(row))
+                                        if (
+                                            _is_actionable_non_watch(row)
+                                            if actionable
+                                            else (not _is_watch_source(row))
+                                        )
+                                    )
+                                )
+
+                            def _non_watch_actionable_snapshot(
+                                rows: list[dict[str, Any]],
+                            ) -> tuple[int, int, dict[str, int]]:
+                                total = 0
+                                passed = 0
+                                reasons: dict[str, int] = {}
+                                for row in rows or []:
+                                    if _is_watch_source(row):
+                                        continue
+                                    total += 1
+                                    ok, reason = _non_watch_actionable_eval(row)
+                                    if ok:
+                                        passed += 1
+                                    else:
+                                        key = str(reason or "unknown").strip().lower() or "unknown"
+                                        reasons[key] = int(reasons.get(key, 0)) + 1
+                                return int(total), int(passed), dict(reasons)
+
+                            def _reason_counts_brief(reason_counts: dict[str, int], *, top_n: int = 4) -> str:
+                                if not reason_counts:
+                                    return "none"
+                                rows_sorted = sorted(
+                                    reason_counts.items(),
+                                    key=lambda kv: (int(kv[1]), str(kv[0])),
+                                    reverse=True,
+                                )[: int(max(1, int(top_n)))]
+                                return ",".join(f"{str(k)}:{int(v)}" for k, v in rows_sorted)
+
+                            def _stable_non_watch_count(rows: list[dict[str, Any]], *, actionable: bool = True) -> int:
+                                return int(
+                                    sum(
+                                        1
+                                        for row in (rows or [])
+                                        if (
+                                            (not _is_watch_source(row))
+                                            and (not actionable or _is_actionable_non_watch(row))
+                                            and _candidate_lane_tag(row) == "stable"
+                                        )
                                     )
                                 )
 
                             raw_non_watch_cycle = int(_non_watch_count(market_tokens))
                             raw_watchlist_cycle = int(len(wl))
+                            (
+                                non_watch_actionable_total_cycle,
+                                non_watch_actionable_pass_cycle,
+                                non_watch_actionable_reasons_cycle,
+                            ) = _non_watch_actionable_snapshot(market_tokens)
+                            non_watch_actionable_fail_cycle = max(
+                                0,
+                                int(non_watch_actionable_total_cycle) - int(non_watch_actionable_pass_cycle),
+                            )
+                            non_watch_actionable_reasons_brief_cycle = _reason_counts_brief(
+                                non_watch_actionable_reasons_cycle
+                            )
                             if flow_legacy_rollback_mode:
                                 watchlist_fallback_used_cycle = bool(raw_watchlist_cycle > 0)
                                 watchlist_fallback_reason_cycle = "legacy_merge"
@@ -2956,6 +4243,74 @@ async def run_local_loop() -> None:
                                     int(raw_non_watch_cycle),
                                     int(raw_watchlist_cycle),
                                 )
+
+                            low_flow_boost_cache_ready = False
+                            low_flow_boost_cache_tokens: list[dict[str, Any]] = []
+                            configured_low_flow_fetch_timeout = max(
+                                5.0,
+                                float(
+                                    getattr(
+                                        config,
+                                        "RAW_SOURCE_REBALANCE_FETCH_TIMEOUT_SECONDS",
+                                        35.0,
+                                    )
+                                    or 35.0
+                                ),
+                            )
+                            low_flow_source_timeout = max(
+                                4.0,
+                                float(
+                                    getattr(
+                                        config,
+                                        "NON_WATCH_LOW_FLOW_SOURCE_TIMEOUT_SECONDS",
+                                        25.0,
+                                    )
+                                    or 25.0
+                                ),
+                            )
+                            low_flow_fetch_timeout_seconds = max(
+                                float(configured_low_flow_fetch_timeout),
+                                float(low_flow_source_timeout) + 5.0,
+                            )
+
+                            async def _fetch_low_flow_tokens_cached() -> list[dict[str, Any]]:
+                                nonlocal low_flow_boost_cache_ready, low_flow_boost_cache_tokens
+                                if low_flow_boost_cache_ready:
+                                    return list(low_flow_boost_cache_tokens or [])
+                                low_flow_boost_cache_ready = True
+                                try:
+                                    if hasattr(dex_monitor, "fetch_low_flow_boost_tokens"):
+                                        fetch_coro = dex_monitor.fetch_low_flow_boost_tokens()
+                                    else:
+                                        fetch_coro = dex_monitor.fetch_new_tokens()
+                                    low_flow_boost_cache_tokens = list(
+                                        await asyncio.wait_for(fetch_coro, timeout=float(low_flow_fetch_timeout_seconds))
+                                        or []
+                                    )
+                                except asyncio.TimeoutError:
+                                    logger.warning(
+                                        "RAW_SOURCE_REBALANCE low_flow_fetch_timeout=%ss",
+                                        int(round(float(low_flow_fetch_timeout_seconds))),
+                                    )
+                                    low_flow_boost_cache_tokens = []
+                                    try:
+                                        if hasattr(dex_monitor, "get_last_low_flow_boost_tokens"):
+                                            cached_tokens = list(dex_monitor.get_last_low_flow_boost_tokens() or [])
+                                            if cached_tokens:
+                                                low_flow_boost_cache_tokens = list(cached_tokens)
+                                                logger.info(
+                                                    "RAW_SOURCE_REBALANCE low_flow_fetch_timeout_fallback cached=%s",
+                                                    int(len(cached_tokens)),
+                                                )
+                                    except Exception as cache_exc:
+                                        logger.warning(
+                                            "RAW_SOURCE_REBALANCE low_flow_fetch_timeout_fallback_failed: %s",
+                                            cache_exc,
+                                        )
+                                except Exception as exc:
+                                    logger.warning("RAW_SOURCE_REBALANCE low_flow_fetch_failed: %s", exc)
+                                    low_flow_boost_cache_tokens = []
+                                return list(low_flow_boost_cache_tokens or [])
 
                             if (not flow_legacy_rollback_mode) and bool(getattr(config, "RAW_SOURCE_REBALANCE_ENABLED", True)):
                                 target_non_watch = max(
@@ -2966,30 +4321,90 @@ async def run_local_loop() -> None:
                                     0,
                                     int(getattr(config, "RAW_SOURCE_REBALANCE_EXTRA_FETCH_ROUNDS", 2) or 2),
                                 )
-                                non_watch_before = _non_watch_count(market_tokens)
+                                non_watch_before = _non_watch_count(market_tokens, actionable=True)
                                 if non_watch_before < target_non_watch and extra_rounds > 0:
                                     added_total = 0
                                     used_rounds = 0
                                     for _ in range(extra_rounds):
                                         used_rounds += 1
-                                        if hasattr(dex_monitor, "fetch_low_flow_boost_tokens"):
-                                            extra_tokens = await dex_monitor.fetch_low_flow_boost_tokens()
-                                        else:
-                                            extra_tokens = await dex_monitor.fetch_new_tokens()
+                                        extra_tokens = await _fetch_low_flow_tokens_cached()
                                         if extra_tokens:
                                             before_len = int(len(market_tokens))
                                             market_tokens = _merge_token_streams(market_tokens, extra_tokens)
-                                            added_total += max(0, int(len(market_tokens)) - before_len)
-                                        if _non_watch_count(market_tokens) >= target_non_watch:
+                                            added_round = max(0, int(len(market_tokens)) - before_len)
+                                            added_total += int(added_round)
+                                            if added_round <= 0:
+                                                break
+                                        else:
                                             break
-                                    non_watch_after = _non_watch_count(market_tokens)
+                                        if _non_watch_count(market_tokens, actionable=True) >= target_non_watch:
+                                            break
+                                    non_watch_after = _non_watch_count(market_tokens, actionable=True)
                                     logger.info(
-                                        "RAW_SOURCE_REBALANCE non_watch=%s->%s added=%s rounds=%s target=%s",
+                                        "RAW_SOURCE_REBALANCE actionable_non_watch=%s->%s added=%s rounds=%s target=%s",
                                         int(non_watch_before),
                                         int(non_watch_after),
                                         int(added_total),
                                         int(used_rounds),
                                         int(target_non_watch),
+                                    )
+
+                            if (not flow_legacy_rollback_mode) and bool(
+                                getattr(config, "RAW_STABLE_UPSTREAM_ENABLED", True)
+                            ):
+                                target_stable_non_watch = max(
+                                    0,
+                                    int(getattr(config, "RAW_STABLE_UPSTREAM_MIN_ACTIONABLE", 8) or 8),
+                                )
+                                stable_extra_rounds = max(
+                                    0,
+                                    int(getattr(config, "RAW_STABLE_UPSTREAM_EXTRA_FETCH_ROUNDS", 2) or 2),
+                                )
+                                stable_extra_max = max(
+                                    0,
+                                    int(getattr(config, "RAW_STABLE_UPSTREAM_MAX_EXTRA_PER_CYCLE", 120) or 120),
+                                )
+                                stable_only_non_watch = bool(
+                                    getattr(config, "RAW_STABLE_UPSTREAM_ONLY_NON_WATCH", True)
+                                )
+                                stable_before = _stable_non_watch_count(market_tokens, actionable=True)
+                                if stable_before < target_stable_non_watch and stable_extra_rounds > 0:
+                                    stable_added_total = 0
+                                    stable_used_rounds = 0
+                                    for _ in range(stable_extra_rounds):
+                                        stable_used_rounds += 1
+                                        stable_extra_tokens = await _fetch_low_flow_tokens_cached()
+                                        if stable_extra_tokens:
+                                            if stable_only_non_watch:
+                                                stable_extra_tokens = [
+                                                    row
+                                                    for row in stable_extra_tokens
+                                                    if not _is_watch_source(row)
+                                                ]
+                                            if stable_extra_max > 0:
+                                                stable_extra_tokens = stable_extra_tokens[: int(stable_extra_max)]
+                                            before_len = int(len(market_tokens))
+                                            market_tokens = _merge_token_streams(market_tokens, stable_extra_tokens)
+                                            stable_added_round = max(0, int(len(market_tokens)) - before_len)
+                                            stable_added_total += int(stable_added_round)
+                                            if stable_added_round <= 0:
+                                                break
+                                        else:
+                                            break
+                                        if _stable_non_watch_count(market_tokens, actionable=True) >= target_stable_non_watch:
+                                            break
+                                    stable_after = _stable_non_watch_count(market_tokens, actionable=True)
+                                    logger.info(
+                                        (
+                                            "RAW_STABLE_UPSTREAM actionable_stable_non_watch=%s->%s "
+                                            "added=%s rounds=%s target=%s only_non_watch=%s"
+                                        ),
+                                        int(stable_before),
+                                        int(stable_after),
+                                        int(stable_added_total),
+                                        int(stable_used_rounds),
+                                        int(target_stable_non_watch),
+                                        bool(stable_only_non_watch),
                                     )
 
                             max_watch_share = max(
@@ -3010,7 +4425,7 @@ async def run_local_loop() -> None:
                                 0,
                                 int(getattr(config, "RAW_SOURCE_REBALANCE_WATCHLIST_FLOOR", 2) or 2),
                             )
-                            non_watch_total = _non_watch_count(market_tokens)
+                            non_watch_total = _non_watch_count(market_tokens, actionable=True)
                             if (not flow_legacy_rollback_mode) and non_watch_total > 0 and 0.0 < max_watch_share < 1.0:
                                 max_watch_allowed = int(
                                     (float(non_watch_total) * float(max_watch_share))
@@ -3053,7 +4468,20 @@ async def run_local_loop() -> None:
                                     0,
                                     int(getattr(config, "RAW_LANE_SPLIT_WATCH_FALLBACK_WHEN_EMPTY", 6) or 6),
                                 )
-                                non_watch_after = _non_watch_count(market_tokens)
+                                non_watch_after = _non_watch_count(market_tokens, actionable=True)
+                                non_watch_after_total = _non_watch_count(market_tokens, actionable=False)
+                                (
+                                    non_watch_actionable_total_cycle,
+                                    non_watch_actionable_pass_cycle,
+                                    non_watch_actionable_reasons_cycle,
+                                ) = _non_watch_actionable_snapshot(market_tokens)
+                                non_watch_actionable_fail_cycle = max(
+                                    0,
+                                    int(non_watch_actionable_total_cycle) - int(non_watch_actionable_pass_cycle),
+                                )
+                                non_watch_actionable_reasons_brief_cycle = _reason_counts_brief(
+                                    non_watch_actionable_reasons_cycle
+                                )
                                 wl_sorted_for_lane = sorted(
                                     wl,
                                     key=lambda row: (
@@ -3079,7 +4507,32 @@ async def run_local_loop() -> None:
                                         int(len(wl)),
                                         int(lane_watch_fallback_max),
                                     )
-                                elif int(non_watch_after) <= 0:
+                                elif int(non_watch_after_total) > 0:
+                                    # Keep non-watch lane alive and expose why non-watch is
+                                    # non-actionable before lane-split caps are applied.
+                                    wl_before_lane = int(len(wl_sorted_for_lane))
+                                    wl = wl_sorted_for_lane[: int(lane_watch_fallback_max)]
+                                    watchlist_fallback_used_cycle = bool(len(wl) > 0)
+                                    watchlist_fallback_reason_cycle = (
+                                        "non_watch_under_actionable"
+                                        if watchlist_fallback_used_cycle
+                                        else "none"
+                                    )
+                                    logger.info(
+                                        (
+                                            "RAW_LANE_SPLIT mode=non_watch_under_actionable "
+                                            "non_watch_actionable=%s non_watch_total=%s non_watch_fail=%s "
+                                            "reasons=%s wl=%s->%s fallback_max=%s"
+                                        ),
+                                        int(non_watch_after),
+                                        int(non_watch_after_total),
+                                        int(non_watch_actionable_fail_cycle),
+                                        str(non_watch_actionable_reasons_brief_cycle or "none"),
+                                        int(wl_before_lane),
+                                        int(len(wl)),
+                                        int(lane_watch_fallback_max),
+                                    )
+                                elif int(non_watch_after_total) <= 0:
                                     wl_before_lane = int(len(wl_sorted_for_lane))
                                     wl = wl_sorted_for_lane[: int(lane_watch_when_empty)]
                                     watchlist_fallback_used_cycle = bool(len(wl) > 0)
@@ -3415,6 +4868,102 @@ async def run_local_loop() -> None:
                         ),
                     )
                     non_watch_transient_age_soft_used_cycle = 0
+                    non_watch_transient_volume_soft_enabled = bool(
+                        getattr(config, "LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_VOLUME_SOFT_ENABLED", True)
+                    )
+                    non_watch_transient_volume_soft_min_seconds = max(
+                        0,
+                        int(
+                            getattr(
+                                config,
+                                "LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_VOLUME_SOFT_MIN_SECONDS",
+                                240,
+                            )
+                            or 240
+                        ),
+                    )
+                    non_watch_transient_volume_soft_min_liquidity = max(
+                        float(getattr(config, "SAFE_MIN_LIQUIDITY_USD", 0.0) or 0.0),
+                        float(
+                            getattr(
+                                config,
+                                "LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_VOLUME_SOFT_MIN_LIQUIDITY_USD",
+                                12000.0,
+                            )
+                            or 12000.0
+                        ),
+                    )
+                    non_watch_transient_volume_soft_min_volume_5m = max(
+                        float(getattr(config, "SAFE_MIN_VOLUME_5M_USD", 0.0) or 0.0),
+                        float(
+                            getattr(
+                                config,
+                                "LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_VOLUME_SOFT_MIN_VOLUME_5M_USD",
+                                450.0,
+                            )
+                            or 450.0
+                        ),
+                    )
+                    non_watch_transient_volume_soft_min_score = max(
+                        0,
+                        int(
+                            getattr(
+                                config,
+                                "LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_VOLUME_SOFT_MIN_SCORE",
+                                60,
+                            )
+                            or 60
+                        ),
+                    )
+                    non_watch_transient_volume_soft_max_warning_flags = max(
+                        0,
+                        int(
+                            getattr(
+                                config,
+                                "LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_VOLUME_SOFT_MAX_WARNING_FLAGS",
+                                1,
+                            )
+                            or 1
+                        ),
+                    )
+                    non_watch_transient_volume_soft_max_risk_level = str(
+                        getattr(
+                            config,
+                            "LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_VOLUME_SOFT_MAX_RISK_LEVEL",
+                            "MEDIUM",
+                        )
+                        or "MEDIUM"
+                    ).strip().upper()
+                    non_watch_transient_volume_soft_max_abs5 = max(
+                        0.0,
+                        float(
+                            getattr(
+                                config,
+                                "LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_VOLUME_SOFT_MAX_ABS_CHANGE_5M",
+                                12.0,
+                            )
+                            or 12.0
+                        ),
+                    )
+                    non_watch_transient_volume_soft_require_contract_safe = bool(
+                        getattr(
+                            config,
+                            "LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_VOLUME_SOFT_REQUIRE_CONTRACT_SAFE",
+                            True,
+                        )
+                    )
+                    non_watch_transient_volume_soft_max_per_cycle = max(
+                        0,
+                        int(
+                            getattr(
+                                config,
+                                "LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_VOLUME_SOFT_MAX_PASSES_PER_CYCLE",
+                                4,
+                            )
+                            or 4
+                        ),
+                    )
+                    non_watch_transient_volume_soft_used_cycle = 0
                     non_watch_transient_contract_soft_enabled = bool(
                         getattr(config, "LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_ENABLED", True)
                     )
@@ -3474,6 +5023,201 @@ async def run_local_loop() -> None:
                         ),
                     )
                     non_watch_transient_contract_soft_used_cycle = 0
+                    onchain_transient_bridge_enabled = bool(
+                        getattr(config, "LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_BRIDGE_ENABLED", True)
+                    )
+                    onchain_transient_bridge_min_age_seconds = max(
+                        0,
+                        int(getattr(config, "LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_BRIDGE_MIN_AGE_SECONDS", 240) or 240),
+                    )
+                    onchain_transient_bridge_max_age_seconds = max(
+                        onchain_transient_bridge_min_age_seconds,
+                        int(getattr(config, "LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_BRIDGE_MAX_AGE_SECONDS", 900) or 900),
+                    )
+                    onchain_transient_bridge_min_liquidity = max(
+                        float(getattr(config, "SAFE_MIN_LIQUIDITY_USD", 0.0) or 0.0),
+                        float(
+                            getattr(config, "LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_BRIDGE_MIN_LIQUIDITY_USD", 50000.0)
+                            or 50000.0
+                        ),
+                    )
+                    onchain_transient_bridge_min_volume_5m = max(
+                        float(getattr(config, "SAFE_MIN_VOLUME_5M_USD", 0.0) or 0.0),
+                        float(
+                            getattr(config, "LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_BRIDGE_MIN_VOLUME_5M_USD", 1000.0)
+                            or 1000.0
+                        ),
+                    )
+                    onchain_transient_bridge_min_score = max(
+                        0,
+                        int(getattr(config, "LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_BRIDGE_MIN_SCORE", 75) or 75),
+                    )
+                    onchain_transient_bridge_max_abs5 = max(
+                        0.0,
+                        float(
+                            getattr(config, "LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_BRIDGE_MAX_ABS_CHANGE_5M", 8.0)
+                            or 8.0
+                        ),
+                    )
+                    onchain_transient_bridge_max_per_cycle = max(
+                        0,
+                        int(
+                            getattr(config, "LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_BRIDGE_MAX_PASSES_PER_CYCLE", 2)
+                            or 2
+                        ),
+                    )
+                    onchain_transient_bridge_used_cycle = 0
+                    onchain_transient_bridge_allowed_risky_flags = {
+                        str(x).strip().lower()
+                        for x in (
+                            getattr(
+                                config,
+                                "LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_BRIDGE_ALLOWED_RISKY_FLAGS",
+                                ["young_token"],
+                            )
+                            or ["young_token"]
+                        )
+                        if str(x).strip()
+                    }
+                    if not onchain_transient_bridge_allowed_risky_flags:
+                        onchain_transient_bridge_allowed_risky_flags = {"young_token"}
+                    onchain_transient_bridge_set_risk_level = str(
+                        getattr(config, "LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_BRIDGE_SET_RISK_LEVEL", "MEDIUM")
+                        or "MEDIUM"
+                    ).strip().upper()
+                    onchain_transient_bridge_set_warning_flags = max(
+                        0,
+                        int(getattr(config, "LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_BRIDGE_SET_WARNING_FLAGS", 0) or 0),
+                    )
+                    onchain_safe_change_bridge_enabled = bool(
+                        getattr(config, "LOCAL_ANTISCAM_ONCHAIN_SAFE_CHANGE_BRIDGE_ENABLED", True)
+                    )
+                    onchain_safe_change_bridge_max_abs5 = max(
+                        0.0,
+                        float(
+                            getattr(
+                                config,
+                                "LOCAL_ANTISCAM_ONCHAIN_SAFE_CHANGE_BRIDGE_MAX_ABS_CHANGE_5M",
+                                45.0,
+                            )
+                            or 45.0
+                        ),
+                    )
+                    onchain_safe_change_bridge_min_liquidity = max(
+                        float(getattr(config, "SAFE_MIN_LIQUIDITY_USD", 0.0) or 0.0),
+                        float(
+                            getattr(
+                                config,
+                                "LOCAL_ANTISCAM_ONCHAIN_SAFE_CHANGE_BRIDGE_MIN_LIQUIDITY_USD",
+                                50000.0,
+                            )
+                            or 50000.0
+                        ),
+                    )
+                    onchain_safe_change_bridge_min_volume_5m = max(
+                        float(getattr(config, "SAFE_MIN_VOLUME_5M_USD", 0.0) or 0.0),
+                        float(
+                            getattr(
+                                config,
+                                "LOCAL_ANTISCAM_ONCHAIN_SAFE_CHANGE_BRIDGE_MIN_VOLUME_5M_USD",
+                                3000.0,
+                            )
+                            or 3000.0
+                        ),
+                    )
+                    onchain_safe_change_bridge_min_score = max(
+                        0,
+                        int(
+                            getattr(
+                                config,
+                                "LOCAL_ANTISCAM_ONCHAIN_SAFE_CHANGE_BRIDGE_MIN_SCORE",
+                                70,
+                            )
+                            or 70
+                        ),
+                    )
+                    onchain_safe_change_bridge_max_per_cycle = max(
+                        0,
+                        int(
+                            getattr(
+                                config,
+                                "LOCAL_ANTISCAM_ONCHAIN_SAFE_CHANGE_BRIDGE_MAX_PASSES_PER_CYCLE",
+                                2,
+                            )
+                            or 2
+                        ),
+                    )
+                    onchain_safe_change_bridge_used_cycle = 0
+                    onchain_transient_age_bridge_enabled = bool(
+                        getattr(config, "LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_AGE_BRIDGE_ENABLED", True)
+                    )
+                    onchain_transient_age_bridge_min_seconds = max(
+                        0,
+                        int(
+                            getattr(
+                                config,
+                                "LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_AGE_BRIDGE_MIN_SECONDS",
+                                150,
+                            )
+                            or 150
+                        ),
+                    )
+                    onchain_transient_age_bridge_min_liquidity = max(
+                        0.0,
+                        float(
+                            getattr(
+                                config,
+                                "LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_AGE_BRIDGE_MIN_LIQUIDITY_USD",
+                                50000.0,
+                            )
+                            or 50000.0
+                        ),
+                    )
+                    onchain_transient_age_bridge_min_volume_5m = max(
+                        0.0,
+                        float(
+                            getattr(
+                                config,
+                                "LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_AGE_BRIDGE_MIN_VOLUME_5M_USD",
+                                900.0,
+                            )
+                            or 900.0
+                        ),
+                    )
+                    onchain_transient_age_bridge_min_score = max(
+                        0,
+                        int(
+                            getattr(
+                                config,
+                                "LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_AGE_BRIDGE_MIN_SCORE",
+                                50,
+                            )
+                            or 50
+                        ),
+                    )
+                    onchain_transient_age_bridge_max_abs5 = max(
+                        0.0,
+                        float(
+                            getattr(
+                                config,
+                                "LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_AGE_BRIDGE_MAX_ABS_CHANGE_5M",
+                                10.0,
+                            )
+                            or 10.0
+                        ),
+                    )
+                    onchain_transient_age_bridge_max_per_cycle = max(
+                        0,
+                        int(
+                            getattr(
+                                config,
+                                "LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_AGE_BRIDGE_MAX_PASSES_PER_CYCLE",
+                                2,
+                            )
+                            or 2
+                        ),
+                    )
+                    onchain_transient_age_bridge_used_cycle = 0
                     anti_scam_pump_history_enabled = bool(
                         getattr(config, "LOCAL_ANTISCAM_PUMP_HISTORY_ENABLED", True)
                     )
@@ -3540,6 +5284,7 @@ async def run_local_loop() -> None:
                                 "decision_stage": "filter_fail",
                                 "decision": "skip",
                                 "reason": key,
+                                "lane_tag": _candidate_lane_tag(token),
                                 "extra": extra,
                                 "market_regime": market_regime_current,
                                 "address": normalize_address(token.get("address", "")),
@@ -3587,6 +5332,7 @@ async def run_local_loop() -> None:
                         token_address = normalize_address(token.get("address", ""))
                         candidate_id = f"{RUN_TAG}:{cycle_index}:{token_idx}:{token_address or 'noaddr'}"
                         token["_candidate_id"] = candidate_id
+                        token["_lane_tag"] = _candidate_lane_tag(token)
                         if _is_placeholder_trade_address(token_address):
                             _filter_fail("invalid_address", token, f"address={token_address or 'missing'}")
                             continue
@@ -3655,6 +5401,63 @@ async def run_local_loop() -> None:
                                 int(non_watch_soft_min_score),
                                 int(soft_score_min) - int(non_watch_soft_score_delta),
                             )
+                        # Phase-1 onchain re-enrich bridge:
+                        # allow a bounded score-relax for onchain rows that already have
+                        # basic market viability, without weakening hard safety checks.
+                        if is_non_watch_source and source_name.startswith("onchain"):
+                            token_liquidity_now = max(0.0, float(token.get("liquidity") or 0.0))
+                            token_volume_5m_now = max(0.0, float(token.get("volume_5m") or 0.0))
+                            token_age_seconds_now = max(0, int(token.get("age_seconds") or 0))
+                            token_abs_change_5m_now = abs(float(token.get("price_change_5m") or 0.0))
+                            onchain_relax_soft_floor = max(0, int(non_watch_soft_min_score))
+                            onchain_relax_min_liq = max(
+                                200.0,
+                                float(getattr(config, "SAFE_MIN_LIQUIDITY_USD", 1500.0) or 1500.0) * 0.75,
+                            )
+                            onchain_relax_min_vol5 = max(
+                                25.0,
+                                float(getattr(config, "SAFE_MIN_VOLUME_5M_USD", 50.0) or 50.0) * 0.80,
+                            )
+                            onchain_relax_min_age = max(
+                                30,
+                                int(round(float(getattr(config, "SAFE_MIN_AGE_SECONDS", 120) or 120) * 0.60)),
+                            )
+                            onchain_relax_max_abs5 = max(
+                                8.0,
+                                float(getattr(config, "SAFE_MAX_CHANGE_5M_PERCENT", 15.0) or 15.0) * 1.25,
+                            )
+                            if (
+                                score_now < int(soft_score_effective)
+                                and score_now >= int(onchain_relax_soft_floor)
+                                and token_liquidity_now >= float(onchain_relax_min_liq)
+                                and token_volume_5m_now >= float(onchain_relax_min_vol5)
+                                and token_age_seconds_now >= int(onchain_relax_min_age)
+                                and token_abs_change_5m_now <= float(onchain_relax_max_abs5)
+                            ):
+                                soft_score_effective = int(onchain_relax_soft_floor)
+                                token["_onchain_score_relax_pass"] = True
+                                token["_onchain_score_relax_detail"] = (
+                                    f"score={score_now} soft={soft_score_min} relax={soft_score_effective} "
+                                    f"liq={token_liquidity_now:.0f}/{onchain_relax_min_liq:.0f} "
+                                    f"vol5={token_volume_5m_now:.0f}/{onchain_relax_min_vol5:.0f} "
+                                    f"age={token_age_seconds_now}/{onchain_relax_min_age} "
+                                    f"abs5={token_abs_change_5m_now:.2f}/{onchain_relax_max_abs5:.2f}"
+                                )
+                                logger.info(
+                                    "ONCHAIN_SCORE_RELAX_PASS token=%s score=%s soft=%s relax=%s liq=%.0f/%.0f vol5=%.0f/%.0f age=%s/%s abs5=%.2f/%.2f",
+                                    token.get("symbol", "N/A"),
+                                    score_now,
+                                    int(soft_score_min),
+                                    int(soft_score_effective),
+                                    token_liquidity_now,
+                                    float(onchain_relax_min_liq),
+                                    token_volume_5m_now,
+                                    float(onchain_relax_min_vol5),
+                                    token_age_seconds_now,
+                                    int(onchain_relax_min_age),
+                                    token_abs_change_5m_now,
+                                    float(onchain_relax_max_abs5),
+                                )
                         if score_now >= strict_score_min:
                             entry_tier = "A"
                         elif score_now >= soft_score_effective:
@@ -3685,35 +5488,49 @@ async def run_local_loop() -> None:
                             and is_non_watch_source
                             and score_now < int(soft_score_min)
                         ):
-                            if (
-                                non_watch_soft_max_per_cycle > 0
-                                and non_watch_soft_used_cycle >= non_watch_soft_max_per_cycle
-                            ):
-                                _filter_fail(
-                                    "non_watch_score_cycle_cap",
-                                    token,
-                                    (
-                                        f"score={score_now} soft_effective={soft_score_effective} "
-                                        f"used={non_watch_soft_used_cycle}/{non_watch_soft_max_per_cycle}"
-                                    ),
+                            # Onchain candidates with missing liquidity are guaranteed to fail on safe_liquidity.
+                            # Do not spend scarce non-watch soft-score budget on these records.
+                            skip_non_watch_probe_budget = False
+                            if source_name.startswith("onchain"):
+                                try:
+                                    onchain_liq_now = float(token.get("liquidity") or 0.0)
+                                except Exception:
+                                    onchain_liq_now = 0.0
+                                if onchain_liq_now <= 0.0:
+                                    skip_non_watch_probe_budget = True
+                            if not skip_non_watch_probe_budget:
+                                if (
+                                    non_watch_soft_max_per_cycle > 0
+                                    and non_watch_soft_used_cycle >= non_watch_soft_max_per_cycle
+                                ):
+                                    _filter_fail(
+                                        "non_watch_score_cycle_cap",
+                                        token,
+                                        (
+                                            f"score={score_now} soft_effective={soft_score_effective} "
+                                            f"used={non_watch_soft_used_cycle}/{non_watch_soft_max_per_cycle}"
+                                        ),
+                                    )
+                                    continue
+                                non_watch_soft_used_cycle += 1
+                                token["_non_watch_score_probe_pass"] = True
+                                token["_non_watch_score_probe_detail"] = (
+                                    f"score={score_now} soft={soft_score_min} soft_effective={soft_score_effective} "
+                                    f"used={non_watch_soft_used_cycle}/{non_watch_soft_max_per_cycle}"
                                 )
-                                continue
-                            non_watch_soft_used_cycle += 1
-                            token["_non_watch_score_probe_pass"] = True
-                            token["_non_watch_score_probe_detail"] = (
-                                f"score={score_now} soft={soft_score_min} soft_effective={soft_score_effective} "
-                                f"used={non_watch_soft_used_cycle}/{non_watch_soft_max_per_cycle}"
-                            )
-                            logger.info(
-                                "NON_WATCH_SCORE_PROBE_PASS token=%s score=%s soft=%s soft_effective=%s used=%s/%s mode=%s",
-                                token.get("symbol", "N/A"),
-                                score_now,
-                                soft_score_min,
-                                soft_score_effective,
-                                non_watch_soft_used_cycle,
-                                non_watch_soft_max_per_cycle,
-                                market_regime_current,
-                            )
+                                logger.info(
+                                    "NON_WATCH_SCORE_PROBE_PASS token=%s score=%s soft=%s soft_effective=%s used=%s/%s mode=%s",
+                                    token.get("symbol", "N/A"),
+                                    score_now,
+                                    soft_score_min,
+                                    soft_score_effective,
+                                    non_watch_soft_used_cycle,
+                                    non_watch_soft_max_per_cycle,
+                                    market_regime_current,
+                                )
+                            else:
+                                token["_non_watch_score_probe_budget_skipped"] = True
+                                token["_non_watch_score_probe_budget_skip_reason"] = "onchain_liquidity_missing"
                         if entry_tier == "B" and soft_cap > 0 and soft_selected_cycle >= soft_cap:
                             _filter_fail(
                                 "tier_b_cycle_cap",
@@ -4031,6 +5848,63 @@ async def run_local_loop() -> None:
                                         non_watch_change_soft_max_per_cycle,
                                         source_name or "unknown",
                                     )
+                                if (
+                                    (not change_soft_passed)
+                                    and is_non_watch_source
+                                    and source_name.startswith("onchain")
+                                    and onchain_safe_change_bridge_enabled
+                                    and int(token.get("age_seconds") or 0)
+                                    >= onchain_transient_bridge_min_age_seconds
+                                    and token_abs_change_5m <= onchain_safe_change_bridge_max_abs5
+                                    and token_liquidity_now >= onchain_safe_change_bridge_min_liquidity
+                                    and token_volume_5m >= onchain_safe_change_bridge_min_volume_5m
+                                    and int(score_now or 0) >= onchain_safe_change_bridge_min_score
+                                ):
+                                    if (
+                                        onchain_safe_change_bridge_max_per_cycle > 0
+                                        and onchain_safe_change_bridge_used_cycle
+                                        >= onchain_safe_change_bridge_max_per_cycle
+                                    ):
+                                        _filter_fail(
+                                            "safe_change_onchain_bridge_cycle_cap",
+                                            token,
+                                            (
+                                                f"abs5m={token_abs_change_5m:.2f}/{safe_change_abs_limit:.2f} "
+                                                f"used={onchain_safe_change_bridge_used_cycle}/"
+                                                f"{onchain_safe_change_bridge_max_per_cycle}"
+                                            ),
+                                        )
+                                        continue
+                                    if onchain_safe_change_bridge_max_per_cycle > 0:
+                                        onchain_safe_change_bridge_used_cycle += 1
+                                    change_soft_passed = True
+                                    token["_safe_change_soft_pass"] = True
+                                    token["_safe_change_soft_detail"] = (
+                                        f"onchain_bridge abs5m={token_abs_change_5m:.2f}/{safe_change_abs_limit:.2f} "
+                                        f"bridge_max={onchain_safe_change_bridge_max_abs5:.2f} "
+                                        f"liq={token_liquidity_now:.0f}/{onchain_safe_change_bridge_min_liquidity:.0f} "
+                                        f"vol5m={token_volume_5m:.0f}/{onchain_safe_change_bridge_min_volume_5m:.0f} "
+                                        f"score={int(score_now or 0)}/{onchain_safe_change_bridge_min_score} "
+                                        f"used={onchain_safe_change_bridge_used_cycle}/"
+                                        f"{onchain_safe_change_bridge_max_per_cycle}"
+                                    )
+                                    logger.info(
+                                        "ONCHAIN_SAFE_CHANGE_BRIDGE_PASS token=%s abs5m=%.2f max=%.2f bridge=%.2f "
+                                        "liq=%.0f/%.0f vol5m=%.0f/%.0f score=%s/%s used=%s/%s source=%s",
+                                        token.get("symbol", "N/A"),
+                                        token_abs_change_5m,
+                                        safe_change_abs_limit,
+                                        onchain_safe_change_bridge_max_abs5,
+                                        token_liquidity_now,
+                                        onchain_safe_change_bridge_min_liquidity,
+                                        token_volume_5m,
+                                        onchain_safe_change_bridge_min_volume_5m,
+                                        int(score_now or 0),
+                                        onchain_safe_change_bridge_min_score,
+                                        onchain_safe_change_bridge_used_cycle,
+                                        onchain_safe_change_bridge_max_per_cycle,
+                                        source_name or "unknown",
+                                    )
                                 if not change_soft_passed:
                                     _filter_fail(
                                         "safe_change_5m",
@@ -4221,8 +6095,143 @@ async def run_local_loop() -> None:
                                             non_watch_transient_contract_soft_max_per_cycle,
                                             source_name or "unknown",
                                         )
+                                if (
+                                    not contract_soft_passed
+                                    and is_non_watch_source
+                                    and source_name.startswith("onchain")
+                                    and onchain_transient_bridge_enabled
+                                    and (not safety_source or safety_source in {"transient_fallback", "cache_transient", "fallback"})
+                                ):
+                                    age_s = int(token.get("age_seconds") or 0)
+                                    liq_u = float(token.get("liquidity") or 0.0)
+                                    vol5_u = float(token.get("volume_5m") or 0.0)
+                                    abs5_u = abs(float(token.get("price_change_5m") or 0.0))
+                                    warning_soft = int(token.get("warning_flags") or 0)
+                                    score_soft = int(score_now or 0)
+                                    risky_flags_soft = {
+                                        str(x).strip().lower()
+                                        for x in ((safety or {}).get("risky_flags") or [])
+                                        if str(x).strip()
+                                    }
+                                    # On transient on-chain safety data, risky flags can be empty.
+                                    # We allow empty set, but if flags exist they must be from strict allow-list.
+                                    risky_flags_allowed = (not risky_flags_soft) or risky_flags_soft.issubset(
+                                        onchain_transient_bridge_allowed_risky_flags
+                                    )
+                                    if (
+                                        age_s >= onchain_transient_bridge_min_age_seconds
+                                        and age_s <= onchain_transient_bridge_max_age_seconds
+                                        and liq_u >= onchain_transient_bridge_min_liquidity
+                                        and vol5_u >= onchain_transient_bridge_min_volume_5m
+                                        and score_soft >= onchain_transient_bridge_min_score
+                                        and abs5_u <= onchain_transient_bridge_max_abs5
+                                        and warning_soft <= max(1, onchain_transient_bridge_set_warning_flags + 1)
+                                        and risky_flags_allowed
+                                    ):
+                                        if (
+                                            onchain_transient_bridge_max_per_cycle > 0
+                                            and onchain_transient_bridge_used_cycle
+                                            >= onchain_transient_bridge_max_per_cycle
+                                        ):
+                                            _filter_fail(
+                                                "safe_contract_onchain_bridge_cycle_cap",
+                                                token,
+                                                (
+                                                    f"used={onchain_transient_bridge_used_cycle}/"
+                                                    f"{onchain_transient_bridge_max_per_cycle}"
+                                                ),
+                                            )
+                                            continue
+                                        if onchain_transient_bridge_max_per_cycle > 0:
+                                            onchain_transient_bridge_used_cycle += 1
+                                        contract_soft_passed = True
+                                        token["is_contract_safe"] = True
+                                        token["risk_level"] = onchain_transient_bridge_set_risk_level
+                                        token["warning_flags"] = onchain_transient_bridge_set_warning_flags
+                                        token["_safe_contract_soft_pass"] = True
+                                        token["_safe_contract_soft_detail"] = (
+                                            f"onchain_transient_bridge age={age_s} "
+                                            f"liq={liq_u:.0f}/{onchain_transient_bridge_min_liquidity:.0f} "
+                                            f"vol5m={vol5_u:.0f}/{onchain_transient_bridge_min_volume_5m:.0f} "
+                                            f"score={score_soft}/{onchain_transient_bridge_min_score} "
+                                            f"abs5m={abs5_u:.2f}/{onchain_transient_bridge_max_abs5:.2f} "
+                                            f"flags={sorted(risky_flags_soft)} "
+                                            f"used={onchain_transient_bridge_used_cycle}/"
+                                            f"{onchain_transient_bridge_max_per_cycle}"
+                                        )
+                                        logger.info(
+                                            "ONCHAIN_TRANSIENT_BRIDGE_PASS token=%s age=%s liq=%.0f/%.0f vol5m=%.0f/%.0f "
+                                            "score=%s/%s abs5m=%.2f/%.2f flags=%s used=%s/%s source=%s",
+                                            token.get("symbol", "N/A"),
+                                            age_s,
+                                            liq_u,
+                                            onchain_transient_bridge_min_liquidity,
+                                            vol5_u,
+                                            onchain_transient_bridge_min_volume_5m,
+                                            score_soft,
+                                            onchain_transient_bridge_min_score,
+                                            abs5_u,
+                                            onchain_transient_bridge_max_abs5,
+                                            ",".join(sorted(risky_flags_soft)),
+                                            onchain_transient_bridge_used_cycle,
+                                            onchain_transient_bridge_max_per_cycle,
+                                            source_name or "unknown",
+                                        )
                                 if not contract_soft_passed:
-                                    _filter_fail("safe_contract", token)
+                                    onchain_contract_detail = ""
+                                    if is_non_watch_source and source_name.startswith("onchain"):
+                                        age_s = int(token.get("age_seconds") or 0)
+                                        liq_u = float(token.get("liquidity") or 0.0)
+                                        vol5_u = float(token.get("volume_5m") or 0.0)
+                                        abs5_u = abs(float(token.get("price_change_5m") or 0.0))
+                                        risk_soft = str(token.get("risk_level") or "").upper()
+                                        warning_soft = int(token.get("warning_flags") or 0)
+                                        risky_flags_soft = {
+                                            str(x).strip().lower()
+                                            for x in ((safety or {}).get("risky_flags") or [])
+                                            if str(x).strip()
+                                        }
+                                        onchain_contract_detail = (
+                                            f"source={source_name or 'unknown'} "
+                                            f"safety_source={safety_source or 'none'} "
+                                            f"age={age_s} liq={liq_u:.0f} vol5m={vol5_u:.0f} abs5m={abs5_u:.2f} "
+                                            f"score={int(score_now or 0)} risk={risk_soft or 'NONE'} "
+                                            f"warn={warning_soft} flags={','.join(sorted(risky_flags_soft)) or '-'}"
+                                        )
+                                    if (
+                                        is_non_watch_source
+                                        and token_address
+                                        and bool(
+                                            getattr(
+                                                config,
+                                                "LOCAL_ANTISCAM_SAFE_CONTRACT_TO_BLACKLIST",
+                                                True,
+                                            )
+                                        )
+                                    ):
+                                        try:
+                                            auto_trader._blacklist_add(
+                                                token_address,
+                                                "pre_rug_guard:safe_contract",
+                                                ttl_seconds=max(
+                                                    900,
+                                                    int(
+                                                        getattr(
+                                                            config,
+                                                            "LOCAL_ANTISCAM_SAFE_CONTRACT_BLACKLIST_TTL_SECONDS",
+                                                            21600,
+                                                        )
+                                                        or 21600
+                                                    ),
+                                                ),
+                                            )
+                                        except Exception:
+                                            logger.exception(
+                                                "LOCAL_ANTISCAM_SAFE_CONTRACT_BLACKLIST_FAILED token=%s address=%s",
+                                                token.get("symbol", "N/A"),
+                                                token_address,
+                                            )
+                                    _filter_fail("safe_contract", token, onchain_contract_detail)
                                     continue
                             required_risk = str(config.SAFE_REQUIRE_RISK_LEVEL).upper()
                             risk = str(token.get("risk_level", "HIGH")).upper()
@@ -4366,15 +6375,234 @@ async def run_local_loop() -> None:
                                                 non_watch_transient_age_soft_max_per_cycle,
                                                 source_name or "unknown",
                                             )
+                                        if (
+                                            (not age_soft_passed)
+                                            and is_non_watch_source
+                                            and source_name.startswith("onchain")
+                                            and onchain_transient_age_bridge_enabled
+                                            and age_s >= onchain_transient_age_bridge_min_seconds
+                                            and liq_u >= onchain_transient_age_bridge_min_liquidity
+                                            and vol5_u >= onchain_transient_age_bridge_min_volume_5m
+                                            and int(score_now) >= onchain_transient_age_bridge_min_score
+                                            and abs5 <= onchain_transient_age_bridge_max_abs5
+                                        ):
+                                            if (
+                                                onchain_transient_age_bridge_max_per_cycle > 0
+                                                and onchain_transient_age_bridge_used_cycle
+                                                >= onchain_transient_age_bridge_max_per_cycle
+                                            ):
+                                                _filter_fail(
+                                                    "safe_transient_age_onchain_bridge_cycle_cap",
+                                                    token,
+                                                    (
+                                                        f"age={age_s}/{min_age_s} "
+                                                        f"used={onchain_transient_age_bridge_used_cycle}/"
+                                                        f"{onchain_transient_age_bridge_max_per_cycle}"
+                                                    ),
+                                                )
+                                                continue
+                                            if onchain_transient_age_bridge_max_per_cycle > 0:
+                                                onchain_transient_age_bridge_used_cycle += 1
+                                            age_soft_passed = True
+                                            token["_safe_transient_age_soft_pass"] = True
+                                            token["_safe_transient_age_soft_detail"] = (
+                                                f"onchain_bridge age={age_s}/{min_age_s} "
+                                                f"relaxed={onchain_transient_age_bridge_min_seconds} "
+                                                f"liq={liq_u:.0f}/{onchain_transient_age_bridge_min_liquidity:.0f} "
+                                                f"vol5m={vol5_u:.0f}/{onchain_transient_age_bridge_min_volume_5m:.0f} "
+                                                f"score={int(score_now)}/{onchain_transient_age_bridge_min_score} "
+                                                f"abs5m={abs5:.2f}/{onchain_transient_age_bridge_max_abs5:.2f} "
+                                                f"used={onchain_transient_age_bridge_used_cycle}/"
+                                                f"{onchain_transient_age_bridge_max_per_cycle}"
+                                            )
+                                            logger.info(
+                                                "ONCHAIN_TRANSIENT_AGE_BRIDGE_PASS token=%s age=%s/%s relaxed=%s "
+                                                "liq=%.0f/%.0f vol5m=%.0f/%.0f score=%s/%s abs5m=%.2f/%.2f used=%s/%s source=%s",
+                                                token.get("symbol", "N/A"),
+                                                age_s,
+                                                min_age_s,
+                                                onchain_transient_age_bridge_min_seconds,
+                                                liq_u,
+                                                onchain_transient_age_bridge_min_liquidity,
+                                                vol5_u,
+                                                onchain_transient_age_bridge_min_volume_5m,
+                                                int(score_now),
+                                                onchain_transient_age_bridge_min_score,
+                                                abs5,
+                                                onchain_transient_age_bridge_max_abs5,
+                                                onchain_transient_age_bridge_used_cycle,
+                                                onchain_transient_age_bridge_max_per_cycle,
+                                                source_name or "unknown",
+                                            )
                                         if not age_soft_passed:
                                             _filter_fail("safe_transient_age", token, f"age={age_s} min={min_age_s}")
                                             continue
                                     if liq_u < min_liq_u:
-                                        _filter_fail("safe_transient_liquidity", token, f"liq={liq_u:.0f} min={min_liq_u:.0f}")
-                                        continue
+                                        liquidity_soft_passed = False
+                                        if is_non_watch_source and non_watch_transient_volume_soft_enabled:
+                                            risk_now = str(token.get("risk_level", "HIGH")).upper()
+                                            warnings_now = int(token.get("warning_flags") or 0)
+                                            is_contract_safe_now = bool(token.get("is_contract_safe", False))
+                                            risk_rank = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
+                                            max_risk_rank = int(risk_rank.get(non_watch_transient_volume_soft_max_risk_level, 1))
+                                            risk_ok = int(risk_rank.get(risk_now, 2)) <= max_risk_rank
+                                            contract_ok = (
+                                                (not non_watch_transient_volume_soft_require_contract_safe)
+                                                or is_contract_safe_now
+                                            )
+                                            if (
+                                                age_s >= non_watch_transient_volume_soft_min_seconds
+                                                and liq_u >= non_watch_transient_volume_soft_min_liquidity
+                                                and vol5_u >= non_watch_transient_volume_soft_min_volume_5m
+                                                and int(score_now) >= non_watch_transient_volume_soft_min_score
+                                                and warnings_now <= non_watch_transient_volume_soft_max_warning_flags
+                                                and abs5 <= non_watch_transient_volume_soft_max_abs5
+                                                and contract_ok
+                                                and risk_ok
+                                            ):
+                                                if (
+                                                    non_watch_transient_volume_soft_max_per_cycle > 0
+                                                    and non_watch_transient_volume_soft_used_cycle
+                                                    >= non_watch_transient_volume_soft_max_per_cycle
+                                                ):
+                                                    _filter_fail(
+                                                        "safe_transient_liquidity_non_watch_cycle_cap",
+                                                        token,
+                                                        (
+                                                            f"liq={liq_u:.0f}/{min_liq_u:.0f} "
+                                                            f"used={non_watch_transient_volume_soft_used_cycle}/"
+                                                            f"{non_watch_transient_volume_soft_max_per_cycle}"
+                                                        ),
+                                                    )
+                                                    continue
+                                                if non_watch_transient_volume_soft_max_per_cycle > 0:
+                                                    non_watch_transient_volume_soft_used_cycle += 1
+                                                liquidity_soft_passed = True
+                                                token["_safe_transient_liquidity_soft_pass"] = True
+                                                token["_safe_transient_liquidity_soft_detail"] = (
+                                                    f"liq={liq_u:.0f}/{min_liq_u:.0f} "
+                                                    f"relaxed={non_watch_transient_volume_soft_min_liquidity:.0f} "
+                                                    f"age={age_s}/{non_watch_transient_volume_soft_min_seconds} "
+                                                    f"vol5m={vol5_u:.0f}/{non_watch_transient_volume_soft_min_volume_5m:.0f} "
+                                                    f"score={int(score_now)}/{non_watch_transient_volume_soft_min_score} "
+                                                    f"risk={risk_now}/{non_watch_transient_volume_soft_max_risk_level} "
+                                                    f"warn={warnings_now}/{non_watch_transient_volume_soft_max_warning_flags} "
+                                                    f"abs5m={abs5:.2f}/{non_watch_transient_volume_soft_max_abs5:.2f} "
+                                                    f"used={non_watch_transient_volume_soft_used_cycle}/"
+                                                    f"{non_watch_transient_volume_soft_max_per_cycle}"
+                                                )
+                                                logger.info(
+                                                    "NON_WATCH_SAFE_TRANSIENT_LIQUIDITY_SOFT_PASS token=%s liq=%.0f/%.0f "
+                                                    "relaxed=%.0f age=%s/%s vol5m=%.0f/%.0f score=%s/%s risk=%s/%s "
+                                                    "warn=%s/%s abs5m=%.2f/%.2f used=%s/%s source=%s",
+                                                    token.get("symbol", "N/A"),
+                                                    liq_u,
+                                                    min_liq_u,
+                                                    non_watch_transient_volume_soft_min_liquidity,
+                                                    age_s,
+                                                    non_watch_transient_volume_soft_min_seconds,
+                                                    vol5_u,
+                                                    non_watch_transient_volume_soft_min_volume_5m,
+                                                    int(score_now),
+                                                    non_watch_transient_volume_soft_min_score,
+                                                    risk_now,
+                                                    non_watch_transient_volume_soft_max_risk_level,
+                                                    warnings_now,
+                                                    non_watch_transient_volume_soft_max_warning_flags,
+                                                    abs5,
+                                                    non_watch_transient_volume_soft_max_abs5,
+                                                    non_watch_transient_volume_soft_used_cycle,
+                                                    non_watch_transient_volume_soft_max_per_cycle,
+                                                    source_name or "unknown",
+                                                )
+                                        if not liquidity_soft_passed:
+                                            _filter_fail("safe_transient_liquidity", token, f"liq={liq_u:.0f} min={min_liq_u:.0f}")
+                                            continue
                                     if vol5_u < min_vol5_u:
-                                        _filter_fail("safe_transient_volume", token, f"vol5m={vol5_u:.0f} min={min_vol5_u:.0f}")
-                                        continue
+                                        volume_soft_passed = False
+                                        if is_non_watch_source and non_watch_transient_volume_soft_enabled:
+                                            risk_now = str(token.get("risk_level", "HIGH")).upper()
+                                            warnings_now = int(token.get("warning_flags") or 0)
+                                            is_contract_safe_now = bool(token.get("is_contract_safe", False))
+                                            risk_rank = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
+                                            max_risk_rank = int(risk_rank.get(non_watch_transient_volume_soft_max_risk_level, 1))
+                                            risk_ok = int(risk_rank.get(risk_now, 2)) <= max_risk_rank
+                                            contract_ok = (
+                                                (not non_watch_transient_volume_soft_require_contract_safe)
+                                                or is_contract_safe_now
+                                            )
+                                            if (
+                                                age_s >= non_watch_transient_volume_soft_min_seconds
+                                                and liq_u >= non_watch_transient_volume_soft_min_liquidity
+                                                and vol5_u >= non_watch_transient_volume_soft_min_volume_5m
+                                                and int(score_now) >= non_watch_transient_volume_soft_min_score
+                                                and warnings_now <= non_watch_transient_volume_soft_max_warning_flags
+                                                and abs5 <= non_watch_transient_volume_soft_max_abs5
+                                                and contract_ok
+                                                and risk_ok
+                                            ):
+                                                if (
+                                                    non_watch_transient_volume_soft_max_per_cycle > 0
+                                                    and non_watch_transient_volume_soft_used_cycle
+                                                    >= non_watch_transient_volume_soft_max_per_cycle
+                                                ):
+                                                    _filter_fail(
+                                                        "safe_transient_volume_non_watch_cycle_cap",
+                                                        token,
+                                                        (
+                                                            f"vol5m={vol5_u:.0f}/{min_vol5_u:.0f} "
+                                                            f"used={non_watch_transient_volume_soft_used_cycle}/"
+                                                            f"{non_watch_transient_volume_soft_max_per_cycle}"
+                                                        ),
+                                                    )
+                                                    continue
+                                                if non_watch_transient_volume_soft_max_per_cycle > 0:
+                                                    non_watch_transient_volume_soft_used_cycle += 1
+                                                volume_soft_passed = True
+                                                token["_safe_transient_volume_soft_pass"] = True
+                                                token["_safe_transient_volume_soft_detail"] = (
+                                                    f"vol5m={vol5_u:.0f}/{min_vol5_u:.0f} "
+                                                    f"relaxed={non_watch_transient_volume_soft_min_volume_5m:.0f} "
+                                                    f"age={age_s}/{non_watch_transient_volume_soft_min_seconds} "
+                                                    f"liq={liq_u:.0f}/{non_watch_transient_volume_soft_min_liquidity:.0f} "
+                                                    f"score={int(score_now)}/{non_watch_transient_volume_soft_min_score} "
+                                                    f"risk={risk_now}/{non_watch_transient_volume_soft_max_risk_level} "
+                                                    f"warn={warnings_now}/{non_watch_transient_volume_soft_max_warning_flags} "
+                                                    f"abs5m={abs5:.2f}/{non_watch_transient_volume_soft_max_abs5:.2f} "
+                                                    f"used={non_watch_transient_volume_soft_used_cycle}/"
+                                                    f"{non_watch_transient_volume_soft_max_per_cycle}"
+                                                )
+                                                logger.info(
+                                                    "NON_WATCH_SAFE_TRANSIENT_VOLUME_SOFT_PASS token=%s vol5m=%.0f/%.0f "
+                                                    "relaxed=%.0f age=%s/%s liq=%.0f/%.0f score=%s/%s risk=%s/%s "
+                                                    "warn=%s/%s abs5m=%.2f/%.2f used=%s/%s source=%s",
+                                                    token.get("symbol", "N/A"),
+                                                    vol5_u,
+                                                    min_vol5_u,
+                                                    non_watch_transient_volume_soft_min_volume_5m,
+                                                    age_s,
+                                                    non_watch_transient_volume_soft_min_seconds,
+                                                    liq_u,
+                                                    non_watch_transient_volume_soft_min_liquidity,
+                                                    int(score_now),
+                                                    non_watch_transient_volume_soft_min_score,
+                                                    risk_now,
+                                                    non_watch_transient_volume_soft_max_risk_level,
+                                                    warnings_now,
+                                                    non_watch_transient_volume_soft_max_warning_flags,
+                                                    abs5,
+                                                    non_watch_transient_volume_soft_max_abs5,
+                                                    non_watch_transient_volume_soft_used_cycle,
+                                                    non_watch_transient_volume_soft_max_per_cycle,
+                                                    source_name or "unknown",
+                                                )
+                                        if not volume_soft_passed:
+                                            _filter_fail(
+                                                "safe_transient_volume",
+                                                token,
+                                                f"vol5m={vol5_u:.0f} min={min_vol5_u:.0f}",
+                                            )
+                                            continue
                                     if abs5 > max_abs5:
                                         _filter_fail("safe_transient_change_5m", token, f"abs5m={abs5:.2f} max={max_abs5:.2f}")
                                         continue
@@ -4482,6 +6710,7 @@ async def run_local_loop() -> None:
                                 "decision_stage": "post_filters",
                                 "decision": "candidate_pass",
                                 "reason": "passed_all_filters",
+                                "lane_tag": _candidate_lane_tag(token),
                                 "market_regime": market_regime_current,
                                 "entry_tier": entry_tier,
                                 "address": token_address,
@@ -4610,6 +6839,7 @@ async def run_local_loop() -> None:
                                 "decision_stage": "quality_gate",
                                 "decision": "skip",
                                 "reason": str((drop_row or {}).get("reason", "quality_gate")),
+                                "lane_tag": _candidate_lane_tag(token_data or {}),
                                 "quality_bucket": str((drop_row or {}).get("bucket", "")),
                                 "market_regime": market_regime_current,
                                 "market_regime_reason": market_regime_reason,
@@ -4752,6 +6982,7 @@ async def run_local_loop() -> None:
                                 "decision_stage": "policy_gate",
                                 "decision": "skip",
                                 "reason": policy_skip_reason,
+                                "lane_tag": _candidate_lane_tag(token_data),
                                 "policy_reason": str(policy_effective_reason),
                                 "market_regime": market_regime_current,
                                 "market_regime_reason": market_regime_reason,
@@ -4762,10 +6993,21 @@ async def run_local_loop() -> None:
                                 "quality": _candidate_quality_features(token_data, score_data),
                             }
                         )
-                await auto_trader.process_open_positions(bot=None)
                 auto_stats = auto_trader.get_stats()
                 skip_reasons_cycle = auto_trader.pop_skip_reason_counts_window()
                 source_flow_cycle = auto_trader.pop_source_flow_window()
+                lane_flow_cycle = auto_trader.pop_lane_flow_window()
+                raw_watchlist_cycle = int(
+                    sum(
+                        1
+                        for row in (tokens or [])
+                        if str((row or {}).get("source", "")).strip().lower().startswith("watchlist")
+                    )
+                )
+                raw_non_watch_cycle = max(0, int(len(tokens or [])) - int(raw_watchlist_cycle))
+                raw_lane_counts_cycle = _count_lanes(tokens)
+                raw_stable_cycle = int(raw_lane_counts_cycle.get("stable", 0))
+                raw_discovery_cycle = int(raw_lane_counts_cycle.get("discovery", 0))
                 post_filters_non_watch_cycle = int(
                     sum(
                         1
@@ -4773,12 +7015,27 @@ async def run_local_loop() -> None:
                         if not str((token_data or {}).get("source", "")).strip().lower().startswith("watchlist")
                     )
                 )
+                post_filters_stable_cycle = int(
+                    sum(
+                        1
+                        for token_data, _score_data in (trade_candidates or [])
+                        if _candidate_lane_tag(token_data or {}) == "stable"
+                    )
+                )
+                post_filters_discovery_cycle = max(
+                    0,
+                    int(len(trade_candidates or [])) - int(post_filters_stable_cycle),
+                )
                 plan_non_watch_cycle = int(
                     sum(
                         int((row or {}).get("plan_attempts", 0) or 0)
                         for src, row in (source_flow_cycle or {}).items()
                         if not str(src or "").strip().lower().startswith("watchlist")
                     )
+                )
+                plan_stable_cycle = int(((lane_flow_cycle or {}).get("stable") or {}).get("plan_attempts", 0) or 0)
+                plan_discovery_cycle = int(
+                    ((lane_flow_cycle or {}).get("discovery") or {}).get("plan_attempts", 0) or 0
                 )
                 candidate_count_cycle = len(candidates_quality)
                 adaptive_filters.record_cycle(
@@ -4830,8 +7087,20 @@ async def run_local_loop() -> None:
                         "score": 0,
                         "raw_non_watch": int(raw_non_watch_cycle),
                         "raw_watchlist": int(raw_watchlist_cycle),
+                        "raw_stable": int(raw_stable_cycle),
+                        "raw_discovery": int(raw_discovery_cycle),
                         "post_filters_non_watch": int(post_filters_non_watch_cycle),
+                        "post_filters_stable": int(post_filters_stable_cycle),
+                        "post_filters_discovery": int(post_filters_discovery_cycle),
                         "plan_non_watch": int(plan_non_watch_cycle),
+                        "plan_stable": int(plan_stable_cycle),
+                        "plan_discovery": int(plan_discovery_cycle),
+                        "raw_non_watch_actionable_total": int(non_watch_actionable_total_cycle),
+                        "raw_non_watch_actionable_pass": int(non_watch_actionable_pass_cycle),
+                        "raw_non_watch_actionable_fail": int(non_watch_actionable_fail_cycle),
+                        "raw_non_watch_actionable_fail_reasons": dict(
+                            sorted((non_watch_actionable_reasons_cycle or {}).items())
+                        ),
                         "watchlist_fallback_used": bool(watchlist_fallback_used_cycle),
                         "fallback_reason": str(watchlist_fallback_reason_cycle or "none"),
                     }
@@ -5000,7 +7269,9 @@ async def run_local_loop() -> None:
                     (
                         "Scanned %s tokens | High quality: %s | Alerts sent: %s | Trade candidates: %s | "
                         "Quality out/core/explore/probe: %s/%s/%s/%s | Opened: %s | "
-                        "Raw lanes nw/wl=%s/%s fallback=%s(%s) | PostNW: %s | PlanNW: %s | "
+                        "Raw lanes nw/wl/stable/discovery=%s/%s/%s/%s fallback=%s(%s) | "
+                        "Raw NW actionable pass/fail=%s/%s reasons=%s | "
+                        "Post NW/stable/discovery=%s/%s/%s | Plan NW/stable/discovery=%s/%s/%s | "
                         "Mode: local | Source: %s | Policy: raw=%s/effective=%s(%s) | Regime: %s(%s) | "
                         "Safety: checked=%s fail_closed=%s reasons=%s | FiltersTop(session): %s | Dedup: heavy_skip=%s override=%s | "
                         "V2Budget: %s/%s | SourceQoS: %s | Ingest: %s | Sources: %s | Tasks: %s | RSS: %.1fMB | CycleAvg: %.2fs"
@@ -5016,10 +7287,19 @@ async def run_local_loop() -> None:
                     opened_trades,
                     int(raw_non_watch_cycle),
                     int(raw_watchlist_cycle),
+                    int(raw_stable_cycle),
+                    int(raw_discovery_cycle),
                     int(1 if watchlist_fallback_used_cycle else 0),
                     str(watchlist_fallback_reason_cycle or "none"),
+                    int(non_watch_actionable_pass_cycle),
+                    int(non_watch_actionable_fail_cycle),
+                    str(non_watch_actionable_reasons_brief_cycle or "none"),
                     int(post_filters_non_watch_cycle),
+                    int(post_filters_stable_cycle),
+                    int(post_filters_discovery_cycle),
                     int(plan_non_watch_cycle),
+                    int(plan_stable_cycle),
+                    int(plan_discovery_cycle),
                     source_mode,
                     policy_state,
                     policy_effective_mode,
@@ -5042,11 +7322,26 @@ async def run_local_loop() -> None:
                     (sum(cycle_times) / len(cycle_times)) if cycle_times else 0.0,
                 )
                 logger.info(
-                    "FLOW_LANE_METRICS raw_non_watch=%s raw_watchlist=%s post_filters_non_watch=%s plan_non_watch=%s watchlist_fallback_used=%s fallback_reason=%s",
+                    (
+                        "FLOW_LANE_METRICS raw_non_watch=%s raw_watchlist=%s raw_stable=%s raw_discovery=%s "
+                        "raw_non_watch_actionable_pass=%s raw_non_watch_actionable_fail=%s reasons=%s "
+                        "post_filters_non_watch=%s post_filters_stable=%s post_filters_discovery=%s "
+                        "plan_non_watch=%s plan_stable=%s plan_discovery=%s "
+                        "watchlist_fallback_used=%s fallback_reason=%s"
+                    ),
                     int(raw_non_watch_cycle),
                     int(raw_watchlist_cycle),
+                    int(raw_stable_cycle),
+                    int(raw_discovery_cycle),
+                    int(non_watch_actionable_pass_cycle),
+                    int(non_watch_actionable_fail_cycle),
+                    str(non_watch_actionable_reasons_brief_cycle or "none"),
                     int(post_filters_non_watch_cycle),
+                    int(post_filters_stable_cycle),
+                    int(post_filters_discovery_cycle),
                     int(plan_non_watch_cycle),
+                    int(plan_stable_cycle),
+                    int(plan_discovery_cycle),
                     int(1 if watchlist_fallback_used_cycle else 0),
                     str(watchlist_fallback_reason_cycle or "none"),
                 )
@@ -5064,6 +7359,21 @@ async def run_local_loop() -> None:
             )
             await asyncio.sleep(sleep_seconds)
     finally:
+        position_watchdog_stop.set()
+        if position_watchdog_task is not None:
+            try:
+                await asyncio.wait_for(
+                    position_watchdog_task,
+                    timeout=max(2.0, float(position_watchdog_interval_seconds) + 2.0),
+                )
+            except asyncio.TimeoutError:
+                position_watchdog_task.cancel()
+                try:
+                    await position_watchdog_task
+                except Exception:
+                    pass
+            except Exception:
+                logger.exception("POSITION_WATCHDOG shutdown failed")
         _write_heartbeat(stage="shutdown", cycle_index=cycle_index, open_trades=len(auto_trader.open_positions))
         stats_snapshot: dict[str, Any] = {}
         try:
@@ -5105,6 +7415,15 @@ def main() -> None:
     atexit.register(lock.release)
     _write_single_pid_file()
     configure_logging()
+    try:
+        _startup_align_runtime_patch_critical_keys(run_tag=RUN_TAG)
+        _startup_self_check_override_keys(run_tag=RUN_TAG)
+    except Exception as exc:
+        _write_startup_exit_report(
+            reason="startup_config_check_failed",
+            detail=f"{exc.__class__.__name__}:{exc}",
+        )
+        raise
     _clear_startup_exit_report()
     _clear_graceful_stop_flag()
     try:

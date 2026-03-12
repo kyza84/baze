@@ -176,6 +176,16 @@ Persistent JSONL log includes:
   - `decision_meta.policy` (phase and degrade counters)
   - `blocked_actions` and `delta_capped_actions`
 
+### V5 Telemetry/Locks (2026-03-12)
+
+- New lane-level profile in tick telemetry:
+  - `telemetry_v2.lane_profile_15m`
+  - fields per lane (`stable`, `discovery`): `candidate_count`, `post_filters_pass`, `plan_attempts`, `plan_skips`, `opens`, `closes`.
+- Structural lock enforcement is no longer dry-run-only:
+  - tuner blocks mutations for structural lane/source keys in both dry-run and apply modes.
+  - blocked entries are reported in `blocked_actions` with `blocked_by=structural_lock` (or `dry_run_structural_lock`).
+- This keeps lane/source architecture single-writer while still allowing economic soft knobs to be tuned.
+
 ## Anti-Concentration
 
 The tuner detects repeated-symbol lock-in from recent `AUTO_BUY` events.

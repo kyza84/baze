@@ -23,6 +23,8 @@
   - Runtime loop and stage orchestration.
   - Candidate collection -> filter/precheck -> planning -> execution dispatch.
   - Emits stage-level diagnostics (`candidates.jsonl`).
+  - Maintains lane split (`stable`/`discovery`) and upstream non-watch actionability accounting.
+  - Runs startup config consistency/sync checks before runtime loop.
 - `trading/v2_runtime.py`
   - Quality routing controls and source shaping.
 - `trading/runtime_policy.py`
@@ -33,6 +35,8 @@
   - Position open/close lifecycle.
   - Trade governance, cooldowns, limits.
   - Interface between planner and paper/live executor.
+  - Lane-aware planning/economics (`stable`/`discovery`) with non-watch bridge controls.
+  - Hard non-watch anti-scam pre-buy gate and post-entry pump/rug guards.
 - `trading/live_executor.py`
   - Route/quote/swap/receipt handling for live mode.
 
@@ -75,9 +79,19 @@
 6. Logs/alerts written for diagnostics.
 7. Runtime tuner consumes logs and updates mutable knobs.
 
+### 2.1 Lane Model (V5)
+- `stable` lane:
+  - higher-quality/older/more-liquid rows, lower volatility tolerance.
+  - intended for sustained execution and lower false-positive rate.
+- `discovery` lane:
+  - broader non-watch intake with stricter anti-scam hard guards.
+  - intended to keep exploration alive without disabling safety.
+- Lane counters are propagated through raw/post-filter/plan/open-close windows.
+
 ## 3. Safety Boundaries
 - Anti-scam hard keys are contract-locked.
 - Runtime tuner can only touch allow-listed mutable keys.
+- Structural lane/source keys are single-writer and blocked in tuner apply path.
 - State persistence uses lock + temp + replace semantics.
 - Matrix watchdog isolates stale/dead workers.
 

@@ -38,6 +38,7 @@ class DexScreenerMonitor:
     def __init__(self) -> None:
         self.seen_tokens: dict[str, float] = {}
         self._low_flow_last_boost_ts = 0.0
+        self._low_flow_last_success_tokens: list[dict[str, Any]] = []
         self._low_flow_trigger_tokens = max(
             4,
             int(getattr(config, "NON_WATCH_LOW_FLOW_TRIGGER_TOKENS", 20) or 20),
@@ -52,6 +53,44 @@ class DexScreenerMonitor:
                 )
                 or 30.0
             ),
+        )
+        self._low_flow_source_timeout_seconds = max(
+            4.0,
+            min(
+                60.0,
+                float(
+                    getattr(
+                        config,
+                        "NON_WATCH_LOW_FLOW_SOURCE_TIMEOUT_SECONDS",
+                        25.0,
+                    )
+                    or 25.0
+                ),
+            ),
+        )
+        self._low_flow_gecko_timeout_seconds = max(
+            3.0,
+            min(
+                60.0,
+                float(
+                    getattr(
+                        config,
+                        "NON_WATCH_LOW_FLOW_GECKO_TIMEOUT_SECONDS",
+                        8.0,
+                    )
+                    or 8.0
+                ),
+            ),
+        )
+        self._low_flow_gecko_queue_first_enabled = bool(
+            getattr(config, "NON_WATCH_LOW_FLOW_GECKO_QUEUE_FIRST_ENABLED", True)
+        )
+        self._low_flow_cache_fill_enabled = bool(
+            getattr(config, "NON_WATCH_LOW_FLOW_CACHE_FILL_ENABLED", True)
+        )
+        self._low_flow_cache_fill_max_tokens = max(
+            1,
+            int(getattr(config, "NON_WATCH_LOW_FLOW_CACHE_FILL_MAX_TOKENS", 8) or 8),
         )
         self._low_flow_relaxed_age_cap_seconds = max(
             int(TOKEN_AGE_MAX),
@@ -70,17 +109,161 @@ class DexScreenerMonitor:
                 getattr(
                     config,
                     "NON_WATCH_LOW_FLOW_RELAXED_MIN_LIQUIDITY_USD",
-                    max(500.0, float(MIN_LIQUIDITY) * 0.40),
+                    max(500.0, float(MIN_LIQUIDITY) * 0.60),
                 )
-                or max(500.0, float(MIN_LIQUIDITY) * 0.40)
+                or max(500.0, float(MIN_LIQUIDITY) * 0.60)
             ),
         )
+        fallback_min_volume_5m = max(
+            30.0,
+            float(getattr(config, "TOKEN_SAFETY_FALLBACK_MIN_VOLUME_5M_USD", 100.0) or 100.0),
+        )
+        self._low_flow_relaxed_min_volume_5m_usd = max(
+            30.0,
+            float(
+                getattr(
+                    config,
+                    "NON_WATCH_LOW_FLOW_RELAXED_MIN_VOLUME_5M_USD",
+                    max(30.0, fallback_min_volume_5m * 0.70),
+                )
+                or max(30.0, fallback_min_volume_5m * 0.70)
+            ),
+        )
+        fallback_min_age_seconds = max(
+            60,
+            int(getattr(config, "TOKEN_SAFETY_FALLBACK_MIN_AGE_SECONDS", 180) or 180),
+        )
+        self._low_flow_relaxed_min_age_seconds = max(
+            60,
+            int(
+                getattr(
+                    config,
+                    "NON_WATCH_LOW_FLOW_RELAXED_MIN_AGE_SECONDS",
+                    max(60, int(round(float(fallback_min_age_seconds) * 0.70))),
+                )
+                or max(60, int(round(float(fallback_min_age_seconds) * 0.70)))
+            ),
+        )
+        transient_max_abs_change = max(
+            5.0,
+            float(getattr(config, "LOCAL_ANTISCAM_TRANSIENT_MAX_ABS_CHANGE_5M", 15.0) or 15.0),
+        )
+        self._low_flow_relaxed_max_abs_change_5m = max(
+            8.0,
+            float(
+                getattr(
+                    config,
+                    "NON_WATCH_LOW_FLOW_RELAXED_MAX_ABS_CHANGE_5M",
+                    min(25.0, max(10.0, transient_max_abs_change * 1.35)),
+                )
+                or min(25.0, max(10.0, transient_max_abs_change * 1.35))
+            ),
+        )
+        if bool(getattr(config, "ANTI_SCAM_LOCKED_MODE", False)):
+            fallback_min_liquidity = max(
+                500.0,
+                float(getattr(config, "TOKEN_SAFETY_FALLBACK_MIN_LIQUIDITY_USD", 6000.0) or 6000.0),
+            )
+            if bool(getattr(config, "ANTI_SCAM_LOCKED_NON_WATCH_UPSTREAM_FLOOR_ENABLED", False)):
+                # Optional strict upstream floor for non-watch discovery in locked mode.
+                # Disabled by default to avoid starving non-watch before hard safety checks.
+                self._low_flow_relaxed_min_liquidity_usd = max(
+                    float(self._low_flow_relaxed_min_liquidity_usd),
+                    float(fallback_min_liquidity) * 0.70,
+                )
+                self._low_flow_relaxed_min_volume_5m_usd = max(
+                    float(self._low_flow_relaxed_min_volume_5m_usd),
+                    float(fallback_min_volume_5m) * 0.70,
+                )
+                self._low_flow_relaxed_min_age_seconds = max(
+                    int(self._low_flow_relaxed_min_age_seconds),
+                    int(round(float(fallback_min_age_seconds) * 0.70)),
+                )
+                self._low_flow_relaxed_max_abs_change_5m = min(
+                    float(self._low_flow_relaxed_max_abs_change_5m),
+                    max(10.0, float(transient_max_abs_change) * 1.35),
+                )
+            if bool(getattr(config, "ANTI_SCAM_LOCKED_NON_WATCH_ACTIONABLE_ALIGN_ENABLED", False)):
+                liq_mult = max(
+                    0.30,
+                    min(
+                        1.00,
+                        float(getattr(config, "ANTI_SCAM_LOCKED_NON_WATCH_ACTIONABLE_LIQ_MULT", 0.70) or 0.70),
+                    ),
+                )
+                vol_mult = max(
+                    0.30,
+                    min(
+                        1.00,
+                        float(getattr(config, "ANTI_SCAM_LOCKED_NON_WATCH_ACTIONABLE_VOL_MULT", 0.70) or 0.70),
+                    ),
+                )
+                age_mult = max(
+                    0.30,
+                    min(
+                        1.00,
+                        float(getattr(config, "ANTI_SCAM_LOCKED_NON_WATCH_ACTIONABLE_AGE_MULT", 0.70) or 0.70),
+                    ),
+                )
+                abs5_mult = max(
+                    1.00,
+                    min(
+                        2.50,
+                        float(
+                            getattr(
+                                config,
+                                "ANTI_SCAM_LOCKED_NON_WATCH_ACTIONABLE_MAX_ABS5_MULT",
+                                1.20,
+                            )
+                            or 1.20
+                        ),
+                    ),
+                )
+                transient_min_liq = max(
+                    500.0,
+                    float(getattr(config, "LOCAL_ANTISCAM_TRANSIENT_MIN_LIQUIDITY_USD", 18000.0) or 18000.0),
+                )
+                transient_min_vol5 = max(
+                    30.0,
+                    float(getattr(config, "LOCAL_ANTISCAM_TRANSIENT_MIN_VOLUME_5M_USD", 900.0) or 900.0),
+                )
+                transient_min_age = max(
+                    60,
+                    int(getattr(config, "LOCAL_ANTISCAM_TRANSIENT_MIN_AGE_SECONDS", 900) or 900),
+                )
+                self._low_flow_relaxed_min_liquidity_usd = max(
+                    float(self._low_flow_relaxed_min_liquidity_usd),
+                    float(transient_min_liq) * float(liq_mult),
+                )
+                self._low_flow_relaxed_min_volume_5m_usd = max(
+                    float(self._low_flow_relaxed_min_volume_5m_usd),
+                    float(transient_min_vol5) * float(vol_mult),
+                )
+                self._low_flow_relaxed_min_age_seconds = max(
+                    int(self._low_flow_relaxed_min_age_seconds),
+                    int(round(float(transient_min_age) * float(age_mult))),
+                )
+                self._low_flow_relaxed_max_abs_change_5m = min(
+                    float(self._low_flow_relaxed_max_abs_change_5m),
+                    max(10.0, float(transient_max_abs_change) * float(abs5_mult)),
+                )
         self._low_flow_gecko_pages = max(
             0,
             int(getattr(config, "NON_WATCH_LOW_FLOW_GECKO_PAGES", 2) or 2),
         )
+        self._low_flow_gecko_trending_pages = max(
+            0,
+            int(getattr(config, "NON_WATCH_LOW_FLOW_GECKO_TRENDING_PAGES", 3) or 3),
+        )
+        self._low_flow_gecko_market_pages = max(
+            0,
+            int(getattr(config, "NON_WATCH_LOW_FLOW_GECKO_MARKET_PAGES", 2) or 2),
+        )
         self._low_flow_include_boosts = bool(
             getattr(config, "NON_WATCH_LOW_FLOW_INCLUDE_DEX_BOOSTS", True)
+        )
+        self._low_flow_actionable_filter_enabled = bool(
+            getattr(config, "NON_WATCH_LOW_FLOW_ACTIONABLE_FILTER_ENABLED", True)
         )
         self._headers = {
             "User-Agent": (
@@ -199,6 +382,9 @@ class DexScreenerMonitor:
         self._prune_seen_tokens()
         return await self._apply_low_flow_boost([], force=True)
 
+    def get_last_low_flow_boost_tokens(self) -> list[dict[str, Any]]:
+        return [dict(row or {}) for row in (self._low_flow_last_success_tokens or [])]
+
     async def _apply_low_flow_boost(
         self,
         base_tokens: list[dict[str, Any]],
@@ -212,43 +398,269 @@ class DexScreenerMonitor:
             return list(base_tokens)
         self._low_flow_last_boost_ts = now_ts
         try:
-            relaxed_dex = await self._fetch_from_dexscreener(
-                ignore_seen=True,
-                age_max_seconds=int(self._low_flow_relaxed_age_cap_seconds),
-                min_liquidity_usd=float(self._low_flow_relaxed_min_liquidity_usd),
-            )
-            relaxed_gecko: list[dict[str, Any]] = []
-            if int(self._low_flow_gecko_pages) > 0:
-                relaxed_gecko = await self._fetch_from_geckoterminal_api(
-                    pages=int(self._low_flow_gecko_pages),
-                    ignore_seen=True,
-                    age_max_seconds=int(self._low_flow_relaxed_age_cap_seconds),
-                    min_liquidity_usd=float(self._low_flow_relaxed_min_liquidity_usd),
-                )
-            relaxed_boosts: list[dict[str, Any]] = []
-            if self._low_flow_include_boosts and DEX_BOOSTS_SOURCE_ENABLED and DEX_BOOSTS_MAX_TOKENS > 0:
-                relaxed_boosts = await self._fetch_from_dex_boosts()
+            async def _run_low_flow_source(
+                name: str,
+                coro: Any,
+            ) -> list[dict[str, Any]]:
+                source_name = str(name or "")
+                is_gecko_source = source_name.startswith("gecko")
+                if is_gecko_source and self._low_flow_gecko_queue_first_enabled:
+                    try:
+                        drained = await self._drain_gecko_queue()
+                        if drained:
+                            logger.info(
+                                "NON_WATCH_LOW_FLOW_SOURCE_QUEUE_FIRST source=%s drained=%s",
+                                source_name,
+                                int(len(drained)),
+                            )
+                            return list(drained or [])
+                    except Exception as queue_exc:
+                        logger.warning(
+                            "NON_WATCH_LOW_FLOW_SOURCE_QUEUE_FIRST_FAIL source=%s err=%s",
+                            source_name,
+                            queue_exc,
+                        )
+                timeout_seconds = float(self._low_flow_source_timeout_seconds)
+                if is_gecko_source:
+                    timeout_seconds = float(self._low_flow_gecko_timeout_seconds)
+                try:
+                    out = await asyncio.wait_for(
+                        coro,
+                        timeout=float(timeout_seconds),
+                    )
+                    return list(out or [])
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "NON_WATCH_LOW_FLOW_SOURCE_TIMEOUT source=%s timeout=%ss",
+                        source_name,
+                        int(round(float(timeout_seconds))),
+                    )
+                    if is_gecko_source:
+                        try:
+                            drained = await self._drain_gecko_queue()
+                            if drained:
+                                logger.info(
+                                    "NON_WATCH_LOW_FLOW_SOURCE_TIMEOUT_FALLBACK source=%s drained=%s",
+                                    source_name,
+                                    int(len(drained)),
+                                )
+                                return list(drained or [])
+                        except Exception as queue_exc:
+                            logger.warning(
+                                "NON_WATCH_LOW_FLOW_SOURCE_TIMEOUT_FALLBACK_FAIL source=%s err=%s",
+                                source_name,
+                                queue_exc,
+                            )
+                    return []
+                except Exception as exc:
+                    logger.warning("NON_WATCH_LOW_FLOW_SOURCE_FAIL source=%s err=%s", source_name, exc)
+                    return []
 
-            out = self._merge_tokens(base_tokens, relaxed_dex, relaxed_gecko, relaxed_boosts)
+            fetch_jobs: list[tuple[str, Any]] = [
+                (
+                    "dex",
+                    self._fetch_from_dexscreener(
+                        ignore_seen=True,
+                        age_max_seconds=int(self._low_flow_relaxed_age_cap_seconds),
+                        min_liquidity_usd=float(self._low_flow_relaxed_min_liquidity_usd),
+                    ),
+                ),
+            ]
+            if int(self._low_flow_gecko_pages) > 0:
+                fetch_jobs.append(
+                    (
+                        "gecko_new",
+                        self._fetch_from_geckoterminal_api(
+                            pages=int(self._low_flow_gecko_pages),
+                            ignore_seen=True,
+                            age_max_seconds=int(self._low_flow_relaxed_age_cap_seconds),
+                            min_liquidity_usd=float(self._low_flow_relaxed_min_liquidity_usd),
+                        ),
+                    )
+                )
+            if int(self._low_flow_gecko_trending_pages) > 0:
+                fetch_jobs.append(
+                    (
+                        "gecko_trending",
+                        self._fetch_from_geckoterminal_trending(
+                            pages=int(self._low_flow_gecko_trending_pages),
+                            ignore_seen=True,
+                            age_max_seconds=int(self._low_flow_relaxed_age_cap_seconds),
+                            min_liquidity_usd=float(self._low_flow_relaxed_min_liquidity_usd),
+                        ),
+                    )
+                )
+            if int(self._low_flow_gecko_market_pages) > 0:
+                fetch_jobs.append(
+                    (
+                        "gecko_market",
+                        self._fetch_from_geckoterminal_market(
+                            pages=int(self._low_flow_gecko_market_pages),
+                            ignore_seen=True,
+                            age_max_seconds=int(self._low_flow_relaxed_age_cap_seconds),
+                            min_liquidity_usd=float(self._low_flow_relaxed_min_liquidity_usd),
+                        ),
+                    )
+                )
+            if self._low_flow_include_boosts and DEX_BOOSTS_SOURCE_ENABLED and DEX_BOOSTS_MAX_TOKENS > 0:
+                fetch_jobs.append(("dex_boosts", self._fetch_from_dex_boosts()))
+
+            results = await asyncio.gather(
+                *[_run_low_flow_source(name, coro) for name, coro in fetch_jobs],
+                return_exceptions=False,
+            )
+            by_name: dict[str, list[dict[str, Any]]] = {}
+            for (name, _), rows in zip(fetch_jobs, results):
+                by_name[str(name)] = list(rows or [])
+
+            relaxed_dex = list(by_name.get("dex") or [])
+            relaxed_gecko = list(by_name.get("gecko_new") or [])
+            relaxed_gecko_trending = list(by_name.get("gecko_trending") or [])
+            relaxed_gecko_market = list(by_name.get("gecko_market") or [])
+            relaxed_boosts = list(by_name.get("dex_boosts") or [])
+            dropped_dex = 0
+            dropped_gecko = 0
+            dropped_gecko_trending = 0
+            dropped_gecko_market = 0
+            dropped_boosts = 0
+            dropped_reasons_dex: dict[str, int] = {}
+            dropped_reasons_gecko: dict[str, int] = {}
+            dropped_reasons_gecko_trending: dict[str, int] = {}
+            dropped_reasons_gecko_market: dict[str, int] = {}
+            dropped_reasons_boosts: dict[str, int] = {}
+            # Keep low-flow intake alive in locked anti-scam mode: let raw rows reach
+            # the main hardened filter pipeline instead of starving before it.
+            apply_actionable_filter = bool(
+                self._low_flow_actionable_filter_enabled
+                and (not force)
+                and (not bool(getattr(config, "ANTI_SCAM_LOCKED_MODE", False)))
+            )
+            if apply_actionable_filter:
+                relaxed_dex, dropped_dex, dropped_reasons_dex = self._filter_low_flow_actionable_with_reasons(
+                    relaxed_dex
+                )
+                relaxed_gecko, dropped_gecko, dropped_reasons_gecko = self._filter_low_flow_actionable_with_reasons(
+                    relaxed_gecko
+                )
+                (
+                    relaxed_gecko_trending,
+                    dropped_gecko_trending,
+                    dropped_reasons_gecko_trending,
+                ) = self._filter_low_flow_actionable_with_reasons(relaxed_gecko_trending)
+                (
+                    relaxed_gecko_market,
+                    dropped_gecko_market,
+                    dropped_reasons_gecko_market,
+                ) = self._filter_low_flow_actionable_with_reasons(relaxed_gecko_market)
+                relaxed_boosts, dropped_boosts, dropped_reasons_boosts = self._filter_low_flow_actionable_with_reasons(
+                    relaxed_boosts
+                )
+
+            def _brief_reasons(bucket: dict[str, int]) -> str:
+                if not bucket:
+                    return "none"
+                rows_sorted = sorted(
+                    bucket.items(),
+                    key=lambda kv: (int(kv[1]), str(kv[0])),
+                    reverse=True,
+                )[:3]
+                return ",".join(f"{str(k)}:{int(v)}" for k, v in rows_sorted)
+
+            out = self._merge_tokens(
+                base_tokens,
+                relaxed_dex,
+                relaxed_gecko,
+                relaxed_gecko_trending,
+                relaxed_gecko_market,
+                relaxed_boosts,
+            )
+            # Keep a clean boost-only cache for low-flow fallback. Do not store
+            # full cycle base rows here, otherwise timeout fallback can replay
+            # stale/mixed symbols unrelated to low-flow discovery.
+            boost_cache_tokens = self._merge_tokens(
+                relaxed_dex,
+                relaxed_gecko,
+                relaxed_gecko_trending,
+                relaxed_gecko_market,
+                relaxed_boosts,
+            )
+            cache_fill_added = 0
+            if (
+                self._low_flow_cache_fill_enabled
+                and (not relaxed_gecko)
+                and (not relaxed_gecko_trending)
+                and (not relaxed_gecko_market)
+                and self._low_flow_last_success_tokens
+            ):
+                try:
+                    max_fill = max(1, int(self._low_flow_cache_fill_max_tokens))
+                    out_before = int(len(out))
+                    out = self._merge_tokens(
+                        out,
+                        list(self._low_flow_last_success_tokens)[:max_fill],
+                    )
+                    cache_fill_added = max(0, int(len(out)) - int(out_before))
+                    if cache_fill_added > 0:
+                        logger.info(
+                            "NON_WATCH_LOW_FLOW_BOOST_CACHE_FILL added=%s max=%s",
+                            int(cache_fill_added),
+                            int(max_fill),
+                        )
+                except Exception as cache_exc:
+                    logger.warning("NON_WATCH_LOW_FLOW_BOOST_CACHE_FILL_FAIL err=%s", cache_exc)
             added = max(0, int(len(out)) - int(len(base_tokens)))
             logger.info(
                 (
                     "NON_WATCH_LOW_FLOW_BOOST base=%s added=%s total=%s "
-                    "dex=%s gecko=%s boosts=%s age_cap=%ss min_liq=%.0f force=%s"
+                    "dex=%s gecko_new=%s gecko_trending=%s gecko_market=%s boosts=%s "
+                    "dropped=(dex:%s gecko_new:%s gecko_trending:%s gecko_market:%s boosts:%s) "
+                    "drop_reasons=(dex:%s gecko_new:%s gecko_trending:%s gecko_market:%s boosts:%s) "
+                    "age_cap=%ss min_liq=%.0f min_vol5=%.0f min_age=%ss max_abs5=%.2f "
+                    "force=%s actionable_filter=%s cache_fill_added=%s"
                 ),
                 int(len(base_tokens)),
                 int(added),
                 int(len(out)),
                 int(len(relaxed_dex)),
                 int(len(relaxed_gecko)),
+                int(len(relaxed_gecko_trending)),
+                int(len(relaxed_gecko_market)),
                 int(len(relaxed_boosts)),
+                int(dropped_dex),
+                int(dropped_gecko),
+                int(dropped_gecko_trending),
+                int(dropped_gecko_market),
+                int(dropped_boosts),
+                _brief_reasons(dropped_reasons_dex),
+                _brief_reasons(dropped_reasons_gecko),
+                _brief_reasons(dropped_reasons_gecko_trending),
+                _brief_reasons(dropped_reasons_gecko_market),
+                _brief_reasons(dropped_reasons_boosts),
                 int(self._low_flow_relaxed_age_cap_seconds),
                 float(self._low_flow_relaxed_min_liquidity_usd),
+                float(self._low_flow_relaxed_min_volume_5m_usd),
+                int(self._low_flow_relaxed_min_age_seconds),
+                float(self._low_flow_relaxed_max_abs_change_5m),
                 int(1 if force else 0),
+                int(1 if apply_actionable_filter else 0),
+                int(cache_fill_added),
             )
+            # Do not overwrite a rich cache snapshot with a poor timeout result
+            # (e.g. dex-only 1 token). Refresh cache only on meaningful boost data.
+            gecko_boost_present = bool(relaxed_gecko or relaxed_gecko_trending or relaxed_gecko_market)
+            cache_refresh_min = max(3, int(self._low_flow_cache_fill_max_tokens // 2))
+            if boost_cache_tokens and (gecko_boost_present or int(len(boost_cache_tokens)) >= int(cache_refresh_min)):
+                self._low_flow_last_success_tokens = [dict(row or {}) for row in boost_cache_tokens]
             return out
         except Exception as exc:
             logger.warning("NON_WATCH_LOW_FLOW_BOOST failed: %s", exc)
+            if force and self._low_flow_last_success_tokens:
+                cached = [dict(row or {}) for row in (self._low_flow_last_success_tokens or [])]
+                logger.warning(
+                    "NON_WATCH_LOW_FLOW_BOOST using_cached_last_success=%s force=1",
+                    int(len(cached)),
+                )
+                return cached
             return list(base_tokens)
 
     async def _fetch_from_dexscreener(
@@ -405,11 +817,61 @@ class DexScreenerMonitor:
         age_max_seconds: int | None = None,
         min_liquidity_usd: float | None = None,
     ) -> list[dict[str, Any]]:
+        return await self._fetch_from_geckoterminal_endpoint(
+            "new_pools",
+            pages=pages,
+            ignore_seen=ignore_seen,
+            age_max_seconds=age_max_seconds,
+            min_liquidity_usd=min_liquidity_usd,
+        )
+
+    async def _fetch_from_geckoterminal_trending(
+        self,
+        *,
+        pages: int | None = None,
+        ignore_seen: bool = False,
+        age_max_seconds: int | None = None,
+        min_liquidity_usd: float | None = None,
+    ) -> list[dict[str, Any]]:
+        return await self._fetch_from_geckoterminal_endpoint(
+            "trending_pools",
+            pages=pages,
+            ignore_seen=ignore_seen,
+            age_max_seconds=age_max_seconds,
+            min_liquidity_usd=min_liquidity_usd,
+        )
+
+    async def _fetch_from_geckoterminal_market(
+        self,
+        *,
+        pages: int | None = None,
+        ignore_seen: bool = False,
+        age_max_seconds: int | None = None,
+        min_liquidity_usd: float | None = None,
+    ) -> list[dict[str, Any]]:
+        return await self._fetch_from_geckoterminal_endpoint(
+            "pools",
+            pages=pages,
+            ignore_seen=ignore_seen,
+            age_max_seconds=age_max_seconds,
+            min_liquidity_usd=min_liquidity_usd,
+        )
+
+    async def _fetch_from_geckoterminal_endpoint(
+        self,
+        endpoint: str,
+        *,
+        pages: int | None = None,
+        ignore_seen: bool = False,
+        age_max_seconds: int | None = None,
+        min_liquidity_usd: float | None = None,
+    ) -> list[dict[str, Any]]:
         all_tokens: list[dict[str, Any]] = []
         pages_to_fetch = max(1, int(pages if pages is not None else GECKO_NEW_POOLS_PAGES))
         for page in range(1, pages_to_fetch + 1):
             page_tokens = await self._fetch_gecko_page(
                 page,
+                endpoint=endpoint,
                 ignore_seen=bool(ignore_seen),
                 age_max_seconds=age_max_seconds,
                 min_liquidity_usd=min_liquidity_usd,
@@ -425,12 +887,13 @@ class DexScreenerMonitor:
         self,
         page: int,
         *,
+        endpoint: str = "new_pools",
         ignore_seen: bool = False,
         age_max_seconds: int | None = None,
         min_liquidity_usd: float | None = None,
     ) -> list[dict[str, Any]]:
         gecko_url = (
-            f"https://api.geckoterminal.com/api/v2/networks/{GECKO_NETWORK}/new_pools"
+            f"https://api.geckoterminal.com/api/v2/networks/{GECKO_NETWORK}/{endpoint}"
             f"?page={page}&include=base_token"
         )
         data = await self._fetch_json(gecko_url, source="geckoterminal")
@@ -481,6 +944,40 @@ class DexScreenerMonitor:
                 out.append(row)
         return out
 
+    async def fetch_tokens_by_addresses(
+        self,
+        addresses: list[str],
+        *,
+        max_count: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Resolve explicit token addresses through DexScreener token endpoint.
+        Used as a secondary enrichment lane when onchain rows arrive with missing
+        market fields (liq/vol/price all zero).
+        """
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for raw in addresses or []:
+            addr = normalize_address(raw)
+            if not addr or addr in seen:
+                continue
+            seen.add(addr)
+            normalized.append(addr)
+            if max_count is not None and len(normalized) >= int(max_count):
+                break
+        if not normalized:
+            return []
+        tasks = [self._fetch_token_by_address(addr) for addr in normalized]
+        rows = await asyncio.gather(*tasks, return_exceptions=True)
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            if isinstance(row, Exception):
+                logger.warning("Address enrichment failed: %s", row)
+                continue
+            if row:
+                out.append(row)
+        return out
+
     async def _fetch_token_by_address(self, token_address: str) -> dict[str, Any] | None:
         token_address = normalize_address(token_address)
         if not token_address:
@@ -492,13 +989,15 @@ class DexScreenerMonitor:
 
         pairs = data.get("pairs", []) or []
         best_pair = None
-        best_liq = -1.0
+        best_score = (-1.0, -1.0, -1.0)
         for pair in pairs:
             if str(pair.get("chainId", "")).lower() != CHAIN_ID.lower():
                 continue
             liq = float((pair.get("liquidity") or {}).get("usd") or 0)
-            if liq > best_liq:
-                best_liq = liq
+            vol5 = float((pair.get("volume") or {}).get("m5") or 0)
+            score = (1.0 if vol5 > 0 else 0.0, vol5, liq)
+            if score > best_score:
+                best_score = score
                 best_pair = pair
         if not isinstance(best_pair, dict):
             return None
@@ -514,6 +1013,12 @@ class DexScreenerMonitor:
         return self._format_token_data(best_pair, created_at)
 
     @staticmethod
+    def _merge_score(token: dict[str, Any]) -> tuple[float, float, float]:
+        vol5 = float((token or {}).get("volume_5m") or 0.0)
+        liq = float((token or {}).get("liquidity") or 0.0)
+        return (1.0 if vol5 > 0.0 else 0.0, vol5, liq)
+
+    @staticmethod
     def _merge_tokens(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
         by_address: dict[str, dict[str, Any]] = {}
         for tokens in groups:
@@ -525,7 +1030,7 @@ class DexScreenerMonitor:
                 if not existing:
                     by_address[address] = token
                     continue
-                if float(token.get("liquidity", 0)) > float(existing.get("liquidity", 0)):
+                if DexScreenerMonitor._merge_score(token) > DexScreenerMonitor._merge_score(existing):
                     by_address[address] = token
         return list(by_address.values())
 
@@ -701,6 +1206,48 @@ class DexScreenerMonitor:
             "age_seconds": max(0, int(token_age_seconds)),
             "age_minutes": max(0, int(round(token_age_seconds / 60))),
         }
+
+    def _low_flow_actionable_eval(self, token: dict[str, Any]) -> tuple[bool, str]:
+        if not isinstance(token, dict):
+            return False, "invalid"
+        liq = float(token.get("liquidity") or 0.0)
+        vol5 = float(token.get("volume_5m") or 0.0)
+        age_s = int(token.get("age_seconds") or 0)
+        abs5 = abs(float(token.get("price_change_5m") or 0.0))
+        if liq < float(self._low_flow_relaxed_min_liquidity_usd):
+            return False, "liq"
+        if vol5 < float(self._low_flow_relaxed_min_volume_5m_usd):
+            return False, "vol5"
+        if age_s < int(self._low_flow_relaxed_min_age_seconds):
+            return False, "age"
+        if abs5 > float(self._low_flow_relaxed_max_abs_change_5m):
+            return False, "abs5"
+        return True, "pass"
+
+    def _is_low_flow_actionable(self, token: dict[str, Any]) -> bool:
+        ok, _reason = self._low_flow_actionable_eval(token)
+        return bool(ok)
+
+    def _filter_low_flow_actionable_with_reasons(
+        self,
+        tokens: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], int, dict[str, int]]:
+        out: list[dict[str, Any]] = []
+        dropped = 0
+        reasons: dict[str, int] = {}
+        for token in tokens or []:
+            ok, reason = self._low_flow_actionable_eval(token)
+            if ok:
+                out.append(token)
+            else:
+                dropped += 1
+                key = str(reason or "unknown").strip().lower() or "unknown"
+                reasons[key] = int(reasons.get(key, 0)) + 1
+        return out, int(dropped), dict(reasons)
+
+    def _filter_low_flow_actionable(self, tokens: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+        out, dropped, _ = self._filter_low_flow_actionable_with_reasons(tokens)
+        return out, int(dropped)
 
     def _build_gecko_token_map(self, included: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         out: dict[str, dict[str, Any]] = {}

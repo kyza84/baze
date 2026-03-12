@@ -120,6 +120,26 @@ NON_WATCH_LOW_FLOW_BOOST_INTERVAL_SECONDS = max(
     5,
     int(os.getenv("NON_WATCH_LOW_FLOW_BOOST_INTERVAL_SECONDS", "30")),
 )
+NON_WATCH_LOW_FLOW_SOURCE_TIMEOUT_SECONDS = max(
+    4.0,
+    min(60.0, float(os.getenv("NON_WATCH_LOW_FLOW_SOURCE_TIMEOUT_SECONDS", "25.0"))),
+)
+NON_WATCH_LOW_FLOW_GECKO_TIMEOUT_SECONDS = max(
+    3.0,
+    min(60.0, float(os.getenv("NON_WATCH_LOW_FLOW_GECKO_TIMEOUT_SECONDS", "8.0"))),
+)
+NON_WATCH_LOW_FLOW_GECKO_QUEUE_FIRST_ENABLED = (
+    os.getenv("NON_WATCH_LOW_FLOW_GECKO_QUEUE_FIRST_ENABLED", "true").strip().lower()
+    in ("1", "true", "yes", "y", "on")
+)
+NON_WATCH_LOW_FLOW_CACHE_FILL_ENABLED = (
+    os.getenv("NON_WATCH_LOW_FLOW_CACHE_FILL_ENABLED", "true").strip().lower()
+    in ("1", "true", "yes", "y", "on")
+)
+NON_WATCH_LOW_FLOW_CACHE_FILL_MAX_TOKENS = max(
+    1,
+    min(50, int(os.getenv("NON_WATCH_LOW_FLOW_CACHE_FILL_MAX_TOKENS", "8"))),
+)
 NON_WATCH_LOW_FLOW_RELAXED_AGE_CAP_SECONDS = max(
     TOKEN_AGE_MAX,
     int(os.getenv("NON_WATCH_LOW_FLOW_RELAXED_AGE_CAP_SECONDS", "2592000")),
@@ -128,9 +148,58 @@ NON_WATCH_LOW_FLOW_RELAXED_MIN_LIQUIDITY_USD = max(
     500.0,
     float(os.getenv("NON_WATCH_LOW_FLOW_RELAXED_MIN_LIQUIDITY_USD", str(max(500.0, MIN_LIQUIDITY * 0.40)))),
 )
+NON_WATCH_LOW_FLOW_RELAXED_MIN_VOLUME_5M_USD = max(
+    30.0,
+    min(
+        5000.0,
+        float(
+            os.getenv(
+                "NON_WATCH_LOW_FLOW_RELAXED_MIN_VOLUME_5M_USD",
+                str(max(30.0, float(os.getenv("TOKEN_SAFETY_FALLBACK_MIN_VOLUME_5M_USD", "100")) * 0.70)),
+            )
+        ),
+    ),
+)
+NON_WATCH_LOW_FLOW_RELAXED_MIN_AGE_SECONDS = max(
+    60,
+    min(
+        86400,
+        int(
+            os.getenv(
+                "NON_WATCH_LOW_FLOW_RELAXED_MIN_AGE_SECONDS",
+                str(max(60, int(round(float(os.getenv("TOKEN_SAFETY_FALLBACK_MIN_AGE_SECONDS", "180")) * 0.70)))),
+            )
+        ),
+    ),
+)
+NON_WATCH_LOW_FLOW_RELAXED_MAX_ABS_CHANGE_5M = max(
+    8.0,
+    min(
+        60.0,
+        float(
+            os.getenv(
+                "NON_WATCH_LOW_FLOW_RELAXED_MAX_ABS_CHANGE_5M",
+                str(
+                    min(
+                        25.0,
+                        max(10.0, float(os.getenv("LOCAL_ANTISCAM_TRANSIENT_MAX_ABS_CHANGE_5M", "15.0")) * 1.35),
+                    )
+                ),
+            )
+        ),
+    ),
+)
 NON_WATCH_LOW_FLOW_GECKO_PAGES = max(
     0,
     int(os.getenv("NON_WATCH_LOW_FLOW_GECKO_PAGES", "2")),
+)
+NON_WATCH_LOW_FLOW_GECKO_TRENDING_PAGES = max(
+    0,
+    int(os.getenv("NON_WATCH_LOW_FLOW_GECKO_TRENDING_PAGES", "3")),
+)
+NON_WATCH_LOW_FLOW_GECKO_MARKET_PAGES = max(
+    0,
+    int(os.getenv("NON_WATCH_LOW_FLOW_GECKO_MARKET_PAGES", "2")),
 )
 NON_WATCH_LOW_FLOW_INCLUDE_DEX_BOOSTS = (
     os.getenv("NON_WATCH_LOW_FLOW_INCLUDE_DEX_BOOSTS", "true").lower() == "true"
@@ -318,8 +387,60 @@ RPC_TIMEOUT_SECONDS = max(3, int(os.getenv("RPC_TIMEOUT_SECONDS", "10")))
 ONCHAIN_BLOCK_CHUNK = max(1, int(os.getenv("ONCHAIN_BLOCK_CHUNK", "500")))
 ONCHAIN_FINALITY_BLOCKS = max(0, int(os.getenv("ONCHAIN_FINALITY_BLOCKS", "2")))
 ONCHAIN_PARALLEL_MARKET_SOURCES = os.getenv("ONCHAIN_PARALLEL_MARKET_SOURCES", "true").lower() == "true"
+ONCHAIN_MAX_BACKFILL_BLOCKS = max(0, int(os.getenv("ONCHAIN_MAX_BACKFILL_BLOCKS", "8000")))
+ONCHAIN_MAX_CHUNKS_PER_CYCLE = max(1, int(os.getenv("ONCHAIN_MAX_CHUNKS_PER_CYCLE", "6")))
 ONCHAIN_ENRICH_RETRIES = max(1, int(os.getenv("ONCHAIN_ENRICH_RETRIES", "3")))
 ONCHAIN_ENRICH_RETRY_DELAY_SECONDS = max(1, int(os.getenv("ONCHAIN_ENRICH_RETRY_DELAY_SECONDS", "8")))
+ONCHAIN_REENRICH_MISSING_MARKET_FIELDS_ENABLED = (
+    os.getenv("ONCHAIN_REENRICH_MISSING_MARKET_FIELDS_ENABLED", "true").lower() == "true"
+)
+# Re-enrich onchain rows when liquidity is missing even if price/volume is present.
+ONCHAIN_REENRICH_MISSING_LIQUIDITY_ENABLED = (
+    os.getenv("ONCHAIN_REENRICH_MISSING_LIQUIDITY_ENABLED", "true").lower() == "true"
+)
+ONCHAIN_REENRICH_MAX_PER_CYCLE = max(
+    0,
+    int(os.getenv("ONCHAIN_REENRICH_MAX_PER_CYCLE", "16")),
+)
+ONCHAIN_FORWARD_UNRESOLVED_FOR_REENRICH = (
+    os.getenv("ONCHAIN_FORWARD_UNRESOLVED_FOR_REENRICH", "true").lower() == "true"
+)
+ONCHAIN_FORWARD_UNRESOLVED_MAX_PER_CYCLE = max(
+    0,
+    int(os.getenv("ONCHAIN_FORWARD_UNRESOLVED_MAX_PER_CYCLE", "24")),
+)
+ONCHAIN_DROP_UNRESOLVED_ZERO_MARKET_FIELDS = (
+    os.getenv("ONCHAIN_DROP_UNRESOLVED_ZERO_MARKET_FIELDS", "true").lower() == "true"
+)
+ONCHAIN_DROP_UNRESOLVED_MISSING_LIQUIDITY = (
+    os.getenv("ONCHAIN_DROP_UNRESOLVED_MISSING_LIQUIDITY", "true").lower() == "true"
+)
+ONCHAIN_REENRICH_KEEP_RETRY_PENDING_ROWS = (
+    os.getenv("ONCHAIN_REENRICH_KEEP_RETRY_PENDING_ROWS", "true").lower() == "true"
+)
+ONCHAIN_UNRESOLVED_RETRY_QUEUE_ENABLED = (
+    os.getenv("ONCHAIN_UNRESOLVED_RETRY_QUEUE_ENABLED", "true").lower() == "true"
+)
+ONCHAIN_UNRESOLVED_RETRY_MAX_PENDING = max(
+    0,
+    int(os.getenv("ONCHAIN_UNRESOLVED_RETRY_MAX_PENDING", "512")),
+)
+ONCHAIN_UNRESOLVED_RETRY_TTL_SECONDS = max(
+    60,
+    int(os.getenv("ONCHAIN_UNRESOLVED_RETRY_TTL_SECONDS", "900")),
+)
+ONCHAIN_UNRESOLVED_RETRY_BACKOFF_SECONDS = max(
+    1.0,
+    float(os.getenv("ONCHAIN_UNRESOLVED_RETRY_BACKOFF_SECONDS", "20.0")),
+)
+ONCHAIN_UNRESOLVED_RETRY_MAX_ATTEMPTS = max(
+    1,
+    int(os.getenv("ONCHAIN_UNRESOLVED_RETRY_MAX_ATTEMPTS", "8")),
+)
+ONCHAIN_UNRESOLVED_RETRY_MAX_PER_CYCLE = max(
+    0,
+    int(os.getenv("ONCHAIN_UNRESOLVED_RETRY_MAX_PER_CYCLE", "24")),
+)
 
 # Base on-chain PairCreated source
 RPC_PRIMARY = os.getenv("RPC_PRIMARY", "").strip()
@@ -438,29 +559,118 @@ SAFE_CHANGE_5M_NON_WATCH_MAX_PASSES_PER_CYCLE = max(
     0,
     int(os.getenv("SAFE_CHANGE_5M_NON_WATCH_MAX_PASSES_PER_CYCLE", "2")),
 )
+RAW_NON_WATCH_ACTIONABLE_MIN_LIQUIDITY_USD = max(
+    500.0,
+    min(
+        50000.0,
+        float(
+            os.getenv(
+                "RAW_NON_WATCH_ACTIONABLE_MIN_LIQUIDITY_USD",
+                str(max(500.0, MIN_LIQUIDITY * 0.60)),
+            )
+        ),
+    ),
+)
+RAW_NON_WATCH_ACTIONABLE_MIN_VOLUME_5M_USD = max(
+    30.0,
+    min(
+        5000.0,
+        float(
+            os.getenv(
+                "RAW_NON_WATCH_ACTIONABLE_MIN_VOLUME_5M_USD",
+                str(max(30.0, SAFE_MIN_VOLUME_5M_USD * 0.60)),
+            )
+        ),
+    ),
+)
+RAW_NON_WATCH_ACTIONABLE_MIN_AGE_SECONDS = max(
+    60,
+    min(
+        86400,
+        int(
+            os.getenv(
+                "RAW_NON_WATCH_ACTIONABLE_MIN_AGE_SECONDS",
+                str(max(60, int(round(float(SAFE_MIN_AGE_SECONDS) * 0.50)))),
+            )
+        ),
+    ),
+)
+RAW_NON_WATCH_ACTIONABLE_MAX_ABS_CHANGE_5M = max(
+    8.0,
+    min(
+        80.0,
+        float(
+            os.getenv(
+                "RAW_NON_WATCH_ACTIONABLE_MAX_ABS_CHANGE_5M",
+                str(min(35.0, max(12.0, float(SAFE_MAX_PRICE_CHANGE_5M_ABS_PERCENT) * 1.50))),
+            )
+        ),
+    ),
+)
 LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_AGE_SOFT_ENABLED = os.getenv(
     "LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_AGE_SOFT_ENABLED",
     "true",
 ).strip().lower() in ("1", "true", "yes", "y", "on")
 LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_AGE_SOFT_MIN_SECONDS = max(
     0,
-    int(os.getenv("LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_AGE_SOFT_MIN_SECONDS", "240")),
+    int(os.getenv("LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_AGE_SOFT_MIN_SECONDS", "180")),
 )
 LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_AGE_SOFT_MIN_LIQUIDITY_USD = max(
     0.0,
-    float(os.getenv("LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_AGE_SOFT_MIN_LIQUIDITY_USD", "12000")),
+    float(os.getenv("LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_AGE_SOFT_MIN_LIQUIDITY_USD", "9000")),
 )
 LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_AGE_SOFT_MIN_VOLUME_5M_USD = max(
     0.0,
-    float(os.getenv("LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_AGE_SOFT_MIN_VOLUME_5M_USD", "200")),
+    float(os.getenv("LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_AGE_SOFT_MIN_VOLUME_5M_USD", "150")),
 )
 LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_AGE_SOFT_MIN_SCORE = max(
     0,
-    int(os.getenv("LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_AGE_SOFT_MIN_SCORE", "45")),
+    int(os.getenv("LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_AGE_SOFT_MIN_SCORE", "40")),
 )
 LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_AGE_SOFT_MAX_PASSES_PER_CYCLE = max(
     0,
-    int(os.getenv("LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_AGE_SOFT_MAX_PASSES_PER_CYCLE", "4")),
+    int(os.getenv("LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_AGE_SOFT_MAX_PASSES_PER_CYCLE", "8")),
+)
+LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_VOLUME_SOFT_ENABLED = os.getenv(
+    "LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_VOLUME_SOFT_ENABLED",
+    "true",
+).strip().lower() in ("1", "true", "yes", "y", "on")
+LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_VOLUME_SOFT_MIN_SECONDS = max(
+    0,
+    int(os.getenv("LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_VOLUME_SOFT_MIN_SECONDS", "180")),
+)
+LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_VOLUME_SOFT_MIN_LIQUIDITY_USD = max(
+    0.0,
+    float(os.getenv("LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_VOLUME_SOFT_MIN_LIQUIDITY_USD", "9000")),
+)
+LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_VOLUME_SOFT_MIN_VOLUME_5M_USD = max(
+    0.0,
+    float(os.getenv("LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_VOLUME_SOFT_MIN_VOLUME_5M_USD", "300")),
+)
+LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_VOLUME_SOFT_MIN_SCORE = max(
+    0,
+    int(os.getenv("LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_VOLUME_SOFT_MIN_SCORE", "55")),
+)
+LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_VOLUME_SOFT_MAX_WARNING_FLAGS = max(
+    0,
+    int(os.getenv("LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_VOLUME_SOFT_MAX_WARNING_FLAGS", "1")),
+)
+LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_VOLUME_SOFT_MAX_RISK_LEVEL = (
+    str(os.getenv("LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_VOLUME_SOFT_MAX_RISK_LEVEL", "MEDIUM") or "MEDIUM")
+    .strip()
+    .upper()
+)
+LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_VOLUME_SOFT_MAX_ABS_CHANGE_5M = max(
+    0.0,
+    float(os.getenv("LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_VOLUME_SOFT_MAX_ABS_CHANGE_5M", "12.0")),
+)
+LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_VOLUME_SOFT_REQUIRE_CONTRACT_SAFE = (
+    os.getenv("LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_VOLUME_SOFT_REQUIRE_CONTRACT_SAFE", "true").strip().lower()
+    in ("1", "true", "yes", "y", "on")
+)
+LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_VOLUME_SOFT_MAX_PASSES_PER_CYCLE = max(
+    0,
+    int(os.getenv("LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_VOLUME_SOFT_MAX_PASSES_PER_CYCLE", "8")),
 )
 LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_ENABLED = os.getenv(
     "LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_ENABLED",
@@ -468,23 +678,23 @@ LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_ENABLED = os.getenv(
 ).strip().lower() in ("1", "true", "yes", "y", "on")
 LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_MIN_AGE_SECONDS = max(
     0,
-    int(os.getenv("LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_MIN_AGE_SECONDS", "240")),
+    int(os.getenv("LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_MIN_AGE_SECONDS", "180")),
 )
 LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_MIN_LIQUIDITY_USD = max(
     0.0,
-    float(os.getenv("LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_MIN_LIQUIDITY_USD", "10000")),
+    float(os.getenv("LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_MIN_LIQUIDITY_USD", "9000")),
 )
 LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_MIN_VOLUME_5M_USD = max(
     0.0,
-    float(os.getenv("LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_MIN_VOLUME_5M_USD", "150")),
+    float(os.getenv("LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_MIN_VOLUME_5M_USD", "120")),
 )
 LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_MIN_SCORE = max(
     0,
-    int(os.getenv("LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_MIN_SCORE", "45")),
+    int(os.getenv("LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_MIN_SCORE", "40")),
 )
 LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_MAX_PASSES_PER_CYCLE = max(
     0,
-    int(os.getenv("LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_MAX_PASSES_PER_CYCLE", "3")),
+    int(os.getenv("LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_MAX_PASSES_PER_CYCLE", "6")),
 )
 LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_REQUIRE_LOW_RISK = (
     os.getenv("LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_REQUIRE_LOW_RISK", "true").strip().lower()
@@ -497,6 +707,113 @@ LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_MAX_WARNING_FLAGS = max(
 LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_MAX_ABS_CHANGE_5M = max(
     0.0,
     float(os.getenv("LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_MAX_ABS_CHANGE_5M", "10.0")),
+)
+LOCAL_ANTISCAM_SAFE_CONTRACT_TO_BLACKLIST = (
+    os.getenv("LOCAL_ANTISCAM_SAFE_CONTRACT_TO_BLACKLIST", "true").strip().lower()
+    in ("1", "true", "yes", "y", "on")
+)
+LOCAL_ANTISCAM_SAFE_CONTRACT_BLACKLIST_TTL_SECONDS = max(
+    900,
+    int(os.getenv("LOCAL_ANTISCAM_SAFE_CONTRACT_BLACKLIST_TTL_SECONDS", "21600")),
+)
+LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_BRIDGE_ENABLED = (
+    os.getenv("LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_BRIDGE_ENABLED", "true").strip().lower()
+    in ("1", "true", "yes", "y", "on")
+)
+LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_BRIDGE_MIN_AGE_SECONDS = max(
+    0,
+    int(os.getenv("LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_BRIDGE_MIN_AGE_SECONDS", "120")),
+)
+LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_BRIDGE_MAX_AGE_SECONDS = max(
+    0,
+    int(os.getenv("LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_BRIDGE_MAX_AGE_SECONDS", "1200")),
+)
+LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_BRIDGE_MIN_LIQUIDITY_USD = max(
+    0.0,
+    float(os.getenv("LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_BRIDGE_MIN_LIQUIDITY_USD", "10000")),
+)
+LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_BRIDGE_MIN_VOLUME_5M_USD = max(
+    0.0,
+    float(os.getenv("LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_BRIDGE_MIN_VOLUME_5M_USD", "300")),
+)
+LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_BRIDGE_MIN_SCORE = max(
+    0,
+    int(os.getenv("LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_BRIDGE_MIN_SCORE", "50")),
+)
+LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_BRIDGE_MAX_ABS_CHANGE_5M = max(
+    0.0,
+    float(os.getenv("LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_BRIDGE_MAX_ABS_CHANGE_5M", "15.0")),
+)
+LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_BRIDGE_MAX_PASSES_PER_CYCLE = max(
+    0,
+    int(os.getenv("LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_BRIDGE_MAX_PASSES_PER_CYCLE", "3")),
+)
+LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_BRIDGE_ALLOWED_RISKY_FLAGS = [
+    str(x).strip().lower()
+    for x in os.getenv(
+        "LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_BRIDGE_ALLOWED_RISKY_FLAGS",
+        "young_token",
+    ).split(",")
+    if str(x).strip()
+]
+LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_BRIDGE_SET_RISK_LEVEL = str(
+    os.getenv("LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_BRIDGE_SET_RISK_LEVEL", "MEDIUM") or "MEDIUM"
+).strip().upper()
+LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_BRIDGE_SET_WARNING_FLAGS = max(
+    0,
+    int(os.getenv("LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_BRIDGE_SET_WARNING_FLAGS", "0")),
+)
+LOCAL_ANTISCAM_ONCHAIN_SAFE_CHANGE_BRIDGE_ENABLED = (
+    os.getenv("LOCAL_ANTISCAM_ONCHAIN_SAFE_CHANGE_BRIDGE_ENABLED", "true").strip().lower()
+    in ("1", "true", "yes", "y", "on")
+)
+LOCAL_ANTISCAM_ONCHAIN_SAFE_CHANGE_BRIDGE_MAX_ABS_CHANGE_5M = max(
+    0.0,
+    float(os.getenv("LOCAL_ANTISCAM_ONCHAIN_SAFE_CHANGE_BRIDGE_MAX_ABS_CHANGE_5M", "75.0")),
+)
+LOCAL_ANTISCAM_ONCHAIN_SAFE_CHANGE_BRIDGE_MIN_LIQUIDITY_USD = max(
+    0.0,
+    float(os.getenv("LOCAL_ANTISCAM_ONCHAIN_SAFE_CHANGE_BRIDGE_MIN_LIQUIDITY_USD", "50000")),
+)
+LOCAL_ANTISCAM_ONCHAIN_SAFE_CHANGE_BRIDGE_MIN_VOLUME_5M_USD = max(
+    0.0,
+    float(os.getenv("LOCAL_ANTISCAM_ONCHAIN_SAFE_CHANGE_BRIDGE_MIN_VOLUME_5M_USD", "3000")),
+)
+LOCAL_ANTISCAM_ONCHAIN_SAFE_CHANGE_BRIDGE_MIN_SCORE = max(
+    0,
+    int(os.getenv("LOCAL_ANTISCAM_ONCHAIN_SAFE_CHANGE_BRIDGE_MIN_SCORE", "70")),
+)
+LOCAL_ANTISCAM_ONCHAIN_SAFE_CHANGE_BRIDGE_MAX_PASSES_PER_CYCLE = max(
+    0,
+    int(os.getenv("LOCAL_ANTISCAM_ONCHAIN_SAFE_CHANGE_BRIDGE_MAX_PASSES_PER_CYCLE", "2")),
+)
+LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_AGE_BRIDGE_ENABLED = (
+    os.getenv("LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_AGE_BRIDGE_ENABLED", "true").strip().lower()
+    in ("1", "true", "yes", "y", "on")
+)
+LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_AGE_BRIDGE_MIN_SECONDS = max(
+    0,
+    int(os.getenv("LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_AGE_BRIDGE_MIN_SECONDS", "150")),
+)
+LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_AGE_BRIDGE_MIN_LIQUIDITY_USD = max(
+    0.0,
+    float(os.getenv("LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_AGE_BRIDGE_MIN_LIQUIDITY_USD", "50000")),
+)
+LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_AGE_BRIDGE_MIN_VOLUME_5M_USD = max(
+    0.0,
+    float(os.getenv("LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_AGE_BRIDGE_MIN_VOLUME_5M_USD", "900")),
+)
+LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_AGE_BRIDGE_MIN_SCORE = max(
+    0,
+    int(os.getenv("LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_AGE_BRIDGE_MIN_SCORE", "50")),
+)
+LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_AGE_BRIDGE_MAX_ABS_CHANGE_5M = max(
+    0.0,
+    float(os.getenv("LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_AGE_BRIDGE_MAX_ABS_CHANGE_5M", "10.0")),
+)
+LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_AGE_BRIDGE_MAX_PASSES_PER_CYCLE = max(
+    0,
+    int(os.getenv("LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_AGE_BRIDGE_MAX_PASSES_PER_CYCLE", "2")),
 )
 LOCAL_ANTISCAM_NON_WATCH_FAST_PUMP_BLOCK_ENABLED = (
     os.getenv("LOCAL_ANTISCAM_NON_WATCH_FAST_PUMP_BLOCK_ENABLED", "true").strip().lower()
@@ -566,11 +883,11 @@ LOCAL_ANTISCAM_TRANSIENT_MIN_AGE_SECONDS = max(
 )
 LOCAL_ANTISCAM_TRANSIENT_MIN_LIQUIDITY_USD = max(
     0.0,
-    float(os.getenv("LOCAL_ANTISCAM_TRANSIENT_MIN_LIQUIDITY_USD", "25000")),
+    float(os.getenv("LOCAL_ANTISCAM_TRANSIENT_MIN_LIQUIDITY_USD", "18000")),
 )
 LOCAL_ANTISCAM_TRANSIENT_MIN_VOLUME_5M_USD = max(
     0.0,
-    float(os.getenv("LOCAL_ANTISCAM_TRANSIENT_MIN_VOLUME_5M_USD", "1500")),
+    float(os.getenv("LOCAL_ANTISCAM_TRANSIENT_MIN_VOLUME_5M_USD", "900")),
 )
 LOCAL_ANTISCAM_TRANSIENT_MAX_ABS_CHANGE_5M = max(
     0.0,
@@ -578,6 +895,37 @@ LOCAL_ANTISCAM_TRANSIENT_MAX_ABS_CHANGE_5M = max(
 )
 LOCAL_ANTISCAM_TRANSIENT_BLOCK_SOFT_CHANGE_PASS = (
     os.getenv("LOCAL_ANTISCAM_TRANSIENT_BLOCK_SOFT_CHANGE_PASS", "true").lower() == "true"
+)
+ANTI_SCAM_LOCKED_NON_WATCH_ACTIONABLE_ALIGN_ENABLED = (
+    os.getenv("ANTI_SCAM_LOCKED_NON_WATCH_ACTIONABLE_ALIGN_ENABLED", "false").lower() == "true"
+)
+ANTI_SCAM_LOCKED_NON_WATCH_ACTIONABLE_LIQ_MULT = max(
+    0.30,
+    min(1.00, float(os.getenv("ANTI_SCAM_LOCKED_NON_WATCH_ACTIONABLE_LIQ_MULT", "0.70"))),
+)
+ANTI_SCAM_LOCKED_NON_WATCH_ACTIONABLE_VOL_MULT = max(
+    0.30,
+    min(1.00, float(os.getenv("ANTI_SCAM_LOCKED_NON_WATCH_ACTIONABLE_VOL_MULT", "0.70"))),
+)
+ANTI_SCAM_LOCKED_NON_WATCH_ACTIONABLE_AGE_MULT = max(
+    0.30,
+    min(1.00, float(os.getenv("ANTI_SCAM_LOCKED_NON_WATCH_ACTIONABLE_AGE_MULT", "0.70"))),
+)
+ANTI_SCAM_LOCKED_NON_WATCH_ACTIONABLE_MAX_ABS5_MULT = max(
+    1.00,
+    min(2.50, float(os.getenv("ANTI_SCAM_LOCKED_NON_WATCH_ACTIONABLE_MAX_ABS5_MULT", "1.20"))),
+)
+ANTI_SCAM_LOCKED_NON_WATCH_UPSTREAM_FLOOR_ENABLED = (
+    os.getenv("ANTI_SCAM_LOCKED_NON_WATCH_UPSTREAM_FLOOR_ENABLED", "false").strip().lower()
+    in ("1", "true", "yes", "y", "on")
+)
+ANTI_SCAM_LOCKED_NON_WATCH_SOFT_BRIDGE_ENABLED = (
+    os.getenv("ANTI_SCAM_LOCKED_NON_WATCH_SOFT_BRIDGE_ENABLED", "true").strip().lower()
+    in ("1", "true", "yes", "y", "on")
+)
+ANTI_SCAM_LOCKED_NON_WATCH_TRANSIENT_VOLUME_BRIDGE_ENABLED = (
+    os.getenv("ANTI_SCAM_LOCKED_NON_WATCH_TRANSIENT_VOLUME_BRIDGE_ENABLED", "true").strip().lower()
+    in ("1", "true", "yes", "y", "on")
 )
 # Track short-window pump bursts and block early entry if a token recently showed
 # extreme 5m moves (common scam/rug pattern: pump then immediate collapse).
@@ -640,6 +988,38 @@ POST_ENTRY_RUG_BLACKLIST_TTL_SECONDS = max(
     300,
     int(os.getenv("POST_ENTRY_RUG_BLACKLIST_TTL_SECONDS", "21600")),
 )
+POST_ENTRY_RUG_SYMBOL_COOLDOWN_SECONDS = max(
+    0,
+    int(os.getenv("POST_ENTRY_RUG_SYMBOL_COOLDOWN_SECONDS", "1800")),
+)
+# Post-entry anti-pump guard: for non-watch tokens that jump to unrealistic PnL
+# in a very short window. This is fail-closed telemetry protection for paper stats.
+POST_ENTRY_PUMP_GUARD_ENABLED = os.getenv("POST_ENTRY_PUMP_GUARD_ENABLED", "true").lower() == "true"
+POST_ENTRY_PUMP_ONLY_NON_WATCH = os.getenv("POST_ENTRY_PUMP_ONLY_NON_WATCH", "true").lower() == "true"
+POST_ENTRY_PUMP_MIN_AGE_SECONDS = max(
+    0,
+    int(os.getenv("POST_ENTRY_PUMP_MIN_AGE_SECONDS", "15")),
+)
+POST_ENTRY_PUMP_MAX_PNL_PERCENT = max(
+    0.0,
+    float(os.getenv("POST_ENTRY_PUMP_MAX_PNL_PERCENT", "120")),
+)
+POST_ENTRY_PUMP_REALIZE_CAP_PERCENT = max(
+    0.0,
+    float(os.getenv("POST_ENTRY_PUMP_REALIZE_CAP_PERCENT", "45")),
+)
+POST_ENTRY_PUMP_MIN_ENTRY_LIQUIDITY_USD = max(
+    0.0,
+    float(os.getenv("POST_ENTRY_PUMP_MIN_ENTRY_LIQUIDITY_USD", "10000")),
+)
+POST_ENTRY_PUMP_BLACKLIST_TTL_SECONDS = max(
+    300,
+    int(os.getenv("POST_ENTRY_PUMP_BLACKLIST_TTL_SECONDS", "21600")),
+)
+POST_ENTRY_PUMP_SYMBOL_COOLDOWN_SECONDS = max(
+    0,
+    int(os.getenv("POST_ENTRY_PUMP_SYMBOL_COOLDOWN_SECONDS", "1800")),
+)
 # Pre-entry anti-rug guard: block and optionally hard-blacklist tokens that show
 # unstable market micro-structure before BUY (spread/source-divergence/liquidity collapse).
 ENTRY_PRE_RUG_GUARD_ENABLED = os.getenv("ENTRY_PRE_RUG_GUARD_ENABLED", "true").lower() == "true"
@@ -663,6 +1043,66 @@ ENTRY_PRE_RUG_HITS_TO_BLACKLIST = max(
 ENTRY_PRE_RUG_BLACKLIST_TTL_SECONDS = max(
     300,
     int(os.getenv("ENTRY_PRE_RUG_BLACKLIST_TTL_SECONDS", "21600")),
+)
+# Hard non-watch anti-scam pre-buy guard (independent from soft flow tuning).
+ENTRY_HARD_NON_WATCH_SCAM_GUARD_ENABLED = (
+    os.getenv("ENTRY_HARD_NON_WATCH_SCAM_GUARD_ENABLED", "true").strip().lower()
+    in ("1", "true", "yes", "y", "on")
+)
+ENTRY_HARD_NON_WATCH_SCAM_ONLY_DISCOVERY = (
+    os.getenv("ENTRY_HARD_NON_WATCH_SCAM_ONLY_DISCOVERY", "false").strip().lower()
+    in ("1", "true", "yes", "y", "on")
+)
+ENTRY_HARD_NON_WATCH_SCAM_MIN_AGE_SECONDS = max(
+    0,
+    int(os.getenv("ENTRY_HARD_NON_WATCH_SCAM_MIN_AGE_SECONDS", "900")),
+)
+ENTRY_HARD_NON_WATCH_SCAM_MIN_LIQUIDITY_USD = max(
+    0.0,
+    float(os.getenv("ENTRY_HARD_NON_WATCH_SCAM_MIN_LIQUIDITY_USD", "25000")),
+)
+ENTRY_HARD_NON_WATCH_SCAM_MIN_VOLUME_5M_USD = max(
+    0.0,
+    float(os.getenv("ENTRY_HARD_NON_WATCH_SCAM_MIN_VOLUME_5M_USD", "1200")),
+)
+ENTRY_HARD_NON_WATCH_SCAM_MAX_ABS_CHANGE_5M = max(
+    0.0,
+    float(os.getenv("ENTRY_HARD_NON_WATCH_SCAM_MAX_ABS_CHANGE_5M", "12.0")),
+)
+ENTRY_HARD_NON_WATCH_SCAM_REQUIRE_CONTRACT_SAFE = (
+    os.getenv("ENTRY_HARD_NON_WATCH_SCAM_REQUIRE_CONTRACT_SAFE", "true").strip().lower()
+    in ("1", "true", "yes", "y", "on")
+)
+ENTRY_HARD_NON_WATCH_SCAM_MAX_WARNING_FLAGS = max(
+    0,
+    int(os.getenv("ENTRY_HARD_NON_WATCH_SCAM_MAX_WARNING_FLAGS", "0")),
+)
+ENTRY_HARD_NON_WATCH_SCAM_MAX_RISK_LEVEL = (
+    str(os.getenv("ENTRY_HARD_NON_WATCH_SCAM_MAX_RISK_LEVEL", "MEDIUM") or "MEDIUM").strip().upper()
+)
+ENTRY_HARD_NON_WATCH_SCAM_HITS_TO_BLACKLIST = max(
+    1,
+    int(os.getenv("ENTRY_HARD_NON_WATCH_SCAM_HITS_TO_BLACKLIST", "1")),
+)
+ENTRY_HARD_NON_WATCH_SCAM_BLACKLIST_TTL_SECONDS = max(
+    300,
+    int(os.getenv("ENTRY_HARD_NON_WATCH_SCAM_BLACKLIST_TTL_SECONDS", "21600")),
+)
+ENTRY_HARD_SCAM_APPLY_DISCOVERY_LANE = (
+    os.getenv("ENTRY_HARD_SCAM_APPLY_DISCOVERY_LANE", "false").strip().lower()
+    in ("1", "true", "yes", "y", "on")
+)
+ENTRY_HARD_NON_WATCH_SCAM_PASS_STREAK_REQUIRED = max(
+    1,
+    int(os.getenv("ENTRY_HARD_NON_WATCH_SCAM_PASS_STREAK_REQUIRED", "2")),
+)
+ENTRY_HARD_NON_WATCH_SCAM_PASS_STREAK_WINDOW_SECONDS = max(
+    60,
+    int(os.getenv("ENTRY_HARD_NON_WATCH_SCAM_PASS_STREAK_WINDOW_SECONDS", "900")),
+)
+ENTRY_HARD_NON_WATCH_SCAM_PASS_STREAK_MAX_AGE_SECONDS = max(
+    0,
+    int(os.getenv("ENTRY_HARD_NON_WATCH_SCAM_PASS_STREAK_MAX_AGE_SECONDS", "1800")),
 )
 # Contract-risk hard block registry (mint/freeze/proxy/owner privileges/etc).
 ENTRY_CONTRACT_RISK_HARD_BLOCK_ENABLED = os.getenv("ENTRY_CONTRACT_RISK_HARD_BLOCK_ENABLED", "true").lower() == "true"
@@ -744,6 +1184,34 @@ RUNTIME_TUNER_PRUNE_STALE_LOCK = os.getenv(
 RUNTIME_TUNER_STALE_LOCK_SECONDS = max(
     10,
     int(os.getenv("RUNTIME_TUNER_STALE_LOCK_SECONDS", "120")),
+)
+STARTUP_CONFIG_LEGACY_ALIGN_RUNTIME_PATCH_CRITICAL = (
+    os.getenv("STARTUP_CONFIG_LEGACY_ALIGN_RUNTIME_PATCH_CRITICAL", "false").strip().lower()
+    in ("1", "true", "yes", "y", "on")
+)
+STARTUP_CONFIG_FAIL_FAST_ON_MISSING_REQUIRED = (
+    os.getenv("STARTUP_CONFIG_FAIL_FAST_ON_MISSING_REQUIRED", "true").strip().lower()
+    in ("1", "true", "yes", "y", "on")
+)
+STARTUP_CONFIG_FAIL_FAST_ON_UNKNOWN_OVERRIDE_KEYS = (
+    os.getenv("STARTUP_CONFIG_FAIL_FAST_ON_UNKNOWN_OVERRIDE_KEYS", "true").strip().lower()
+    in ("1", "true", "yes", "y", "on")
+)
+STARTUP_CONFIG_FAIL_FAST_ON_UNUSED_NOT_IN_CONTRACT = (
+    os.getenv("STARTUP_CONFIG_FAIL_FAST_ON_UNUSED_NOT_IN_CONTRACT", "false").strip().lower()
+    in ("1", "true", "yes", "y", "on")
+)
+STARTUP_CONFIG_FAIL_FAST_ON_STRUCTURAL_UNUSED_NOT_IN_CONTRACT = (
+    os.getenv("STARTUP_CONFIG_FAIL_FAST_ON_STRUCTURAL_UNUSED_NOT_IN_CONTRACT", "true").strip().lower()
+    in ("1", "true", "yes", "y", "on")
+)
+STARTUP_CONFIG_FAIL_FAST_ON_CRITICAL_DIFF = (
+    os.getenv("STARTUP_CONFIG_FAIL_FAST_ON_CRITICAL_DIFF", "true").strip().lower()
+    in ("1", "true", "yes", "y", "on")
+)
+STARTUP_CONFIG_FAIL_FAST_ON_CONTRACT_OVERLAP = (
+    os.getenv("STARTUP_CONFIG_FAIL_FAST_ON_CONTRACT_OVERLAP", "true").strip().lower()
+    in ("1", "true", "yes", "y", "on")
 )
 ADAPTIVE_FILTERS_INTERVAL_SECONDS = max(60, int(os.getenv("ADAPTIVE_FILTERS_INTERVAL_SECONDS", "900")))
 ADAPTIVE_FILTERS_MIN_WINDOW_CYCLES = max(1, int(os.getenv("ADAPTIVE_FILTERS_MIN_WINDOW_CYCLES", "5")))
@@ -2055,6 +2523,11 @@ HONEYPOT_API_URL = os.getenv("HONEYPOT_API_URL", "https://api.honeypot.is/v2/IsH
 HONEYPOT_API_TIMEOUT_SECONDS = max(3, int(os.getenv("HONEYPOT_API_TIMEOUT_SECONDS", "10")))
 HONEYPOT_API_CACHE_TTL_SECONDS = max(60, int(os.getenv("HONEYPOT_API_CACHE_TTL_SECONDS", "1800")))
 HONEYPOT_API_FAIL_CLOSED = os.getenv("HONEYPOT_API_FAIL_CLOSED", "true").lower() == "true"
+# Keep live fail-closed strict; allow paper to operate on local anti-scam + roundtrip guards
+# when honeypot API endpoint is transiently unavailable.
+HONEYPOT_API_FAIL_CLOSED_IN_PAPER = (
+    os.getenv("HONEYPOT_API_FAIL_CLOSED_IN_PAPER", "false").lower() == "true"
+)
 # Also apply honeypot guard for paper/matrix mode to keep simulation close to live safety.
 HONEYPOT_GUARD_IN_PAPER = os.getenv("HONEYPOT_GUARD_IN_PAPER", "true").lower() == "true"
 # When false, transient honeypot API failures (status/timeouts) only trigger cooldown, not persistent blacklist.
@@ -2147,6 +2620,40 @@ ENTRY_QUARANTINE_IN_PAPER_NON_WATCH = os.getenv(
     "true",
 ).lower() == "true"
 ENTRY_QUARANTINE_REQUIRED_CYCLES = max(0, int(os.getenv("ENTRY_QUARANTINE_REQUIRED_CYCLES", "2")))
+ENTRY_QUARANTINE_PAPER_NON_WATCH_RELAX_CYCLES = max(
+    0,
+    int(os.getenv("ENTRY_QUARANTINE_PAPER_NON_WATCH_RELAX_CYCLES", "0")),
+)
+ENTRY_QUARANTINE_PAPER_NON_WATCH_FASTTRACK_ENABLED = (
+    os.getenv("ENTRY_QUARANTINE_PAPER_NON_WATCH_FASTTRACK_ENABLED", "true").lower() == "true"
+)
+ENTRY_QUARANTINE_PAPER_NON_WATCH_FASTTRACK_MIN_SCORE = max(
+    0,
+    int(os.getenv("ENTRY_QUARANTINE_PAPER_NON_WATCH_FASTTRACK_MIN_SCORE", "65")),
+)
+ENTRY_QUARANTINE_PAPER_NON_WATCH_FASTTRACK_MIN_AGE_SECONDS = max(
+    0,
+    int(os.getenv("ENTRY_QUARANTINE_PAPER_NON_WATCH_FASTTRACK_MIN_AGE_SECONDS", "600")),
+)
+ENTRY_QUARANTINE_PAPER_NON_WATCH_FASTTRACK_MIN_LIQUIDITY_USD = max(
+    0.0,
+    float(os.getenv("ENTRY_QUARANTINE_PAPER_NON_WATCH_FASTTRACK_MIN_LIQUIDITY_USD", "50000")),
+)
+ENTRY_QUARANTINE_PAPER_NON_WATCH_FASTTRACK_MIN_VOLUME_5M_USD = max(
+    0.0,
+    float(os.getenv("ENTRY_QUARANTINE_PAPER_NON_WATCH_FASTTRACK_MIN_VOLUME_5M_USD", "900")),
+)
+ENTRY_QUARANTINE_PAPER_NON_WATCH_FASTTRACK_MAX_ABS_CHANGE_5M = max(
+    0.0,
+    float(os.getenv("ENTRY_QUARANTINE_PAPER_NON_WATCH_FASTTRACK_MAX_ABS_CHANGE_5M", "8.0")),
+)
+ENTRY_QUARANTINE_PAPER_NON_WATCH_FASTTRACK_MAX_WARNING_FLAGS = max(
+    0,
+    int(os.getenv("ENTRY_QUARANTINE_PAPER_NON_WATCH_FASTTRACK_MAX_WARNING_FLAGS", "0")),
+)
+ENTRY_QUARANTINE_PAPER_NON_WATCH_FASTTRACK_REQUIRE_CONTRACT_SAFE = (
+    os.getenv("ENTRY_QUARANTINE_PAPER_NON_WATCH_FASTTRACK_REQUIRE_CONTRACT_SAFE", "true").lower() == "true"
+)
 ENTRY_QUARANTINE_MAX_LIQUIDITY_DELTA_PCT = max(
     0.0,
     min(1.0, float(os.getenv("ENTRY_QUARANTINE_MAX_LIQUIDITY_DELTA_PCT", "0.35"))),
@@ -2208,6 +2715,10 @@ AUTOTRADE_BLACKLIST_TRANSIENT_SAFETY_TTL_SECONDS = max(
     300,
     int(os.getenv("AUTOTRADE_BLACKLIST_TRANSIENT_SAFETY_TTL_SECONDS", "900")),
 )
+AUTOTRADE_BLACKLIST_HONEYPOT_TTL_SECONDS = max(
+    300,
+    int(os.getenv("AUTOTRADE_BLACKLIST_HONEYPOT_TTL_SECONDS", "86400")),
+)
 AUTOTRADE_BLACKLIST_MAX_ENTRIES = max(100, int(os.getenv("AUTOTRADE_BLACKLIST_MAX_ENTRIES", "5000")))
 AUTOTRADE_BLACKLIST_PAPER_HARD_ONLY = os.getenv("AUTOTRADE_BLACKLIST_PAPER_HARD_ONLY", "true").lower() == "true"
 # AUTO_TRADE_ENTRY_MODE:
@@ -2243,9 +2754,24 @@ PLAN_PREFILTER_MAX_WATCHLIST_SHARE = max(
     0.0,
     min(1.0, float(os.getenv("PLAN_PREFILTER_MAX_WATCHLIST_SHARE", "0.65"))),
 )
+# Extra guard during bridge stage: keep watchlist trim stricter while
+# non-watch rows are being injected back into the plan pool.
+PLAN_PREFILTER_BRIDGE_MAX_WATCHLIST_SHARE = max(
+    0.0,
+    min(1.0, float(os.getenv("PLAN_PREFILTER_BRIDGE_MAX_WATCHLIST_SHARE", "0.45"))),
+)
 PLAN_PREFILTER_MIN_NON_WATCH_ROWS = max(
     0,
     int(os.getenv("PLAN_PREFILTER_MIN_NON_WATCH_ROWS", "3")),
+)
+# Enforce non-watch floor by actionable window so post-filter non-watch rows
+# are not lost before plan selection.
+PLAN_PREFILTER_ACTIONABLE_NON_WATCH_FLOOR_ENABLED = (
+    os.getenv("PLAN_PREFILTER_ACTIONABLE_NON_WATCH_FLOOR_ENABLED", "true").lower() == "true"
+)
+PLAN_PREFILTER_ACTIONABLE_NON_WATCH_FLOOR_SHARE = max(
+    0.0,
+    min(1.0, float(os.getenv("PLAN_PREFILTER_ACTIONABLE_NON_WATCH_FLOOR_SHARE", "0.45"))),
 )
 PLAN_PREFILTER_MAX_WATCH_PER_NON_WATCH = max(
     0,
@@ -2259,6 +2785,10 @@ RAW_SOURCE_REBALANCE_MIN_NON_WATCH = max(
 RAW_SOURCE_REBALANCE_EXTRA_FETCH_ROUNDS = max(
     0,
     int(os.getenv("RAW_SOURCE_REBALANCE_EXTRA_FETCH_ROUNDS", "2")),
+)
+RAW_SOURCE_REBALANCE_FETCH_TIMEOUT_SECONDS = max(
+    5.0,
+    min(120.0, float(os.getenv("RAW_SOURCE_REBALANCE_FETCH_TIMEOUT_SECONDS", "35.0"))),
 )
 RAW_SOURCE_REBALANCE_WATCHLIST_MAX_SHARE = max(
     0.0,
@@ -2310,6 +2840,21 @@ PLAN_NON_WATCHLIST_QUOTA_ACTIONABLE_MIN_ROWS = max(
     1,
     int(os.getenv("PLAN_NON_WATCHLIST_QUOTA_ACTIONABLE_MIN_ROWS", "2")),
 )
+PLAN_NON_WATCH_SYMBOL_WINDOW_GUARD_ENABLED = (
+    os.getenv("PLAN_NON_WATCH_SYMBOL_WINDOW_GUARD_ENABLED", "true").lower() == "true"
+)
+PLAN_NON_WATCH_SYMBOL_WINDOW_SECONDS = max(
+    300,
+    int(os.getenv("PLAN_NON_WATCH_SYMBOL_WINDOW_SECONDS", "900")),
+)
+PLAN_NON_WATCH_MAX_OPENS_PER_SYMBOL_WINDOW = max(
+    1,
+    int(os.getenv("PLAN_NON_WATCH_MAX_OPENS_PER_SYMBOL_WINDOW", "3")),
+)
+PLAN_NON_WATCH_SYMBOL_WINDOW_MIN_SELECTED_NON_WATCH = max(
+    1,
+    int(os.getenv("PLAN_NON_WATCH_SYMBOL_WINDOW_MIN_SELECTED_NON_WATCH", "2")),
+)
 PLAN_SOURCE_DIVERSITY_ALLOW_WATCHLIST_CAP_BYPASS = (
     os.getenv("PLAN_SOURCE_DIVERSITY_ALLOW_WATCHLIST_CAP_BYPASS", "false").lower() == "true"
 )
@@ -2325,6 +2870,90 @@ PLAN_ACTIONABLE_NON_WATCH_PRIORITY_ENABLED = (
 PLAN_ACTIONABLE_NON_WATCH_PRIORITY_MIN_ROWS = max(
     1,
     int(os.getenv("PLAN_ACTIONABLE_NON_WATCH_PRIORITY_MIN_ROWS", "4")),
+)
+PLAN_NON_WATCH_ECON_QUOTA_ENABLED = os.getenv("PLAN_NON_WATCH_ECON_QUOTA_ENABLED", "true").lower() == "true"
+PLAN_NON_WATCH_ECON_MIN_EDGE_USD = float(
+    os.getenv("PLAN_NON_WATCH_ECON_MIN_EDGE_USD", "0.0010")
+)
+PLAN_NON_WATCH_ECON_MIN_EDGE_PERCENT = float(
+    os.getenv("PLAN_NON_WATCH_ECON_MIN_EDGE_PERCENT", "0.10")
+)
+PLAN_NON_WATCH_ECON_MIN_SCORE = max(
+    0,
+    int(os.getenv("PLAN_NON_WATCH_ECON_MIN_SCORE", "30")),
+)
+PLAN_SOURCE_DIVERSITY_ENABLED = os.getenv("PLAN_SOURCE_DIVERSITY_ENABLED", "true").lower() == "true"
+PLAN_LANE_TAG_ENABLED = os.getenv("PLAN_LANE_TAG_ENABLED", "true").lower() == "true"
+PLAN_LANE_STABLE_MIN_AGE_SECONDS = max(
+    0,
+    int(os.getenv("PLAN_LANE_STABLE_MIN_AGE_SECONDS", "900")),
+)
+PLAN_LANE_STABLE_MIN_LIQUIDITY_USD = max(
+    0.0,
+    float(os.getenv("PLAN_LANE_STABLE_MIN_LIQUIDITY_USD", "90000")),
+)
+PLAN_LANE_STABLE_MIN_VOLUME_5M_USD = max(
+    0.0,
+    float(os.getenv("PLAN_LANE_STABLE_MIN_VOLUME_5M_USD", "900")),
+)
+PLAN_LANE_STABLE_MAX_ABS_CHANGE_5M = max(
+    0.0,
+    float(os.getenv("PLAN_LANE_STABLE_MAX_ABS_CHANGE_5M", "18.0")),
+)
+PLAN_LANE_STABLE_REQUIRE_CONTRACT_SAFE = (
+    os.getenv("PLAN_LANE_STABLE_REQUIRE_CONTRACT_SAFE", "true").lower() == "true"
+)
+PLAN_LANE_STABLE_MAX_WARNING_FLAGS = max(
+    0,
+    int(os.getenv("PLAN_LANE_STABLE_MAX_WARNING_FLAGS", "1")),
+)
+PLAN_LANE_QUOTAS_ENABLED = os.getenv("PLAN_LANE_QUOTAS_ENABLED", "true").lower() == "true"
+PLAN_MIN_STABLE_PER_BATCH = max(
+    0,
+    int(os.getenv("PLAN_MIN_STABLE_PER_BATCH", "1")),
+)
+PLAN_MIN_DISCOVERY_PER_BATCH = max(
+    0,
+    int(os.getenv("PLAN_MIN_DISCOVERY_PER_BATCH", "1")),
+)
+PLAN_WATCHLIST_FALLBACK_ONLY = os.getenv("PLAN_WATCHLIST_FALLBACK_ONLY", "true").lower() == "true"
+RAW_STABLE_UPSTREAM_ENABLED = os.getenv("RAW_STABLE_UPSTREAM_ENABLED", "true").lower() == "true"
+RAW_STABLE_UPSTREAM_MIN_ACTIONABLE = max(
+    0,
+    int(os.getenv("RAW_STABLE_UPSTREAM_MIN_ACTIONABLE", "8")),
+)
+RAW_STABLE_UPSTREAM_EXTRA_FETCH_ROUNDS = max(
+    0,
+    int(os.getenv("RAW_STABLE_UPSTREAM_EXTRA_FETCH_ROUNDS", "2")),
+)
+RAW_STABLE_UPSTREAM_MAX_EXTRA_PER_CYCLE = max(
+    0,
+    int(os.getenv("RAW_STABLE_UPSTREAM_MAX_EXTRA_PER_CYCLE", "120")),
+)
+RAW_STABLE_UPSTREAM_ONLY_NON_WATCH = (
+    os.getenv("RAW_STABLE_UPSTREAM_ONLY_NON_WATCH", "true").lower() == "true"
+)
+PLAN_UNDERFLOW_ALLOW_HOLD = os.getenv("PLAN_UNDERFLOW_ALLOW_HOLD", "false").lower() == "true"
+PLAN_UNDERFLOW_HOLD_MIN_SCORE = max(
+    0,
+    int(os.getenv("PLAN_UNDERFLOW_HOLD_MIN_SCORE", "35")),
+)
+PLAN_PROFIT_PRIORITY_ENABLED = os.getenv("PLAN_PROFIT_PRIORITY_ENABLED", "true").lower() == "true"
+PLAN_PROFIT_PRIORITY_HIGH_EDGE_USD = max(
+    0.0,
+    float(os.getenv("PLAN_PROFIT_PRIORITY_HIGH_EDGE_USD", "0.015")),
+)
+PLAN_PROFIT_PRIORITY_MID_EDGE_USD = max(
+    0.0,
+    float(os.getenv("PLAN_PROFIT_PRIORITY_MID_EDGE_USD", "0.006")),
+)
+PLAN_PROFIT_PRIORITY_MINOR_SHARE = max(
+    0.0,
+    min(0.80, float(os.getenv("PLAN_PROFIT_PRIORITY_MINOR_SHARE", "0.35"))),
+)
+PLAN_PROFIT_PRIORITY_MINOR_MIN_SLOTS = max(
+    0,
+    int(os.getenv("PLAN_PROFIT_PRIORITY_MINOR_MIN_SLOTS", "1")),
 )
 # Non-watch bridge: safely promote non-watch rows into plan when BUY set is watchlist-only.
 # Does not bypass hard safety; rows are still produced only after candidate hard filters.
@@ -2438,6 +3067,10 @@ BURST_GOVERNOR_MAX_PER_SYMBOL_PER_BATCH = max(1, int(os.getenv("BURST_GOVERNOR_M
 BURST_GOVERNOR_MAX_PER_CLUSTER_PER_BATCH = max(1, int(os.getenv("BURST_GOVERNOR_MAX_PER_CLUSTER_PER_BATCH", "1")))
 BURST_GOVERNOR_WINDOW_SECONDS = max(5, int(os.getenv("BURST_GOVERNOR_WINDOW_SECONDS", "45")))
 BURST_GOVERNOR_MAX_OPENS_PER_WINDOW = max(1, int(os.getenv("BURST_GOVERNOR_MAX_OPENS_PER_WINDOW", "2")))
+BURST_GOVERNOR_ATTEMPT_MULTIPLIER = max(
+    1,
+    int(os.getenv("BURST_GOVERNOR_ATTEMPT_MULTIPLIER", "4")),
+)
 
 # Source router (dynamic route budget by realized EV of source windows).
 SOURCE_ROUTER_ENABLED = os.getenv("SOURCE_ROUTER_ENABLED", "true").lower() == "true"
@@ -2478,6 +3111,7 @@ PAPER_WATCHLIST_MIN_ABS_CHANGE_5M = max(
 KILL_SWITCH_FILE = os.getenv("KILL_SWITCH_FILE", os.path.join("data", "kill.txt"))
 GRACEFUL_STOP_FILE = os.getenv("GRACEFUL_STOP_FILE", os.path.join("data", "graceful_stop.signal"))
 GRACEFUL_STOP_TIMEOUT_SECONDS = max(2, int(os.getenv("GRACEFUL_STOP_TIMEOUT_SECONDS", "12")))
+WALLET_MODE = str(os.getenv("WALLET_MODE", "paper") or "paper").strip().lower()
 WALLET_BALANCE_USD = float(os.getenv("WALLET_BALANCE_USD", "2.75"))
 PAPER_TRADE_SIZE_USD = float(os.getenv("PAPER_TRADE_SIZE_USD", "1.0"))
 PAPER_MAX_HOLD_SECONDS = int(os.getenv("PAPER_MAX_HOLD_SECONDS", "1800"))
@@ -2579,6 +3213,117 @@ EDGE_FILTER_ENABLED = os.getenv("EDGE_FILTER_ENABLED", "true").lower() == "true"
 MIN_EXPECTED_EDGE_PERCENT = float(os.getenv("MIN_EXPECTED_EDGE_PERCENT", "2.0"))
 EDGE_FILTER_MODE = os.getenv("EDGE_FILTER_MODE", "usd").strip().lower()
 MIN_EXPECTED_EDGE_USD = float(os.getenv("MIN_EXPECTED_EDGE_USD", "0.10"))
+# Lane economic split: separate edge/EV/size pressure between watchlist and non-watch paths.
+# This is path-level economics only; anti-scam hard safety remains unchanged.
+LANE_ECON_SPLIT_ENABLED = os.getenv("LANE_ECON_SPLIT_ENABLED", "true").lower() == "true"
+LANE_ECON_WATCHLIST_EDGE_PCT_MULT = max(
+    0.50,
+    min(2.00, float(os.getenv("LANE_ECON_WATCHLIST_EDGE_PCT_MULT", "1.00"))),
+)
+LANE_ECON_WATCHLIST_EDGE_USD_MULT = max(
+    0.50,
+    min(2.00, float(os.getenv("LANE_ECON_WATCHLIST_EDGE_USD_MULT", "1.00"))),
+)
+LANE_ECON_WATCHLIST_EV_MIN_MULT = max(
+    0.50,
+    min(2.00, float(os.getenv("LANE_ECON_WATCHLIST_EV_MIN_MULT", "1.00"))),
+)
+LANE_ECON_WATCHLIST_MIN_TRADE_USD = max(
+    0.0,
+    float(os.getenv("LANE_ECON_WATCHLIST_MIN_TRADE_USD", "0.00")),
+)
+LANE_ECON_NON_WATCH_EDGE_PCT_MULT = max(
+    0.30,
+    min(2.00, float(os.getenv("LANE_ECON_NON_WATCH_EDGE_PCT_MULT", "0.85"))),
+)
+LANE_ECON_NON_WATCH_EDGE_USD_MULT = max(
+    0.30,
+    min(2.00, float(os.getenv("LANE_ECON_NON_WATCH_EDGE_USD_MULT", "0.75"))),
+)
+LANE_ECON_NON_WATCH_EV_MIN_MULT = max(
+    0.20,
+    min(2.00, float(os.getenv("LANE_ECON_NON_WATCH_EV_MIN_MULT", "0.85"))),
+)
+LANE_ECON_NON_WATCH_MIN_TRADE_USD = max(
+    0.0,
+    float(os.getenv("LANE_ECON_NON_WATCH_MIN_TRADE_USD", "1.10")),
+)
+LANE_ECON_NON_WATCH_MIN_TRADE_GAS_MULT = max(
+    0.0,
+    float(os.getenv("LANE_ECON_NON_WATCH_MIN_TRADE_GAS_MULT", "10.0")),
+)
+LANE_ECON_NON_WATCH_HINT_MIN_SIZE_USD = max(
+    0.0,
+    float(os.getenv("LANE_ECON_NON_WATCH_HINT_MIN_SIZE_USD", "1.10")),
+)
+LANE_ECON_STABLE_EDGE_PCT_MULT = max(
+    0.30,
+    min(2.00, float(os.getenv("LANE_ECON_STABLE_EDGE_PCT_MULT", "0.92"))),
+)
+LANE_ECON_STABLE_EDGE_USD_MULT = max(
+    0.30,
+    min(2.00, float(os.getenv("LANE_ECON_STABLE_EDGE_USD_MULT", "0.90"))),
+)
+LANE_ECON_STABLE_EV_MIN_MULT = max(
+    0.20,
+    min(2.00, float(os.getenv("LANE_ECON_STABLE_EV_MIN_MULT", "0.90"))),
+)
+LANE_ECON_STABLE_MIN_TRADE_USD = max(
+    0.0,
+    float(os.getenv("LANE_ECON_STABLE_MIN_TRADE_USD", "0.80")),
+)
+LANE_ECON_DISCOVERY_EDGE_PCT_MULT = max(
+    0.30,
+    min(2.50, float(os.getenv("LANE_ECON_DISCOVERY_EDGE_PCT_MULT", "1.10"))),
+)
+LANE_ECON_DISCOVERY_EDGE_USD_MULT = max(
+    0.30,
+    min(2.50, float(os.getenv("LANE_ECON_DISCOVERY_EDGE_USD_MULT", "1.10"))),
+)
+LANE_ECON_DISCOVERY_EV_MIN_MULT = max(
+    0.20,
+    min(2.50, float(os.getenv("LANE_ECON_DISCOVERY_EV_MIN_MULT", "1.15"))),
+)
+LANE_ECON_DISCOVERY_MIN_TRADE_USD = max(
+    0.0,
+    float(os.getenv("LANE_ECON_DISCOVERY_MIN_TRADE_USD", "1.10")),
+)
+LANE_ECON_DISCOVERY_MIN_TRADE_GAS_MULT = max(
+    0.0,
+    float(os.getenv("LANE_ECON_DISCOVERY_MIN_TRADE_GAS_MULT", "10.0")),
+)
+LANE_ECON_DISCOVERY_HINT_MIN_SIZE_USD = max(
+    0.0,
+    float(os.getenv("LANE_ECON_DISCOVERY_HINT_MIN_SIZE_USD", "1.10")),
+)
+LANE_DISCOVERY_ROUTE_STRICT_ENABLED = (
+    os.getenv("LANE_DISCOVERY_ROUTE_STRICT_ENABLED", "true").lower() == "true"
+)
+LANE_DISCOVERY_ROUTE_MIN_SCORE = max(
+    0,
+    int(os.getenv("LANE_DISCOVERY_ROUTE_MIN_SCORE", "55")),
+)
+# Non-watch route-prob relax: reduce false source_route_prob skips when
+# actionable non-watch rows are present but watchlist still dominates.
+PLAN_NON_WATCH_ROUTE_PROB_RELAX_ENABLED = (
+    os.getenv("PLAN_NON_WATCH_ROUTE_PROB_RELAX_ENABLED", "true").lower() == "true"
+)
+PLAN_NON_WATCH_ROUTE_PROB_RELAX_MIN_FLOOR = max(
+    0.0,
+    min(1.0, float(os.getenv("PLAN_NON_WATCH_ROUTE_PROB_RELAX_MIN_FLOOR", "0.85"))),
+)
+PLAN_NON_WATCH_ROUTE_PROB_RELAX_ACTIONABLE_MIN_ROWS = max(
+    1,
+    int(os.getenv("PLAN_NON_WATCH_ROUTE_PROB_RELAX_ACTIONABLE_MIN_ROWS", "3")),
+)
+LANE_DISCOVERY_SYMBOL_LOSS_LOCK_MULT = max(
+    0.5,
+    min(3.0, float(os.getenv("LANE_DISCOVERY_SYMBOL_LOSS_LOCK_MULT", "1.35"))),
+)
+LANE_DISCOVERY_EDGE_LOOP_HITS_TO_COOLDOWN_MULT = max(
+    0.20,
+    min(1.50, float(os.getenv("LANE_DISCOVERY_EDGE_LOOP_HITS_TO_COOLDOWN_MULT", "0.70"))),
+)
 # Guardrail: if repeated skips are caused by cost>gross edge math, temporarily cool down that symbol.
 EDGE_COST_DOMINANT_GUARD_ENABLED = os.getenv("EDGE_COST_DOMINANT_GUARD_ENABLED", "true").lower() == "true"
 EDGE_COST_DOMINANT_MIN_GROSS_PERCENT = max(
@@ -2614,6 +3359,26 @@ EDGE_COST_DOMINANT_HITS_TO_COOLDOWN = max(
 EDGE_COST_DOMINANT_SYMBOL_COOLDOWN_SECONDS = max(
     0,
     int(os.getenv("EDGE_COST_DOMINANT_SYMBOL_COOLDOWN_SECONDS", "900")),
+)
+EDGE_COST_DOMINANT_NON_WATCH_MIN_GROSS_PERCENT = max(
+    0.0,
+    float(os.getenv("EDGE_COST_DOMINANT_NON_WATCH_MIN_GROSS_PERCENT", "1.0")),
+)
+EDGE_COST_DOMINANT_NON_WATCH_MIN_COST_PERCENT = max(
+    0.0,
+    float(os.getenv("EDGE_COST_DOMINANT_NON_WATCH_MIN_COST_PERCENT", "6.0")),
+)
+EDGE_COST_DOMINANT_NON_WATCH_MIN_DELTA_PERCENT = max(
+    0.0,
+    float(os.getenv("EDGE_COST_DOMINANT_NON_WATCH_MIN_DELTA_PERCENT", "4.0")),
+)
+EDGE_COST_DOMINANT_NON_WATCH_HITS_TO_COOLDOWN = max(
+    1,
+    int(os.getenv("EDGE_COST_DOMINANT_NON_WATCH_HITS_TO_COOLDOWN", "2")),
+)
+EDGE_COST_DOMINANT_NON_WATCH_SYMBOL_COOLDOWN_SECONDS = max(
+    0,
+    int(os.getenv("EDGE_COST_DOMINANT_NON_WATCH_SYMBOL_COOLDOWN_SECONDS", "1200")),
 )
 EDGE_COST_DOMINANT_NON_WATCH_EXPLORE_FAST_GUARD_ENABLED = (
     os.getenv("EDGE_COST_DOMINANT_NON_WATCH_EXPLORE_FAST_GUARD_ENABLED", "true").lower() == "true"
@@ -2708,6 +3473,20 @@ NON_WATCH_EXPLORE_MIN_TRADE_FLOOR_ENABLED = (
 )
 NON_WATCH_EXPLORE_MIN_TRADE_USD = max(0.0, float(os.getenv("NON_WATCH_EXPLORE_MIN_TRADE_USD", "0.30")))
 NON_WATCH_EXPLORE_GAS_MULT_FLOOR = max(0.0, float(os.getenv("NON_WATCH_EXPLORE_GAS_MULT_FLOOR", "8.0")))
+NON_WATCH_EDGE_SIZE_RECOVERY_ENABLED = os.getenv("NON_WATCH_EDGE_SIZE_RECOVERY_ENABLED", "true").lower() == "true"
+NON_WATCH_EDGE_SIZE_RECOVERY_ALLOW_CORE = os.getenv("NON_WATCH_EDGE_SIZE_RECOVERY_ALLOW_CORE", "true").lower() == "true"
+NON_WATCH_EDGE_SIZE_RECOVERY_MIN_GROSS_PERCENT = max(
+    0.0,
+    float(os.getenv("NON_WATCH_EDGE_SIZE_RECOVERY_MIN_GROSS_PERCENT", "1.0")),
+)
+NON_WATCH_EDGE_SIZE_RECOVERY_MIN_COST_DELTA_PERCENT = max(
+    0.0,
+    float(os.getenv("NON_WATCH_EDGE_SIZE_RECOVERY_MIN_COST_DELTA_PERCENT", "0.30")),
+)
+NON_WATCH_EDGE_SIZE_RECOVERY_MAX_USD = max(
+    0.10,
+    float(os.getenv("NON_WATCH_EDGE_SIZE_RECOVERY_MAX_USD", "1.20")),
+)
 # Fail closed for non-watch explore entries with negative expected net EV.
 NON_WATCH_EXPLORE_REQUIRE_POSITIVE_EV = os.getenv(
     "NON_WATCH_EXPLORE_REQUIRE_POSITIVE_EV",
@@ -2878,7 +3657,32 @@ TOP1_OPEN_SHARE_15M_MIN_OPENS = max(
 )
 TOP1_OPEN_SHARE_15M_MAX_SHARE = max(
     0.20,
-    min(1.0, float(os.getenv("TOP1_OPEN_SHARE_15M_MAX_SHARE", "0.72"))),
+    min(1.0, float(os.getenv("TOP1_OPEN_SHARE_15M_MAX_SHARE", "0.62"))),
+)
+# Hard loss-lock for repeatedly losing symbols inside rolling EV window.
+# This is source-agnostic by default and does not bypass anti-choke.
+SYMBOL_LOSS_LOCK_ENABLED = os.getenv("SYMBOL_LOSS_LOCK_ENABLED", "true").lower() == "true"
+SYMBOL_LOSS_LOCK_WINDOW_MINUTES = max(
+    10,
+    int(os.getenv("SYMBOL_LOSS_LOCK_WINDOW_MINUTES", "60")),
+)
+SYMBOL_LOSS_LOCK_MIN_TRADES = max(
+    2,
+    int(os.getenv("SYMBOL_LOSS_LOCK_MIN_TRADES", "4")),
+)
+SYMBOL_LOSS_LOCK_MAX_NET_PNL_USD = float(
+    os.getenv("SYMBOL_LOSS_LOCK_MAX_NET_PNL_USD", "-0.0200")
+)
+SYMBOL_LOSS_LOCK_MIN_LOSS_SHARE = max(
+    0.0,
+    min(1.0, float(os.getenv("SYMBOL_LOSS_LOCK_MIN_LOSS_SHARE", "0.66"))),
+)
+SYMBOL_LOSS_LOCK_COOLDOWN_SECONDS = max(
+    60,
+    int(os.getenv("SYMBOL_LOSS_LOCK_COOLDOWN_SECONDS", "1800")),
+)
+SYMBOL_LOSS_LOCK_APPLY_WATCHLIST = (
+    os.getenv("SYMBOL_LOSS_LOCK_APPLY_WATCHLIST", "true").lower() == "true"
 )
 
 # EV-core (entry/sizing/exit) controls.
@@ -3268,8 +4072,239 @@ ANTI_CHOKE_BYPASS_TOKEN_COOLDOWN_MAX_SECONDS = max(
     0,
     int(os.getenv("ANTI_CHOKE_BYPASS_TOKEN_COOLDOWN_MAX_SECONDS", "180")),
 )
+ANTI_CHOKE_ALLOW_TRANSIENT_SAFETY_COOLDOWN_BYPASS = (
+    os.getenv("ANTI_CHOKE_ALLOW_TRANSIENT_SAFETY_COOLDOWN_BYPASS", "false").lower() == "true"
+)
+ANTI_CHOKE_BYPASS_SYMBOL_MIN_OPENS = max(
+    1,
+    int(os.getenv("ANTI_CHOKE_BYPASS_SYMBOL_MIN_OPENS", "4")),
+)
+ANTI_CHOKE_BYPASS_SYMBOL_SHARE_LIMIT = max(
+    0.0,
+    min(1.0, float(os.getenv("ANTI_CHOKE_BYPASS_SYMBOL_SHARE_LIMIT", "0.70"))),
+)
+ANTI_CHOKE_ALLOW_SYMBOL_CONCENTRATION_BYPASS = (
+    os.getenv("ANTI_CHOKE_ALLOW_SYMBOL_CONCENTRATION_BYPASS", "true").lower() == "true"
+)
+ANTI_CHOKE_CONCENTRATION_MIN_SHARE_CAP = max(
+    0.0,
+    min(1.0, float(os.getenv("ANTI_CHOKE_CONCENTRATION_MIN_SHARE_CAP", "0.35"))),
+)
 ANTI_CHOKE_ALLOW_SYMBOL_FATIGUE_BYPASS = os.getenv("ANTI_CHOKE_ALLOW_SYMBOL_FATIGUE_BYPASS", "true").lower() == "true"
 ANTI_CHOKE_ALLOW_SYMBOL_STRICT_BYPASS = os.getenv("ANTI_CHOKE_ALLOW_SYMBOL_STRICT_BYPASS", "true").lower() == "true"
+
+# Anti-scam lock mode: enforce local hard-safe contour in free-mode/non-GoPlus runs
+# and disable transient non-watch soft bypasses that let fast scam movers slip through.
+ANTI_SCAM_LOCKED_MODE = (
+    os.getenv("ANTI_SCAM_LOCKED_MODE", "true").strip().lower() in ("1", "true", "yes", "y", "on")
+    or (not str(GOPLUS_ACCESS_TOKEN or "").strip())
+)
+ANTI_SCAM_LOCKED_DISCOVERY_BRIDGE_ENABLED = (
+    os.getenv("ANTI_SCAM_LOCKED_DISCOVERY_BRIDGE_ENABLED", "false").strip().lower()
+    in ("1", "true", "yes", "y", "on")
+)
+if ANTI_SCAM_LOCKED_MODE:
+    TOKEN_SAFETY_FAIL_CLOSED = True
+    TOKEN_SAFETY_TRANSIENT_DEGRADED_ENABLED = True
+    TOKEN_SAFETY_TRANSIENT_USE_CACHE = True
+    TOKEN_SAFETY_TRANSIENT_USE_FALLBACK = True
+    TOKEN_SAFETY_FALLBACK_REQUIRE_VOLUME = True
+    TOKEN_SAFETY_FALLBACK_REQUIRE_AGE = True
+    TOKEN_SAFETY_FALLBACK_MIN_LIQUIDITY_USD = max(float(TOKEN_SAFETY_FALLBACK_MIN_LIQUIDITY_USD), 10000.0)
+    TOKEN_SAFETY_FALLBACK_MIN_VOLUME_5M_USD = max(float(TOKEN_SAFETY_FALLBACK_MIN_VOLUME_5M_USD), 350.0)
+    TOKEN_SAFETY_FALLBACK_MIN_AGE_SECONDS = max(int(TOKEN_SAFETY_FALLBACK_MIN_AGE_SECONDS), 600)
+
+    ENTRY_FAIL_CLOSED_ON_SAFETY_GAP = True
+    ENTRY_ALLOW_TRANSIENT_SAFETY_SOURCE = True
+    _anti_scam_allowed_sources = {"goplus", "cache_transient", "transient_fallback", "fallback"}
+    ENTRY_ALLOWED_SAFETY_SOURCES = [x for x in ENTRY_ALLOWED_SAFETY_SOURCES if x in _anti_scam_allowed_sources]
+    if not ENTRY_ALLOWED_SAFETY_SOURCES:
+        ENTRY_ALLOWED_SAFETY_SOURCES = ["cache_transient", "transient_fallback", "fallback"]
+
+    SAFE_REQUIRE_CONTRACT_SAFE = True
+    SAFE_REQUIRE_RISK_LEVEL = "MEDIUM"
+    SAFE_MAX_WARNING_FLAGS = min(int(SAFE_MAX_WARNING_FLAGS), 0)
+    ENTRY_BLOCK_RISKY_CONTRACT_FLAGS = True
+    # Keep anti-scam hard contour independent from non-watch flow tuning.
+    # In locked mode, non-watch soft bridge is disabled by default and can be
+    # enabled only explicitly via ANTI_SCAM_LOCKED_DISCOVERY_BRIDGE_ENABLED.
+    if not (
+        bool(ANTI_SCAM_LOCKED_DISCOVERY_BRIDGE_ENABLED)
+        or bool(ANTI_SCAM_LOCKED_NON_WATCH_SOFT_BRIDGE_ENABLED)
+    ):
+        SAFE_VOLUME_TWO_TIER_NON_WATCH_ENABLED = False
+        SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_SOFT_ENABLED = False
+        SAFE_AGE_NON_WATCH_SOFT_ENABLED = False
+        SAFE_CHANGE_5M_NON_WATCH_SOFT_ENABLED = False
+    else:
+        # When explicitly enabled, keep bridge conservative and bounded.
+        SAFE_VOLUME_TWO_TIER_NON_WATCH_ENABLED = True
+        SAFE_VOLUME_TWO_TIER_NON_WATCH_SOFT_RATIO = max(
+            float(SAFE_VOLUME_TWO_TIER_NON_WATCH_SOFT_RATIO),
+            0.80,
+        )
+        SAFE_VOLUME_TWO_TIER_NON_WATCH_MAX_PASSES_PER_CYCLE = min(
+            int(SAFE_VOLUME_TWO_TIER_NON_WATCH_MAX_PASSES_PER_CYCLE),
+            4,
+        )
+        SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_SOFT_ENABLED = True
+        SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_SOFT_RATIO = max(
+            float(SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_SOFT_RATIO),
+            0.80,
+        )
+        SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_MAX_PASSES_PER_CYCLE = min(
+            int(SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_MAX_PASSES_PER_CYCLE),
+            4,
+        )
+        SAFE_AGE_NON_WATCH_SOFT_ENABLED = True
+        SAFE_AGE_NON_WATCH_SOFT_RATIO = max(float(SAFE_AGE_NON_WATCH_SOFT_RATIO), 0.80)
+        SAFE_AGE_NON_WATCH_MAX_PASSES_PER_CYCLE = min(
+            int(SAFE_AGE_NON_WATCH_MAX_PASSES_PER_CYCLE),
+            4,
+        )
+        SAFE_CHANGE_5M_NON_WATCH_SOFT_ENABLED = True
+        SAFE_CHANGE_5M_NON_WATCH_SOFT_MULT = min(
+            max(float(SAFE_CHANGE_5M_NON_WATCH_SOFT_MULT), 1.15),
+            1.35,
+        )
+        SAFE_CHANGE_5M_NON_WATCH_MAX_PASSES_PER_CYCLE = min(
+            int(SAFE_CHANGE_5M_NON_WATCH_MAX_PASSES_PER_CYCLE),
+            3,
+        )
+    ANTI_CHOKE_ALLOW_TRANSIENT_SAFETY_COOLDOWN_BYPASS = False
+
+    LOCAL_ANTISCAM_TRANSIENT_STRICT_ENABLED = True
+    LOCAL_ANTISCAM_TRANSIENT_MIN_AGE_SECONDS = max(int(LOCAL_ANTISCAM_TRANSIENT_MIN_AGE_SECONDS), 900)
+    LOCAL_ANTISCAM_TRANSIENT_MIN_LIQUIDITY_USD = max(float(LOCAL_ANTISCAM_TRANSIENT_MIN_LIQUIDITY_USD), 18000.0)
+    LOCAL_ANTISCAM_TRANSIENT_MIN_VOLUME_5M_USD = max(float(LOCAL_ANTISCAM_TRANSIENT_MIN_VOLUME_5M_USD), 900.0)
+    LOCAL_ANTISCAM_TRANSIENT_MAX_ABS_CHANGE_5M = min(float(LOCAL_ANTISCAM_TRANSIENT_MAX_ABS_CHANGE_5M), 12.0)
+    LOCAL_ANTISCAM_TRANSIENT_BLOCK_SOFT_CHANGE_PASS = True
+    # Keep non-watch transient bridge conservative in locked mode:
+    # allow only volume-soft pass under strict hard-safe constraints.
+    LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_AGE_SOFT_ENABLED = False
+    if bool(ANTI_SCAM_LOCKED_NON_WATCH_TRANSIENT_VOLUME_BRIDGE_ENABLED):
+        LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_VOLUME_SOFT_ENABLED = True
+        LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_VOLUME_SOFT_MIN_SECONDS = max(
+            int(globals().get("LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_VOLUME_SOFT_MIN_SECONDS", 240)),
+            600,
+        )
+        LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_VOLUME_SOFT_MIN_LIQUIDITY_USD = max(
+            float(globals().get("LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_VOLUME_SOFT_MIN_LIQUIDITY_USD", 12000.0)),
+            25000.0,
+        )
+        LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_VOLUME_SOFT_MIN_VOLUME_5M_USD = max(
+            float(globals().get("LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_VOLUME_SOFT_MIN_VOLUME_5M_USD", 450.0)),
+            600.0,
+        )
+        LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_VOLUME_SOFT_MIN_SCORE = max(
+            int(globals().get("LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_VOLUME_SOFT_MIN_SCORE", 60)),
+            70,
+        )
+        LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_VOLUME_SOFT_MAX_WARNING_FLAGS = min(
+            int(globals().get("LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_VOLUME_SOFT_MAX_WARNING_FLAGS", 1)),
+            0,
+        )
+        LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_VOLUME_SOFT_MAX_RISK_LEVEL = "MEDIUM"
+        LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_VOLUME_SOFT_MAX_ABS_CHANGE_5M = min(
+            float(globals().get("LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_VOLUME_SOFT_MAX_ABS_CHANGE_5M", 12.0)),
+            8.0,
+        )
+        LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_VOLUME_SOFT_REQUIRE_CONTRACT_SAFE = True
+        LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_VOLUME_SOFT_MAX_PASSES_PER_CYCLE = min(
+            int(globals().get("LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_VOLUME_SOFT_MAX_PASSES_PER_CYCLE", 4)),
+            2,
+        )
+    else:
+        LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_VOLUME_SOFT_ENABLED = False
+    LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_CONTRACT_SOFT_ENABLED = False
+    LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_BRIDGE_ENABLED = True
+    LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_BRIDGE_MIN_AGE_SECONDS = max(
+        int(LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_BRIDGE_MIN_AGE_SECONDS), 120
+    )
+    LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_BRIDGE_MAX_AGE_SECONDS = max(
+        int(LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_BRIDGE_MAX_AGE_SECONDS), 900
+    )
+    LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_BRIDGE_MIN_LIQUIDITY_USD = max(
+        float(LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_BRIDGE_MIN_LIQUIDITY_USD), 10000.0
+    )
+    LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_BRIDGE_MIN_VOLUME_5M_USD = max(
+        float(LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_BRIDGE_MIN_VOLUME_5M_USD), 300.0
+    )
+    LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_BRIDGE_MIN_SCORE = max(
+        int(LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_BRIDGE_MIN_SCORE), 50
+    )
+    LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_BRIDGE_MAX_ABS_CHANGE_5M = min(
+        float(LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_BRIDGE_MAX_ABS_CHANGE_5M), 15.0
+    )
+    LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_BRIDGE_MAX_PASSES_PER_CYCLE = min(
+        max(int(LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_BRIDGE_MAX_PASSES_PER_CYCLE), 1), 6
+    )
+    LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_BRIDGE_ALLOWED_RISKY_FLAGS = ["young_token"]
+    LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_BRIDGE_SET_RISK_LEVEL = "MEDIUM"
+    LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_BRIDGE_SET_WARNING_FLAGS = 0
+    LOCAL_ANTISCAM_ONCHAIN_SAFE_CHANGE_BRIDGE_ENABLED = True
+    LOCAL_ANTISCAM_ONCHAIN_SAFE_CHANGE_BRIDGE_MAX_ABS_CHANGE_5M = min(
+        float(LOCAL_ANTISCAM_ONCHAIN_SAFE_CHANGE_BRIDGE_MAX_ABS_CHANGE_5M), 75.0
+    )
+    LOCAL_ANTISCAM_ONCHAIN_SAFE_CHANGE_BRIDGE_MIN_LIQUIDITY_USD = max(
+        float(LOCAL_ANTISCAM_ONCHAIN_SAFE_CHANGE_BRIDGE_MIN_LIQUIDITY_USD), 30000.0
+    )
+    LOCAL_ANTISCAM_ONCHAIN_SAFE_CHANGE_BRIDGE_MIN_VOLUME_5M_USD = max(
+        float(LOCAL_ANTISCAM_ONCHAIN_SAFE_CHANGE_BRIDGE_MIN_VOLUME_5M_USD), 1500.0
+    )
+    LOCAL_ANTISCAM_ONCHAIN_SAFE_CHANGE_BRIDGE_MIN_SCORE = max(
+        int(LOCAL_ANTISCAM_ONCHAIN_SAFE_CHANGE_BRIDGE_MIN_SCORE), 65
+    )
+    LOCAL_ANTISCAM_ONCHAIN_SAFE_CHANGE_BRIDGE_MAX_PASSES_PER_CYCLE = min(
+        max(int(LOCAL_ANTISCAM_ONCHAIN_SAFE_CHANGE_BRIDGE_MAX_PASSES_PER_CYCLE), 1), 4
+    )
+    LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_AGE_BRIDGE_ENABLED = True
+    LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_AGE_BRIDGE_MIN_SECONDS = max(
+        int(LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_AGE_BRIDGE_MIN_SECONDS), 120
+    )
+    LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_AGE_BRIDGE_MIN_LIQUIDITY_USD = max(
+        float(LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_AGE_BRIDGE_MIN_LIQUIDITY_USD), 40000.0
+    )
+    LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_AGE_BRIDGE_MIN_VOLUME_5M_USD = max(
+        float(LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_AGE_BRIDGE_MIN_VOLUME_5M_USD), 900.0
+    )
+    LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_AGE_BRIDGE_MIN_SCORE = max(
+        int(LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_AGE_BRIDGE_MIN_SCORE), 45
+    )
+    LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_AGE_BRIDGE_MAX_ABS_CHANGE_5M = min(
+        float(LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_AGE_BRIDGE_MAX_ABS_CHANGE_5M), 10.0
+    )
+    LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_AGE_BRIDGE_MAX_PASSES_PER_CYCLE = min(
+        max(int(LOCAL_ANTISCAM_ONCHAIN_TRANSIENT_AGE_BRIDGE_MAX_PASSES_PER_CYCLE), 1), 4
+    )
+
+    LOCAL_ANTISCAM_PUMP_HISTORY_ENABLED = True
+    LOCAL_ANTISCAM_PUMP_HISTORY_TO_BLACKLIST = True
+    LOCAL_ANTISCAM_NON_WATCH_FAST_PUMP_BLOCK_ENABLED = True
+    LOCAL_ANTISCAM_NON_WATCH_FAST_PUMP_TO_BLACKLIST = True
+
+    HONEYPOT_API_ENABLED = True
+    HONEYPOT_API_FAIL_CLOSED = True
+    HONEYPOT_API_FAIL_CLOSED_IN_PAPER = False
+    HONEYPOT_GUARD_IN_PAPER = True
+    HONEYPOT_TRANSIENT_TO_BLACKLIST = True
+
+    ENTRY_PRE_RUG_GUARD_ENABLED = True
+    ENTRY_PRE_RUG_HITS_TO_BLACKLIST = max(int(ENTRY_PRE_RUG_HITS_TO_BLACKLIST), 1)
+    ENTRY_PRE_RUG_BLACKLIST_TTL_SECONDS = max(int(ENTRY_PRE_RUG_BLACKLIST_TTL_SECONDS), 21600)
+    POST_ENTRY_RUG_GUARD_ENABLED = True
+    POST_ENTRY_RUG_HITS_TO_TRIGGER = max(int(POST_ENTRY_RUG_HITS_TO_TRIGGER), 1)
+    POST_ENTRY_RUG_BLACKLIST_TTL_SECONDS = max(int(POST_ENTRY_RUG_BLACKLIST_TTL_SECONDS), 21600)
+    POST_ENTRY_RUG_SYMBOL_COOLDOWN_SECONDS = max(int(POST_ENTRY_RUG_SYMBOL_COOLDOWN_SECONDS), 1800)
+    POST_ENTRY_PUMP_GUARD_ENABLED = True
+    POST_ENTRY_PUMP_MAX_PNL_PERCENT = max(float(POST_ENTRY_PUMP_MAX_PNL_PERCENT), 100.0)
+    POST_ENTRY_PUMP_REALIZE_CAP_PERCENT = min(float(POST_ENTRY_PUMP_REALIZE_CAP_PERCENT), 60.0)
+    POST_ENTRY_PUMP_BLACKLIST_TTL_SECONDS = max(int(POST_ENTRY_PUMP_BLACKLIST_TTL_SECONDS), 21600)
+    POST_ENTRY_PUMP_SYMBOL_COOLDOWN_SECONDS = max(int(POST_ENTRY_PUMP_SYMBOL_COOLDOWN_SECONDS), 1800)
+    ENTRY_HARD_SCAM_APPLY_DISCOVERY_LANE = True
+    ENTRY_HARD_NON_WATCH_SCAM_PASS_STREAK_REQUIRED = max(int(ENTRY_HARD_NON_WATCH_SCAM_PASS_STREAK_REQUIRED), 2)
+    ENTRY_HARD_NON_WATCH_SCAM_PASS_STREAK_WINDOW_SECONDS = max(int(ENTRY_HARD_NON_WATCH_SCAM_PASS_STREAK_WINDOW_SECONDS), 900)
+    ENTRY_HARD_NON_WATCH_SCAM_PASS_STREAK_MAX_AGE_SECONDS = max(int(ENTRY_HARD_NON_WATCH_SCAM_PASS_STREAK_MAX_AGE_SECONDS), 1800)
 
 GOPLUS_EVM_API = os.getenv(
     "GOPLUS_EVM_API",

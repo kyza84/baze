@@ -73,6 +73,7 @@ class PaperPosition:
     entry_tier: str = ""
     entry_channel: str = ""
     source: str = ""
+    lane_tag: str = ""
     partial_tp_trigger_mult: float = 1.0
     partial_tp_sell_mult: float = 1.0
     candidate_id: str = ""
@@ -167,6 +168,7 @@ class AutoTrader:
         self._honeypot_transient_hits_by_token: dict[str, list[float]] = {}
         self._post_entry_rug_hits_by_token: dict[str, list[float]] = {}
         self._pre_entry_rug_hits_by_token: dict[str, list[float]] = {}
+        self._hard_scam_safe_streak_by_token: dict[str, tuple[int, float]] = {}
         self.recovery_queue: list[str] = []
         self.recovery_untracked: dict[str, int] = {}
         self._recovery_attempts: dict[str, int] = {}
@@ -174,6 +176,8 @@ class AutoTrader:
         self._skip_reason_counts_window: dict[str, int] = {}
         self._plan_attempts_by_source_window: dict[str, int] = {}
         self._opens_by_source_window: dict[str, int] = {}
+        self._plan_attempts_by_lane_window: dict[str, int] = {}
+        self._opens_by_lane_window: dict[str, int] = {}
         self._skip_reasons_by_source_window: dict[str, dict[str, int]] = {}
         self._recent_open_symbols: list[tuple[float, str]] = []
         self._recent_open_sources: list[tuple[float, str]] = []
@@ -358,6 +362,35 @@ class AutoTrader:
             self._pre_entry_rug_hits_by_token[addr] = [float(now_ts)]
         return hit_count, triggered
 
+    def _record_hard_scam_safe_streak(self, token_address: str) -> int:
+        addr = normalize_address(token_address)
+        if self._is_placeholder_token_address(addr):
+            return 0
+        now_ts = datetime.now(timezone.utc).timestamp()
+        streak_window = max(
+            60,
+            int(getattr(config, "ENTRY_HARD_NON_WATCH_SCAM_PASS_STREAK_WINDOW_SECONDS", 900) or 900),
+        )
+        cutoff_ts = float(now_ts) - float(streak_window)
+        prev = self._hard_scam_safe_streak_by_token.get(addr)
+        streak = 1
+        if isinstance(prev, (tuple, list)) and len(prev) >= 2:
+            try:
+                prev_streak = max(0, int(prev[0] or 0))
+                prev_ts = float(prev[1] or 0.0)
+                if prev_ts >= cutoff_ts:
+                    streak = max(1, prev_streak + 1)
+            except Exception:
+                streak = 1
+        self._hard_scam_safe_streak_by_token[addr] = (int(streak), float(now_ts))
+        return int(streak)
+
+    def _reset_hard_scam_safe_streak(self, token_address: str) -> None:
+        addr = normalize_address(token_address)
+        if self._is_placeholder_token_address(addr):
+            return
+        self._hard_scam_safe_streak_by_token.pop(addr, None)
+
     def _pre_entry_anti_rug_gate(self, token_data: dict[str, Any], *, token_address: str) -> tuple[bool, str]:
         if not bool(getattr(config, "ENTRY_PRE_RUG_GUARD_ENABLED", True)):
             return True, "disabled"
@@ -422,6 +455,123 @@ class AutoTrader:
                 int(getattr(config, "ENTRY_PRE_RUG_BLACKLIST_TTL_SECONDS", 21600) or 21600),
             )
             self._blacklist_add(addr, f"pre_rug_guard:{fail_reason}:{detail}", ttl_seconds=ttl)
+        return False, f"{fail_reason}:{detail} hits={hit_count}"
+
+    def _hard_non_watch_antiscam_gate(
+        self,
+        token_data: dict[str, Any],
+        *,
+        token_address: str,
+        lane_tag: str = "",
+    ) -> tuple[bool, str]:
+        if not bool(getattr(config, "ENTRY_HARD_NON_WATCH_SCAM_GUARD_ENABLED", True)):
+            return True, "disabled"
+        source_key = self._token_source_key(token_data)
+        lane = self._normalized_lane_value(lane_tag or token_data.get("_lane_tag") or "")
+        apply_discovery_lane = bool(getattr(config, "ENTRY_HARD_SCAM_APPLY_DISCOVERY_LANE", False))
+        should_apply = bool(self._is_non_watch_source(source_key) or (apply_discovery_lane and lane == "discovery"))
+        if not should_apply:
+            return True, "watch_source"
+        if bool(getattr(config, "ENTRY_HARD_NON_WATCH_SCAM_ONLY_DISCOVERY", False)):
+            if lane != "discovery":
+                return True, "not_discovery_lane"
+
+        addr = normalize_address(token_address)
+        if self._is_placeholder_token_address(addr):
+            return False, "hard_non_watch_scam_missing_address"
+
+        age_s = max(0, int(token_data.get("age_seconds") or 0))
+        liq_u = max(0.0, float(token_data.get("liquidity") or 0.0))
+        vol5_u = max(0.0, float(token_data.get("volume_5m") or 0.0))
+        abs5 = abs(float(token_data.get("price_change_5m") or 0.0))
+
+        min_age = max(0, int(getattr(config, "ENTRY_HARD_NON_WATCH_SCAM_MIN_AGE_SECONDS", 900) or 900))
+        min_liq = max(
+            0.0,
+            float(getattr(config, "ENTRY_HARD_NON_WATCH_SCAM_MIN_LIQUIDITY_USD", 25000.0) or 25000.0),
+        )
+        min_vol = max(
+            0.0,
+            float(getattr(config, "ENTRY_HARD_NON_WATCH_SCAM_MIN_VOLUME_5M_USD", 1200.0) or 1200.0),
+        )
+        max_abs5 = max(
+            0.0,
+            float(getattr(config, "ENTRY_HARD_NON_WATCH_SCAM_MAX_ABS_CHANGE_5M", 12.0) or 12.0),
+        )
+        require_contract_safe = bool(
+            getattr(config, "ENTRY_HARD_NON_WATCH_SCAM_REQUIRE_CONTRACT_SAFE", True)
+        )
+        max_warning_flags = max(
+            0,
+            int(getattr(config, "ENTRY_HARD_NON_WATCH_SCAM_MAX_WARNING_FLAGS", 0) or 0),
+        )
+        max_risk_level = str(
+            getattr(config, "ENTRY_HARD_NON_WATCH_SCAM_MAX_RISK_LEVEL", "MEDIUM") or "MEDIUM"
+        ).strip().upper()
+
+        safety = token_data.get("safety") if isinstance(token_data.get("safety"), dict) else {}
+        is_contract_safe = bool(token_data.get("is_contract_safe", (safety or {}).get("is_safe", False)))
+        warning_flags = int(token_data.get("warning_flags", len((safety or {}).get("warnings") or [])) or 0)
+        risk_level = str(token_data.get("risk_level", (safety or {}).get("risk_level", "HIGH")) or "HIGH").strip().upper()
+        rank = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
+
+        fail_reason = ""
+        detail = ""
+        if age_s < min_age:
+            fail_reason = "hard_non_watch_scam_age"
+            detail = f"{age_s}<{min_age}"
+        elif liq_u < min_liq:
+            fail_reason = "hard_non_watch_scam_liquidity"
+            detail = f"{liq_u:.0f}<{min_liq:.0f}"
+        elif vol5_u < min_vol:
+            fail_reason = "hard_non_watch_scam_volume"
+            detail = f"{vol5_u:.0f}<{min_vol:.0f}"
+        elif abs5 > max_abs5:
+            fail_reason = "hard_non_watch_scam_change_5m"
+            detail = f"{abs5:.2f}>{max_abs5:.2f}"
+        elif require_contract_safe and (not is_contract_safe):
+            fail_reason = "hard_non_watch_scam_contract"
+            detail = "contract_safe=false"
+        elif warning_flags > max_warning_flags:
+            fail_reason = "hard_non_watch_scam_warnings"
+            detail = f"{warning_flags}>{max_warning_flags}"
+        elif rank.get(risk_level, 2) > rank.get(max_risk_level, 1):
+            fail_reason = "hard_non_watch_scam_risk"
+            detail = f"{risk_level}>{max_risk_level}"
+
+        if not fail_reason:
+            required_streak = max(
+                1,
+                int(getattr(config, "ENTRY_HARD_NON_WATCH_SCAM_PASS_STREAK_REQUIRED", 2) or 2),
+            )
+            streak_max_age = max(
+                0,
+                int(getattr(config, "ENTRY_HARD_NON_WATCH_SCAM_PASS_STREAK_MAX_AGE_SECONDS", 1800) or 1800),
+            )
+            if required_streak > 1 and age_s <= streak_max_age:
+                streak = self._record_hard_scam_safe_streak(addr)
+                if streak < required_streak:
+                    return False, f"hard_non_watch_scam_warmup:{streak}/{required_streak}"
+            else:
+                self._reset_hard_scam_safe_streak(addr)
+            self._pre_entry_rug_hits_by_token.pop(addr, None)
+            return True, "ok"
+
+        self._reset_hard_scam_safe_streak(addr)
+        hit_count, triggered = self._record_pre_entry_rug_hit(addr)
+        hits_to_blacklist = max(
+            1,
+            int(getattr(config, "ENTRY_HARD_NON_WATCH_SCAM_HITS_TO_BLACKLIST", 1) or 1),
+        )
+        if hit_count >= hits_to_blacklist:
+            triggered = True
+        if triggered:
+            ttl = max(
+                300,
+                int(getattr(config, "ENTRY_HARD_NON_WATCH_SCAM_BLACKLIST_TTL_SECONDS", 21600) or 21600),
+            )
+            self._blacklist_add(addr, f"hard_non_watch_scam_guard:{fail_reason}:{detail}", ttl_seconds=ttl)
+            self._pre_entry_rug_hits_by_token[addr] = [datetime.now(timezone.utc).timestamp()]
         return False, f"{fail_reason}:{detail} hits={hit_count}"
 
     @staticmethod
@@ -840,6 +990,40 @@ class AutoTrader:
         )
         return bool(triggered), detail
 
+    def _post_entry_pump_guard_triggered(
+        self,
+        *,
+        position: PaperPosition,
+        age_seconds: int,
+    ) -> tuple[bool, str]:
+        if not bool(getattr(config, "POST_ENTRY_PUMP_GUARD_ENABLED", True)):
+            return False, ""
+        if bool(getattr(config, "POST_ENTRY_PUMP_ONLY_NON_WATCH", True)) and (
+            not self._is_non_watch_source(position.source)
+        ):
+            return False, ""
+        if int(age_seconds) < int(getattr(config, "POST_ENTRY_PUMP_MIN_AGE_SECONDS", 15) or 15):
+            return False, ""
+        pnl_pct = float(getattr(position, "pnl_percent", 0.0) or 0.0)
+        max_pnl = max(
+            0.0,
+            float(getattr(config, "POST_ENTRY_PUMP_MAX_PNL_PERCENT", 120.0) or 120.0),
+        )
+        if pnl_pct < max_pnl:
+            return False, ""
+        entry_liq = max(0.0, float(getattr(position, "liquidity_usd", 0.0) or 0.0))
+        min_entry_liq = max(
+            0.0,
+            float(getattr(config, "POST_ENTRY_PUMP_MIN_ENTRY_LIQUIDITY_USD", 10000.0) or 10000.0),
+        )
+        if entry_liq < min_entry_liq:
+            return False, ""
+        detail = (
+            f"pnl={pnl_pct:.2f}% cap={max_pnl:.2f}% "
+            f"entry_liq={entry_liq:.0f} age={int(age_seconds)}s"
+        )
+        return True, detail
+
     async def _maybe_run_proof_sell_canary(self, position: PaperPosition, *, age_seconds: int) -> tuple[bool, str]:
         if not bool(getattr(config, "PROOF_SELL_CANARY_ENABLED", True)):
             return False, ""
@@ -1155,7 +1339,19 @@ class AutoTrader:
                     if liq_u < min_liq_u:
                         return False, "safe_transient_liquidity"
                     if vol5_u < min_vol5_u:
-                        return False, "safe_transient_volume"
+                        transient_volume_soft_ok = bool(token_data.get("_safe_transient_volume_soft_pass", False))
+                        if not (
+                            is_non_watch_source
+                            and bool(
+                                getattr(
+                                    config,
+                                    "LOCAL_ANTISCAM_TRANSIENT_NON_WATCH_VOLUME_SOFT_ENABLED",
+                                    True,
+                                )
+                            )
+                            and transient_volume_soft_ok
+                        ):
+                            return False, "safe_transient_volume"
                     if abs5 > max_abs5:
                         return False, "safe_transient_change_5m"
                     if bool(getattr(config, "LOCAL_ANTISCAM_TRANSIENT_BLOCK_SOFT_CHANGE_PASS", True)):
@@ -1183,6 +1379,10 @@ class AutoTrader:
         source_is_watchlist: bool,
         entry_channel: str,
         ev_expected_net_usd: float,
+        token_data: dict[str, Any] | None = None,
+        score: int = 0,
+        gross_percent: float = 0.0,
+        cost_total_percent: float = 0.0,
     ) -> tuple[bool, str]:
         if source_is_watchlist:
             return True, "watchlist_source"
@@ -1191,8 +1391,70 @@ class AutoTrader:
         if not bool(getattr(config, "NON_WATCH_EXPLORE_REQUIRE_POSITIVE_EV", True)):
             return True, "disabled"
         min_ev = float(getattr(config, "NON_WATCH_EXPLORE_MIN_EV_NET_USD", 0.0) or 0.0)
-        if float(ev_expected_net_usd) < float(min_ev):
-            return False, f"ev_expected_net:{float(ev_expected_net_usd):.6f}<{float(min_ev):.6f}"
+        ev_expected_net_usd = float(ev_expected_net_usd)
+        if ev_expected_net_usd < float(min_ev):
+            # Paper-only strict soft path for non-watch discovery:
+            # allow tiny negative EV when candidate quality is strong and near cost break-even.
+            if (
+                (not self._is_live_mode())
+                and bool(getattr(config, "NON_WATCH_EXPLORE_STRICT_SOFT_EV_ENABLED", True))
+            ):
+                risk = str((token_data or {}).get("risk_level") or "").strip().upper()
+                warnings = int((token_data or {}).get("warning_flags") or 0)
+                contract_safe = bool((token_data or {}).get("is_contract_safe", False))
+                liq = float((token_data or {}).get("liquidity") or 0.0)
+                vol5 = float((token_data or {}).get("volume_5m") or 0.0)
+                age_s = int((token_data or {}).get("age_seconds") or 0)
+                abs5 = abs(float((token_data or {}).get("price_change_5m") or 0.0))
+                min_score = max(
+                    0,
+                    int(getattr(config, "NON_WATCH_EXPLORE_STRICT_SOFT_EV_MIN_SCORE", 82) or 82),
+                )
+                min_liq = max(
+                    0.0,
+                    float(getattr(config, "NON_WATCH_EXPLORE_STRICT_SOFT_EV_MIN_LIQUIDITY_USD", 70000.0) or 70000.0),
+                )
+                min_vol = max(
+                    0.0,
+                    float(getattr(config, "NON_WATCH_EXPLORE_STRICT_SOFT_EV_MIN_VOLUME_5M_USD", 500.0) or 500.0),
+                )
+                min_age = max(
+                    0,
+                    int(getattr(config, "NON_WATCH_EXPLORE_STRICT_SOFT_EV_MIN_AGE_SECONDS", 240) or 240),
+                )
+                max_abs5 = max(
+                    0.1,
+                    float(getattr(config, "NON_WATCH_EXPLORE_STRICT_SOFT_EV_MAX_ABS_CHANGE_5M", 6.0) or 6.0),
+                )
+                max_warn = max(
+                    0,
+                    int(getattr(config, "NON_WATCH_EXPLORE_STRICT_SOFT_EV_MAX_WARNING_FLAGS", 1) or 1),
+                )
+                edge_margin = max(
+                    0.0,
+                    float(getattr(config, "NON_WATCH_EXPLORE_STRICT_SOFT_EV_EDGE_MARGIN_PERCENT", 0.35) or 0.35),
+                )
+                soft_min_ev = float(
+                    getattr(config, "NON_WATCH_EXPLORE_STRICT_SOFT_EV_MIN_NET_USD", -0.0025) or -0.0025
+                )
+                strict_ok = bool(
+                    int(score) >= int(min_score)
+                    and contract_safe
+                    and warnings <= int(max_warn)
+                    and risk in {"LOW", "MEDIUM"}
+                    and liq >= float(min_liq)
+                    and vol5 >= float(min_vol)
+                    and age_s >= int(min_age)
+                    and abs5 <= float(max_abs5)
+                    and (float(gross_percent) + float(edge_margin)) >= float(cost_total_percent)
+                )
+                if strict_ok and ev_expected_net_usd >= float(soft_min_ev):
+                    return True, (
+                        "strict_soft_ev "
+                        f"ev={ev_expected_net_usd:.6f}>={soft_min_ev:.6f} "
+                        f"gross={float(gross_percent):.2f}% cost={float(cost_total_percent):.2f}%"
+                    )
+            return False, f"ev_expected_net:{ev_expected_net_usd:.6f}<{float(min_ev):.6f}"
         return True, "ok"
 
     def _quarantine_gate(self, token_data: dict[str, Any], *, candidate_id: str, token_address: str) -> tuple[bool, str]:
@@ -1207,6 +1469,105 @@ class AutoTrader:
             return True, "verified_token"
 
         required = max(0, int(getattr(config, "ENTRY_QUARANTINE_REQUIRED_CYCLES", 2) or 2))
+        source_key = self._token_source_key(token_data)
+        if not self._is_live_mode():
+            if self._is_non_watch_source(source_key):
+                # In paper mode for non-watch discovery we require one fewer stable cycle.
+                # This keeps quarantine active but reduces plan-side starvation on quality non-watch flow.
+                relax_cycles = max(
+                    0,
+                    int(getattr(config, "ENTRY_QUARANTINE_PAPER_NON_WATCH_RELAX_CYCLES", 0) or 0),
+                )
+                required = max(1, required - relax_cycles)
+                if bool(getattr(config, "ENTRY_QUARANTINE_PAPER_NON_WATCH_FASTTRACK_ENABLED", True)):
+                    score_data = token_data.get("score_data") if isinstance(token_data.get("score_data"), dict) else {}
+                    score_now = int(token_data.get("score") or score_data.get("score") or 0)
+                    age_now = int(token_data.get("age_seconds") or 0)
+                    liq_now = float(token_data.get("liquidity") or 0.0)
+                    vol_now = float(token_data.get("volume_5m") or 0.0)
+                    abs5_now = abs(float(token_data.get("price_change_5m") or 0.0))
+                    warning_flags_now = int(token_data.get("warning_flags") or 0)
+                    risk_now = str(token_data.get("risk_level", "UNKNOWN") or "UNKNOWN").strip().upper()
+                    contract_safe_now = bool(token_data.get("is_contract_safe", False))
+
+                    ft_min_score = max(
+                        0,
+                        int(getattr(config, "ENTRY_QUARANTINE_PAPER_NON_WATCH_FASTTRACK_MIN_SCORE", 65) or 65),
+                    )
+                    ft_min_age = max(
+                        0,
+                        int(
+                            getattr(
+                                config,
+                                "ENTRY_QUARANTINE_PAPER_NON_WATCH_FASTTRACK_MIN_AGE_SECONDS",
+                                600,
+                            )
+                            or 600
+                        ),
+                    )
+                    ft_min_liq = max(
+                        0.0,
+                        float(
+                            getattr(
+                                config,
+                                "ENTRY_QUARANTINE_PAPER_NON_WATCH_FASTTRACK_MIN_LIQUIDITY_USD",
+                                50000.0,
+                            )
+                            or 50000.0
+                        ),
+                    )
+                    ft_min_vol = max(
+                        0.0,
+                        float(
+                            getattr(
+                                config,
+                                "ENTRY_QUARANTINE_PAPER_NON_WATCH_FASTTRACK_MIN_VOLUME_5M_USD",
+                                900.0,
+                            )
+                            or 900.0
+                        ),
+                    )
+                    ft_max_abs5 = max(
+                        0.0,
+                        float(
+                            getattr(
+                                config,
+                                "ENTRY_QUARANTINE_PAPER_NON_WATCH_FASTTRACK_MAX_ABS_CHANGE_5M",
+                                8.0,
+                            )
+                            or 8.0
+                        ),
+                    )
+                    ft_max_warn = max(
+                        0,
+                        int(
+                            getattr(
+                                config,
+                                "ENTRY_QUARANTINE_PAPER_NON_WATCH_FASTTRACK_MAX_WARNING_FLAGS",
+                                0,
+                            )
+                            or 0
+                        ),
+                    )
+                    ft_require_contract_safe = bool(
+                        getattr(
+                            config,
+                            "ENTRY_QUARANTINE_PAPER_NON_WATCH_FASTTRACK_REQUIRE_CONTRACT_SAFE",
+                            True,
+                        )
+                    )
+                    fasttrack_ok = bool(
+                        score_now >= ft_min_score
+                        and age_now >= ft_min_age
+                        and liq_now >= ft_min_liq
+                        and vol_now >= ft_min_vol
+                        and abs5_now <= ft_max_abs5
+                        and warning_flags_now <= ft_max_warn
+                        and risk_now in {"LOW", "MEDIUM"}
+                        and ((not ft_require_contract_safe) or contract_safe_now)
+                    )
+                    if fasttrack_ok:
+                        required = min(required, 1)
         if required <= 0:
             return True, "disabled_required_0"
 
@@ -1241,14 +1602,19 @@ class AutoTrader:
         now_ts = time.time()
         row = self._quarantine_rows.get(token_address)
         if not isinstance(row, dict):
+            stable_cycles = 1
             self._quarantine_rows[token_address] = {
                 "last_ts": float(now_ts),
                 "last_cycle": float(cycle_idx if cycle_idx is not None else -1),
                 "last_liq": float(liq),
                 "last_vol": float(vol),
-                "stable_cycles": 1.0,
+                "stable_cycles": float(stable_cycles),
             }
-            return False, f"quarantine_warmup:1/{required}"
+            if required <= 1:
+                return True, f"quarantine_ok:{stable_cycles}/{required}"
+            if stable_cycles >= required:
+                return True, f"quarantine_ok:{stable_cycles}/{required}"
+            return False, f"quarantine_warmup:{stable_cycles}/{required}"
 
         prev_cycle = int(float(row.get("last_cycle", -1.0) or -1.0))
         same_cycle = (cycle_idx is not None) and (prev_cycle == int(cycle_idx))
@@ -1517,6 +1883,12 @@ class AutoTrader:
             )
             if actionable_present:
                 actionable_dominant_non_watch = int(actionable_non_watch) > int(actionable_watch)
+                actionable_has_non_watch = int(actionable_non_watch) > 0
+                effective_min_non_watch = int(min_non_watch)
+                if actionable_has_non_watch:
+                    # Prevent quota deadlock when actionable non-watch rows are fewer than
+                    # configured target for this batch.
+                    effective_min_non_watch = max(1, min(int(min_non_watch), int(actionable_non_watch)))
                 if not bool(batch_has_non_watchlist):
                     if enforce_empty_batch and int(actionable_non_watch) > 0:
                         detail = (
@@ -1524,17 +1896,27 @@ class AutoTrader:
                             f"mode=actionable_window source={str(source_name or '-')} "
                             f"actionable_non_watch={int(actionable_non_watch)}/{int(actionable_total)} "
                             f"selected_non_watch={int(selected_non_watch)}/{int(selected_non_watch + selected_watch)} "
-                            f"min_non_watch={int(min_non_watch)} enforce_empty_batch=True"
+                            f"min_non_watch={int(min_non_watch)} effective_min_non_watch={int(effective_min_non_watch)} "
+                            f"enforce_empty_batch=True"
                         )
                         return True, detail
                     return False, ""
+                if actionable_has_non_watch and int(selected_non_watch) < int(effective_min_non_watch):
+                    detail = (
+                        "plan_non_watchlist_quota "
+                        f"mode=actionable_floor source={str(source_name or '-')} "
+                        f"actionable_non_watch={int(actionable_non_watch)}/{int(actionable_total)} "
+                        f"selected_non_watch={int(selected_non_watch)} selected_watch={int(selected_watch)} "
+                        f"min_non_watch={int(min_non_watch)} effective_min_non_watch={int(effective_min_non_watch)}"
+                    )
+                    return True, detail
                 if actionable_dominant_non_watch and int(selected_non_watch) < int(selected_watch):
                     detail = (
                         "plan_non_watchlist_quota "
                         f"mode=actionable_window source={str(source_name or '-')} "
                         f"actionable_non_watch={int(actionable_non_watch)}/{int(actionable_total)} "
                         f"selected_non_watch={int(selected_non_watch)} selected_watch={int(selected_watch)} "
-                        f"min_non_watch={int(min_non_watch)}"
+                        f"min_non_watch={int(min_non_watch)} effective_min_non_watch={int(effective_min_non_watch)}"
                     )
                     return True, detail
                 return False, ""
@@ -1565,6 +1947,46 @@ class AutoTrader:
             f"watch_share_cap={watch_share_cap:.3f} batch_has_non_watch={bool(batch_has_non_watchlist)} "
             f"enforce_empty_batch={bool(enforce_empty_batch)} "
             f"window={window_seconds}s"
+        )
+        return True, detail
+
+    def _non_watch_symbol_window_blocked(
+        self,
+        *,
+        source_name: str,
+        symbol: str,
+        token_data: dict[str, Any] | None = None,
+    ) -> tuple[bool, str]:
+        if not bool(getattr(config, "PLAN_NON_WATCH_SYMBOL_WINDOW_GUARD_ENABLED", True)):
+            return False, ""
+        if self._is_watchlist_source(source_name):
+            return False, ""
+        key = self._symbol_key(symbol)
+        if not key:
+            return False, ""
+        min_selected_non_watch = max(
+            1,
+            int(getattr(config, "PLAN_NON_WATCH_SYMBOL_WINDOW_MIN_SELECTED_NON_WATCH", 2) or 2),
+        )
+        selected_non_watch = int((token_data or {}).get("_plan_selected_non_watch", 0) or 0)
+        # Do not starve the lane when the batch has too few non-watch alternatives.
+        if selected_non_watch < min_selected_non_watch:
+            return False, ""
+        window_seconds = max(
+            300,
+            int(getattr(config, "PLAN_NON_WATCH_SYMBOL_WINDOW_SECONDS", 900) or 900),
+        )
+        max_opens = max(
+            1,
+            int(getattr(config, "PLAN_NON_WATCH_MAX_OPENS_PER_SYMBOL_WINDOW", 3) or 3),
+        )
+        same, total, share = self._symbol_open_share_recent(symbol=key, window_seconds=window_seconds)
+        if same < max_opens:
+            return False, ""
+        detail = (
+            f"non_watch_symbol_window_cap symbol={key} opens={same}/{total} cap={max_opens} "
+            f"window={window_seconds}s selected_non_watch={selected_non_watch} min_selected={min_selected_non_watch} "
+            f"share={share:.3f}"
         )
         return True, detail
 
@@ -1630,6 +2052,41 @@ class AutoTrader:
             f"symbol_concentration symbol={key} projected_share={projected_share:.3f} "
             f"cap={cap:.3f} opens={same}/{total} current_share={current_share:.3f} "
             f"window={window_seconds}s anti_choke={anti_choke}"
+        )
+        return True, detail
+
+    def _symbol_loss_lock_blocked(
+        self,
+        *,
+        symbol: str,
+        source_name: str,
+        symbol_metrics: dict[str, float | int],
+    ) -> tuple[bool, str]:
+        if not bool(getattr(config, "SYMBOL_LOSS_LOCK_ENABLED", True)):
+            return False, ""
+        if (not bool(getattr(config, "SYMBOL_LOSS_LOCK_APPLY_WATCHLIST", True))) and self._is_watchlist_source(
+            source_name
+        ):
+            return False, ""
+        key = self._symbol_key(symbol)
+        if not key:
+            return False, ""
+
+        trades = int(symbol_metrics.get("trades", 0) or 0)
+        loss_share = float(symbol_metrics.get("loss_share", 0.0) or 0.0)
+        sum_pnl = float(symbol_metrics.get("sum_pnl", 0.0) or 0.0)
+        min_trades = max(2, int(getattr(config, "SYMBOL_LOSS_LOCK_MIN_TRADES", 4) or 4))
+        min_loss_share = max(0.0, min(1.0, float(getattr(config, "SYMBOL_LOSS_LOCK_MIN_LOSS_SHARE", 0.66) or 0.66)))
+        max_net = float(getattr(config, "SYMBOL_LOSS_LOCK_MAX_NET_PNL_USD", -0.02) or -0.02)
+        if trades < min_trades or loss_share < min_loss_share or sum_pnl > max_net:
+            return False, ""
+
+        cooldown_seconds = max(60, int(getattr(config, "SYMBOL_LOSS_LOCK_COOLDOWN_SECONDS", 1800) or 1800))
+        self._set_symbol_cooldown(key, cooldown_seconds, "loss_lock")
+        detail = (
+            f"symbol={key} trades={trades} sum_pnl=${sum_pnl:.4f} loss_share={loss_share:.2f} "
+            f"thresholds[min_trades={min_trades}, max_net=${max_net:.4f}, min_loss_share={min_loss_share:.2f}] "
+            f"cooldown={cooldown_seconds}s source={str(source_name or '-').lower()}"
         )
         return True, detail
 
@@ -1889,6 +2346,49 @@ class AutoTrader:
             0,
             int(getattr(config, "EDGE_COST_DOMINANT_SYMBOL_COOLDOWN_SECONDS", 900) or 900),
         )
+        if is_non_watch_source:
+            min_gross = min(
+                min_gross,
+                max(
+                    0.0,
+                    float(getattr(config, "EDGE_COST_DOMINANT_NON_WATCH_MIN_GROSS_PERCENT", 1.0) or 1.0),
+                ),
+            )
+            min_cost = max(
+                min_cost,
+                max(
+                    0.0,
+                    float(getattr(config, "EDGE_COST_DOMINANT_NON_WATCH_MIN_COST_PERCENT", 6.0) or 6.0),
+                ),
+            )
+            min_delta = max(
+                min_delta,
+                max(
+                    0.0,
+                    float(getattr(config, "EDGE_COST_DOMINANT_NON_WATCH_MIN_DELTA_PERCENT", 4.0) or 4.0),
+                ),
+            )
+            hits_to_cooldown = min(
+                hits_to_cooldown,
+                max(
+                    1,
+                    int(getattr(config, "EDGE_COST_DOMINANT_NON_WATCH_HITS_TO_COOLDOWN", 2) or 2),
+                ),
+            )
+            cooldown_seconds = max(
+                cooldown_seconds,
+                max(
+                    0,
+                    int(
+                        getattr(
+                            config,
+                            "EDGE_COST_DOMINANT_NON_WATCH_SYMBOL_COOLDOWN_SECONDS",
+                            1200,
+                        )
+                        or 1200
+                    ),
+                ),
+            )
         if (
             bool(getattr(config, "EDGE_COST_DOMINANT_NON_WATCH_EXPLORE_FAST_GUARD_ENABLED", True))
             and is_non_watch_source
@@ -2087,6 +2587,7 @@ class AutoTrader:
         symbol: str,
         skip_reason: str,
         source_name: str = "",
+        lane_tag: str = "",
     ) -> None:
         if not bool(getattr(config, "EDGE_LOW_LOOP_GUARD_ENABLED", True)):
             return
@@ -2112,6 +2613,16 @@ class AutoTrader:
             60,
             int(getattr(config, "EDGE_LOW_LOOP_SYMBOL_COOLDOWN_SECONDS", 600) or 600),
         )
+        lane = self._normalized_lane_value(lane_tag)
+        if lane == "discovery":
+            hits_mult = max(
+                0.20,
+                min(
+                    1.50,
+                    float(getattr(config, "LANE_DISCOVERY_EDGE_LOOP_HITS_TO_COOLDOWN_MULT", 0.70) or 0.70),
+                ),
+            )
+            hits_to_cooldown = max(2, int(math.ceil(float(hits_to_cooldown) * float(hits_mult))))
         cutoff_ts = now_ts - float(window_seconds)
         rows = [
             float(ts)
@@ -2136,7 +2647,7 @@ class AutoTrader:
             source_key or "unknown",
         )
 
-    def _symbol_window_metrics(self, symbol: str) -> dict[str, float | int]:
+    def _symbol_window_metrics(self, symbol: str, *, window_minutes: int | None = None) -> dict[str, float | int]:
         key = self._symbol_key(symbol)
         if not key:
             return {
@@ -2148,8 +2659,11 @@ class AutoTrader:
                 "avg_pnl": 0.0,
                 "loss_streak": 0,
             }
-        window_minutes = max(1, int(getattr(config, "SYMBOL_EV_WINDOW_MINUTES", 120) or 120))
-        cutoff = datetime.now(timezone.utc).timestamp() - (window_minutes * 60)
+        if window_minutes is None:
+            window_minutes = max(1, int(getattr(config, "SYMBOL_EV_WINDOW_MINUTES", 120) or 120))
+        else:
+            window_minutes = max(1, int(window_minutes))
+        cutoff = datetime.now(timezone.utc).timestamp() - (int(window_minutes) * 60)
         rows = [
             p
             for p in self.closed_positions
@@ -2976,6 +3490,7 @@ class AutoTrader:
             "entry_channel": str(position.entry_channel or ""),
             "market_mode": str(position.market_mode or ""),
             "source": self._normalized_source_value(position.source),
+            "lane_tag": str(position.lane_tag or ""),
             "position_size_usd": float(position.position_size_usd),
             "expected_edge_percent": float(position.expected_edge_percent),
             "ev_expected_net_usd": float(position.ev_expected_net_usd),
@@ -3011,6 +3526,20 @@ class AutoTrader:
         self._plan_attempts_by_source_window = {}
         self._opens_by_source_window = {}
         self._skip_reasons_by_source_window = {}
+        return out
+
+    def pop_lane_flow_window(self) -> dict[str, dict[str, int]]:
+        lanes = set(self._plan_attempts_by_lane_window.keys())
+        lanes.update(self._opens_by_lane_window.keys())
+        out: dict[str, dict[str, int]] = {}
+        for raw_lane in lanes:
+            lane = self._normalized_lane_value(raw_lane) or "unknown"
+            out[lane] = {
+                "plan_attempts": int(self._plan_attempts_by_lane_window.get(raw_lane, 0) or 0),
+                "opens": int(self._opens_by_lane_window.get(raw_lane, 0) or 0),
+            }
+        self._plan_attempts_by_lane_window = {}
+        self._opens_by_lane_window = {}
         return out
 
     @staticmethod
@@ -3089,6 +3618,209 @@ class AutoTrader:
         return not AutoTrader._is_watchlist_source(key)
 
     @staticmethod
+    def _normalized_lane_value(value: Any) -> str:
+        key = str(value or "").strip().lower()
+        if key in {"stable", "discovery"}:
+            return key
+        return ""
+
+    def _lane_tag_from_token(self, token: dict[str, Any]) -> str:
+        row = dict(token or {})
+        explicit_locked = self._normalized_lane_value(
+            row.get("economic_lane")
+            or row.get("entry_lane")
+        )
+        if explicit_locked:
+            return explicit_locked
+        explicit_hint = self._normalized_lane_value(
+            row.get("_lane_tag")
+            or row.get("lane_tag")
+        )
+
+        source_name = self._token_source_key(row)
+        fallback = "stable" if self._is_watchlist_source(source_name) else "discovery"
+        if not bool(getattr(config, "PLAN_LANE_TAG_ENABLED", True)):
+            return fallback
+
+        def _f(*keys: str, default: float = 0.0) -> float:
+            for key in keys:
+                if key in row and row.get(key) is not None:
+                    try:
+                        return float(row.get(key) or 0.0)
+                    except Exception:
+                        continue
+            return float(default)
+
+        age_seconds = int(_f("age_seconds", default=0.0))
+        liquidity_usd = _f("liquidity_usd", "liquidity", default=0.0)
+        volume_5m_usd = _f("volume_5m_usd", "volume_5m", default=0.0)
+        abs_change_5m = abs(_f("price_change_5m", default=0.0))
+        contract_raw = row.get("is_contract_safe", None)
+        contract_safe = (
+            bool(contract_raw)
+            if contract_raw is not None
+            else self._is_watchlist_source(source_name)
+        )
+        warning_flags = int(row.get("warning_flags") or 0)
+        risk_level = str(row.get("risk_level", "") or "").strip().upper()
+        stable_min_age = max(0, int(getattr(config, "PLAN_LANE_STABLE_MIN_AGE_SECONDS", 900) or 900))
+        stable_min_liq = max(0.0, float(getattr(config, "PLAN_LANE_STABLE_MIN_LIQUIDITY_USD", 90000.0) or 90000.0))
+        stable_min_vol5 = max(0.0, float(getattr(config, "PLAN_LANE_STABLE_MIN_VOLUME_5M_USD", 900.0) or 900.0))
+        stable_max_abs5 = max(0.0, float(getattr(config, "PLAN_LANE_STABLE_MAX_ABS_CHANGE_5M", 18.0) or 18.0))
+        max_warning_flags = max(0, int(getattr(config, "PLAN_LANE_STABLE_MAX_WARNING_FLAGS", 1) or 1))
+        require_contract_safe = bool(getattr(config, "PLAN_LANE_STABLE_REQUIRE_CONTRACT_SAFE", True))
+        risk_allowed = (
+            (risk_level in {"LOW", "MEDIUM"})
+            or (self._is_watchlist_source(source_name) and risk_level in {"", "UNKNOWN", "N/A", "NONE"})
+        )
+        stable_by_quality = (
+            age_seconds >= stable_min_age
+            and liquidity_usd >= stable_min_liq
+            and volume_5m_usd >= stable_min_vol5
+            and abs_change_5m <= stable_max_abs5
+            and warning_flags <= max_warning_flags
+            and risk_allowed
+            and ((not require_contract_safe) or contract_safe)
+        )
+        if stable_by_quality:
+            return "stable"
+        if explicit_hint and age_seconds <= 0 and liquidity_usd <= 0.0 and volume_5m_usd <= 0.0:
+            return explicit_hint
+        return "discovery"
+
+    def _lane_econ_profile(self, *, source_name: str, lane_tag: str = "") -> dict[str, float | str]:
+        src = str(source_name or "").strip().lower()
+        lane = self._normalized_lane_value(lane_tag)
+        if not lane:
+            lane = "stable" if self._is_watchlist_source(src) else "discovery"
+        profile: dict[str, float | str] = {
+            "lane": str(lane),
+            "edge_pct_mult": 1.0,
+            "edge_usd_mult": 1.0,
+            "ev_min_mult": 1.0,
+            "min_trade_usd": 0.0,
+            "min_trade_gas_mult": 0.0,
+            "hint_min_size_usd": 0.0,
+        }
+        if not bool(getattr(config, "LANE_ECON_SPLIT_ENABLED", True)):
+            return profile
+
+        if lane == "stable":
+            profile["edge_pct_mult"] = max(
+                0.30,
+                float(
+                    getattr(
+                        config,
+                        "LANE_ECON_STABLE_EDGE_PCT_MULT",
+                        getattr(config, "LANE_ECON_WATCHLIST_EDGE_PCT_MULT", 1.0),
+                    )
+                    or getattr(config, "LANE_ECON_WATCHLIST_EDGE_PCT_MULT", 1.0)
+                ),
+            )
+            profile["edge_usd_mult"] = max(
+                0.30,
+                float(
+                    getattr(
+                        config,
+                        "LANE_ECON_STABLE_EDGE_USD_MULT",
+                        getattr(config, "LANE_ECON_WATCHLIST_EDGE_USD_MULT", 1.0),
+                    )
+                    or getattr(config, "LANE_ECON_WATCHLIST_EDGE_USD_MULT", 1.0)
+                ),
+            )
+            profile["ev_min_mult"] = max(
+                0.20,
+                float(
+                    getattr(
+                        config,
+                        "LANE_ECON_STABLE_EV_MIN_MULT",
+                        getattr(config, "LANE_ECON_WATCHLIST_EV_MIN_MULT", 1.0),
+                    )
+                    or getattr(config, "LANE_ECON_WATCHLIST_EV_MIN_MULT", 1.0)
+                ),
+            )
+            profile["min_trade_usd"] = max(
+                0.0,
+                float(
+                    getattr(
+                        config,
+                        "LANE_ECON_STABLE_MIN_TRADE_USD",
+                        getattr(config, "LANE_ECON_WATCHLIST_MIN_TRADE_USD", 0.0),
+                    )
+                    or getattr(config, "LANE_ECON_WATCHLIST_MIN_TRADE_USD", 0.0)
+                ),
+            )
+            return profile
+
+        profile["edge_pct_mult"] = max(
+            0.30,
+            float(
+                getattr(
+                    config,
+                    "LANE_ECON_DISCOVERY_EDGE_PCT_MULT",
+                    getattr(config, "LANE_ECON_NON_WATCH_EDGE_PCT_MULT", 0.85),
+                )
+                or getattr(config, "LANE_ECON_NON_WATCH_EDGE_PCT_MULT", 0.85)
+            ),
+        )
+        profile["edge_usd_mult"] = max(
+            0.30,
+            float(
+                getattr(
+                    config,
+                    "LANE_ECON_DISCOVERY_EDGE_USD_MULT",
+                    getattr(config, "LANE_ECON_NON_WATCH_EDGE_USD_MULT", 0.75),
+                )
+                or getattr(config, "LANE_ECON_NON_WATCH_EDGE_USD_MULT", 0.75)
+            ),
+        )
+        profile["ev_min_mult"] = max(
+            0.20,
+            float(
+                getattr(
+                    config,
+                    "LANE_ECON_DISCOVERY_EV_MIN_MULT",
+                    getattr(config, "LANE_ECON_NON_WATCH_EV_MIN_MULT", 0.85),
+                )
+                or getattr(config, "LANE_ECON_NON_WATCH_EV_MIN_MULT", 0.85)
+            ),
+        )
+        profile["min_trade_usd"] = max(
+            0.0,
+            float(
+                getattr(
+                    config,
+                    "LANE_ECON_DISCOVERY_MIN_TRADE_USD",
+                    getattr(config, "LANE_ECON_NON_WATCH_MIN_TRADE_USD", 1.10),
+                )
+                or getattr(config, "LANE_ECON_NON_WATCH_MIN_TRADE_USD", 1.10)
+            ),
+        )
+        profile["min_trade_gas_mult"] = max(
+            0.0,
+            float(
+                getattr(
+                    config,
+                    "LANE_ECON_DISCOVERY_MIN_TRADE_GAS_MULT",
+                    getattr(config, "LANE_ECON_NON_WATCH_MIN_TRADE_GAS_MULT", 10.0),
+                )
+                or getattr(config, "LANE_ECON_NON_WATCH_MIN_TRADE_GAS_MULT", 10.0)
+            ),
+        )
+        profile["hint_min_size_usd"] = max(
+            0.0,
+            float(
+                getattr(
+                    config,
+                    "LANE_ECON_DISCOVERY_HINT_MIN_SIZE_USD",
+                    getattr(config, "LANE_ECON_NON_WATCH_HINT_MIN_SIZE_USD", 1.10),
+                )
+                or getattr(config, "LANE_ECON_NON_WATCH_HINT_MIN_SIZE_USD", 1.10)
+            ),
+        )
+        return profile
+
+    @staticmethod
     def _batch_candidate_key(token: dict[str, Any]) -> str:
         addr = normalize_address(str((token or {}).get("address", "") or ""))
         if addr:
@@ -3101,6 +3833,100 @@ class AutoTrader:
             return f"sym:{sym}"
         return f"obj:{id(token)}"
 
+    def _non_watch_econ_viable_for_plan(
+        self,
+        token_data: dict[str, Any],
+        score_data: dict[str, Any],
+    ) -> bool:
+        if not bool(getattr(config, "PLAN_NON_WATCH_ECON_QUOTA_ENABLED", True)):
+            return True
+        if self._is_watchlist_source(self._token_source_key(token_data)):
+            return False
+        min_score = max(0, int(getattr(config, "PLAN_NON_WATCH_ECON_MIN_SCORE", 30) or 30))
+        min_edge_usd = float(getattr(config, "PLAN_NON_WATCH_ECON_MIN_EDGE_USD", 0.0010) or 0.0010)
+        min_edge_pct = float(getattr(config, "PLAN_NON_WATCH_ECON_MIN_EDGE_PERCENT", 0.10) or 0.10)
+        score = int((score_data or {}).get("score", 0) or 0)
+        hint_usd = float((token_data or {}).get("_batch_profit_hint_edge_usd", 0.0) or 0.0)
+        hint_pct = float((token_data or {}).get("_batch_profit_hint_edge_pct", 0.0) or 0.0)
+        if bool(
+            score >= min_score
+            and hint_usd >= min_edge_usd
+            and hint_pct >= min_edge_pct
+        ):
+            return True
+
+        # Non-watch fallback: allow strong, clean candidates to reach plan even when
+        # profit hints are sparse/zero in fresh windows; final EV/cost guards still apply later.
+        if score >= max(int(min_score), 70):
+            liq = float((token_data or {}).get("liquidity") or 0.0)
+            vol5 = float((token_data or {}).get("volume_5m") or 0.0)
+            age_s = int((token_data or {}).get("age_seconds") or 0)
+            abs5 = abs(float((token_data or {}).get("price_change_5m") or 0.0))
+            contract_safe = bool((token_data or {}).get("is_contract_safe", False))
+            warnings = int((token_data or {}).get("warning_flags") or 0)
+            risk = str((token_data or {}).get("risk_level") or "HIGH").strip().upper()
+            if (
+                contract_safe
+                and warnings <= 1
+                and risk in {"LOW", "MEDIUM"}
+                and liq >= 70000.0
+                and vol5 >= 250.0
+                and age_s >= 240
+                and abs5 <= 6.0
+            ):
+                return True
+        # Actionable-window relax: if non-watch already dominates post-filters but is
+        # under-selected before plan, allow clean candidates to reach final EV checks.
+        if bool(getattr(config, "PLAN_NON_WATCH_ECON_ACTIONABLE_RELAX_ENABLED", True)):
+            actionable_non_watch = int((token_data or {}).get("_plan_actionable_non_watch", 0) or 0)
+            actionable_watch = int((token_data or {}).get("_plan_actionable_watch", 0) or 0)
+            selected_non_watch = int((token_data or {}).get("_plan_selected_non_watch", 0) or 0)
+            min_non_watch_target = max(
+                1,
+                int(getattr(config, "PLAN_MIN_NON_WATCHLIST_PER_BATCH", 1) or 1),
+            )
+            actionable_min_rows = max(
+                2,
+                int(getattr(config, "PLAN_NON_WATCH_ECON_ACTIONABLE_MIN_ROWS", 6) or 6),
+            )
+            if (
+                actionable_non_watch >= actionable_min_rows
+                and selected_non_watch < min_non_watch_target
+            ):
+                relax_score_min = max(
+                    0,
+                    int(getattr(config, "PLAN_NON_WATCH_ECON_ACTIONABLE_SCORE_MIN", 55) or 55),
+                )
+                relax_liq_min = max(
+                    0.0,
+                    float(getattr(config, "PLAN_NON_WATCH_ECON_ACTIONABLE_MIN_LIQUIDITY_USD", 25000.0) or 25000.0),
+                )
+                relax_vol5_min = max(
+                    0.0,
+                    float(getattr(config, "PLAN_NON_WATCH_ECON_ACTIONABLE_MIN_VOLUME_5M_USD", 120.0) or 120.0),
+                )
+                relax_abs5_max = max(
+                    0.0,
+                    float(getattr(config, "PLAN_NON_WATCH_ECON_ACTIONABLE_MAX_ABS_CHANGE_5M", 12.0) or 12.0),
+                )
+                liq = float((token_data or {}).get("liquidity") or 0.0)
+                vol5 = float((token_data or {}).get("volume_5m") or 0.0)
+                abs5 = abs(float((token_data or {}).get("price_change_5m") or 0.0))
+                contract_safe = bool((token_data or {}).get("is_contract_safe", False))
+                warnings = int((token_data or {}).get("warning_flags") or 0)
+                risk = str((token_data or {}).get("risk_level") or "HIGH").strip().upper()
+                if (
+                    score >= relax_score_min
+                    and contract_safe
+                    and warnings <= 1
+                    and risk in {"LOW", "MEDIUM"}
+                    and liq >= relax_liq_min
+                    and vol5 >= relax_vol5_min
+                    and abs5 <= relax_abs5_max
+                ):
+                    return True
+        return False
+
     def _shape_prefilter_source_mix_rows(
         self,
         rows: list[tuple[dict[str, Any], dict[str, Any]]],
@@ -3111,12 +3937,29 @@ class AutoTrader:
             return rows
         if not bool(getattr(config, "PLAN_PREFILTER_SOURCE_SHAPE_ENABLED", True)):
             return rows
+        stage_key = str(stage or "unknown").strip().lower() or "unknown"
+        bridge_stage = stage_key.startswith("bridge")
         max_watch_share = _safe_float(getattr(config, "PLAN_PREFILTER_MAX_WATCHLIST_SHARE", 0.80), 0.80)
         max_watch_share = max(0.0, min(1.0, float(max_watch_share)))
+        if bridge_stage:
+            bridge_watch_share_cap = _safe_float(
+                getattr(config, "PLAN_PREFILTER_BRIDGE_MAX_WATCHLIST_SHARE", 0.45),
+                0.45,
+            )
+            bridge_watch_share_cap = max(0.0, min(1.0, float(bridge_watch_share_cap)))
+            max_watch_share = min(float(max_watch_share), float(bridge_watch_share_cap))
         min_non_watch = max(
             0,
             int(getattr(config, "PLAN_PREFILTER_MIN_NON_WATCH_ROWS", 2) or 2),
         )
+        actionable_floor_enabled = bool(
+            getattr(config, "PLAN_PREFILTER_ACTIONABLE_NON_WATCH_FLOOR_ENABLED", True)
+        )
+        actionable_floor_share = _safe_float(
+            getattr(config, "PLAN_PREFILTER_ACTIONABLE_NON_WATCH_FLOOR_SHARE", 0.45),
+            0.45,
+        )
+        actionable_floor_share = max(0.0, min(1.0, float(actionable_floor_share)))
         max_watch_per_non_watch = max(
             0,
             int(getattr(config, "PLAN_PREFILTER_MAX_WATCH_PER_NON_WATCH", 5) or 5),
@@ -3137,6 +3980,13 @@ class AutoTrader:
             watch_limit = 1
         watch_limit = min(len(watch_rows), max(0, int(watch_limit)))
         non_watch_floor = min(len(non_watch_rows), max(0, int(min_non_watch)))
+        floor_by_actionable = 0
+        if actionable_floor_enabled and non_watch_rows:
+            floor_by_actionable = min(
+                len(non_watch_rows),
+                max(0, int(math.ceil(float(total) * float(actionable_floor_share)))),
+            )
+            non_watch_floor = max(int(non_watch_floor), int(floor_by_actionable))
         watch_limit = min(int(watch_limit), max(0, int(total) - int(non_watch_floor)))
         if non_watch_rows and max_watch_per_non_watch > 0:
             watch_ratio_cap = int(len(non_watch_rows) * int(max_watch_per_non_watch))
@@ -3169,7 +4019,7 @@ class AutoTrader:
             (
                 "PLAN_PREFILTER_SOURCE_SHAPE stage=%s in=%s out=%s dropped_watch=%s "
                 "watch_in=%s non_watch_in=%s watch_limit=%s non_watch_floor=%s "
-                "max_watch_share=%.2f watch_per_non_watch=%s"
+                "max_watch_share=%.2f watch_per_non_watch=%s actionable_floor=%s floor_by_actionable=%s"
             ),
             str(stage or "unknown"),
             len(rows),
@@ -3181,6 +4031,8 @@ class AutoTrader:
             int(non_watch_floor),
             float(max_watch_share),
             int(max_watch_per_non_watch),
+            int(1 if actionable_floor_enabled else 0),
+            int(floor_by_actionable),
         )
         return shaped
 
@@ -3376,10 +4228,24 @@ class AutoTrader:
                 continue
             pool_seen.add(key)
             pool.append((token_data, score_data))
-        pool_non_watch_available = sum(
+
+        non_watch_econ_guard_enabled = bool(
+            getattr(config, "PLAN_SOURCE_DIVERSITY_NON_WATCH_ECON_GUARD_ENABLED", False)
+        )
+        def _econ_non_watch_ok(item: tuple[dict[str, Any], dict[str, Any]]) -> bool:
+            token_data, score_data = item
+            src = self._token_source_key(token_data)
+            if self._is_watchlist_source(src):
+                return False
+            if not non_watch_econ_guard_enabled:
+                return True
+            return bool(self._non_watch_econ_viable_for_plan(token_data, score_data))
+
+        pool_non_watch_total = sum(
             1 for token_data, _score_data in pool if self._is_non_watch_source(self._token_source_key(token_data))
         )
-        pool_watch_available = max(0, int(len(pool)) - int(pool_non_watch_available))
+        pool_non_watch_available = sum(1 for item in pool if _econ_non_watch_ok(item))
+        pool_watch_available = max(0, int(len(pool)) - int(pool_non_watch_total))
         if window_non_watch_supply is None:
             window_non_watch_supply_count = int(pool_non_watch_available)
         else:
@@ -3447,6 +4313,8 @@ class AutoTrader:
                 src = self._token_source_key(item[0])
                 if self._is_watchlist_source(src):
                     continue
+                if not _econ_non_watch_ok(item):
+                    continue
                 _try_add(item, enforce_watch_cap=False, enforce_source_cap=False)
         else:
             # Legacy pass: reserve only minimal non-watch quota.
@@ -3456,6 +4324,8 @@ class AutoTrader:
                         break
                     src = self._token_source_key(item[0])
                     if self._is_watchlist_source(src):
+                        continue
+                    if not _econ_non_watch_ok(item):
                         continue
                     # Reserve non-watch capacity first; strict per-source cap is relaxed here on purpose.
                     _try_add(item, enforce_watch_cap=True, enforce_source_cap=False)
@@ -3483,9 +4353,11 @@ class AutoTrader:
         allow_watch_cap_bypass_cfg = bool(getattr(config, "PLAN_SOURCE_DIVERSITY_ALLOW_WATCHLIST_CAP_BYPASS", False))
         remaining_non_watch_candidates = 0
         if min_non_watch > 0 and non_watch_count < min_non_watch:
-            for token_data, _score_data in pool:
+            for token_data, score_data in pool:
                 src = self._token_source_key(token_data)
                 if self._is_watchlist_source(src):
+                    continue
+                if not self._non_watch_econ_viable_for_plan(token_data, score_data):
                     continue
                 if self._batch_candidate_key(token_data) in picked_keys:
                     continue
@@ -3549,6 +4421,8 @@ class AutoTrader:
             for token_data, score_data in pool:
                 src = self._token_source_key(token_data)
                 if self._is_watchlist_source(src):
+                    continue
+                if not self._non_watch_econ_viable_for_plan(token_data, score_data):
                     continue
                 if self._batch_candidate_key(token_data) in picked_keys:
                     continue
@@ -3644,6 +4518,129 @@ class AutoTrader:
 
         return picked
 
+    def _rebalance_plan_batch_lanes(
+        self,
+        *,
+        selected: list[tuple[dict[str, Any], dict[str, Any]]],
+        eligible: list[tuple[dict[str, Any], dict[str, Any]]],
+    ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+        if not selected:
+            return selected
+        if not bool(getattr(config, "PLAN_LANE_QUOTAS_ENABLED", True)):
+            return selected
+
+        budget = int(len(selected))
+        if budget <= 1:
+            return selected
+
+        min_stable = max(0, int(getattr(config, "PLAN_MIN_STABLE_PER_BATCH", 1) or 1))
+        min_discovery = max(0, int(getattr(config, "PLAN_MIN_DISCOVERY_PER_BATCH", 1) or 1))
+        watchlist_fallback_only = bool(getattr(config, "PLAN_WATCHLIST_FALLBACK_ONLY", True))
+
+        pool: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        seen: set[str] = set()
+        for token_data, score_data in list(selected) + list(eligible):
+            key = self._batch_candidate_key(token_data)
+            if key in seen:
+                continue
+            seen.add(key)
+            token_data["_lane_tag"] = self._lane_tag_from_token(token_data)
+            pool.append((token_data, score_data))
+
+        has_non_watch_supply = any(
+            self._is_non_watch_source(self._token_source_key(token_data))
+            for token_data, _ in pool
+        )
+
+        picked: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        picked_keys: set[str] = set()
+        lane_counts = {"stable": 0, "discovery": 0}
+        source_counts = {"watchlist": 0, "non_watch": 0}
+
+        def _try_add(item: tuple[dict[str, Any], dict[str, Any]], *, require_non_watch: bool = False) -> bool:
+            token_data, _ = item
+            key = self._batch_candidate_key(token_data)
+            if key in picked_keys:
+                return False
+            src = self._token_source_key(token_data)
+            is_watch = self._is_watchlist_source(src)
+            if require_non_watch and is_watch:
+                return False
+            lane = self._lane_tag_from_token(token_data)
+            picked.append(item)
+            picked_keys.add(key)
+            lane_counts[lane if lane in lane_counts else "discovery"] = int(
+                lane_counts.get(lane if lane in lane_counts else "discovery", 0)
+            ) + 1
+            source_counts["watchlist" if is_watch else "non_watch"] = int(
+                source_counts.get("watchlist" if is_watch else "non_watch", 0)
+            ) + 1
+            return True
+
+        min_stable = min(int(min_stable), int(budget))
+        min_discovery = min(int(min_discovery), int(budget))
+
+        for lane_name, target in (("stable", min_stable), ("discovery", min_discovery)):
+            if target <= 0:
+                continue
+            for item in pool:
+                if len(picked) >= budget:
+                    break
+                if int(lane_counts.get(lane_name, 0)) >= int(target):
+                    break
+                token_data, _score_data = item
+                if self._lane_tag_from_token(token_data) != lane_name:
+                    continue
+                _try_add(
+                    item,
+                    require_non_watch=(watchlist_fallback_only and has_non_watch_supply),
+                )
+
+        if len(picked) < budget and watchlist_fallback_only and has_non_watch_supply:
+            for item in pool:
+                if len(picked) >= budget:
+                    break
+                _try_add(item, require_non_watch=True)
+
+        if len(picked) < budget:
+            for item in pool:
+                if len(picked) >= budget:
+                    break
+                _try_add(item, require_non_watch=False)
+
+        if not picked:
+            return selected
+
+        def _lane_hist(rows: list[tuple[dict[str, Any], dict[str, Any]]]) -> dict[str, int]:
+            out: dict[str, int] = {}
+            for token_data, _score_data in rows:
+                lane = self._lane_tag_from_token(token_data)
+                out[lane] = int(out.get(lane, 0)) + 1
+            return out
+
+        old_lane_hist = _lane_hist(selected)
+        new_lane_hist = _lane_hist(picked)
+        if old_lane_hist != new_lane_hist:
+            logger.info(
+                (
+                    "PLAN_LANE_DIVERSITY budget=%s old=%s new=%s "
+                    "min_stable=%s min_discovery=%s watch_fallback_only=%s has_non_watch_supply=%s "
+                    "source_mix=%s"
+                ),
+                int(budget),
+                old_lane_hist,
+                new_lane_hist,
+                int(min_stable),
+                int(min_discovery),
+                bool(watchlist_fallback_only),
+                bool(has_non_watch_supply),
+                {
+                    "watchlist": int(source_counts.get("watchlist", 0)),
+                    "non_watch": int(source_counts.get("non_watch", 0)),
+                },
+            )
+        return picked
+
     def _batch_candidate_profit_hint(
         self,
         token_data: dict[str, Any],
@@ -3656,9 +4653,14 @@ class AutoTrader:
         risk_level = str(token_data.get("risk_level", "MEDIUM") or "MEDIUM").upper()
         tp = int(getattr(config, "PROFIT_TARGET_PERCENT", 5) or 5)
         sl = int(getattr(config, "STOP_LOSS_PERCENT", 3) or 3)
+        source_name = str((token_data or {}).get("source", "unknown") or "unknown").strip().lower()
+        lane_tag = self._lane_tag_from_token(token_data)
+        token_data["_lane_tag"] = lane_tag
+        lane_econ = self._lane_econ_profile(source_name=source_name, lane_tag=lane_tag)
 
         # Use minimum trade size for a stable, conservative ranking baseline.
         min_size = max(0.1, float(getattr(config, "PAPER_TRADE_SIZE_MIN_USD", 0.1) or 0.1))
+        min_size = max(min_size, float(lane_econ.get("hint_min_size_usd", 0.0) or 0.0))
         max_size = max(min_size, float(getattr(config, "PAPER_TRADE_SIZE_MAX_USD", min_size) or min_size))
 
         cost_profile = self._estimate_cost_profile(
@@ -4093,6 +5095,9 @@ class AutoTrader:
             return True, "disabled"
         if not config.HONEYPOT_API_URL:
             return True, "no_url"
+        fail_closed = bool(getattr(config, "HONEYPOT_API_FAIL_CLOSED", True))
+        if not self._is_live_mode():
+            fail_closed = bool(fail_closed and bool(getattr(config, "HONEYPOT_API_FAIL_CLOSED_IN_PAPER", False)))
 
         cached = self._honeypot_cache_get(token_address)
         if cached is not None:
@@ -4113,13 +5118,13 @@ class AutoTrader:
             )
             if not result.ok or not isinstance(result.data, dict):
                 detail = f"honeypot_api_status_{result.status}" if int(result.status or 0) > 0 else str(result.error or "honeypot_api_error")
-                ok = not bool(config.HONEYPOT_API_FAIL_CLOSED)
+                ok = not bool(fail_closed)
                 self._honeypot_cache_put(token_address, {"ok": ok, "detail": detail})
                 return ok, detail
             payload = result.data
         except Exception as exc:
             detail = f"honeypot_api_error:{exc}"
-            ok = not bool(config.HONEYPOT_API_FAIL_CLOSED)
+            ok = not bool(fail_closed)
             self._honeypot_cache_put(token_address, {"ok": ok, "detail": detail})
             return ok, detail
 
@@ -4293,6 +5298,7 @@ class AutoTrader:
             score_value = int((score or {}).get("score", 0) or 0)
             source_key = self._token_source_key(token)
             is_non_watch = self._is_non_watch_source(source_key)
+            token["_lane_tag"] = self._lane_tag_from_token(token)
             min_score = int(non_watch_min_score) if is_non_watch else int(strict_min_score)
             if recommendation == "BUY" and score_value >= min_score:
                 eligible.append((token, score))
@@ -4751,6 +5757,10 @@ class AutoTrader:
             selected=selected,
             eligible=eligible,
         )
+        selected = self._rebalance_plan_batch_lanes(
+            selected=selected,
+            eligible=eligible,
+        )
         base_selected = list(selected)
 
         # Burst governor: avoid correlated packet opens in one cycle/window.
@@ -4845,10 +5855,18 @@ class AutoTrader:
                 selected=selected,
                 eligible=eligible,
             )
+            selected = self._rebalance_plan_batch_lanes(
+                selected=selected,
+                eligible=eligible,
+            )
 
         opened = 0
         actionable_non_watch = int(_count_non_watch_rows(eligible))
         actionable_watch = max(0, int(len(eligible)) - int(actionable_non_watch))
+        actionable_stable = int(
+            sum(1 for token_data, _score_data in eligible if self._lane_tag_from_token(token_data) == "stable")
+        )
+        actionable_discovery = max(0, int(len(eligible)) - int(actionable_stable))
         selected_non_watch = int(
             sum(
                 1
@@ -4857,6 +5875,10 @@ class AutoTrader:
             )
         )
         selected_watch = max(0, int(len(selected)) - int(selected_non_watch))
+        selected_stable = int(
+            sum(1 for token_data, _score_data in selected if self._lane_tag_from_token(token_data) == "stable")
+        )
+        selected_discovery = max(0, int(len(selected)) - int(selected_stable))
         batch_has_non_watchlist = any(
             not self._is_watchlist_source(self._token_source_key(token_data))
             for token_data, _ in selected
@@ -4868,8 +5890,12 @@ class AutoTrader:
                 token_data["_plan_batch_has_non_watchlist"] = bool(batch_has_non_watchlist)
                 token_data["_plan_actionable_non_watch"] = int(actionable_non_watch)
                 token_data["_plan_actionable_watch"] = int(actionable_watch)
+                token_data["_plan_actionable_stable"] = int(actionable_stable)
+                token_data["_plan_actionable_discovery"] = int(actionable_discovery)
                 token_data["_plan_selected_non_watch"] = int(selected_non_watch)
                 token_data["_plan_selected_watch"] = int(selected_watch)
+                token_data["_plan_selected_stable"] = int(selected_stable)
+                token_data["_plan_selected_discovery"] = int(selected_discovery)
             except Exception:
                 pass
             pos = await self.plan_trade(token_data, score_data)
@@ -4891,6 +5917,10 @@ class AutoTrader:
                 "selected_total": int(len(selected)),
                 "opened_total": int(opened),
                 "burst_open_budget": int(open_budget) if open_budget is not None else -1,
+                "actionable_stable": int(actionable_stable),
+                "actionable_discovery": int(actionable_discovery),
+                "selected_stable": int(selected_stable),
+                "selected_discovery": int(selected_discovery),
                 "prefilter_removed_total": int(prefilter_removed_total),
                 "prefilter_removed_rows": int(prefilter_removed_rows),
                 "prefilter_removed_by_reason": dict(prefilter_removed_by_reason),
@@ -5050,6 +6080,11 @@ class AutoTrader:
         self._plan_attempts_by_source_window[source_key_ctx] = (
             int(self._plan_attempts_by_source_window.get(source_key_ctx, 0)) + 1
         )
+        lane_tag_ctx = self._lane_tag_from_token(token_data)
+        token_data["_lane_tag"] = lane_tag_ctx
+        self._plan_attempts_by_lane_window[lane_tag_ctx] = (
+            int(self._plan_attempts_by_lane_window.get(lane_tag_ctx, 0)) + 1
+        )
         symbol_upper = symbol.strip().upper()
         excluded_symbols = self._as_symbol_set(getattr(config, "AUTO_TRADE_EXCLUDED_SYMBOLS", []) or [])
         if symbol_upper and symbol_upper in excluded_symbols:
@@ -5125,6 +6160,13 @@ class AutoTrader:
             entry_channel = "core"
         source_name = str(token_data.get("source", "") or "").strip().lower()
         source_is_watchlist = source_name.startswith("watchlist")
+        lane_tag = self._lane_tag_from_token(token_data)
+        token_data["_lane_tag"] = lane_tag
+        lane_econ = self._lane_econ_profile(source_name=source_name, lane_tag=lane_tag)
+        lane_name = str(lane_econ.get("lane", lane_tag or ("stable" if source_is_watchlist else "discovery")) or "discovery")
+        if self._active_trade_decision_context is not None:
+            self._active_trade_decision_context["economic_lane"] = lane_name
+            self._active_trade_decision_context["lane_tag"] = lane_tag
         batch_has_non_watchlist = bool(token_data.get("_plan_batch_has_non_watchlist", False))
         if source_is_watchlist and (not self._is_live_mode()) and (not bool(getattr(config, "PAPER_ALLOW_WATCHLIST_SOURCE", False))):
             strict_guard_enabled = bool(getattr(config, "PAPER_WATCHLIST_STRICT_GUARD_ENABLED", True))
@@ -5177,6 +6219,19 @@ class AutoTrader:
                 "AutoTrade skip token=%s reason=plan_non_watchlist_quota detail=%s",
                 symbol,
                 non_watch_quota_detail,
+            )
+            return None
+        non_watch_symbol_blocked, non_watch_symbol_detail = self._non_watch_symbol_window_blocked(
+            source_name=source_name,
+            symbol=symbol,
+            token_data=token_data,
+        )
+        if non_watch_symbol_blocked:
+            self._bump_skip_reason("non_watch_symbol_window_cap")
+            logger.info(
+                "AutoTrade skip token=%s reason=non_watch_symbol_window_cap detail=%s",
+                symbol,
+                non_watch_symbol_detail,
             )
             return None
         concentration_blocked, concentration_detail = self._symbol_concentration_blocked(
@@ -5310,21 +6365,156 @@ class AutoTrader:
             source=source_name,
             candidate_id=candidate_id,
         )
+        if bool(getattr(config, "LANE_DISCOVERY_ROUTE_STRICT_ENABLED", True)) and str(lane_name) == "discovery":
+            discovery_route_min_score = max(
+                0,
+                int(getattr(config, "LANE_DISCOVERY_ROUTE_MIN_SCORE", 55) or 55),
+            )
+            if int(score) < int(discovery_route_min_score):
+                self._bump_skip_reason("discovery_route_score_min")
+                logger.info(
+                    "AutoTrade skip token=%s reason=discovery_route_score_min score=%s min=%s lane=%s",
+                    symbol,
+                    int(score),
+                    int(discovery_route_min_score),
+                    str(lane_name),
+                )
+                return None
         src_prob = float(source_route.get("entry_probability", 1.0) or 1.0)
-        if src_prob < 1.0:
+        src_prob_gate = float(src_prob)
+        route_prob_relaxed = False
+        route_prob_relax_reason = ""
+        if self._is_non_watch_source(source_name) and bool(
+            getattr(config, "PLAN_NON_WATCH_ROUTE_PROB_RELAX_ENABLED", True)
+        ):
+            relax_floor = max(
+                0.0,
+                min(
+                    1.0,
+                    float(getattr(config, "PLAN_NON_WATCH_ROUTE_PROB_RELAX_MIN_FLOOR", 0.85) or 0.85),
+                ),
+            )
+            relax_actionable_min_rows = max(
+                1,
+                int(getattr(config, "PLAN_NON_WATCH_ROUTE_PROB_RELAX_ACTIONABLE_MIN_ROWS", 2) or 2),
+            )
+            actionable_non_watch = int((token_data or {}).get("_plan_actionable_non_watch", 0) or 0)
+            actionable_watch = int((token_data or {}).get("_plan_actionable_watch", 0) or 0)
+            selected_non_watch = int((token_data or {}).get("_plan_selected_non_watch", 0) or 0)
+            min_non_watch_target = max(
+                1,
+                int(getattr(config, "PLAN_MIN_NON_WATCHLIST_PER_BATCH", 1) or 1),
+            )
+            actionable_dominant = bool(
+                actionable_non_watch >= relax_actionable_min_rows
+                and actionable_non_watch >= actionable_watch
+            )
+            actionable_present = bool(actionable_non_watch >= relax_actionable_min_rows)
+            selected_shortfall = bool(selected_non_watch < min_non_watch_target)
+            if actionable_present or selected_shortfall:
+                route_prob_relax_reason = (
+                    "actionable_dominant_non_watch"
+                    if actionable_dominant
+                    else ("actionable_non_watch_present" if actionable_present else "selected_non_watch_shortfall")
+                )
+                relaxed_prob = max(float(src_prob_gate), float(relax_floor))
+                if relaxed_prob > float(src_prob_gate):
+                    src_prob_gate = float(relaxed_prob)
+                    route_prob_relaxed = True
+        if src_prob_gate < 1.0:
             seed = str(source_route.get("seed", "") or f"src|{source_name}|{candidate_id}")
-            if not self._passes_probability_gate(seed=seed, probability=src_prob):
+            if not self._passes_probability_gate(seed=seed, probability=src_prob_gate):
                 self._bump_skip_reason("source_route_prob")
                 logger.info(
-                    "AutoTrade skip token=%s reason=source_route_prob source=%s p=%.2f detail=%s",
+                    "AutoTrade skip token=%s reason=source_route_prob source=%s p=%.2f p_gate=%.2f detail=%s relax_reason=%s",
                     symbol,
                     source_name or "-",
                     src_prob,
+                    src_prob_gate,
                     str(source_route.get("detail", "")),
+                    str(route_prob_relax_reason or "-"),
                 )
                 return None
+        if route_prob_relaxed:
+            logger.info(
+                "AutoTrade relax token=%s reason=non_watch_route_prob floor=%.2f p=%.2f->%.2f detail=%s",
+                symbol,
+                max(
+                    0.0,
+                    min(
+                        1.0,
+                        float(getattr(config, "PLAN_NON_WATCH_ROUTE_PROB_RELAX_MIN_FLOOR", 0.85) or 0.85),
+                    ),
+                ),
+                src_prob,
+                src_prob_gate,
+                str(route_prob_relax_reason or "-"),
+            )
 
         symbol_metrics = self._symbol_window_metrics(symbol_upper)
+        loss_lock_window_minutes = max(
+            10,
+            int(getattr(config, "SYMBOL_LOSS_LOCK_WINDOW_MINUTES", 60) or 60),
+        )
+        symbol_loss_metrics = self._symbol_window_metrics(
+            symbol_upper,
+            window_minutes=loss_lock_window_minutes,
+        )
+        if str(lane_name) == "discovery":
+            loss_lock_mult = max(
+                0.5,
+                min(3.0, float(getattr(config, "LANE_DISCOVERY_SYMBOL_LOSS_LOCK_MULT", 1.35) or 1.35)),
+            )
+            if loss_lock_mult > 1.0:
+                trades_d = int(symbol_loss_metrics.get("trades", 0) or 0)
+                loss_share_d = float(symbol_loss_metrics.get("loss_share", 0.0) or 0.0)
+                sum_pnl_d = float(symbol_loss_metrics.get("sum_pnl", 0.0) or 0.0)
+                base_min_trades = max(2, int(getattr(config, "SYMBOL_LOSS_LOCK_MIN_TRADES", 4) or 4))
+                base_min_loss_share = max(
+                    0.0,
+                    min(1.0, float(getattr(config, "SYMBOL_LOSS_LOCK_MIN_LOSS_SHARE", 0.66) or 0.66)),
+                )
+                base_max_net = float(getattr(config, "SYMBOL_LOSS_LOCK_MAX_NET_PNL_USD", -0.02) or -0.02)
+                discovery_min_trades = max(2, int(math.ceil(float(base_min_trades) / float(loss_lock_mult))))
+                discovery_min_loss_share = max(0.0, min(1.0, float(base_min_loss_share) * 0.90))
+                discovery_max_net = float(base_max_net) / float(max(1.0, loss_lock_mult))
+                if (
+                    trades_d >= discovery_min_trades
+                    and loss_share_d >= discovery_min_loss_share
+                    and sum_pnl_d <= discovery_max_net
+                ):
+                    cooldown_seconds = max(60, int(getattr(config, "SYMBOL_LOSS_LOCK_COOLDOWN_SECONDS", 1800) or 1800))
+                    self._set_symbol_cooldown(symbol_upper, cooldown_seconds, "discovery_loss_lock")
+                    self._bump_skip_reason("symbol_loss_lock")
+                    logger.info(
+                        (
+                            "AutoTrade skip token=%s reason=symbol_loss_lock_discovery "
+                            "trades=%s/%s loss_share=%.2f/%.2f sum_pnl=$%.4f<=%.4f lane=%s cooldown=%ss"
+                        ),
+                        symbol,
+                        trades_d,
+                        discovery_min_trades,
+                        loss_share_d,
+                        discovery_min_loss_share,
+                        sum_pnl_d,
+                        discovery_max_net,
+                        lane_name,
+                        cooldown_seconds,
+                    )
+                    return None
+        symbol_loss_lock_blocked, symbol_loss_lock_detail = self._symbol_loss_lock_blocked(
+            symbol=symbol_upper,
+            source_name=source_name,
+            symbol_metrics=symbol_loss_metrics,
+        )
+        if symbol_loss_lock_blocked:
+            self._bump_skip_reason("symbol_loss_lock")
+            logger.info(
+                "AutoTrade skip token=%s reason=symbol_loss_lock detail=%s",
+                symbol,
+                symbol_loss_lock_detail,
+            )
+            return None
         token_ev_memory = {
             "size_mult": 1.0,
             "edge_mult": 1.0,
@@ -5562,6 +6752,19 @@ class AutoTrader:
                 "AutoTrade skip token=%s reason=pre_rug_guard detail=%s",
                 symbol,
                 self._short_error_text(pre_rug_reason),
+            )
+            return None
+        hard_non_watch_ok, hard_non_watch_reason = self._hard_non_watch_antiscam_gate(
+            token_data,
+            token_address=token_address,
+            lane_tag=lane_name,
+        )
+        if not hard_non_watch_ok:
+            self._bump_skip_reason("hard_non_watch_scam")
+            logger.info(
+                "AutoTrade skip token=%s reason=hard_non_watch_scam detail=%s",
+                symbol,
+                self._short_error_text(hard_non_watch_reason),
             )
             return None
         cluster_key = self._token_cluster_key(
@@ -6003,6 +7206,50 @@ class AutoTrader:
                     floor_usd,
                     gas_usd,
                 )
+        if not self._is_live_mode():
+            lane_floor_usd = max(
+                min_trade_usd,
+                float(lane_econ.get("min_trade_usd", 0.0) or 0.0),
+            )
+            lane_gas_mult = max(
+                0.0,
+                float(lane_econ.get("min_trade_gas_mult", 0.0) or 0.0),
+            )
+            if lane_floor_usd > 0.0:
+                floor_usd = float(lane_floor_usd)
+                gas_usd = max(0.0, float(cost_profile.get("gas_usd", 0.0) or 0.0))
+                if gas_usd > 0.0 and lane_gas_mult > 0.0:
+                    floor_usd = max(floor_usd, gas_usd * lane_gas_mult)
+                available_usd = float(self._available_balance_usd())
+                if max_buy_weth > 0:
+                    floor_usd = min(floor_usd, float(cap_usd))
+                floor_usd = min(floor_usd, available_usd)
+                if floor_usd >= min_trade_usd and floor_usd > position_size_usd:
+                    prev_size = float(position_size_usd)
+                    position_size_usd = float(floor_usd)
+                    cost_profile = self._estimate_cost_profile(
+                        liquidity_usd,
+                        risk_level,
+                        score,
+                        position_size_usd=position_size_usd,
+                    )
+                    expected_edge_percent = self._estimate_edge_percent(
+                        score,
+                        tp,
+                        sl,
+                        cost_profile["total_percent"],
+                        risk_level,
+                    )
+                    edge_percent_for_decision = float(expected_edge_percent) * float(regime_edge_mult)
+                    logger.info(
+                        "AutoTrade adjust token=%s reason=lane_econ_trade_floor lane=%s size=$%.2f->$%.2f floor=$%.2f gas=$%.4f",
+                        symbol,
+                        lane_name,
+                        prev_size,
+                        position_size_usd,
+                        floor_usd,
+                        gas_usd,
+                    )
         if position_size_usd < min_trade_usd and (not self._is_live_mode()):
             paper_floor = max(
                 min_trade_usd,
@@ -6100,6 +7347,7 @@ class AutoTrader:
                     symbol=symbol,
                     skip_reason=skip_reason,
                     source_name=source_name,
+                    lane_tag=lane_name,
                 )
                 return None
 
@@ -6120,6 +7368,10 @@ class AutoTrader:
             source_is_watchlist=source_is_watchlist,
             entry_channel=entry_channel,
             ev_expected_net_usd=ev_expected_net_current,
+            token_data=token_data,
+            score=score,
+            gross_percent=float(edge_dbg.get("gross_percent", 0.0) or 0.0),
+            cost_total_percent=float(cost_profile.get("total_percent", 0.0) or 0.0),
         )
         if not non_watch_ev_ok:
             self._bump_skip_reason_ext(
@@ -6174,6 +7426,7 @@ class AutoTrader:
             ev_min *= float(quality_edge_mult)
             ev_min *= float(token_ev_edge_mult)
             ev_min *= float(execution_edge_mult)
+            ev_min *= float(lane_econ.get("ev_min_mult", 1.0) or 1.0)
             if (
                 bool(getattr(config, "ENTRY_SMALL_SIZE_EV_RELAX_ENABLED", True))
                 and is_tier_a
@@ -6309,6 +7562,8 @@ class AutoTrader:
                 * float(token_ev_edge_mult)
                 * float(execution_edge_mult)
             )
+            min_edge_pct *= float(lane_econ.get("edge_pct_mult", 1.0) or 1.0)
+            min_edge_usd *= float(lane_econ.get("edge_usd_mult", 1.0) or 1.0)
             if (
                 bool(getattr(config, "ENTRY_EDGE_SOFTEN_GREEN_A_CORE_ENABLED", True))
                 and mm == "GREEN"
@@ -6332,7 +7587,13 @@ class AutoTrader:
             if (
                 bool(getattr(config, "NON_WATCH_EDGE_SIZE_RECOVERY_ENABLED", True))
                 and (not source_is_watchlist)
-                and entry_channel == "explore"
+                and (
+                    entry_channel == "explore"
+                    or (
+                        entry_channel == "core"
+                        and bool(getattr(config, "NON_WATCH_EDGE_SIZE_RECOVERY_ALLOW_CORE", True))
+                    )
+                )
                 and (not self._is_live_mode())
             ):
                 recovery_min_gross = float(
@@ -6416,9 +7677,11 @@ class AutoTrader:
                     logger.info(
                         (
                             "AutoTrade adjust token=%s reason=non_watch_edge_size_recovery "
-                            "size=$%.2f->$%.2f req=$%.2f max=$%.2f gross=%.2f%% costs=%.2f%% min_pct=%.2f%% min_usd=$%.3f"
+                            "lane=%s channel=%s size=$%.2f->$%.2f req=$%.2f max=$%.2f gross=%.2f%% costs=%.2f%% min_pct=%.2f%% min_usd=$%.3f"
                         ),
                         symbol,
+                        lane_name,
+                        entry_channel,
                         prev_size,
                         position_size_usd,
                         required_size,
@@ -6554,6 +7817,7 @@ class AutoTrader:
                     symbol=symbol,
                     skip_reason=skip_reason,
                     source_name=source_name,
+                    lane_tag=lane_name,
                 )
                 return None
             if mode == "usd" and not usd_ok:
@@ -6619,6 +7883,7 @@ class AutoTrader:
                     symbol=symbol,
                     skip_reason=skip_reason,
                     source_name=source_name,
+                    lane_tag=lane_name,
                 )
                 return None
             if mode == "both" and not (pct_ok and usd_ok):
@@ -6688,6 +7953,7 @@ class AutoTrader:
                     symbol=symbol,
                     skip_reason=skip_reason,
                     source_name=source_name,
+                    lane_tag=lane_name,
                 )
                 return None
 
@@ -7074,6 +8340,7 @@ class AutoTrader:
                 entry_tier=entry_tier,
                 entry_channel=entry_channel,
                 source=source_name,
+                lane_tag=str(lane_name),
                 partial_tp_trigger_mult=regime_partial_tp_trigger_mult,
                 partial_tp_sell_mult=regime_partial_tp_sell_mult,
                 token_cluster_key=cluster_key,
@@ -7095,6 +8362,9 @@ class AutoTrader:
             self.trade_open_timestamps.append(datetime.now(timezone.utc).timestamp())
             source_key_open = self._normalized_source_value(source_name)
             self._opens_by_source_window[source_key_open] = int(self._opens_by_source_window.get(source_key_open, 0)) + 1
+            self._opens_by_lane_window[str(lane_name or "unknown")] = int(
+                self._opens_by_lane_window.get(str(lane_name or "unknown"), 0)
+            ) + 1
             if core_probe_applied:
                 self._record_core_probe_open()
             self._record_open_symbol(pos.symbol)
@@ -7134,6 +8404,7 @@ class AutoTrader:
                     "entry_tier": pos.entry_tier,
                     "entry_channel": pos.entry_channel,
                     "source": self._normalized_source_value(pos.source),
+                    "lane_tag": str(pos.lane_tag or ""),
                     "market_mode": pos.market_mode,
                     "position_size_usd": float(pos.position_size_usd),
                     "expected_edge_percent": float(pos.expected_edge_percent),
@@ -7188,6 +8459,7 @@ class AutoTrader:
             entry_tier=entry_tier,
             entry_channel=entry_channel,
             source=source_name,
+            lane_tag=str(lane_name),
             partial_tp_trigger_mult=regime_partial_tp_trigger_mult,
             partial_tp_sell_mult=regime_partial_tp_sell_mult,
             token_cluster_key=cluster_key,
@@ -7210,6 +8482,9 @@ class AutoTrader:
         self.trade_open_timestamps.append(datetime.now(timezone.utc).timestamp())
         source_key_open = self._normalized_source_value(source_name)
         self._opens_by_source_window[source_key_open] = int(self._opens_by_source_window.get(source_key_open, 0)) + 1
+        self._opens_by_lane_window[str(lane_name or "unknown")] = int(
+            self._opens_by_lane_window.get(str(lane_name or "unknown"), 0)
+        ) + 1
         if core_probe_applied:
             self._record_core_probe_open()
         self._record_open_symbol(pos.symbol)
@@ -7252,6 +8527,7 @@ class AutoTrader:
                 "entry_tier": pos.entry_tier,
                 "entry_channel": pos.entry_channel,
                 "source": self._normalized_source_value(pos.source),
+                "lane_tag": str(pos.lane_tag or ""),
                 "market_mode": pos.market_mode,
                 "position_size_usd": float(pos.position_size_usd),
                 "expected_edge_percent": float(pos.expected_edge_percent),
@@ -7754,6 +9030,10 @@ class AutoTrader:
                 current_liquidity_usd=current_liquidity_usd,
                 age_seconds=age_seconds,
             )
+            pump_guard_triggered, pump_guard_detail = self._post_entry_pump_guard_triggered(
+                position=position,
+                age_seconds=age_seconds,
+            )
 
             if canary_triggered:
                 should_close = True
@@ -7786,11 +9066,49 @@ class AutoTrader:
                     f"rug_guard:{self._short_error_text(rug_guard_detail)}",
                     ttl_seconds=ttl_seconds,
                 )
+                rug_symbol_cd = max(
+                    0,
+                    int(getattr(config, "POST_ENTRY_RUG_SYMBOL_COOLDOWN_SECONDS", 1800) or 1800),
+                )
+                if rug_symbol_cd > 0:
+                    self._set_symbol_cooldown(
+                        self._symbol_key(position.symbol),
+                        int(rug_symbol_cd),
+                        "rug_guard",
+                    )
                 logger.warning(
                     "RUG_GUARD_TRIGGER token=%s address=%s detail=%s",
                     position.symbol,
                     position.token_address,
                     rug_guard_detail,
+                )
+            elif pump_guard_triggered:
+                should_close = True
+                close_reason = "PUMP_GUARD"
+                ttl_seconds = max(
+                    300,
+                    int(getattr(config, "POST_ENTRY_PUMP_BLACKLIST_TTL_SECONDS", 21600) or 21600),
+                )
+                self._blacklist_add(
+                    position.token_address,
+                    f"pump_guard:{self._short_error_text(pump_guard_detail)}",
+                    ttl_seconds=ttl_seconds,
+                )
+                pump_symbol_cd = max(
+                    0,
+                    int(getattr(config, "POST_ENTRY_PUMP_SYMBOL_COOLDOWN_SECONDS", 1800) or 1800),
+                )
+                if pump_symbol_cd > 0:
+                    self._set_symbol_cooldown(
+                        self._symbol_key(position.symbol),
+                        int(pump_symbol_cd),
+                        "pump_guard",
+                    )
+                logger.warning(
+                    "PUMP_GUARD_TRIGGER token=%s address=%s detail=%s",
+                    position.symbol,
+                    position.token_address,
+                    pump_guard_detail,
                 )
             elif has_price_update and position.pnl_percent >= position.take_profit_percent:
                 should_close = True
@@ -8259,6 +9577,32 @@ class AutoTrader:
         self._refresh_daily_window()
         raw_price_pnl_percent = ((position.current_price_usd - position.entry_price_usd) / position.entry_price_usd) * 100
         effective_price_pnl_percent = raw_price_pnl_percent
+        pump_guard_enabled = bool(getattr(config, "POST_ENTRY_PUMP_GUARD_ENABLED", True))
+        pump_guard_only_non_watch = bool(getattr(config, "POST_ENTRY_PUMP_ONLY_NON_WATCH", True))
+        pump_guard_trigger_pct = max(
+            0.0,
+            float(getattr(config, "POST_ENTRY_PUMP_MAX_PNL_PERCENT", 120.0) or 120.0),
+        )
+        pump_guard_cap_pct = max(
+            0.0,
+            float(getattr(config, "POST_ENTRY_PUMP_REALIZE_CAP_PERCENT", 45.0) or 45.0),
+        )
+        allow_pump_guard = bool(pump_guard_enabled) and (
+            (not pump_guard_only_non_watch) or self._is_non_watch_source(position.source)
+        )
+        if allow_pump_guard and effective_price_pnl_percent >= pump_guard_trigger_pct:
+            capped = min(float(effective_price_pnl_percent), float(pump_guard_cap_pct))
+            if capped != effective_price_pnl_percent:
+                logger.warning(
+                    "PAPER_PUMP_GUARD_CAP token=%s raw=%.2f%% capped=%.2f%% reason=%s",
+                    position.symbol,
+                    float(effective_price_pnl_percent),
+                    float(capped),
+                    str(reason or ""),
+                )
+                effective_price_pnl_percent = float(capped)
+                if str(reason or "").upper() == "TP":
+                    reason = "TP_PUMP_GUARD"
         if config.PAPER_REALISM_CAP_ENABLED:
             max_gain = max(0.0, float(config.PAPER_REALISM_MAX_GAIN_PERCENT))
             max_loss = max(0.0, float(config.PAPER_REALISM_MAX_LOSS_PERCENT))
@@ -8386,6 +9730,30 @@ class AutoTrader:
             return False
 
         effective_price_pnl_percent = float(raw_price_pnl_percent)
+        pump_guard_enabled = bool(getattr(config, "POST_ENTRY_PUMP_GUARD_ENABLED", True))
+        pump_guard_only_non_watch = bool(getattr(config, "POST_ENTRY_PUMP_ONLY_NON_WATCH", True))
+        pump_guard_trigger_pct = max(
+            0.0,
+            float(getattr(config, "POST_ENTRY_PUMP_MAX_PNL_PERCENT", 120.0) or 120.0),
+        )
+        pump_guard_cap_pct = max(
+            0.0,
+            float(getattr(config, "POST_ENTRY_PUMP_REALIZE_CAP_PERCENT", 45.0) or 45.0),
+        )
+        allow_pump_guard = bool(pump_guard_enabled) and (
+            (not pump_guard_only_non_watch) or self._is_non_watch_source(position.source)
+        )
+        if allow_pump_guard and effective_price_pnl_percent >= pump_guard_trigger_pct:
+            capped = min(float(effective_price_pnl_percent), float(pump_guard_cap_pct))
+            if capped != effective_price_pnl_percent:
+                logger.warning(
+                    "PAPER_PUMP_GUARD_CAP_PARTIAL token=%s raw=%.2f%% capped=%.2f%% reason=%s",
+                    position.symbol,
+                    float(effective_price_pnl_percent),
+                    float(capped),
+                    str(reason or ""),
+                )
+                effective_price_pnl_percent = float(capped)
         if config.PAPER_REALISM_CAP_ENABLED:
             max_gain = max(0.0, float(config.PAPER_REALISM_MAX_GAIN_PERCENT))
             max_loss = max(0.0, float(config.PAPER_REALISM_MAX_LOSS_PERCENT))
@@ -8894,6 +10262,7 @@ class AutoTrader:
         self._edge_loop_hits_by_symbol.clear()
         self._post_entry_rug_hits_by_token.clear()
         self._pre_entry_rug_hits_by_token.clear()
+        self._hard_scam_safe_streak_by_token.clear()
         self.trade_open_timestamps.clear()
         self._recent_open_symbols.clear()
         self._recent_open_sources.clear()

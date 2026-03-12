@@ -372,6 +372,19 @@ class OnChainFactoryMonitor:
             self.last_processed_block = max(0, latest_block - 1)
             self._save_last_block(self.last_processed_block)
             return []
+        max_backfill_blocks = max(0, int(getattr(config, "ONCHAIN_MAX_BACKFILL_BLOCKS", 8000) or 8000))
+        lag_blocks = max(0, int(latest_block - int(self.last_processed_block)))
+        if max_backfill_blocks > 0 and lag_blocks > max_backfill_blocks:
+            clamped_cursor = max(0, int(latest_block - max_backfill_blocks))
+            logger.warning(
+                "ONCHAIN_BACKFILL_CLAMP lag_blocks=%s max_backfill=%s cursor=%s->%s",
+                int(lag_blocks),
+                int(max_backfill_blocks),
+                int(self.last_processed_block),
+                int(clamped_cursor),
+            )
+            self.last_processed_block = clamped_cursor
+            self._save_last_block(self.last_processed_block)
         if latest_block <= self.last_processed_block:
             return []
 
@@ -379,9 +392,11 @@ class OnChainFactoryMonitor:
         from_block = self.last_processed_block + 1
         to_block = latest_block
         chunk = int(config.ONCHAIN_BLOCK_CHUNK)
+        max_chunks = max(1, int(getattr(config, "ONCHAIN_MAX_CHUNKS_PER_CYCLE", 6) or 6))
+        max_to_block = min(to_block, from_block + chunk * max_chunks - 1)
 
-        for start in range(from_block, to_block + 1, chunk):
-            end = min(to_block, start + chunk - 1)
+        for start in range(from_block, max_to_block + 1, chunk):
+            end = min(max_to_block, start + chunk - 1)
             for source in self.log_sources:
                 params = {
                     "address": Web3.to_checksum_address(source["factory"]),
@@ -420,6 +435,15 @@ class OnChainFactoryMonitor:
             self.last_processed_block = end
             self._save_last_block(self.last_processed_block)
             self._save_seen_pairs()
+
+        if max_to_block < to_block:
+            logger.info(
+                "ONCHAIN_BACKFILL_PROGRESS cursor=%s latest=%s chunks=%s chunk_size=%s",
+                int(self.last_processed_block),
+                int(to_block),
+                int(max_chunks),
+                int(chunk),
+            )
 
         return out
 
@@ -579,6 +603,14 @@ class OnChainFactoryMonitor:
         )
         out: list[dict[str, Any]] = []
         now_ts = datetime.now(timezone.utc).timestamp()
+        forward_unresolved_enabled = bool(
+            getattr(config, "ONCHAIN_FORWARD_UNRESOLVED_FOR_REENRICH", True)
+        )
+        forward_unresolved_max = max(
+            0,
+            int(getattr(config, "ONCHAIN_FORWARD_UNRESOLVED_MAX_PER_CYCLE", 24) or 24),
+        )
+        forwarded_unresolved = 0
         for candidate, row in zip(candidates, enriched):
             pair_key = str(candidate.pair_address or "").lower()
             if isinstance(row, Exception):
@@ -600,11 +632,25 @@ class OnChainFactoryMonitor:
                 if pair_key:
                     self._pending_enrich[pair_key] = candidate
                     self._pending_enrich_ts[pair_key] = now_ts
+                if forward_unresolved_enabled and forwarded_unresolved < forward_unresolved_max:
+                    # Forward unresolved rows into the main pipeline so the central re-enrich
+                    # stage can try address-level hydration in the same cycle.
+                    forwarded = dict(row or {})
+                    forwarded["_onchain_unresolved_forwarded"] = True
+                    out.append(forwarded)
+                    forwarded_unresolved += 1
                 continue
             if pair_key:
                 self._pending_enrich.pop(pair_key, None)
                 self._pending_enrich_ts.pop(pair_key, None)
             out.append(row)
+        if forwarded_unresolved > 0:
+            logger.info(
+                "ONCHAIN_FORWARD_UNRESOLVED forwarded=%s max_per_cycle=%s pending=%s",
+                int(forwarded_unresolved),
+                int(forward_unresolved_max),
+                int(len(self._pending_enrich)),
+            )
         self._prune_pending_enrich()
         return out
 

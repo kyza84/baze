@@ -10,6 +10,7 @@ This protocol is designed for external agents so they cannot break critical runt
 3. Only keys from the safe contract are allowed.
 4. Any key outside allow-list is blocked automatically.
 5. Protected keys (safety/live/router/identity) are blocked automatically.
+6. Structural lane/source keys are single-writer and must not be tuned in runtime loops.
 
 ## Safety Contract
 - Contract file: `tools/matrix_safe_tuning_contract.json`
@@ -31,6 +32,16 @@ python tools\matrix_preset_guard.py validate-preset-file --root . --path data\ma
 - `matrix_user_presets.py` validates on `create` and `clone`.
 - `matrix_paper_launcher.ps1` validates user preset files before loading.
 - Invalid/unsafe user presets are skipped and do not start.
+- `tools/matrix_runtime_tuner.py` enforces structural locks in both dry-run and apply modes.
+
+## Non-Negotiable Protected Families (V5)
+- `LOCAL_ANTISCAM_*`
+- `ENTRY_HARD_NON_WATCH_SCAM_*`
+- `ENTRY_PRE_RUG_*`
+- `POST_ENTRY_RUG_*`
+- `POST_ENTRY_PUMP_*`
+- `TOKEN_SAFETY_*`
+- `HONEYPOT_*`
 
 ## Recommended Agent Workflow
 1. Pick trusted base (`mx30_guarded_balanced` or `mx31_guarded_aggressive`).

@@ -124,3 +124,20 @@
 - First diagnostic checks after restart:
   - verify `active_matrix` override values for `PAPER_TRADE_SIZE_MIN_USD`, `SOURCE_ROUTER_MIN_TRADES`, `TOKEN_EV_MEMORY_MIN_TRADES`,
   - verify latest session log has no unexpected `RUNTIME_TUNER_HOT_APPLY` while tuner runs in dry-run lock mode.
+
+## Commit Update 2026-03-12 (V5 structural lanes + anti-scam hard)
+- Lane split and lane metrics are first-class:
+  - `lane_tag` (`stable|discovery`) now flows through candidate -> plan -> open/close telemetry.
+  - Check `FLOW_LANE_METRICS` in `main_local` logs and `telemetry_v2.lane_profile_15m` in tuner ticks.
+- Non-watch upstream bridge hardening:
+  - onchain unresolved rows are retried/re-enriched (not dropped blindly),
+  - low-flow fetch has timeout + cache-fill fallback path.
+- Startup config consistency hardening:
+  - runtime startup now validates/aligned critical override layers (`STARTUP_CONFIG_SYNC` markers).
+  - diagnose unknown/unused/critical-diff from startup logs before touching knobs.
+- Anti-scam hard contour extended:
+  - non-watch hard pre-buy gate (`ENTRY_HARD_NON_WATCH_SCAM_*`),
+  - post-entry pump guard (`POST_ENTRY_PUMP_*`) to prevent +300% distortion/rug-like outliers.
+- Structural key ownership tightened:
+  - tuner now applies structural locks in all modes (not only dry-run),
+  - lane/source structural keys must not be tuned dynamically.

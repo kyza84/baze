@@ -174,3 +174,19 @@ Forensics (если есть в событии):
 - `trace_id/decision_id/position_id` используются для сквозной цепочки candidate -> decision -> open -> close.
 - Текстовые логи и JSONL могут отличаться по детализации; источник истины для метрик — JSONL.
 - `runtime_tuner.lock.json` и `watchdog.lock.json` должны иметь одного актуального владельца процесса; второй экземпляр считается конфликтом.
+
+## 8) V5 диагностика (2026-03-12)
+
+- `main_local` session text log:
+  - `STARTUP_CONFIG_SYNC ...`
+    - runtime/startup alignment markers for critical overrides.
+  - `FLOW_LANE_METRICS ...`
+    - lane/source funnel snapshot per cycle.
+- `runtime_tuner.jsonl`:
+  - `telemetry_v2.lane_profile_15m`
+    - lane-level funnel and open/close profile for `stable`/`discovery`.
+  - `blocked_actions[].blocked_by`
+    - includes structural lock reasons (`structural_lock`, `dry_run_structural_lock`).
+- `candidates.jsonl` / `trade_decisions.jsonl`:
+  - `lane_tag` propagated through candidate and trade events.
+  - use with `source` to debug conversion gaps (`non-watch raw -> post -> plan`).

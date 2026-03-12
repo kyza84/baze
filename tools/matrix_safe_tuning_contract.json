@@ -2,48 +2,20 @@
   "schema_version": "matrix.safe_tuning_contract.v1",
   "description": "Safe tuning envelope for user presets. Keys outside this allow-list are blocked.",
   "allowed_keys": {
-    "AUTO_TRADE_TOP_N": {
-      "type": "int",
-      "min": 8,
-      "max": 80,
-      "sensitivity": "medium",
-      "importance": "flow"
+    "ADAPTIVE_FILTERS_ENABLED": {
+      "type": "bool",
+      "sensitivity": "high",
+      "importance": "control_plane"
     },
-    "AUTO_TRADE_ENTRY_MODE": {
+    "ADAPTIVE_FILTERS_MODE": {
       "type": "enum",
       "values": [
-        "single",
-        "top_n",
-        "all"
+        "off",
+        "dry_run",
+        "apply"
       ],
       "sensitivity": "high",
-      "importance": "routing"
-    },
-    "FLOW_LEGACY_ROLLBACK_MODE": {
-      "type": "bool",
-      "sensitivity": "critical",
-      "importance": "rollback"
-    },
-    "MAX_OPEN_TRADES": {
-      "type": "int",
-      "min": 2,
-      "max": 12,
-      "sensitivity": "high",
-      "importance": "risk"
-    },
-    "MAX_BUYS_PER_HOUR": {
-      "type": "int",
-      "min": 20,
-      "max": 220,
-      "sensitivity": "high",
-      "importance": "flow"
-    },
-    "MAX_TX_PER_DAY": {
-      "type": "int",
-      "min": 0,
-      "max": 5000,
-      "sensitivity": "high",
-      "importance": "flow"
+      "importance": "control_plane"
     },
     "ANTI_CHOKE_ALLOW_SYMBOL_COOLDOWN_BYPASS": {
       "type": "bool",
@@ -60,54 +32,50 @@
       "sensitivity": "high",
       "importance": "diversification"
     },
-    "MIN_TOKEN_SCORE": {
-      "type": "int",
-      "min": 15,
-      "max": 95,
-      "sensitivity": "medium",
-      "importance": "entry_quality"
-    },
-    "MARKET_MODE_STRICT_SCORE": {
-      "type": "int",
-      "min": 15,
-      "max": 95,
+    "AUTONOMOUS_CONTROL_ENABLED": {
+      "type": "bool",
       "sensitivity": "high",
-      "importance": "entry_quality"
+      "importance": "control_plane"
     },
-    "MARKET_MODE_SOFT_SCORE": {
-      "type": "int",
-      "min": 10,
-      "max": 90,
+    "AUTONOMOUS_CONTROL_MODE": {
+      "type": "enum",
+      "values": [
+        "off",
+        "dry_run",
+        "apply"
+      ],
       "sensitivity": "high",
-      "importance": "entry_quality"
+      "importance": "control_plane"
     },
-    "MARKET_MODE_NON_WATCH_SOFT_SCORE_DELTA": {
-      "type": "int",
-      "min": 0,
-      "max": 24,
-      "sensitivity": "medium",
-      "importance": "entry_quality"
+    "AUTO_TRADE_ENTRY_MODE": {
+      "type": "enum",
+      "values": [
+        "single",
+        "top_n",
+        "all"
+      ],
+      "sensitivity": "high",
+      "importance": "routing"
     },
-    "MARKET_MODE_NON_WATCH_SOFT_MAX_PER_CYCLE": {
+    "AUTO_TRADE_EXCLUDED_SYMBOLS": {
+      "type": "csv_symbol_list",
+      "max_items": 40,
+      "sensitivity": "low",
+      "importance": "routing"
+    },
+    "AUTO_TRADE_TOP_N": {
       "type": "int",
-      "min": 0,
-      "max": 8,
+      "min": 8,
+      "max": 80,
       "sensitivity": "medium",
       "importance": "flow"
     },
-    "MIN_EXPECTED_EDGE_PERCENT": {
-      "type": "float",
-      "min": 0.05,
-      "max": 3.0,
-      "sensitivity": "high",
-      "importance": "entry_quality"
-    },
-    "MIN_EXPECTED_EDGE_USD": {
-      "type": "float",
-      "min": 0.0005,
-      "max": 0.05,
-      "sensitivity": "high",
-      "importance": "entry_quality"
+    "EDGE_COST_DOMINANT_HITS_TO_COOLDOWN": {
+      "type": "int",
+      "min": 2,
+      "max": 8,
+      "sensitivity": "medium",
+      "importance": "risk"
     },
     "EDGE_COST_DOMINANT_MIN_DELTA_PERCENT": {
       "type": "float",
@@ -116,10 +84,38 @@
       "sensitivity": "medium",
       "importance": "entry_quality"
     },
-    "EDGE_COST_DOMINANT_HITS_TO_COOLDOWN": {
+    "EDGE_COST_DOMINANT_NON_WATCH_HITS_TO_COOLDOWN": {
       "type": "int",
-      "min": 2,
+      "min": 1,
       "max": 8,
+      "sensitivity": "medium",
+      "importance": "risk"
+    },
+    "EDGE_COST_DOMINANT_NON_WATCH_MIN_COST_PERCENT": {
+      "type": "float",
+      "min": 2.0,
+      "max": 20.0,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "EDGE_COST_DOMINANT_NON_WATCH_MIN_DELTA_PERCENT": {
+      "type": "float",
+      "min": 1.0,
+      "max": 12.0,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "EDGE_COST_DOMINANT_NON_WATCH_MIN_GROSS_PERCENT": {
+      "type": "float",
+      "min": 0.0,
+      "max": 5.0,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "EDGE_COST_DOMINANT_NON_WATCH_SYMBOL_COOLDOWN_SECONDS": {
+      "type": "int",
+      "min": 60,
+      "max": 3600,
       "sensitivity": "medium",
       "importance": "risk"
     },
@@ -130,49 +126,30 @@
       "sensitivity": "medium",
       "importance": "risk"
     },
-    "V2_ROLLING_EDGE_MIN_USD": {
+    "ENTRY_A_CORE_MIN_TRADE_USD": {
       "type": "float",
-      "min": 0.0005,
-      "max": 0.05,
+      "min": 0.1,
+      "max": 2.5,
       "sensitivity": "high",
+      "importance": "risk"
+    },
+    "ENTRY_MIN_PRICE_CHANGE_5M_PERCENT": {
+      "type": "float",
+      "min": -2.0,
+      "max": 8.0,
+      "sensitivity": "medium",
       "importance": "entry_quality"
     },
-    "V2_ROLLING_EDGE_MIN_PERCENT": {
+    "ENTRY_MIN_VOLUME_5M_MULT": {
       "type": "float",
-      "min": 0.05,
+      "min": 0.5,
       "max": 3.0,
-      "sensitivity": "high",
-      "importance": "entry_quality"
-    },
-    "V2_CALIBRATION_ENABLED": {
-      "type": "bool",
-      "sensitivity": "high",
-      "importance": "routing"
-    },
-    "V2_CALIBRATION_NO_TIGHTEN_DURING_RELAX_WINDOW": {
-      "type": "bool",
-      "sensitivity": "medium",
-      "importance": "routing"
-    },
-    "V2_CALIBRATION_EDGE_USD_MIN": {
-      "type": "float",
-      "min": 0.0005,
-      "max": 0.05,
-      "sensitivity": "high",
-      "importance": "entry_quality"
-    },
-    "V2_CALIBRATION_VOLUME_MIN": {
-      "type": "float",
-      "min": 5.0,
-      "max": 450.0,
       "sensitivity": "medium",
       "importance": "entry_quality"
     },
-    "EV_FIRST_ENTRY_MIN_NET_USD": {
-      "type": "float",
-      "min": -0.002,
-      "max": 0.02,
-      "sensitivity": "high",
+    "ENTRY_REQUIRE_POSITIVE_CHANGE_5M": {
+      "type": "bool",
+      "sensitivity": "medium",
       "importance": "entry_quality"
     },
     "EV_FIRST_ENTRY_CORE_PROBE_EV_TOLERANCE_USD": {
@@ -189,122 +166,29 @@
       "sensitivity": "high",
       "importance": "entry_quality"
     },
-    "SAFE_MIN_VOLUME_5M_USD": {
+    "EV_FIRST_ENTRY_MIN_NET_USD": {
       "type": "float",
-      "min": 5.0,
-      "max": 8000.0,
-      "sensitivity": "medium",
+      "min": -0.002,
+      "max": 0.02,
+      "sensitivity": "high",
       "importance": "entry_quality"
     },
-    "SAFE_VOLUME_TWO_TIER_NON_WATCH_SOFT_RATIO": {
-      "type": "float",
-      "min": 0.20,
-      "max": 0.95,
-      "sensitivity": "medium",
-      "importance": "entry_quality"
+    "FLOW_LEGACY_ROLLBACK_MODE": {
+      "type": "bool",
+      "sensitivity": "critical",
+      "importance": "rollback"
     },
-    "SAFE_VOLUME_TWO_TIER_NON_WATCH_MAX_PASSES_PER_CYCLE": {
+    "HEAVY_CHECK_DEDUP_TTL_SECONDS": {
       "type": "int",
       "min": 0,
-      "max": 8,
+      "max": 120,
       "sensitivity": "medium",
-      "importance": "flow"
+      "importance": "routing"
     },
-    "SAFE_AGE_NON_WATCH_SOFT_RATIO": {
-      "type": "float",
-      "min": 0.25,
-      "max": 1.0,
-      "sensitivity": "medium",
-      "importance": "entry_quality"
-    },
-    "SAFE_AGE_NON_WATCH_MAX_PASSES_PER_CYCLE": {
+    "HOLD_MAX_SECONDS": {
       "type": "int",
-      "min": 0,
-      "max": 8,
-      "sensitivity": "medium",
-      "importance": "flow"
-    },
-    "SAFE_CHANGE_5M_NON_WATCH_SOFT_MULT": {
-      "type": "float",
-      "min": 1.0,
-      "max": 2.2,
-      "sensitivity": "medium",
-      "importance": "entry_quality"
-    },
-    "SAFE_CHANGE_5M_NON_WATCH_MAX_PASSES_PER_CYCLE": {
-      "type": "int",
-      "min": 0,
-      "max": 8,
-      "sensitivity": "medium",
-      "importance": "flow"
-    },
-    "SAFE_MIN_LIQUIDITY_USD": {
-      "type": "float",
-      "min": 100.0,
-      "max": 600000.0,
-      "sensitivity": "medium",
-      "importance": "entry_quality"
-    },
-    "MIN_LIQUIDITY": {
-      "type": "float",
-      "min": 100.0,
-      "max": 100000.0,
-      "sensitivity": "medium",
-      "importance": "source_quality"
-    },
-    "SAFE_MIN_AGE_SECONDS": {
-      "type": "int",
-      "min": 0,
-      "max": 3600,
-      "sensitivity": "high",
-      "importance": "entry_quality"
-    },
-    "TOKEN_AGE_MAX": {
-      "type": "int",
-      "min": 1800,
-      "max": 21600,
-      "sensitivity": "medium",
-      "importance": "source_quality"
-    },
-    "SEEN_TOKEN_TTL": {
-      "type": "int",
-      "min": 300,
-      "max": 21600,
-      "sensitivity": "medium",
-      "importance": "source_quality"
-    },
-    "PAPER_TRADE_SIZE_MIN_USD": {
-      "type": "float",
-      "min": 0.1,
-      "max": 2.0,
-      "sensitivity": "high",
-      "importance": "risk"
-    },
-    "MIN_TRADE_USD": {
-      "type": "float",
-      "min": 0.01,
-      "max": 2.0,
-      "sensitivity": "high",
-      "importance": "risk"
-    },
-    "ENTRY_A_CORE_MIN_TRADE_USD": {
-      "type": "float",
-      "min": 0.1,
-      "max": 2.5,
-      "sensitivity": "high",
-      "importance": "risk"
-    },
-    "PAPER_TRADE_SIZE_MAX_USD": {
-      "type": "float",
-      "min": 0.3,
-      "max": 2.5,
-      "sensitivity": "high",
-      "importance": "risk"
-    },
-    "PAPER_MAX_HOLD_SECONDS": {
-      "type": "int",
-      "min": 60,
-      "max": 900,
+      "min": 30,
+      "max": 1200,
       "sensitivity": "medium",
       "importance": "exit"
     },
@@ -315,38 +199,202 @@
       "sensitivity": "medium",
       "importance": "exit"
     },
-    "HOLD_MAX_SECONDS": {
+    "LANE_DISCOVERY_EDGE_LOOP_HITS_TO_COOLDOWN_MULT": {
+      "type": "float",
+      "min": 0.25,
+      "max": 1.0,
+      "sensitivity": "high",
+      "importance": "risk"
+    },
+    "LANE_DISCOVERY_ROUTE_MIN_SCORE": {
       "type": "int",
-      "min": 30,
-      "max": 1200,
-      "sensitivity": "medium",
-      "importance": "exit"
+      "min": 0,
+      "max": 95,
+      "sensitivity": "high",
+      "importance": "entry_quality"
     },
-    "PAPER_PARTIAL_TP_TRIGGER_PERCENT": {
-      "type": "float",
-      "min": 0.3,
-      "max": 8.0,
-      "sensitivity": "medium",
-      "importance": "exit"
+    "LANE_DISCOVERY_ROUTE_STRICT_ENABLED": {
+      "type": "bool",
+      "sensitivity": "high",
+      "importance": "routing"
     },
-    "PAPER_PARTIAL_TP_SELL_FRACTION": {
+    "LANE_DISCOVERY_SYMBOL_LOSS_LOCK_MULT": {
       "type": "float",
-      "min": 0.1,
-      "max": 0.9,
-      "sensitivity": "medium",
-      "importance": "exit"
+      "min": 1.0,
+      "max": 3.0,
+      "sensitivity": "high",
+      "importance": "risk"
     },
-    "NO_MOMENTUM_EXIT_MAX_PNL_PERCENT": {
+    "LANE_ECON_DISCOVERY_EDGE_PCT_MULT": {
       "type": "float",
-      "min": -0.5,
+      "min": 0.8,
+      "max": 2.5,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "LANE_ECON_DISCOVERY_EDGE_USD_MULT": {
+      "type": "float",
+      "min": 0.8,
+      "max": 2.5,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "LANE_ECON_DISCOVERY_EV_MIN_MULT": {
+      "type": "float",
+      "min": 0.8,
+      "max": 2.5,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "LANE_ECON_DISCOVERY_HINT_MIN_SIZE_USD": {
+      "type": "float",
+      "min": 0.8,
+      "max": 2.5,
+      "sensitivity": "medium",
+      "importance": "routing"
+    },
+    "LANE_ECON_DISCOVERY_MIN_TRADE_GAS_MULT": {
+      "type": "float",
+      "min": 4.0,
+      "max": 25.0,
+      "sensitivity": "medium",
+      "importance": "risk"
+    },
+    "LANE_ECON_DISCOVERY_MIN_TRADE_USD": {
+      "type": "float",
+      "min": 0.8,
+      "max": 2.5,
+      "sensitivity": "high",
+      "importance": "risk"
+    },
+    "LANE_ECON_NON_WATCH_EDGE_PCT_MULT": {
+      "type": "float",
+      "min": 0.5,
       "max": 1.2,
-      "sensitivity": "medium",
-      "importance": "exit"
+      "sensitivity": "high",
+      "importance": "entry_quality"
     },
-    "WEAKNESS_EXIT_PNL_PERCENT": {
+    "LANE_ECON_NON_WATCH_EDGE_USD_MULT": {
       "type": "float",
-      "min": -8.0,
-      "max": -0.2,
+      "min": 0.5,
+      "max": 1.2,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "LANE_ECON_NON_WATCH_EV_MIN_MULT": {
+      "type": "float",
+      "min": 0.5,
+      "max": 1.2,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "LANE_ECON_NON_WATCH_HINT_MIN_SIZE_USD": {
+      "type": "float",
+      "min": 0.8,
+      "max": 2.0,
+      "sensitivity": "medium",
+      "importance": "routing"
+    },
+    "LANE_ECON_NON_WATCH_MIN_TRADE_GAS_MULT": {
+      "type": "float",
+      "min": 4.0,
+      "max": 20.0,
+      "sensitivity": "medium",
+      "importance": "risk"
+    },
+    "LANE_ECON_NON_WATCH_MIN_TRADE_USD": {
+      "type": "float",
+      "min": 0.8,
+      "max": 2.0,
+      "sensitivity": "high",
+      "importance": "risk"
+    },
+    "LANE_ECON_SPLIT_ENABLED": {
+      "type": "bool",
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "LANE_ECON_STABLE_EDGE_PCT_MULT": {
+      "type": "float",
+      "min": 0.6,
+      "max": 1.5,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "LANE_ECON_STABLE_EDGE_USD_MULT": {
+      "type": "float",
+      "min": 0.6,
+      "max": 1.5,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "LANE_ECON_STABLE_EV_MIN_MULT": {
+      "type": "float",
+      "min": 0.6,
+      "max": 1.5,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "LANE_ECON_STABLE_MIN_TRADE_USD": {
+      "type": "float",
+      "min": 0.4,
+      "max": 2.5,
+      "sensitivity": "high",
+      "importance": "risk"
+    },
+    "LANE_ECON_WATCHLIST_EDGE_PCT_MULT": {
+      "type": "float",
+      "min": 0.8,
+      "max": 1.5,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "LANE_ECON_WATCHLIST_EDGE_USD_MULT": {
+      "type": "float",
+      "min": 0.8,
+      "max": 1.5,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "LANE_ECON_WATCHLIST_EV_MIN_MULT": {
+      "type": "float",
+      "min": 0.8,
+      "max": 1.5,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "LANE_ECON_WATCHLIST_MIN_TRADE_USD": {
+      "type": "float",
+      "min": 0.0,
+      "max": 2.0,
+      "sensitivity": "high",
+      "importance": "risk"
+    },
+    "MARKET_MODE_SOFT_SCORE": {
+      "type": "int",
+      "min": 10,
+      "max": 90,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "MARKET_MODE_STRICT_SCORE": {
+      "type": "int",
+      "min": 15,
+      "max": 95,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "MAX_BUYS_PER_HOUR": {
+      "type": "int",
+      "min": 20,
+      "max": 220,
+      "sensitivity": "high",
+      "importance": "flow"
+    },
+    "MAX_OPEN_TRADES": {
+      "type": "int",
+      "min": 2,
+      "max": 12,
       "sensitivity": "high",
       "importance": "risk"
     },
@@ -357,11 +405,586 @@
       "sensitivity": "medium",
       "importance": "flow"
     },
-    "HEAVY_CHECK_DEDUP_TTL_SECONDS": {
+    "MAX_TX_PER_DAY": {
       "type": "int",
       "min": 0,
-      "max": 120,
+      "max": 5000,
+      "sensitivity": "high",
+      "importance": "flow"
+    },
+    "MIN_EXPECTED_EDGE_PERCENT": {
+      "type": "float",
+      "min": 0.05,
+      "max": 3.0,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "MIN_EXPECTED_EDGE_USD": {
+      "type": "float",
+      "min": 0.0005,
+      "max": 0.05,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "MIN_LIQUIDITY": {
+      "type": "float",
+      "min": 100.0,
+      "max": 100000.0,
       "sensitivity": "medium",
+      "importance": "source_quality"
+    },
+    "MIN_TOKEN_SCORE": {
+      "type": "int",
+      "min": 15,
+      "max": 95,
+      "sensitivity": "medium",
+      "importance": "entry_quality"
+    },
+    "MIN_TRADE_USD": {
+      "type": "float",
+      "min": 0.01,
+      "max": 2.0,
+      "sensitivity": "high",
+      "importance": "risk"
+    },
+    "NON_WATCH_EDGE_SIZE_RECOVERY_ALLOW_CORE": {
+      "type": "bool",
+      "sensitivity": "medium",
+      "importance": "routing"
+    },
+    "NON_WATCH_EDGE_SIZE_RECOVERY_ENABLED": {
+      "type": "bool",
+      "sensitivity": "medium",
+      "importance": "routing"
+    },
+    "NON_WATCH_EDGE_SIZE_RECOVERY_MAX_USD": {
+      "type": "float",
+      "min": 0.8,
+      "max": 2.0,
+      "sensitivity": "high",
+      "importance": "risk"
+    },
+    "NON_WATCH_EDGE_SIZE_RECOVERY_MIN_COST_DELTA_PERCENT": {
+      "type": "float",
+      "min": 0.1,
+      "max": 5.0,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "NON_WATCH_EDGE_SIZE_RECOVERY_MIN_GROSS_PERCENT": {
+      "type": "float",
+      "min": 0.0,
+      "max": 5.0,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "NON_WATCH_LOW_FLOW_CACHE_FILL_ENABLED": {
+      "type": "bool",
+      "sensitivity": "medium",
+      "importance": "routing"
+    },
+    "NON_WATCH_LOW_FLOW_GECKO_MARKET_PAGES": {
+      "type": "int",
+      "min": 0,
+      "max": 12,
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "NON_WATCH_LOW_FLOW_GECKO_PAGES": {
+      "type": "int",
+      "min": 0,
+      "max": 12,
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "NON_WATCH_LOW_FLOW_GECKO_TIMEOUT_SECONDS": {
+      "type": "float",
+      "min": 4.0,
+      "max": 60.0,
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "NON_WATCH_LOW_FLOW_GECKO_TRENDING_PAGES": {
+      "type": "int",
+      "min": 0,
+      "max": 12,
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "NON_WATCH_LOW_FLOW_RELAXED_MAX_ABS_CHANGE_5M": {
+      "type": "float",
+      "min": 8.0,
+      "max": 60.0,
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "NON_WATCH_LOW_FLOW_RELAXED_MIN_AGE_SECONDS": {
+      "type": "int",
+      "min": 60,
+      "max": 86400,
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "NON_WATCH_LOW_FLOW_RELAXED_MIN_LIQUIDITY_USD": {
+      "type": "float",
+      "min": 500.0,
+      "max": 50000.0,
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "NON_WATCH_LOW_FLOW_RELAXED_MIN_VOLUME_5M_USD": {
+      "type": "float",
+      "min": 30.0,
+      "max": 5000.0,
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "NON_WATCH_LOW_FLOW_SOURCE_TIMEOUT_SECONDS": {
+      "type": "float",
+      "min": 4.0,
+      "max": 60.0,
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "NO_MOMENTUM_EXIT_MAX_PNL_PERCENT": {
+      "type": "float",
+      "min": -0.5,
+      "max": 1.2,
+      "sensitivity": "medium",
+      "importance": "exit"
+    },
+    "ONCHAIN_ENRICH_RETRIES": {
+      "type": "int",
+      "min": 1,
+      "max": 6,
+      "sensitivity": "medium",
+      "importance": "source_quality"
+    },
+    "ONCHAIN_ENRICH_RETRY_DELAY_SECONDS": {
+      "type": "int",
+      "min": 1,
+      "max": 20,
+      "sensitivity": "medium",
+      "importance": "source_quality"
+    },
+    "PAPER_ALLOW_WATCHLIST_SOURCE": {
+      "type": "bool",
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "PAPER_MAX_HOLD_SECONDS": {
+      "type": "int",
+      "min": 60,
+      "max": 900,
+      "sensitivity": "medium",
+      "importance": "exit"
+    },
+    "PAPER_PARTIAL_TP_SELL_FRACTION": {
+      "type": "float",
+      "min": 0.1,
+      "max": 0.9,
+      "sensitivity": "medium",
+      "importance": "exit"
+    },
+    "PAPER_PARTIAL_TP_TRIGGER_PERCENT": {
+      "type": "float",
+      "min": 0.3,
+      "max": 8.0,
+      "sensitivity": "medium",
+      "importance": "exit"
+    },
+    "PAPER_TRADE_SIZE_MAX_USD": {
+      "type": "float",
+      "min": 0.3,
+      "max": 2.5,
+      "sensitivity": "high",
+      "importance": "risk"
+    },
+    "PAPER_TRADE_SIZE_MIN_USD": {
+      "type": "float",
+      "min": 0.1,
+      "max": 2.0,
+      "sensitivity": "high",
+      "importance": "risk"
+    },
+    "PAPER_WATCHLIST_MIN_ABS_CHANGE_5M": {
+      "type": "float",
+      "min": 0.0,
+      "max": 12.0,
+      "sensitivity": "medium",
+      "importance": "entry_quality"
+    },
+    "PAPER_WATCHLIST_MIN_LIQUIDITY_USD": {
+      "type": "float",
+      "min": 10000.0,
+      "max": 500000.0,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "PAPER_WATCHLIST_MIN_SCORE": {
+      "type": "int",
+      "min": 70,
+      "max": 98,
+      "sensitivity": "medium",
+      "importance": "entry_quality"
+    },
+    "PAPER_WATCHLIST_MIN_VOLUME_5M_USD": {
+      "type": "float",
+      "min": 10.0,
+      "max": 20000.0,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "PLAN_LANE_QUOTAS_ENABLED": {
+      "type": "bool",
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "PLAN_LANE_STABLE_MAX_ABS_CHANGE_5M": {
+      "type": "float",
+      "min": 1.0,
+      "max": 80.0,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "PLAN_LANE_STABLE_MAX_WARNING_FLAGS": {
+      "type": "int",
+      "min": 0,
+      "max": 5,
+      "sensitivity": "high",
+      "importance": "safety"
+    },
+    "PLAN_LANE_STABLE_MIN_AGE_SECONDS": {
+      "type": "int",
+      "min": 60,
+      "max": 172800,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "PLAN_LANE_STABLE_MIN_LIQUIDITY_USD": {
+      "type": "float",
+      "min": 1000.0,
+      "max": 1000000.0,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "PLAN_LANE_STABLE_MIN_VOLUME_5M_USD": {
+      "type": "float",
+      "min": 20.0,
+      "max": 50000.0,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "PLAN_LANE_STABLE_REQUIRE_CONTRACT_SAFE": {
+      "type": "bool",
+      "sensitivity": "critical",
+      "importance": "safety"
+    },
+    "PLAN_LANE_TAG_ENABLED": {
+      "type": "bool",
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "PLAN_MAX_SINGLE_SOURCE_SHARE": {
+      "type": "float",
+      "min": 0.2,
+      "max": 1.0,
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "PLAN_MAX_WATCHLIST_SHARE": {
+      "type": "float",
+      "min": 0.0,
+      "max": 1.0,
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "PLAN_MIN_DISCOVERY_PER_BATCH": {
+      "type": "int",
+      "min": 0,
+      "max": 20,
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "PLAN_MIN_NON_WATCHLIST_PER_BATCH": {
+      "type": "int",
+      "min": 0,
+      "max": 20,
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "PLAN_MIN_STABLE_PER_BATCH": {
+      "type": "int",
+      "min": 0,
+      "max": 20,
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "PLAN_NON_WATCH_BRIDGE_ALLOW_HOLD": {
+      "type": "bool",
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "PLAN_NON_WATCH_BRIDGE_ENABLED": {
+      "type": "bool",
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "PLAN_NON_WATCH_BRIDGE_MAX_PER_BATCH": {
+      "type": "int",
+      "min": 0,
+      "max": 8,
+      "sensitivity": "medium",
+      "importance": "routing"
+    },
+    "PLAN_NON_WATCH_BRIDGE_MIN_PER_BATCH": {
+      "type": "int",
+      "min": 0,
+      "max": 4,
+      "sensitivity": "medium",
+      "importance": "routing"
+    },
+    "PLAN_NON_WATCH_BRIDGE_MIN_SCORE": {
+      "type": "int",
+      "min": 8,
+      "max": 95,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "PLAN_NON_WATCH_BRIDGE_POST_PREFILTER_ENABLED": {
+      "type": "bool",
+      "sensitivity": "medium",
+      "importance": "routing"
+    },
+    "PLAN_NON_WATCH_BRIDGE_POST_PREFILTER_MAX_PER_BATCH": {
+      "type": "int",
+      "min": 0,
+      "max": 8,
+      "sensitivity": "medium",
+      "importance": "routing"
+    },
+    "PLAN_NON_WATCH_BRIDGE_PROBE_MIN_SCORE": {
+      "type": "int",
+      "min": 0,
+      "max": 95,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "PLAN_NON_WATCH_ECON_MIN_EDGE_PERCENT": {
+      "type": "float",
+      "min": 0.0,
+      "max": 1.0,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "PLAN_NON_WATCH_ECON_MIN_EDGE_USD": {
+      "type": "float",
+      "min": 0.0,
+      "max": 0.01,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "PLAN_NON_WATCH_ECON_MIN_SCORE": {
+      "type": "int",
+      "min": 0,
+      "max": 95,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "PLAN_NON_WATCH_ECON_QUOTA_ENABLED": {
+      "type": "bool",
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "PLAN_SOURCE_DIVERSITY_ENABLED": {
+      "type": "bool",
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "PLAN_UNDERFLOW_ALLOW_HOLD": {
+      "type": "bool",
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "PLAN_UNDERFLOW_HOLD_MIN_SCORE": {
+      "type": "int",
+      "min": 0,
+      "max": 95,
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "PLAN_WATCHLIST_FALLBACK_ONLY": {
+      "type": "bool",
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "PROFIT_ENGINE_ENABLED": {
+      "type": "bool",
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "PROFIT_TARGET_PERCENT": {
+      "type": "float",
+      "min": 0.6,
+      "max": 20.0,
+      "sensitivity": "medium",
+      "importance": "exit"
+    },
+    "RAW_LANE_SPLIT_NON_WATCH_PRIMARY_MIN": {
+      "type": "int",
+      "min": 0,
+      "max": 40,
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "RAW_LANE_SPLIT_WATCH_FALLBACK_MAX": {
+      "type": "int",
+      "min": 0,
+      "max": 20,
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "RAW_LANE_SPLIT_WATCH_FALLBACK_WHEN_EMPTY": {
+      "type": "int",
+      "min": 0,
+      "max": 40,
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "RAW_NON_WATCH_ACTIONABLE_MAX_ABS_CHANGE_5M": {
+      "type": "float",
+      "min": 8.0,
+      "max": 80.0,
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "RAW_NON_WATCH_ACTIONABLE_MIN_AGE_SECONDS": {
+      "type": "int",
+      "min": 60,
+      "max": 86400,
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "RAW_NON_WATCH_ACTIONABLE_MIN_LIQUIDITY_USD": {
+      "type": "float",
+      "min": 500.0,
+      "max": 50000.0,
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "RAW_NON_WATCH_ACTIONABLE_MIN_VOLUME_5M_USD": {
+      "type": "float",
+      "min": 30.0,
+      "max": 5000.0,
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "RAW_SOURCE_REBALANCE_EXTRA_FETCH_ROUNDS": {
+      "type": "int",
+      "min": 0,
+      "max": 8,
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "RAW_SOURCE_REBALANCE_FETCH_TIMEOUT_SECONDS": {
+      "type": "float",
+      "min": 3.0,
+      "max": 60.0,
+      "sensitivity": "medium",
+      "importance": "routing"
+    },
+    "RAW_SOURCE_REBALANCE_MIN_NON_WATCH": {
+      "type": "int",
+      "min": 0,
+      "max": 80,
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "RAW_SOURCE_REBALANCE_WATCHLIST_MAX_SHARE": {
+      "type": "float",
+      "min": 0.05,
+      "max": 0.95,
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "RAW_STABLE_UPSTREAM_ENABLED": {
+      "type": "bool",
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "RAW_STABLE_UPSTREAM_EXTRA_FETCH_ROUNDS": {
+      "type": "int",
+      "min": 0,
+      "max": 8,
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "RAW_STABLE_UPSTREAM_MAX_EXTRA_PER_CYCLE": {
+      "type": "int",
+      "min": 0,
+      "max": 300,
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "RAW_STABLE_UPSTREAM_MIN_ACTIONABLE": {
+      "type": "int",
+      "min": 0,
+      "max": 80,
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "RAW_STABLE_UPSTREAM_ONLY_NON_WATCH": {
+      "type": "bool",
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "SAFE_MIN_AGE_SECONDS": {
+      "type": "int",
+      "min": 0,
+      "max": 3600,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "SAFE_MIN_LIQUIDITY_USD": {
+      "type": "float",
+      "min": 100.0,
+      "max": 600000.0,
+      "sensitivity": "medium",
+      "importance": "entry_quality"
+    },
+    "SAFE_MIN_VOLUME_5M_USD": {
+      "type": "float",
+      "min": 5.0,
+      "max": 8000.0,
+      "sensitivity": "medium",
+      "importance": "entry_quality"
+    },
+    "SEEN_TOKEN_TTL": {
+      "type": "int",
+      "min": 300,
+      "max": 21600,
+      "sensitivity": "medium",
+      "importance": "source_quality"
+    },
+    "SOURCE_ROUTER_BAD_ENTRY_PROBABILITY": {
+      "type": "float",
+      "min": 0.35,
+      "max": 0.95,
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "SOURCE_ROUTER_MIN_TRADES": {
+      "type": "int",
+      "min": 4,
+      "max": 40,
+      "sensitivity": "medium",
+      "importance": "routing"
+    },
+    "SOURCE_ROUTER_SEVERE_ENTRY_PROBABILITY": {
+      "type": "float",
+      "min": 0.2,
+      "max": 0.9,
+      "sensitivity": "high",
       "importance": "routing"
     },
     "STOP_LOSS_PERCENT": {
@@ -371,12 +994,64 @@
       "sensitivity": "high",
       "importance": "risk"
     },
-    "PROFIT_TARGET_PERCENT": {
+    "SYMBOL_CONCENTRATION_MAX_SHARE": {
       "type": "float",
-      "min": 0.6,
-      "max": 20.0,
+      "min": 0.05,
+      "max": 0.5,
+      "sensitivity": "high",
+      "importance": "diversification"
+    },
+    "TOKEN_AGE_MAX": {
+      "type": "int",
+      "min": 1800,
+      "max": 21600,
       "sensitivity": "medium",
-      "importance": "exit"
+      "importance": "source_quality"
+    },
+    "TOKEN_EV_MEMORY_BAD_ENTRY_PROBABILITY": {
+      "type": "float",
+      "min": 0.35,
+      "max": 0.95,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "TOKEN_EV_MEMORY_MIN_TRADES": {
+      "type": "int",
+      "min": 2,
+      "max": 30,
+      "sensitivity": "medium",
+      "importance": "entry_quality"
+    },
+    "TOKEN_EV_MEMORY_SEVERE_ENTRY_PROBABILITY": {
+      "type": "float",
+      "min": 0.2,
+      "max": 0.9,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "V2_CALIBRATION_EDGE_USD_MIN": {
+      "type": "float",
+      "min": 0.0005,
+      "max": 0.05,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "V2_CALIBRATION_ENABLED": {
+      "type": "bool",
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "V2_CALIBRATION_NO_TIGHTEN_DURING_RELAX_WINDOW": {
+      "type": "bool",
+      "sensitivity": "medium",
+      "importance": "routing"
+    },
+    "V2_CALIBRATION_VOLUME_MIN": {
+      "type": "float",
+      "min": 5.0,
+      "max": 450.0,
+      "sensitivity": "medium",
+      "importance": "entry_quality"
     },
     "V2_ENTRY_EXPLORE_MAX_SHARE": {
       "type": "float",
@@ -385,10 +1060,17 @@
       "sensitivity": "high",
       "importance": "routing"
     },
-    "V2_UNIVERSE_NOVELTY_MIN_SHARE": {
-      "type": "float",
-      "min": 0.05,
-      "max": 0.9,
+    "V2_KPI_POLICY_MODE": {
+      "type": "enum",
+      "values": [
+        "normal",
+        "lock_zero_open"
+      ],
+      "sensitivity": "medium",
+      "importance": "routing"
+    },
+    "V2_QUALITY_SOURCE_BUDGET_ENABLED": {
+      "type": "bool",
       "sensitivity": "high",
       "importance": "routing"
     },
@@ -413,144 +1095,18 @@
       "sensitivity": "medium",
       "importance": "diversification"
     },
-    "SYMBOL_CONCENTRATION_MAX_SHARE": {
+    "V2_ROLLING_EDGE_MIN_PERCENT": {
       "type": "float",
       "min": 0.05,
-      "max": 0.5,
-      "sensitivity": "high",
-      "importance": "diversification"
-    },
-    "AUTO_TRADE_EXCLUDED_SYMBOLS": {
-      "type": "csv_symbol_list",
-      "max_items": 40,
-      "sensitivity": "low",
-      "importance": "routing"
-    },
-    "ENTRY_REQUIRE_POSITIVE_CHANGE_5M": {
-      "type": "bool",
-      "sensitivity": "medium",
-      "importance": "entry_quality"
-    },
-    "ENTRY_MIN_PRICE_CHANGE_5M_PERCENT": {
-      "type": "float",
-      "min": -2.0,
-      "max": 8.0,
-      "sensitivity": "medium",
-      "importance": "entry_quality"
-    },
-    "ENTRY_MIN_VOLUME_5M_MULT": {
-      "type": "float",
-      "min": 0.5,
       "max": 3.0,
-      "sensitivity": "medium",
-      "importance": "entry_quality"
-    },
-    "PAPER_ALLOW_WATCHLIST_SOURCE": {
-      "type": "bool",
-      "sensitivity": "high",
-      "importance": "routing"
-    },
-    "WATCHLIST_ENABLED": {
-      "type": "bool",
-      "sensitivity": "high",
-      "importance": "routing"
-    },
-    "WATCHLIST_REFRESH_SECONDS": {
-      "type": "int",
-      "min": 30,
-      "max": 3600,
-      "sensitivity": "medium",
-      "importance": "routing"
-    },
-    "WATCHLIST_MAX_TOKENS": {
-      "type": "int",
-      "min": 5,
-      "max": 120,
-      "sensitivity": "medium",
-      "importance": "routing"
-    },
-    "WATCHLIST_MIN_LIQUIDITY_USD": {
-      "type": "float",
-      "min": 5000.0,
-      "max": 1000000.0,
       "sensitivity": "high",
       "importance": "entry_quality"
     },
-    "WATCHLIST_MIN_VOLUME_5M_USD": {
+    "V2_ROLLING_EDGE_MIN_USD": {
       "type": "float",
-      "min": 100.0,
-      "max": 20000.0,
+      "min": 0.0005,
+      "max": 0.05,
       "sensitivity": "high",
-      "importance": "entry_quality"
-    },
-    "WATCHLIST_MIN_VOLUME_24H_USD": {
-      "type": "float",
-      "min": 10000.0,
-      "max": 5000000.0,
-      "sensitivity": "high",
-      "importance": "entry_quality"
-    },
-    "WATCHLIST_LOW_SUPPLY_MIN_COUNT": {
-      "type": "int",
-      "min": 1,
-      "max": 30,
-      "sensitivity": "medium",
-      "importance": "routing"
-    },
-    "WATCHLIST_LOW_SUPPLY_RELAX_FACTOR": {
-      "type": "float",
-      "min": 0.1,
-      "max": 1.0,
-      "sensitivity": "medium",
-      "importance": "routing"
-    },
-    "WATCHLIST_LOW_SUPPLY_MIN_VOLUME_5M_USD": {
-      "type": "float",
-      "min": 0.0,
-      "max": 20000.0,
-      "sensitivity": "medium",
-      "importance": "routing"
-    },
-    "WATCHLIST_GECKO_TRENDING_PAGES": {
-      "type": "int",
-      "min": 1,
-      "max": 5,
-      "sensitivity": "medium",
-      "importance": "routing"
-    },
-    "WATCHLIST_GECKO_POOLS_PAGES": {
-      "type": "int",
-      "min": 0,
-      "max": 5,
-      "sensitivity": "medium",
-      "importance": "routing"
-    },
-    "PAPER_WATCHLIST_MIN_SCORE": {
-      "type": "int",
-      "min": 70,
-      "max": 98,
-      "sensitivity": "medium",
-      "importance": "entry_quality"
-    },
-    "PAPER_WATCHLIST_MIN_LIQUIDITY_USD": {
-      "type": "float",
-      "min": 10000.0,
-      "max": 500000.0,
-      "sensitivity": "high",
-      "importance": "entry_quality"
-    },
-    "PAPER_WATCHLIST_MIN_VOLUME_5M_USD": {
-      "type": "float",
-      "min": 10.0,
-      "max": 20000.0,
-      "sensitivity": "high",
-      "importance": "entry_quality"
-    },
-    "PAPER_WATCHLIST_MIN_ABS_CHANGE_5M": {
-      "type": "float",
-      "min": 0.0,
-      "max": 12.0,
-      "sensitivity": "medium",
       "importance": "entry_quality"
     },
     "V2_SAFETY_BUDGET_ENABLED": {
@@ -573,49 +1129,6 @@
       "sensitivity": "high",
       "importance": "safety"
     },
-    "V2_SOURCE_QOS_ENABLED": {
-      "type": "bool",
-      "sensitivity": "medium",
-      "importance": "routing"
-    },
-    "V2_QUALITY_SOURCE_BUDGET_ENABLED": {
-      "type": "bool",
-      "sensitivity": "high",
-      "importance": "routing"
-    },
-    "ONCHAIN_ENRICH_RETRIES": {
-      "type": "int",
-      "min": 1,
-      "max": 6,
-      "sensitivity": "medium",
-      "importance": "source_quality"
-    },
-    "ONCHAIN_ENRICH_RETRY_DELAY_SECONDS": {
-      "type": "int",
-      "min": 1,
-      "max": 20,
-      "sensitivity": "medium",
-      "importance": "source_quality"
-    },
-    "V2_SOURCE_QOS_FORCE_DUAL_ENTRY": {
-      "type": "bool",
-      "sensitivity": "medium",
-      "importance": "routing"
-    },
-    "V2_SOURCE_QOS_TOPK_PER_CYCLE": {
-      "type": "int",
-      "min": 20,
-      "max": 600,
-      "sensitivity": "high",
-      "importance": "routing"
-    },
-    "V2_SOURCE_QOS_MAX_PER_SYMBOL_PER_CYCLE": {
-      "type": "int",
-      "min": 1,
-      "max": 20,
-      "sensitivity": "high",
-      "importance": "routing"
-    },
     "V2_SOURCE_QOS_COOLDOWN_SECONDS": {
       "type": "int",
       "min": 60,
@@ -623,10 +1136,20 @@
       "sensitivity": "medium",
       "importance": "routing"
     },
-    "V2_SOURCE_QOS_MIN_PASS_RATE": {
-      "type": "float",
-      "min": 0.0,
-      "max": 0.2,
+    "V2_SOURCE_QOS_ENABLED": {
+      "type": "bool",
+      "sensitivity": "medium",
+      "importance": "routing"
+    },
+    "V2_SOURCE_QOS_FORCE_DUAL_ENTRY": {
+      "type": "bool",
+      "sensitivity": "medium",
+      "importance": "routing"
+    },
+    "V2_SOURCE_QOS_MAX_PER_SYMBOL_PER_CYCLE": {
+      "type": "int",
+      "min": 1,
+      "max": 20,
       "sensitivity": "high",
       "importance": "routing"
     },
@@ -644,11 +1167,32 @@
       "sensitivity": "high",
       "importance": "routing"
     },
+    "V2_SOURCE_QOS_MIN_PASS_RATE": {
+      "type": "float",
+      "min": 0.0,
+      "max": 0.2,
+      "sensitivity": "high",
+      "importance": "routing"
+    },
     "V2_SOURCE_QOS_SOURCE_CAPS": {
       "type": "source_cap_map",
       "max_items": 16,
       "min_value": 1,
       "max_value": 600,
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "V2_SOURCE_QOS_TOPK_PER_CYCLE": {
+      "type": "int",
+      "min": 20,
+      "max": 600,
+      "sensitivity": "high",
+      "importance": "routing"
+    },
+    "V2_UNIVERSE_NOVELTY_MIN_SHARE": {
+      "type": "float",
+      "min": 0.05,
+      "max": 0.9,
       "sensitivity": "high",
       "importance": "routing"
     },
@@ -660,102 +1204,91 @@
       "sensitivity": "high",
       "importance": "routing"
     },
-    "PLAN_SOURCE_DIVERSITY_ENABLED": {
+    "WATCHLIST_ENABLED": {
       "type": "bool",
       "sensitivity": "high",
       "importance": "routing"
     },
-    "PLAN_MAX_SINGLE_SOURCE_SHARE": {
-      "type": "float",
-      "min": 0.2,
-      "max": 1.0,
-      "sensitivity": "high",
-      "importance": "routing"
-    },
-    "PLAN_MAX_WATCHLIST_SHARE": {
-      "type": "float",
-      "min": 0.0,
-      "max": 1.0,
-      "sensitivity": "high",
-      "importance": "routing"
-    },
-    "PLAN_MIN_NON_WATCHLIST_PER_BATCH": {
+    "WATCHLIST_GECKO_POOLS_PAGES": {
       "type": "int",
       "min": 0,
-      "max": 20,
-      "sensitivity": "high",
-      "importance": "routing"
-    },
-    "PLAN_UNDERFLOW_ALLOW_HOLD": {
-      "type": "bool",
-      "sensitivity": "high",
-      "importance": "routing"
-    },
-    "PLAN_UNDERFLOW_HOLD_MIN_SCORE": {
-      "type": "int",
-      "min": 0,
-      "max": 95,
-      "sensitivity": "high",
-      "importance": "routing"
-    },
-    "V2_KPI_POLICY_MODE": {
-      "type": "enum",
-      "values": [
-        "normal",
-        "lock_zero_open"
-      ],
+      "max": 5,
       "sensitivity": "medium",
       "importance": "routing"
     },
-    "SOURCE_ROUTER_MIN_TRADES": {
+    "WATCHLIST_GECKO_TRENDING_PAGES": {
       "type": "int",
-      "min": 4,
-      "max": 40,
+      "min": 1,
+      "max": 5,
       "sensitivity": "medium",
       "importance": "routing"
     },
-    "SOURCE_ROUTER_BAD_ENTRY_PROBABILITY": {
-      "type": "float",
-      "min": 0.35,
-      "max": 0.95,
-      "sensitivity": "high",
-      "importance": "routing"
-    },
-    "SOURCE_ROUTER_SEVERE_ENTRY_PROBABILITY": {
-      "type": "float",
-      "min": 0.2,
-      "max": 0.9,
-      "sensitivity": "high",
-      "importance": "routing"
-    },
-    "TOKEN_EV_MEMORY_MIN_TRADES": {
+    "WATCHLIST_LOW_SUPPLY_MIN_COUNT": {
       "type": "int",
-      "min": 2,
+      "min": 1,
       "max": 30,
       "sensitivity": "medium",
-      "importance": "entry_quality"
-    },
-    "TOKEN_EV_MEMORY_BAD_ENTRY_PROBABILITY": {
-      "type": "float",
-      "min": 0.35,
-      "max": 0.95,
-      "sensitivity": "high",
-      "importance": "entry_quality"
-    },
-    "TOKEN_EV_MEMORY_SEVERE_ENTRY_PROBABILITY": {
-      "type": "float",
-      "min": 0.2,
-      "max": 0.9,
-      "sensitivity": "high",
-      "importance": "entry_quality"
-    },
-    "PROFIT_ENGINE_ENABLED": {
-      "type": "bool",
-      "sensitivity": "high",
       "importance": "routing"
+    },
+    "WATCHLIST_LOW_SUPPLY_MIN_VOLUME_5M_USD": {
+      "type": "float",
+      "min": 0.0,
+      "max": 20000.0,
+      "sensitivity": "medium",
+      "importance": "routing"
+    },
+    "WATCHLIST_LOW_SUPPLY_RELAX_FACTOR": {
+      "type": "float",
+      "min": 0.1,
+      "max": 1.0,
+      "sensitivity": "medium",
+      "importance": "routing"
+    },
+    "WATCHLIST_MAX_TOKENS": {
+      "type": "int",
+      "min": 5,
+      "max": 120,
+      "sensitivity": "medium",
+      "importance": "routing"
+    },
+    "WATCHLIST_MIN_LIQUIDITY_USD": {
+      "type": "float",
+      "min": 5000.0,
+      "max": 1000000.0,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "WATCHLIST_MIN_VOLUME_24H_USD": {
+      "type": "float",
+      "min": 10000.0,
+      "max": 5000000.0,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "WATCHLIST_MIN_VOLUME_5M_USD": {
+      "type": "float",
+      "min": 100.0,
+      "max": 20000.0,
+      "sensitivity": "high",
+      "importance": "entry_quality"
+    },
+    "WATCHLIST_REFRESH_SECONDS": {
+      "type": "int",
+      "min": 30,
+      "max": 3600,
+      "sensitivity": "medium",
+      "importance": "routing"
+    },
+    "WEAKNESS_EXIT_PNL_PERCENT": {
+      "type": "float",
+      "min": -8.0,
+      "max": -0.2,
+      "sensitivity": "high",
+      "importance": "risk"
     }
   },
   "protected_keys": [
+    "ANTI_SCAM_LOCKED_MODE",
     "WALLET_BALANCE_USD",
     "WALLET_MODE",
     "AUTO_TRADE_ENABLED",
@@ -783,8 +1316,40 @@
     "HONEYPOT_TRANSIENT_BLACKLIST_TTL_SECONDS",
     "SAFE_REQUIRE_CONTRACT_SAFE",
     "SAFE_REQUIRE_RISK_LEVEL",
+    "SAFE_VOLUME_TWO_TIER_NON_WATCH_ENABLED",
+    "SAFE_VOLUME_TWO_TIER_NON_WATCH_SOFT_RATIO",
+    "SAFE_VOLUME_TWO_TIER_NON_WATCH_MAX_PASSES_PER_CYCLE",
+    "SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_SOFT_ENABLED",
+    "SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_SOFT_RATIO",
+    "SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_MIN_VOLUME_5M_MULT",
+    "SAFE_LIQUIDITY_ONCHAIN_NON_WATCH_MAX_PASSES_PER_CYCLE",
+    "SAFE_AGE_NON_WATCH_SOFT_ENABLED",
+    "SAFE_AGE_NON_WATCH_SOFT_RATIO",
+    "SAFE_AGE_NON_WATCH_MAX_PASSES_PER_CYCLE",
+    "SAFE_CHANGE_5M_NON_WATCH_SOFT_ENABLED",
+    "SAFE_CHANGE_5M_NON_WATCH_SOFT_MULT",
+    "SAFE_CHANGE_5M_NON_WATCH_MAX_PASSES_PER_CYCLE",
+    "MARKET_MODE_NON_WATCH_SOFT_SCORE_DELTA",
+    "MARKET_MODE_NON_WATCH_SOFT_MAX_PER_CYCLE",
     "ENTRY_FAIL_CLOSED_ON_SAFETY_GAP",
     "ENTRY_ALLOWED_SAFETY_SOURCES",
+    "ANTI_SCAM_LOCKED_DISCOVERY_BRIDGE_ENABLED",
+    "ENTRY_HARD_NON_WATCH_SCAM_GUARD_ENABLED",
+    "ENTRY_HARD_NON_WATCH_SCAM_ONLY_DISCOVERY",
+    "ENTRY_HARD_NON_WATCH_SCAM_MIN_AGE_SECONDS",
+    "ENTRY_HARD_NON_WATCH_SCAM_MIN_LIQUIDITY_USD",
+    "ENTRY_HARD_NON_WATCH_SCAM_MIN_VOLUME_5M_USD",
+    "ENTRY_HARD_NON_WATCH_SCAM_MAX_ABS_CHANGE_5M",
+    "ENTRY_HARD_NON_WATCH_SCAM_REQUIRE_CONTRACT_SAFE",
+    "ENTRY_HARD_NON_WATCH_SCAM_MAX_WARNING_FLAGS",
+    "ENTRY_HARD_NON_WATCH_SCAM_MAX_RISK_LEVEL",
+    "ENTRY_HARD_NON_WATCH_SCAM_HITS_TO_BLACKLIST",
+    "ENTRY_HARD_NON_WATCH_SCAM_BLACKLIST_TTL_SECONDS",
+    "ENTRY_HARD_SCAM_APPLY_DISCOVERY_LANE",
+    "ENTRY_HARD_NON_WATCH_SCAM_PASS_STREAK_REQUIRED",
+    "ENTRY_HARD_NON_WATCH_SCAM_PASS_STREAK_WINDOW_SECONDS",
+    "ENTRY_HARD_NON_WATCH_SCAM_PASS_STREAK_MAX_AGE_SECONDS",
+    "POST_ENTRY_RUG_SYMBOL_COOLDOWN_SECONDS",
     "PAPER_WATCHLIST_STRICT_GUARD_ENABLED",
     "LOCAL_ANTISCAM_TRANSIENT_STRICT_ENABLED",
     "LOCAL_ANTISCAM_TRANSIENT_MIN_AGE_SECONDS",

@@ -1,12 +1,54 @@
 # PROJECT_STATE
 
 ## Snapshot
-- Updated: 2026-03-07
+- Updated: 2026-03-12
 - Repo: d:\earnforme\solana-alert-bot
 - Remote: https://github.com/kyza84/baze
 - Branch: main
-- Active profile: u_station_flow_intake_dryrun_v1
-- Last validated runtime: matrix+tuner+watchdog running; runtime hot-apply lock guard prevents stale patch override after restart.
+- Active profile: use `data/matrix/runs/active_matrix.json` as source of truth.
+- Last validated runtime: structural lane/source locks and anti-scam hard contour are enforced in runtime + tuner contract.
+
+## Latest Update (2026-03-12, V5 structural lane/safety hardening)
+- `config.py`
+  - Added startup/config consistency controls and fail-fast toggles for unknown/unused/critical override drift.
+  - Added onchain re-enrich + unresolved retry queue controls.
+  - Added raw non-watch actionable thresholds and stable upstream controls.
+  - Added lane planning/economic split controls (`PLAN_LANE_*`, `RAW_STABLE_UPSTREAM_*`, `LANE_ECON_*`).
+  - Added hard non-watch anti-scam contour keys (`ENTRY_HARD_NON_WATCH_SCAM_*`) and anti-scam lock mode.
+  - Added post-entry anti-pump controls (`POST_ENTRY_PUMP_*`) for paper-stat distortion/rug-like spikes.
+- `main_local.py`
+  - Added startup self-check/alignment helpers for runtime patch + active matrix overrides.
+  - Added lane tagging helpers (`stable`/`discovery`) and lane-aware cycle metrics.
+  - Added onchain unresolved row re-enrich path with bounded retry queue/TTL/backoff.
+  - Added upstream non-watch actionable gate accounting before lane split.
+  - Added source rebalance + stable upstream boost with explicit fallback reason telemetry.
+  - Added expanded `FLOW_LANE_METRICS` with:
+    - raw/post/plan by lane,
+    - non-watch actionable pass/fail + reasons,
+    - watchlist fallback usage/reason.
+- `monitor/dexscreener.py`
+  - Added low-flow source timeouts, actionable filtering, and cached-last-success fallback fill.
+  - Added force low-flow pull helper for non-watch recovery.
+- `monitor/onchain_factory.py`
+  - Added backfill clamp + chunk limits.
+  - Added unresolved onchain forwarding so rows can be re-enriched centrally instead of hard-drop.
+- `monitor/token_scorer.py`
+  - Added non-watch uplift scoring path bounded by safety/risk constraints.
+- `trading/auto_trader.py`
+  - Added position lane tagging and lane flow counters (`plan_attempts`/`opens` per lane).
+  - Added plan-batch lane quotas (`stable`/`discovery`) and non-watch bridge controls.
+  - Added lane economic profiles and lane-aware trade floors/edge gates.
+  - Added non-watch route-prob relax path (bounded and conditional).
+  - Added symbol loss-lock and non-watch symbol window guards.
+  - Added hard non-watch anti-scam pre-buy gate with streak + TTL blacklist escalation.
+  - Added post-entry pump guard with cap/blacklist/cooldown handling.
+- `tools/matrix_runtime_tuner.py`
+  - Added lane-profile telemetry (`lane_profile_15m`).
+  - Enforced structural locks independent of dry-run (`_enforce_structural_locks`).
+  - Preserved protected-key filtering before action budgets with explicit blocked-action trace.
+- `tools/matrix_safe_tuning_contract.json`
+  - Extended allowed runtime knobs for lane econ/upstream split controls.
+  - Extended protected keys for anti-scam hard contour and non-watch hard guard families.
 
 ## Latest Update (2026-03-07, Runtime Hot-Apply lock/stale guard)
 - `main_local.py`

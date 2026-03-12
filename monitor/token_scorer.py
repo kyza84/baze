@@ -11,6 +11,8 @@ class TokenScorer:
         age_seconds = int(token_data.get("age_seconds") or 0)
         warning_flags = int(token_data.get("warning_flags") or 0)
         is_contract_safe = bool(token_data.get("is_contract_safe", True))
+        source = str(token_data.get("source") or "").strip().lower()
+        abs_change_5m = abs(float(token_data.get("price_change_5m") or 0.0))
 
         liquidity_score = self._score_liquidity(liquidity)
         volume_score = self._score_volume(volume_5m)
@@ -19,6 +21,20 @@ class TokenScorer:
 
         safety_score = self._score_safety(warning_flags, is_contract_safe)
         score = max(0, min(100, liquidity_score + volume_score + risk_score + age_score + safety_score))
+
+        # Non-watch uplift:
+        # strong, safer non-watch candidates should not be permanently stuck at HOLD=60.
+        non_watch_uplift = self._score_non_watch_uplift(
+            source=source,
+            liquidity=liquidity,
+            volume_5m=volume_5m,
+            age_seconds=age_seconds,
+            abs_change_5m=abs_change_5m,
+            risk_level=risk_level,
+            warning_flags=warning_flags,
+            is_contract_safe=is_contract_safe,
+        )
+        score = max(0, min(100, int(score) + int(non_watch_uplift)))
         recommendation = self._recommendation(score)
 
         return {
@@ -29,6 +45,7 @@ class TokenScorer:
                 "risk_score": risk_score,
                 "age_score": age_score,
                 "safety_score": safety_score,
+                "non_watch_uplift": int(non_watch_uplift),
             },
             "recommendation": recommendation,
         }
@@ -86,6 +103,69 @@ class TokenScorer:
         else:
             score -= min(15, warning_flags * 4)
         return score
+
+    @staticmethod
+    def _score_non_watch_uplift(
+        *,
+        source: str,
+        liquidity: float,
+        volume_5m: float,
+        age_seconds: int,
+        abs_change_5m: float,
+        risk_level: str,
+        warning_flags: int,
+        is_contract_safe: bool,
+    ) -> int:
+        src = str(source or "").strip().lower()
+        if (not src) or src.startswith("watchlist"):
+            return 0
+        if not is_contract_safe:
+            return 0
+        if int(warning_flags) > 1:
+            return 0
+        if str(risk_level).upper() not in {"LOW", "MEDIUM"}:
+            return 0
+
+        # Conservative uplift only for mature, liquid and not-overheated non-watch tokens.
+        # This path helps non-watch avoid permanent HOLD=60 when safety is clean but 5m volume is modest.
+        if (
+            liquidity >= 100000
+            and volume_5m >= 600
+            and age_seconds >= 300
+            and abs_change_5m <= 5.0
+            and int(warning_flags) == 0
+        ):
+            return 30
+        if (
+            liquidity >= 70000
+            and volume_5m >= 250
+            and age_seconds >= 240
+            and abs_change_5m <= 6.0
+            and int(warning_flags) == 0
+        ):
+            return 25
+        if (
+            liquidity >= 45000
+            and volume_5m >= 1200
+            and age_seconds >= 300
+            and abs_change_5m <= 12.0
+        ):
+            return 25
+        if (
+            liquidity >= 30000
+            and volume_5m >= 2500
+            and age_seconds >= 240
+            and abs_change_5m <= 10.0
+        ):
+            return 20
+        if (
+            liquidity >= 20000
+            and volume_5m >= 5000
+            and age_seconds >= 240
+            and abs_change_5m <= 8.0
+        ):
+            return 15
+        return 0
 
     @staticmethod
     def _recommendation(score: int) -> str:
